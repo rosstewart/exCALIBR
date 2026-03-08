@@ -6,6 +6,7 @@ import os
 import sys
 import argparse
 import json
+import pandas as pd
 from pathlib import Path
 from typing import Dict
 
@@ -13,7 +14,8 @@ from src.assay_calibration.pipeline.config import PipelineConfig
 from src.assay_calibration.pipeline.fit_bootstrap import BootstrapRunner
 from src.assay_calibration.pipeline.model_selection import bootstrap_paired_test
 from src.assay_calibration.pipeline.visualize import generate_visualizations
-from src.assay_calibration.pipeline.utils import setup_logging, save_results
+from src.assay_calibration.pipeline.variant_evidence import compute_variant_table
+from src.assay_calibration.pipeline.utils import setup_logging, save_results, load_dataset_from_df
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -59,6 +61,18 @@ Examples:
                        help="Use equation for 2c prior (instead of EM estimation)")
     parser.add_argument("--conservative-monotonicity", action="store_true",
                        help="Conservative enforcement of monotonicity on evidence thresholds")
+    parser.add_argument("--manual-prior", type=float, default=None,
+                       help="Manually set prior probability (0-1). Skips empirical estimation.")
+    parser.add_argument("--population-type", default="gnomAD",
+                       choices=["all_variants", "all_nsSNV", "all_missense_nsSNV",
+                                "gnomAD", "gnomAD_nsSNV", "gnomAD_missense_nsSNV"],
+                       help="Population type for dataset loading (default: gnomAD)")
+    
+    # OOB evidence
+    parser.add_argument("--oob", action="store_true",
+                       help="Compute out-of-bag per-variant evidence (slower)")
+    parser.add_argument("--oob-min-samples", type=int, default=1,
+                       help="Min OOB bootstrap samples per variant (default: 1)")
     
     # Bootstrap parameters
     parser.add_argument("--n-bootstraps", type=int, default=1000,
@@ -111,6 +125,10 @@ Examples:
         use_2c_equation=args.use_equation,
         liberal_monotonicity=not args.conservative_monotonicity,
         benign_method=args.benign_method,
+        manual_prior=args.manual_prior,
+        population_type=args.population_type,
+        compute_oob=args.oob,
+        oob_min_samples=args.oob_min_samples,
         execution_mode=args.mode,
         n_jobs=args.n_jobs,
         slurm_account=args.slurm_account,
@@ -155,7 +173,7 @@ def run_calibration_pipeline(config: PipelineConfig):
     logger.info("="*80)
     
     runner = BootstrapRunner(config)
-    bootstrap_results = runner.run()
+    bootstrap_results, dataset_splits = runner.run()
     
     logger.info(f"\nCompleted {len(bootstrap_results)} bootstrap iterations")
     
@@ -195,7 +213,7 @@ def run_calibration_pipeline(config: PipelineConfig):
         selected_components = {f"{c}c": c for c in config.components}
         logger.info(f"\nUsing fitted components: {list(selected_components.keys())}")
     
-    # Step 3: Generate visualizations and export
+    # Step 3a: Generate visualizations and export
     logger.info("\n" + "="*80)
     logger.info("STEP 3: Visualization and Export")
     logger.info("="*80)
@@ -206,6 +224,26 @@ def run_calibration_pipeline(config: PipelineConfig):
         selected_components=selected_components,
         logger=logger
     )
+    
+    # Step 3b: Per-variant evidence table
+    logger.info("\n" + "="*80)
+    logger.info("STEP 3b: Per-Variant Evidence Table")
+    logger.info("="*80)
+    
+    df_vt = pd.read_csv(config.dataset_csv)
+    scoreset_vt = load_dataset_from_df(df_vt, config)
+    
+    for component_key, calibration in results.items():
+        variant_df = compute_variant_table(
+            scoreset=scoreset_vt,
+            calibration=calibration,
+            config=config,
+            dataset_splits=dataset_splits if config.compute_oob else None,
+            logger=logger,
+        )
+        table_path = Path(config.output_dir) / f"{config.dataset_name}_{component_key}_variants.csv"
+        variant_df.to_csv(table_path, index=False)
+        logger.info(f"  Saved variant table: {table_path} ({len(variant_df)} variants)")
     
     # Step 4: Save results
     logger.info("\n" + "="*80)
@@ -223,8 +261,9 @@ def run_calibration_pipeline(config: PipelineConfig):
     logger.info("PIPELINE COMPLETE")
     logger.info("="*80)
     logger.info(f"\nResults saved to: {config.output_dir}")
-    logger.info(f"  - Calibration: {config.dataset_name}_calibration.json")
-    logger.info(f"  - Visualization: {config.dataset_name}_visualization.png")
+    logger.info(f"  - Calibration: {config.dataset_name}_<component>_calibration.json")
+    logger.info(f"  - Visualization: {config.dataset_name}_<component>_visualization.png")
+    logger.info(f"  - Variant table: {config.dataset_name}_<component>_variants.csv")
     if config.save_bootstrap_fits:
         logger.info(f"  - Bootstrap fits: {config.dataset_name}_bootstrap_fits.pkl")
 

@@ -7,7 +7,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from joblib import Parallel, delayed
 import subprocess
 
@@ -24,8 +24,14 @@ class BootstrapRunner:
         self.dataset = None
         self.fitter = None
         
-    def run(self) -> Dict:
-        """Main entry point for bootstrap fitting"""
+    def run(self) -> Tuple[Dict, Optional[Dict]]:
+        """Main entry point for bootstrap fitting.
+        
+        Returns
+        -------
+        (bootstrap_results, dataset_splits)
+            dataset_splits is None when execution_mode == 'slurm'.
+        """
         
         # Load dataset
         self._load_dataset()
@@ -54,7 +60,7 @@ class BootstrapRunner:
         
         self.fitter = Fit(self.dataset)
     
-    def _run_parallel(self) -> Dict:
+    def _run_parallel(self) -> Tuple[Dict, Dict]:
         """Run bootstrap fits in parallel using joblib"""
         print(f"\nRunning {self.config.n_bootstraps} bootstraps in parallel...")
         print(f"  Jobs: {self.config.n_jobs if self.config.n_jobs > 0 else 'all CPUs'}")
@@ -66,6 +72,9 @@ class BootstrapRunner:
             bootstrap_job = self._generate_bootstrap_job(bootstrap_idx)
             all_jobs.append(bootstrap_job)
         
+        # Extract dataset splits for OOB (before execution, zero overhead)
+        dataset_splits = self._extract_splits(all_jobs)
+        
         # Execute in parallel
         results = Parallel(n_jobs=self.config.n_jobs, verbose=10)(
             delayed(self._execute_bootstrap_job)(job) 
@@ -73,25 +82,32 @@ class BootstrapRunner:
         )
         
         # Aggregate results
-        return self._aggregate_results(results)
+        return self._aggregate_results(results), dataset_splits
     
-    def _run_single(self) -> Dict:
+    def _run_single(self) -> Tuple[Dict, Dict]:
         """Run bootstrap fits single-threaded (for debugging)"""
         print(f"\nRunning {self.config.n_bootstraps} bootstraps (single-threaded)...")
         print("Warning: This will be slow. Consider using --mode parallel")
         
-        results = []
+        # Generate all jobs first to extract splits
+        all_jobs = []
         for bootstrap_idx in range(self.config.n_bootstraps):
+            all_jobs.append(self._generate_bootstrap_job(bootstrap_idx))
+        
+        dataset_splits = self._extract_splits(all_jobs)
+        
+        results = []
+        for bootstrap_idx, bootstrap_job in enumerate(all_jobs):
             print(f"\nBootstrap {bootstrap_idx + 1}/{self.config.n_bootstraps}")
             
-            bootstrap_job = self._generate_bootstrap_job(bootstrap_idx)
             result = self._execute_bootstrap_job(bootstrap_job)
             results.append(result)
             
             if (bootstrap_idx + 1) % 10 == 0:
                 print(f"  Completed {bootstrap_idx + 1}/{self.config.n_bootstraps}")
         
-        return self._aggregate_results(results)
+        return self._aggregate_results(results), dataset_splits
+
     
     def _run_slurm(self) -> Dict:
         """Run bootstrap fits on SLURM cluster"""
@@ -140,13 +156,33 @@ class BootstrapRunner:
         print(f"\nTo submit:")
         print(f"  cd {jobs_dir}")
         print(f"  sbatch submit.sh")
+        if self.config.compute_oob:
+            print(f"\nNote: OOB evidence is not supported with SLURM execution.")
+        
         print(f"\nAfter completion, run:")
         print(f"  python run_pipeline.py --dataset {self.config.dataset_csv} " +
               f"--name {self.config.dataset_name} --collect-slurm {jobs_dir}")
         
         sys.exit(0)  # Exit after setup
+        
+        sys.exit(0)  # Exit after setup
+    
+    @staticmethod
+    def _extract_splits(all_jobs: List[Dict]) -> Dict[int, Dict]:
+        """Extract val observations/assignments from pre-generated jobs for OOB."""
+        splits = {}
+        for job in all_jobs:
+            seed = job['bootstrap_seed']
+            first_key = next(iter(job['component_jobs']))
+            shared = job['component_jobs'][first_key]['shared_data']
+            splits[seed] = {
+                'val_observations': shared['val_observations'],
+                'val_sample_assignments': shared['val_sample_assignments'],
+            }
+        return splits
     
     def _generate_bootstrap_job(self, bootstrap_idx: int) -> Dict:
+
         """Generate jobs for a single bootstrap iteration"""
         
         # Generate fit jobs for each component count

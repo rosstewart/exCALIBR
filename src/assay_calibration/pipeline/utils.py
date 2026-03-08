@@ -188,5 +188,6 @@ def load_dataset_from_df(df, config):
     return Scoreset(
         df,
         clinvar_release=config.clinvar_release,
-        min_clinvar_star=config.min_clinvar_star
+        min_clinvar_star=config.min_clinvar_star,
+        population_type=config.population_type,
     )

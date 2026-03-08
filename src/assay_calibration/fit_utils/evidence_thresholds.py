@@ -4,7 +4,7 @@ import numpy as np
 def get_tavtigian_constant(prior: float, *args, **kwargs) -> float | int:
     original = kwargs.get("original", False)
     strict = kwargs.get("strict", False)
-    C_max = kwargs.get("C_max", 30000)
+    C_max = kwargs.get("C_max", 100000)
     verbose = kwargs.get("verbose", False)
     C_vals = np.arange(1, C_max + 1)
     pathogenic_posteriors = np.round(

@@ -668,6 +668,7 @@ def makeOneHot(sample_assignments):
                 onehot[i, selected_index] = True
     assert np.all(np.any(onehot, axis=0))
     assert np.all(onehot.sum(axis=1) <= 1)
+    # print(onehot)
     return onehot
 
 def assign_points(scores, point_score_ranges: Dict[int, List[Tuple[float,float]]]):

@@ -50,6 +50,169 @@ def _clean_clinsigs(values):
     return [v.split(";")[0] if isinstance(v, str) else "nan" for v in values]
 
 
+func_class_map = {#'BRCA1_Findlay_2018': {'LOF':'Abnormal','FUNC':'Normal','INT':'Indeterminate'},
+         'BAP1_Waters_2024': {'depleted':'Abnormal','unchanged':'Normal','enriched':'Not specified'},
+         'BRCA2_Hu_2024': {'Abnormal': 'Abnormal', 'Normal': 'Normal', 'Intermediate': 'Indeterminate'},
+         'CRX_Shepherdson_2024': {'low_activity': 'Abnormal','non-significant': 'Normal',
+                                  'high_activity': 'Not specified'},
+         'DDX3X_Radford_2023_cLFC_day15': {'fast depleting': 'Abnormal', 'slow depleting': 'Abnormal',
+                                          'unchanged': 'Normal', 'enriched': 'Not specified'},
+         'FKRP_Ma_2024': {'damaging_severe': 'Abnormal', 'damaging_mild': 'Abnormal', 
+                          'damaging_intermediate': 'Abnormal', 'functional': 'Normal'},
+         'JAG1_Gilbert_2024': {'Abnormal': 'Abnormal', 'Likely abnormal': 'Abnormal','Normal': 'Normal'},
+         'KCNE1_Muhammad_2024_presence_of_WT': {'Loss': 'Abnormal','Possible':'Abnormal','Partial':'Abnormal',
+                                               'Normal':'Normal','Gain':'Not specified','PossibleGain':'Not specified'},
+         'KCNE1_Muhammad_2024_absence_of_WT': {'Loss': 'Abnormal','Possible':'Abnormal','Partial':'Abnormal',
+                                               'Normal':'Normal','Gain':'Not specified','PossibleGain':'Not specified'},
+         'KCNE1_Muhammad_2024_potassium_flux': {'Loss': 'Abnormal','Possible':'Abnormal','Partial':'Abnormal',
+                                               'Normal':'Normal','Gain':'Not specified','PossibleGain':'Not specified'},
+         'LARGE1_Ma_2024': {'damaging':'Abnormal','functional': 'Normal'},
+         'NDUFAF6_Sung_2024': {'abnormal': 'Abnormal','normal':'Normal','uncertain': 'Indeterminate'},
+         'OTC_Lo_2023': {'Amorphic':'Abnormal','Unimpaired':'Normal', 'Hypomorphic':'Not specified'},
+         'RAD51C_Olvera-León_2024_z_score_D4_D14': {'fast depleted': 'Abnormal','slow depleted': 'Abnormal',
+                                                   'unchanged': 'Normal','enriched':'Not specified'},
+         'RHO_Wan_2019':{'low': 'Abnormal','very low': 'Abnormal','high': 'Normal','indeterminate': 'Indeterminate'},
+         'SCN5A_Glazer_2020': {'LOF':'Abnormal','possiblyLOF':'Abnormal','possiblyWT':'Normal','WT':'Normal',
+                              'GOF': 'Not specified','possiblyGOF':'Not specified'},
+         'SCN5A_Ma_2024_current_density':{'severe LOF': 'Abnormal', 'moderate LOF': 'Abnormal','normal': 'Normal'},
+         'SGCB_Li_2023': {'Non-Functional': 'Abnormal','Functional': 'Normal'},
+         'TP53_Fayer_2021_meta': {'Functionally abnormal': 'Abnormal','Functionally normal': 'Normal'},
+         'VHL_Buckley_2024': {'LOF1': 'Abnormal','LOF2': 'Abnormal','Neutral': 'Normal', 'Intermediate': 'Indeterminate'},
+         'BARD1_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal', 'indeterminate': 'Indeterminate'},
+         'PALB2_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal', 'indeterminate': 'Indeterminate'},
+         'CTCF_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal', 'indeterminate': 'Indeterminate'},
+         'RAD51D_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal', 'indeterminate': 'Indeterminate'},
+         'SFPQ_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal', 'indeterminate': 'Indeterminate'},
+         'PTEN_Matreyek_2018': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal'},
+         'F9_Popp_2025_model': {'WT-like': 'Normal','Loss of function': 'Abnormal'},
+         'G6PD_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal'}, 
+         'TSC2_rapgap_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal'},
+         'TSC2_tuberin_unpublished': {'functionally_abnormal': 'Abnormal', 'functionally_normal': 'Normal'},
+         'CARD11_Meitlis_2020_DMSO_no_introns': {'functional': 'Normal', 'not definitive': 'Indeterminate', 
+                                                 'likely functional': 'Normal','likely nonfunctional': 'Abnormal', 
+                                                 'nonfunctional': 'Abnormal'}}
+
+INTERVAL_CLASS_NORMALIZATION = {
+    "normal": "Normal",
+    "abnormal": "Abnormal",
+    "not specified": "Indeterminate",
+}
+
+def classify_by_intervals(score, intervals):
+    """
+    intervals: list of dicts with keys:
+        - 'range': tuple (start, end, start_inclusive, end_inclusive)
+        - 'class': raw MaveDB class string
+    """
+    for interval in intervals:
+        lo, hi, lo_inc, hi_inc = interval["range"]
+
+        in_range = (
+            (score > lo or (lo_inc and score == lo)) and
+            (score < hi or (hi_inc and score == hi))
+        )
+
+        if in_range:
+            raw = interval["class"]
+            if raw is None or str(raw).lower() == "nan":
+                return "Indeterminate"
+
+            return INTERVAL_CLASS_NORMALIZATION.get(
+                raw.strip().lower(),
+                "Indeterminate"
+            )
+
+    return "Indeterminate"
+
+import math
+import re
+
+def parse_interval_range(range_str):
+    """
+    Parses strings like:
+      '[-0.748, Inf)'
+      '(-Inf,-1.328]'
+    Returns: (lo, hi, lo_inc, hi_inc)
+    """
+    if not isinstance(range_str, str):
+        return None
+
+    m = re.match(r'([\[\(])\s*([^,]+)\s*,\s*([^\]\)]+)\s*([\]\)])', range_str)
+    if not m:
+        return None
+
+    lo_br, lo, hi, hi_br = m.groups()
+
+    def to_float(x):
+        x = x.strip()
+        if x.lower() in {"-inf", "-infinity"}:
+            return -math.inf
+        if x.lower() in {"inf", "infinity"}:
+            return math.inf
+        return float(x)
+
+    return (
+        to_float(lo),
+        to_float(hi),
+        lo_br == "[",
+        hi_br == "]",
+    )
+
+def extract_intervals_from_row(row, max_intervals=6):
+    intervals = []
+
+    for i in range(1, max_intervals + 1):
+        range_key = f"Interval {i} range"
+        class_key = f"Interval {i} MaveDB class"
+
+        range_str = row.get(range_key)
+        class_val = row.get(class_key)
+
+        parsed = parse_interval_range(range_str)
+        if parsed is None:
+            continue
+
+        intervals.append({
+            "range": parsed,
+            "class": class_val
+        })
+
+    return intervals
+
+
+
+def standardize_auth_label(
+    dataset_name,
+    func_class,
+    score=None,
+    intervals=None,
+):
+    """
+    Returns standardized label: Normal / Abnormal / Indeterminate
+
+    Priority:
+      1) Dataset-specific func_class_map
+      2) Interval-based classification using score
+      3) Indeterminate
+    """
+
+    if dataset_name in func_class_map:
+        dataset_map = func_class_map[dataset_name]
+        if func_class in dataset_map:
+            return dataset_map[func_class]
+
+    if isinstance(func_class, str):
+        norm = func_class.strip().lower()
+        if norm in INTERVAL_CLASS_NORMALIZATION:
+            return INTERVAL_CLASS_NORMALIZATION[norm]
+
+    if score is not None and intervals is not None:
+        return classify_by_intervals(score, intervals)
+
+    return "Indeterminate"
+
+
+
 class BasicScoreset:
     def __init__(self, scores: np.ndarray, sample_assignments: np.ndarray,**kwargs):
         self.scores = scores
@@ -154,6 +317,7 @@ class Scoreset:
         - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
         - clinvar_release : str in {'2025','2018'} (default '2025') : Clinvar release to use
         """
+        self._init_kwargs = dict(kwargs)
         self._init_dataframe(dataframe, **kwargs)
 
     def to_json(self, output_path: Path | str):
@@ -275,15 +439,30 @@ class Scoreset:
                 "dataframe must contain at least one row with a non-NaN auth_reported_score"
             )
         self.dataframe = dataframe
+        self.filter_nonsense = kwargs.get("filter_nonsense",False)
         self.filter_invalid()
         self.splicing_filter(**kwargs)
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
         clinvar_release = kwargs.get("clinvar_release",'2025')
         self.variants = [Variant(row,min_clinvar_star,clinvar_release) for _, row in self.dataframe.iterrows()]
+        self.synonymous_exclusive = kwargs.get("synonymous_exclusive",True)
+        self.score_avg = kwargs.get("score_avg",False)
         self._init_matrices(**kwargs)
 
     def filter_invalid(self):
-         self.dataframe = self.dataframe[self.dataframe.Flag != "*"]
+        self.dataframe = self.dataframe[self.dataframe.Flag != "*"]
+
+        if self.filter_nonsense:
+            # print('filtering nonsense variants within 50 aa of termini...')
+            mask = (
+                # Keep all non-stop_gained variants
+                (self.dataframe['simplified_consequence'] != 'stop_gained') |
+                # OR keep stop_gained only if position is between 51-349
+                ((self.dataframe['simplified_consequence'] == 'stop_gained') &
+                 (self.dataframe['aa_pos'] >= 51) &
+                 (self.dataframe['aa_pos'] <= 349))
+            )
+            self.dataframe = self.dataframe[mask]
 
     def splicing_filter(self, **kwargs):
         self.detects_splice = (
@@ -346,38 +525,50 @@ class Scoreset:
         
         """
         self.has_synomyous = any([variant.is_synonymous for variant in self.variants])
-        if self.has_synomyous:
-            self.NSamples = 4
-            self.sample_names = [
-                "Pathogenic/Likely Pathogenic",
-                "Benign/Likely Benign",
-                "population",
-                "Synonymous",
-            ]
-        else:
-            self.NSamples = 3
-            self.sample_names = [
-                "Pathogenic/Likely Pathogenic",
-                "Benign/Likely Benign",
-                "population",
-            ]
+        # if self.has_synomyous:
+        self.NSamples = 4
+        self.sample_names = [
+            "Pathogenic/Likely Pathogenic",
+            "Benign/Likely Benign",
+            "population",
+            "Synonymous",
+        ]
+        # else:
+        #     self.NSamples = 3
+        #     self.sample_names = [
+        #         "Pathogenic/Likely Pathogenic",
+        #         "Benign/Likely Benign",
+        #         "population",
+        #     ]
         variants_by_id = self.get_variants_by_id()
         self.n_variants = len(variants_by_id)
         self._sample_assignments = np.zeros(
             (self.n_variants, self.NSamples), dtype=bool
         )
         self._scores = np.zeros(self.n_variants)
+        self._auth_labels = np.empty(self.n_variants, dtype='U50')
         self._snv_scores = []
+        self._vus_scores = []
+        self._all_scores = []
         self._aa_subs = np.empty(self.n_variants, dtype='U50')
         self._ids = []
-        self._auth_labels = []
         self.parse_population_type(**kwargs)
         for idx, (_id, variants) in enumerate(variants_by_id.items()):
+
+                
             self._ids.append(_id)
+
+            if self.score_avg:
+                variants[0].auth_reported_score = np.mean([v.auth_reported_score for v in variants])
+            
             self._scores[idx] = variants[0].auth_reported_score
-            self._auth_labels.append(variants[0].auth_label)
+            self._auth_labels[idx] = variants[0].auth_label
             if variants[0].is_snv:
                 self._snv_scores.append(variants[0].auth_reported_score)
+            self._all_scores.append(variants[0].auth_reported_score)
+            
+            if any([variant.is_vus for variant in variants]):
+                self._vus_scores.append(variants[0].auth_reported_score)
             
             try:
                 self._aa_subs[idx] = variants[0].aa_ref + str(int(variants[0].aa_pos)) + variants[0].aa_alt
@@ -385,7 +576,8 @@ class Scoreset:
                 self._aa_subs[idx] = None
             if any([variant.is_synonymous for variant in variants]):
                 self._sample_assignments[idx, 3] = True
-                continue
+                if self.synonymous_exclusive:
+                    continue
             if any([self.is_population_member(variant) for variant in variants]):
                 self._sample_assignments[idx, 2] = True
             if any([variant.is_pathogenic for variant in variants]):
@@ -397,10 +589,12 @@ class Scoreset:
         self._keep_mask = keep_mask
         self._scores = self.scores[keep_mask]
         self._sample_assignments = self._sample_assignments[keep_mask]
+        self._auth_labels = self._auth_labels[keep_mask]
         self.n_variants = len(self._scores)
         self.sample_counts = self._sample_assignments.sum(axis=0)
         self._snv_scores = np.array(self._snv_scores)
-        self._auth_labels = np.array(self._auth_labels)
+        self._vus_scores = np.array(self._vus_scores)
+        self._all_scores = np.array(self._all_scores)
 
     def parse_population_type(self,**kwargs):
         population_type = kwargs.get("population_type",'gnomAD')
@@ -473,6 +667,14 @@ class Scoreset:
         return self._snv_scores
         
     @property
+    def vus_scores(self):
+        return self._vus_scores
+    
+    @property
+    def all_scores(self):
+        return self._all_scores
+        
+    @property
     def aa_subs(self):
         return self._aa_subs
 
@@ -499,11 +701,26 @@ class Scoreset:
 
         return out
 
+    def to_serializable(self):
+        return {
+            "__type__": "Scoreset",
+            "dataframe": self.dataframe.to_dict(orient="split"),
+            "kwargs": self._init_kwargs,
+        }
+
+    
+    @classmethod
+    def from_serializable(cls, payload: dict):
+        df = pd.DataFrame(**payload["dataframe"])
+        return cls(df, **payload["kwargs"])
+
+
 
 class Variant:
     def __init__(self, variant_info: pd.Series, min_clinvar_star: int, clinvar_release: str):
         self.min_clinvar_star = min_clinvar_star
         self.clinvar_release = clinvar_release
+        self.row = variant_info
         self._init_variant_info(variant_info)
 
     def _init_variant_info(self, variant_info: pd.Series):
@@ -557,13 +774,48 @@ class Variant:
             "Likely pathogenic",
             "Pathogenic/Likely pathogenic",
         }
-        self.is_vus = self.sufficient_quality and self.clinvar_sig in {
+        self.is_vus = self.sufficient_quality_2025 and self.clinvar_sig_2025 in { # VUS ALWAYS 2025 SINCE NOT CONTROL
             "Uncertain significance",
         }
 
+    def standardize_class(self, c):
+        # c: Class
+        if c is None:
+            return c
+        elif pd.isna(c) or (isinstance(c, str) and c.strip().lower() in {"nan", "not specified"}):
+            return "Indeterminate"
+        else:
+            return c.capitalize()
+        
+
     def parse_auth_class(self):
-        self.auth_label = getattr(self, "StandardizedClass", None) \
-                          or getattr(self, "auth_reported_func_class", None)
+        self.auth_label = self.standardize_class(getattr(self, "StandardizedClass", None))
+        if self.auth_label is not None:
+            return
+    
+        func_class = getattr(self, "auth_reported_func_class", None)
+    
+        score = getattr(self, "score", None)
+    
+        intervals = extract_intervals_from_row(self.row)
+        # print('intervals',intervals)
+    
+        if func_class is not None and self.Dataset in func_class_map:
+            self.auth_label = standardize_auth_label(
+                dataset_name=self.Dataset,
+                func_class=func_class,
+                score=score,
+                intervals=intervals if intervals else None
+            )
+            # print("class",self.auth_label)
+        else:
+            if score is not None and intervals:
+                self.auth_label = classify_by_intervals(score, intervals)
+                # print("interval",self.auth_label)
+            else:
+                self.auth_label = "Indeterminate"
+                # print("ind",self.auth_label)
+
 
     def eval_quality(self):
         one_star_status = {
@@ -589,14 +841,19 @@ class Variant:
         }
         if self.min_clinvar_star == 0:
             self.sufficient_quality = True
+            self.sufficient_quality_2025 = True
         elif self.min_clinvar_star == 1:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses
         elif self.min_clinvar_star == 2:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status)
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status)
         elif self.min_clinvar_star == 3:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
         elif self.min_clinvar_star == 4:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
         else:
             raise ValueError(f"Invalid min_clinvar_star value {self.min_clinvar_star}")
 
@@ -646,6 +903,8 @@ def summarize_datasets(dataframe_path, **kwargs):
             ds_df,
             missense_only=kwargs.get("missense_only", False),
             synonymous_exclusive=kwargs.get("synonymous_exclusive", True),
+            score_avg=kwargs.get("score_avg", False),
+            filter_nonsense=kwargs.get("filter_nonsense", False)
         )
         f.write(f"{dataset_name}\n")
         f.write(str(scoreset))
@@ -720,6 +979,213 @@ def csv_to_vcf(input_filepath, output_filepath):
             vcf_file.write(
                 f"{row['Chrom']}\t{int(row.hg38_start)}\t{row['ID']}\t{row['ref_allele']}\t{row['alt_allele']}\t.\t.\t.\n"
             )
+
+
+
+import numpy as np
+
+
+class MultiScoreset:
+
+    group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
+
+    def __init__(self, scoresets, dataset_names=None):
+
+        if len(scoresets) == 0:
+            raise ValueError("scoresets cannot be empty")
+
+        self.scoresets = scoresets
+        self.d = len(scoresets)
+
+        if dataset_names is None:
+            dataset_names = [f"assay_{i}" for i in range(self.d)]
+
+        if len(dataset_names) != self.d:
+            raise ValueError("dataset_names must match number of scoresets")
+
+        self.dataset_names = dataset_names
+
+        self._build()
+
+
+    def _get_variant_keys(self, scoreset):
+        """
+        Extract stable variant keys from dataframe using group_cols.
+        Only for kept variants.
+        """
+
+        df = scoreset.dataframe.loc[scoreset.keep_mask]
+
+        missing = [c for c in self.group_cols if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"{scoreset.scoreset_name} missing columns {missing}"
+            )
+
+        keys = [
+            tuple(row)
+            for row in df[self.group_cols].to_numpy()
+        ]
+
+        return np.array(keys, dtype=object)
+
+
+    def _build(self):
+
+        variant_set = set()
+
+        variant_keys = []
+        scores_list = []
+        samples_list = []
+
+        # ----------------------------------
+        # collect per-assay data
+        # ----------------------------------
+
+        for s in self.scoresets:
+
+            keys = self._get_variant_keys(s)
+
+            scores = s.scores
+            samples = s.sample_assignments
+
+            if not (len(keys) == len(scores) == samples.shape[0]):
+                raise ValueError(
+                    f"Inconsistent lengths in {s.scoreset_name}"
+                )
+
+            variant_keys.append(keys)
+            scores_list.append(scores)
+            samples_list.append(samples)
+
+            variant_set.update(keys)
+
+        all_variants = np.array(sorted(variant_set), dtype=object)
+
+        n_variants = len(all_variants)
+
+        variant_to_idx = {v: i for i, v in enumerate(all_variants)}
+
+        # ----------------------------------
+        # allocate matrices
+        # ----------------------------------
+
+        scores_matrix = np.full((n_variants, self.d), np.nan)
+
+        sample_assignments = np.zeros((n_variants, 4), dtype=bool)
+        sample_seen = np.zeros(n_variants, dtype=bool)
+
+        # ----------------------------------
+        # fill matrices
+        # ----------------------------------
+
+        for assay_i in range(self.d):
+
+            keys = variant_keys[assay_i]
+            scores = scores_list[assay_i]
+            samples = samples_list[assay_i]
+
+            for k in range(len(keys)):
+
+                v = keys[k]
+                idx = variant_to_idx[v]
+
+                scores_matrix[idx, assay_i] = scores[k]
+
+                if not sample_seen[idx]:
+                    sample_assignments[idx] = samples[k]
+                    sample_seen[idx] = True
+                else:
+                    if not np.array_equal(sample_assignments[idx], samples[k]):
+                        raise ValueError(
+                            f"Inconsistent sample assignments for variant {v}"
+                        )
+
+        # ----------------------------------
+        # compute masks
+        # ----------------------------------
+
+        missing_mask = np.isnan(scores_matrix)
+
+        keep_mask = ~np.all(missing_mask, axis=1)
+
+        # ----------------------------------
+        # store
+        # ----------------------------------
+
+        self._scores_matrix = scores_matrix
+        self._missing_mask = missing_mask
+        self._keep_mask = keep_mask
+
+        self._scores = scores_matrix[keep_mask]
+        self._missing = missing_mask[keep_mask]
+
+        self.variants = all_variants
+        self._variants_kept = all_variants[keep_mask]
+
+        self._sample_assignments = sample_assignments[keep_mask]
+
+        self.n_variants = self._scores.shape[0]
+
+
+    # ----------------------------------
+    # Scoreset-like API
+    # ----------------------------------
+
+    @property
+    def scores(self):
+        return self._scores
+
+
+    @property
+    def full_scores(self):
+        return self._scores_matrix
+
+
+    @property
+    def missing(self):
+        return self._missing
+
+
+    @property
+    def keep_mask(self):
+        return self._keep_mask
+
+
+    @property
+    def kept_variants(self):
+        return self._variants_kept
+
+
+    @property
+    def sample_assignments(self):
+        return self._sample_assignments
+
+
+    @property
+    def pathogenic_mask(self):
+        return self._sample_assignments[:,0]
+
+
+    @property
+    def benign_mask(self):
+        return self._sample_assignments[:,1]
+
+
+    @property
+    def population_mask(self):
+        return self._sample_assignments[:,2]
+
+
+    @property
+    def synonymous_mask(self):
+        return self._sample_assignments[:,3]
+
+
+    @property
+    def n_assays(self):
+        return self.d
+
 
 
 if __name__ == "__main__":

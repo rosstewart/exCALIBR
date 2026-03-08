@@ -60,11 +60,15 @@ def generate_visualizations(
         
         # Extract fits for this component count
         fits = []
+        bootstrap_seeds = []
         for bootstrap_idx in sorted(bootstrap_results.keys(), key=int):
             if component_key in bootstrap_results[bootstrap_idx]:
                 fit_result = bootstrap_results[bootstrap_idx][component_key]
                 if fit_result is not None:
                     fits.append(fit_result)
+                    bootstrap_seeds.append(int(bootstrap_idx))
+        bootstrap_seeds = np.array(bootstrap_seeds)
+
         
         logger.info(f"  Valid fits: {len(fits)}/{len(bootstrap_results)}")
         
@@ -78,8 +82,10 @@ def generate_visualizations(
             scoreset=scoreset,
             config=config,
             n_c=n_c,
-            logger=logger
+            logger=logger,
+            bootstrap_seeds=bootstrap_seeds,
         )
+
         
         results[component_key] = calibration
         
@@ -114,7 +120,8 @@ def process_component_fits(
     scoreset: Scoreset,
     config: PipelineConfig,
     n_c: int,
-    logger: logging.Logger
+    logger: logging.Logger,
+    bootstrap_seeds: np.ndarray = None,
 ) -> Dict:
     """
     Process bootstrap fits to generate calibration thresholds
@@ -171,60 +178,68 @@ def process_component_fits(
     
     logger.info(f"  Sample indices: P={pathogenic_idx}, B={benign_idx}, G={gnomad_idx}, S={synonymous_idx}")
     
-    # Compute priors - PASS ALL INDICES
-    if not config.use_2c_equation or n_c != 2:
-        # Use EM estimation
-        n_cores = os.cpu_count() or 1
-        fit_priors = np.array(Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
-            delayed(get_fit_prior)(
-                fit, scoreset, config.benign_method,
-                pathogenic_idx=pathogenic_idx,
-                benign_idx=benign_idx,
-                gnomad_idx=gnomad_idx,
-                synonymous_idx=synonymous_idx
-            )
-            for fit in fits
-        ))
+    if config.manual_prior is not None:
+        # Use manually specified prior — skip estimation
+        prior = config.manual_prior
+        fit_priors = np.full(len(fits), prior)
+        valid_bootstrap_seeds = bootstrap_seeds  # no filtering
+        logger.info(f"  Using manual prior: {prior:.6f}")
     else:
-        # Use 2c equation
-        fit_priors = []
-        for fit in fits:
-            weights = fit['fit']['weights']
-            
-            if len(weights) == 3:
-                w_p = weights[pathogenic_idx] if pathogenic_idx is not None else None
-                w_g = weights[gnomad_idx]
-                if benign_idx is not None:
-                    w_b = weights[benign_idx]
-                    w_s = w_b
+        # Compute priors - PASS ALL INDICES
+        if not config.use_2c_equation or n_c != 2:
+            # Use EM estimation
+            n_cores = os.cpu_count() or 1
+            fit_priors = np.array(Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+                delayed(get_fit_prior)(
+                    fit, scoreset, config.benign_method,
+                    pathogenic_idx=pathogenic_idx,
+                    benign_idx=benign_idx,
+                    gnomad_idx=gnomad_idx,
+                    synonymous_idx=synonymous_idx
+                )
+                for fit in fits
+            ))
+        else:
+            # Use 2c equation
+            fit_priors = []
+            for fit in fits:
+                weights = fit['fit']['weights']
+                
+                if len(weights) == 3:
+                    w_p = weights[pathogenic_idx] if pathogenic_idx is not None else None
+                    w_g = weights[gnomad_idx]
+                    if benign_idx is not None:
+                        w_b = weights[benign_idx]
+                        w_s = w_b
+                    else:
+                        w_b = weights[synonymous_idx]
+                        w_s = w_b
+                elif len(weights) == 4:
+                    w_p, w_b, w_g, w_s = weights
                 else:
-                    w_b = weights[synonymous_idx]
-                    w_s = w_b
-            elif len(weights) == 4:
-                w_p, w_b, w_g, w_s = weights
-            else:
-                raise ValueError(f"Unexpected number of samples: {len(weights)}")
+                    raise ValueError(f"Unexpected number of samples: {len(weights)}")
+                
+                if config.benign_method == 'synonymous':
+                    fit_priors.append(prior_equation_2c(w_p, w_s, w_g))
+                elif config.benign_method == 'avg':
+                    w_bs = (np.array(w_b) + np.array(w_s)) / 2
+                    fit_priors.append(prior_equation_2c(w_p, w_bs, w_g))
+                else:
+                    fit_priors.append(prior_equation_2c(w_p, w_b, w_g))
             
-            if config.benign_method == 'synonymous':
-                fit_priors.append(prior_equation_2c(w_p, w_s, w_g))
-            elif config.benign_method == 'avg':
-                w_bs = (np.array(w_b) + np.array(w_s)) / 2
-                fit_priors.append(prior_equation_2c(w_p, w_bs, w_g))
-            else:
-                fit_priors.append(prior_equation_2c(w_p, w_b, w_g))
+            fit_priors = np.array(fit_priors)
         
-        fit_priors = np.array(fit_priors)
-    
-    # Filter invalid priors
-    valid_mask = ~(np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1))
-    fit_priors = fit_priors[valid_mask]
-    fits = np.array(fits)[valid_mask].tolist()
-    
-    logger.info(f"  Valid priors: {len(fit_priors)}")
-    
-    # Compute prior
-    prior = np.nanmedian(fit_priors)
-    logger.info(f"  Prior: {prior:.6f}")
+        # Filter invalid priors
+        valid_mask = ~(np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1))
+        fit_priors = fit_priors[valid_mask]
+        fits = np.array(fits)[valid_mask].tolist()
+        valid_bootstrap_seeds = bootstrap_seeds[valid_mask] if bootstrap_seeds is not None else np.array([])
+        
+        logger.info(f"  Valid priors: {len(fit_priors)}")
+        
+        # Compute prior
+        prior = np.nanmedian(fit_priors)
+        logger.info(f"  Prior: {prior:.6f}")
     
     # Setup score range
     observed_scores = scoreset.scores[scoreset._sample_assignments.any(1)]
@@ -402,6 +417,7 @@ def process_component_fits(
     return serialize_dict({
         'prior': prior,
         'priors': fit_priors,
+        'valid_bootstrap_seeds': valid_bootstrap_seeds,
         'point_ranges': point_ranges,
         'score_range': score_range[range_subset],
         'log_lr_plus': log_lr_plus[:, range_subset],

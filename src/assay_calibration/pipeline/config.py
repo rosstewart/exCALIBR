@@ -23,6 +23,12 @@ class PipelineConfig:
     use_2c_equation: bool = False  # Use EM estimation instead
     liberal_monotonicity: bool = True
     benign_method: Literal["benign", "avg", "synonymous"] = "avg"
+    manual_prior: float = None  # If set, skip prior estimation and use this value
+    population_type: str = "gnomAD"
+    
+    # OOB evidence
+    compute_oob: bool = False
+    oob_min_samples: int = 10
     
     # Execution parameters
     execution_mode: Literal["slurm", "parallel", "single"] = "parallel"
@@ -60,6 +66,20 @@ class PipelineConfig:
         # Validate components
         if not all(c in [2, 3, 4] for c in self.components):
             raise ValueError("Components must be 2, 3, or 4")
+        
+        # Validate manual_prior
+        if self.manual_prior is not None:
+            if not (0 < self.manual_prior < 1):
+                raise ValueError(f"manual_prior must be in (0, 1), got {self.manual_prior}")
+        
+        # Validate population_type
+        valid_pop_types = {
+            'all_variants', 'all_nsSNV', 'all_missense_nsSNV',
+            'gnomAD', 'gnomAD_nsSNV', 'gnomAD_missense_nsSNV'
+        }
+        if self.population_type not in valid_pop_types:
+            raise ValueError(f"population_type must be one of {valid_pop_types}, got {self.population_type}")
+
         
         # If using SLURM, adjust job count
         if self.execution_mode == "slurm" and self.n_jobs == -1:
