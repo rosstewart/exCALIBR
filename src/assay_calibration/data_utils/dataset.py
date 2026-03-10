@@ -579,7 +579,7 @@ class Scoreset:
 
             
             try:
-                self._variant_codes.append([variants[0][group] for group in group_cols])
+                self._variant_codes.append([getattr(variants[0], group) for group in group_cols])
             except (ValueError, TypeError):
                 self._variant_codes.append(None)
             
@@ -995,211 +995,279 @@ def csv_to_vcf(input_filepath, output_filepath):
 
 
 
-import numpy as np
-
 
 class MultiScoreset:
+    """Combine D Scoresets into a single (N, D) score matrix for multivariate fitting.
 
-    group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
+    Observations may be missing in some dimensions (NaN).
+    Sample assignments are merged (OR) across assays for each variant.
+    """
 
-    def __init__(self, scoresets, dataset_names=None):
+    group_cols = ['Gene', 'Chrom', 'hg38_start', 'ref_allele', 'alt_allele']
 
+    def __init__(self, scoresets, dataset_names=None, **kwargs):
         if len(scoresets) == 0:
             raise ValueError("scoresets cannot be empty")
 
         self.scoresets = scoresets
         self.d = len(scoresets)
+        self._init_kwargs = dict(kwargs)
 
         if dataset_names is None:
-            dataset_names = [f"assay_{i}" for i in range(self.d)]
+            dataset_names = [
+                getattr(s, 'scoreset_name', f"assay_{i}")
+                for i, s in enumerate(scoresets)
+            ]
 
         if len(dataset_names) != self.d:
             raise ValueError("dataset_names must match number of scoresets")
 
         self.dataset_names = dataset_names
+        self._sample_names = kwargs.get("sample_names", [
+            "Pathogenic/Likely Pathogenic",
+            "Benign/Likely Benign",
+            "population",
+            "Synonymous",
+        ])
 
         self._build()
 
+    # ──────────────────────────────────────
+    # Extract variant keys from a scoreset
+    # ──────────────────────────────────────
 
     def _get_variant_keys(self, scoreset):
-        """
-        Extract stable variant keys from dataframe using group_cols.
-        Only for kept variants.
-        """
+        """Extract variant keys for the KEPT variants in a scoreset.
 
-        df = scoreset.dataframe.loc[scoreset.keep_mask]
-
-        missing = [c for c in self.group_cols if c not in df.columns]
-        if missing:
+        Uses _variant_codes (pre-filter, len = n_before_keep) indexed by
+        _keep_mask to produce keys aligned with scoreset.scores (post-filter).
+        """
+        if not hasattr(scoreset, '_variant_codes') or not hasattr(scoreset, '_keep_mask'):
             raise ValueError(
-                f"{scoreset.scoreset_name} missing columns {missing}"
+                f"{getattr(scoreset, 'scoreset_name', 'scoreset')} missing "
+                f"_variant_codes or _keep_mask; ensure it is a Scoreset instance."
             )
 
-        keys = [
-            tuple(row)
-            for row in df[self.group_cols].to_numpy()
-        ]
+        all_codes = scoreset._variant_codes   # list, len = n_before_keep
+        mask = scoreset._keep_mask             # bool array, len = n_before_keep
 
-        return np.array(keys, dtype=object)
+        if len(all_codes) != len(mask):
+            raise ValueError(
+                f"Length mismatch: _variant_codes ({len(all_codes)}) vs "
+                f"_keep_mask ({len(mask)}) in "
+                f"{getattr(scoreset, 'scoreset_name', '?')}"
+            )
 
+        # Filter to kept variants
+        kept_codes = [all_codes[i] for i in range(len(mask)) if mask[i]]
+
+        # Sanity check alignment with scores
+        if len(kept_codes) != len(scoreset.scores):
+            raise ValueError(
+                f"After filtering: {len(kept_codes)} keys but "
+                f"{len(scoreset.scores)} scores in "
+                f"{getattr(scoreset, 'scoreset_name', '?')}"
+            )
+
+        # Convert to hashable tuples — return a plain Python list,
+        # NOT a numpy object array (which breaks set hashing).
+        keys = []
+        for code in kept_codes:
+            if code is None:
+                raise ValueError(
+                    f"None variant code in {getattr(scoreset, 'scoreset_name', '?')}; "
+                    f"ensure group columns {self.group_cols} are present."
+                )
+            keys.append(tuple(code))
+
+        return keys
+
+    # ──────────────────────────────────────
+    # Build the aligned (N, D) matrix
+    # ──────────────────────────────────────
 
     def _build(self):
-
         variant_set = set()
-
         variant_keys = []
         scores_list = []
         samples_list = []
 
-        # ----------------------------------
-        # collect per-assay data
-        # ----------------------------------
-
         for s in self.scoresets:
-
             keys = self._get_variant_keys(s)
+            scores = s.scores  # (n_kept,) — already filtered
 
-            scores = s.scores
-            samples = s.sample_assignments
+            # Use _sample_assignments (always 4 columns), NOT the
+            # .sample_assignments property which drops empty columns.
+            # _sample_assignments is already filtered by keep_mask
+            # inside Scoreset._init_matrices.
+            if hasattr(s, '_sample_assignments'):
+                samples = s._sample_assignments
+                # Pad to 4 columns if fewer (shouldn't happen for Scoreset, but safety)
+                if samples.shape[1] < 4:
+                    pad = np.zeros((samples.shape[0], 4 - samples.shape[1]), dtype=bool)
+                    samples = np.hstack([samples, pad])
+            else:
+                # Fallback for BasicScoreset or similar
+                sa = s.sample_assignments
+                if sa.shape[1] < 4:
+                    pad = np.zeros((sa.shape[0], 4 - sa.shape[1]), dtype=bool)
+                    samples = np.hstack([sa, pad])
+                else:
+                    samples = sa
 
             if not (len(keys) == len(scores) == samples.shape[0]):
                 raise ValueError(
-                    f"Inconsistent lengths in {s.scoreset_name}"
+                    f"Inconsistent lengths in {getattr(s, 'scoreset_name', '?')}: "
+                    f"keys={len(keys)}, scores={len(scores)}, samples={samples.shape[0]}"
                 )
 
             variant_keys.append(keys)
             scores_list.append(scores)
             samples_list.append(samples)
-
             variant_set.update(keys)
 
-        all_variants = np.array(sorted(variant_set), dtype=object)
-
+        # Build union of all variants — sort by string repr to handle mixed types
+        all_variants = sorted(variant_set, key=lambda t: tuple(str(x) for x in t))
         n_variants = len(all_variants)
-
         variant_to_idx = {v: i for i, v in enumerate(all_variants)}
 
-        # ----------------------------------
-        # allocate matrices
-        # ----------------------------------
-
+        # Allocate matrices
         scores_matrix = np.full((n_variants, self.d), np.nan)
-
         sample_assignments = np.zeros((n_variants, 4), dtype=bool)
-        sample_seen = np.zeros(n_variants, dtype=bool)
 
-        # ----------------------------------
-        # fill matrices
-        # ----------------------------------
-
+        # Fill from each assay
         for assay_i in range(self.d):
-
             keys = variant_keys[assay_i]
             scores = scores_list[assay_i]
             samples = samples_list[assay_i]
-
             for k in range(len(keys)):
-
                 v = keys[k]
                 idx = variant_to_idx[v]
-
                 scores_matrix[idx, assay_i] = scores[k]
+                # Merge sample assignments via OR across assays.
+                # A variant is pathogenic/benign/etc if ANY assay flags it.
+                sample_assignments[idx] |= samples[k]
 
-                if not sample_seen[idx]:
-                    sample_assignments[idx] = samples[k]
-                    sample_seen[idx] = True
-                else:
-                    if not np.array_equal(sample_assignments[idx], samples[k]):
-                        raise ValueError(
-                            f"Inconsistent sample assignments for variant {v}"
-                        )
-
-        # ----------------------------------
-        # compute masks
-        # ----------------------------------
-
+        # Filter: keep variants with at least one non-NaN score
         missing_mask = np.isnan(scores_matrix)
-
         keep_mask = ~np.all(missing_mask, axis=1)
-
-        # ----------------------------------
-        # store
-        # ----------------------------------
 
         self._scores_matrix = scores_matrix
         self._missing_mask = missing_mask
         self._keep_mask = keep_mask
-
         self._scores = scores_matrix[keep_mask]
         self._missing = missing_mask[keep_mask]
-
-        self.variants = all_variants
-        self._variants_kept = all_variants[keep_mask]
-
+        self.variants = all_variants  # list of tuples
+        self._variants_kept = [all_variants[i] for i in range(n_variants) if keep_mask[i]]
         self._sample_assignments = sample_assignments[keep_mask]
-
         self.n_variants = self._scores.shape[0]
 
+        # Per-dimension xlims (ignoring NaN)
+        self._xlims = tuple(
+            (np.nanmin(self._scores[:, dim]), np.nanmax(self._scores[:, dim]))
+            for dim in range(self.d)
+        )
 
-    # ----------------------------------
-    # Scoreset-like API
-    # ----------------------------------
+        self.sample_counts = self._sample_assignments.sum(axis=0)
+
+    # ──────────────────────────────────────
+    # Scoreset-compatible API
+    # ──────────────────────────────────────
 
     @property
     def scores(self):
+        """(N, D) array with NaN for missing."""
         return self._scores
-
 
     @property
     def full_scores(self):
         return self._scores_matrix
 
-
     @property
     def missing(self):
         return self._missing
-
 
     @property
     def keep_mask(self):
         return self._keep_mask
 
-
     @property
     def kept_variants(self):
         return self._variants_kept
 
-
     @property
     def sample_assignments(self):
-        return self._sample_assignments
-
-
-    @property
-    def pathogenic_mask(self):
-        return self._sample_assignments[:,0]
-
+        """(N, S) with empty-sample columns dropped."""
+        return self._sample_assignments[:, self.sample_counts > 0]
 
     @property
-    def benign_mask(self):
-        return self._sample_assignments[:,1]
-
-
-    @property
-    def population_mask(self):
-        return self._sample_assignments[:,2]
-
+    def n_samples(self):
+        return (self.sample_counts > 0).sum()
 
     @property
-    def synonymous_mask(self):
-        return self._sample_assignments[:,3]
+    def scoreset_name(self):
+        return " + ".join(self.dataset_names)
 
+    @property
+    def sample_names(self):
+        return [
+            self._sample_names[i]
+            for i in range(min(len(self._sample_names), len(self.sample_counts)))
+            if self.sample_counts[i] > 0
+        ]
+
+    @property
+    def xlims(self):
+        """Per-dimension (min, max) tuples."""
+        return self._xlims
 
     @property
     def n_assays(self):
         return self.d
 
+    @property
+    def is_multivariate(self):
+        return True
 
+    @property
+    def samples(self):
+        """Iterate over (scores, sample_name) pairs.
+        Scores are (n_sample, D) arrays with NaN for missing dims."""
+        for si in range(min(len(self._sample_names), self._sample_assignments.shape[1])):
+            if self.sample_counts[si] > 0:
+                mask = self._sample_assignments[:, si]
+                yield self._scores[mask], self._sample_names[si]
+
+    @property
+    def pathogenic_mask(self):
+        return self._sample_assignments[:, 0]
+
+    @property
+    def benign_mask(self):
+        return self._sample_assignments[:, 1]
+
+    @property
+    def population_mask(self):
+        return self._sample_assignments[:, 2]
+
+    @property
+    def synonymous_mask(self):
+        return self._sample_assignments[:, 3]
+
+    def __repr__(self):
+        out = f"MultiScoreset: {self.scoreset_name}\n"
+        out += f"  {self.n_variants} variants, {self.d} assays\n"
+        for dim in range(self.d):
+            n_obs = (~np.isnan(self._scores[:, dim])).sum()
+            out += f"  Dim {dim} ({self.dataset_names[dim]}): {n_obs}/{self.n_variants} observed\n"
+        miss_pct = self._missing.mean() * 100
+        out += f"  Overall: {miss_pct:.1f}% missing entries\n"
+        for scores, name in self.samples:
+            out += f"  {name}: {len(scores)} variants\n"
+        return out
+
+    def __len__(self):
+        return self.n_variants
 
 if __name__ == "__main__":
     Fire()

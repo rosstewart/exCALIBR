@@ -1,6 +1,6 @@
 from .update_steps import em_iteration, get_sample_weights
 from .density_utils import get_likelihood
-from .initializations import kmeans_init, methodOfMomentsInit
+from .initializations import kmeans_init, methodOfMomentsInit, kmeans_init_mv
 from . import constraints
 
 import numpy as np
@@ -10,284 +10,246 @@ import warnings
 
 
 def single_fit(
-    observations, sample_indicators, N_components, constrained, init_method, init_constraint_adjustment, **kwargs
+    observations, sample_indicators, N_components, constrained,
+    init_method, init_constraint_adjustment, multivariate=False, **kwargs
 ):
     """
-    Fit a two-component mixture model to the observations using the EM algorithm.
+    Fit a mixture model using EM.
 
     Parameters
     ----------
     observations : np.ndarray
-        1D array of observations (e.g., scores).
+        (N,) for univariate, (N, K) for multivariate.
     sample_indicators : np.ndarray
-        2D one-hot encoded array indicating sample membership for each observation.
+        (N, S) one-hot sample membership.
+    N_components : int
     constrained : bool
-        Whether to enforce component-pair density ratio constraints
-    init_method : kmeans or method_of_moments
-
-    Optional Parameters (kwargs)
-    -------------------------
-
-
-    max_em_iters : int, default=10000
-        Maximum number of EM iterations.
-
-    verbose : bool, default=True
-        Whether to display a progress bar.
-
-    initial_weights : np.ndarray, optional
-        Optional initial weights for the samples. If provided along with initial_params, these will be used to initialize the EM algorithm.
-            Otherwise, the model will be initialized using k-means initialization.
-
-    initial_params : list of np.ndarray, optional
-        Optional initial parameters for the mixture components. If provided along with initial_weights, these will be used to initialize the EM algorithm.
-            Otherwise, the model will be initialized using k-means initialization.
-
-    early_stopping : bool, default=True
-        Whether to stop the EM algorithm early if the likelihood converges.
-
-    check_submerged_duration : bool, default=False
-        Whether to check if the unconstrained model goes underwater. Useful for learning model behavior.
-
-    DEPRECATED : submerge_steps : int, optional
-        Optional max number of initial steps to explore without constraint. constrained must be set to true.
+    init_method : str  ("kmeans" or "method_of_moments")
+    init_constraint_adjustment : str
+    multivariate : bool
+        Whether data/model is multivariate.
 
     Returns
     -------
-    dict
-        A dictionary containing:
-        - 'component_params': List of parameters for each mixture component.
-        - 'weights': Final weights for each sample.
-        - 'likelihoods': Array of likelihood values at each iteration.
-        - 'history': List of dictionaries containing component parameters and weights at each iteration.
-        - 'kmeans': KMeans object used for initialization (if applicable), or None.
-        - 'xlims': bounds of scores
-        - 'times_submerged': 'list containing each underwater duration taken by the model'
+    dict with component_params, weights, likelihoods, history, etc.
     """
     MAX_EM_ITERS = kwargs.get("max_em_iters", 10000)
     verbose = kwargs.get("verbose", True)
     check_submerged_duration = kwargs.get("check_submerged_duration", False)
     MIN_SCALE = 1e-100
-    
-    submerge_steps = kwargs.get("submerge_steps", None)
-    if submerge_steps is not None:# and not constrained:
-        # raise ValueError("constrained must be True when submerge_steps is not None.")
-        raise NotImplementedError('submerge_steps is deprecated')
-    
-    xlims = (observations.min(), observations.max())
+    mv = multivariate
+
+    if kwargs.get("submerge_steps") is not None:
+        raise NotImplementedError("submerge_steps is deprecated")
+
+    # Determine xlims
+    if mv:
+        # per-dimension bounds — use nanmin/nanmax since data has NaN
+        xlims = tuple(
+            (float(np.nanmin(observations[:, d])), float(np.nanmax(observations[:, d])))
+            for d in range(observations.shape[1])
+        )
+    else:
+        xlims = (observations.min(), observations.max())
+
     N_samples = sample_indicators.shape[1]
+
+    # ---- Initialization ----
     if (
-        kwargs.get("initial_weights", None) is not None
-        and kwargs.get("initial_params", None) is not None
+        kwargs.get("initial_weights") is not None
+        and kwargs.get("initial_params") is not None
     ):
         kmeans = None
-        # Start with user provided initialization
-        initial_params = kwargs.get("initial_params", [])
-        W = np.array(kwargs.get("initial_weights"))
+        initial_params = kwargs["initial_params"]
+        W = np.array(kwargs["initial_weights"])
         if W.shape != (N_samples, N_components):
-            raise ValueError(
-                f"Initial weights shape {W.shape} does not match number of samples {N_samples}"
-            )
+            raise ValueError(f"Initial weights shape {W.shape} mismatch")
         if len(initial_params) != N_components:
-            raise ValueError(
-                f"Initial params length {len(initial_params)} does not match number of components {N_components}"
-            )
+            raise ValueError(f"Initial params length {len(initial_params)} mismatch")
     else:
         W = np.ones((N_samples, N_components)) / N_components
 
-        assert init_method == "method_of_moments" or init_method == "kmeans"
         initial_params = None
-        
-        if init_method == "method_of_moments":
+        if init_method == "method_of_moments" and not mv:
             kmeans = "method_of_moments"
-            initial_params = methodOfMomentsInit(observations, N_components, constrained, init_constraint_adjustment=init_constraint_adjustment, **kwargs)
+            initial_params = methodOfMomentsInit(
+                observations, N_components, constrained,
+                init_constraint_adjustment=init_constraint_adjustment, **kwargs
+            )
 
-        # init_method is kmeans or was a failed method of moments (fall back to kmeans)
         if initial_params is None:
-            if init_method == "method_of_moments" and verbose:
-                print('failed method of moments, falling back to kmeans')
-                
-            # Run Initialization
+            if init_method == "method_of_moments" and verbose and not mv:
+                print("failed method of moments, falling back to kmeans")
+            if verbose:
+                print(f"[INIT] mv={mv}, method={'kmeans_mv' if mv else 'kmeans'}, "
+                      f"obs shape={observations.shape}, "
+                      f"NaN count={np.isnan(observations).sum()}, "
+                      f"xlims={xlims}")
             try:
-                initial_params, kmeans = kmeans_init(
-                    observations, n_clusters=N_components, constrained=constrained, init_constraint_adjustment=init_constraint_adjustment, **kwargs
-                )
-            except ValueError:
-                logging.warning("Failed to initialize")
+                if mv:
+                    initial_params, kmeans = kmeans_init_mv(
+                        observations, n_clusters=N_components,
+                        constrained=constrained,
+                        init_constraint_adjustment=init_constraint_adjustment,
+                        **kwargs
+                    )
+                else:
+                    initial_params, kmeans = kmeans_init(
+                        observations, n_clusters=N_components,
+                        constrained=constrained,
+                        init_constraint_adjustment=init_constraint_adjustment,
+                        **kwargs
+                    )
+            except ValueError as e:
+                if kwargs.get("raise_on_error", False):
+                    raise
+                print(f"[INIT FAILED] {e}")
                 return dict(
                     component_params=[[] for _ in range(N_components)],
                     weights=W,
-                    likelihoods=[-1 * np.inf],
+                    likelihoods=[-np.inf],
                     xlims=xlims,
                     times_submerged=[],
                 )
-            
-        W = get_sample_weights(observations, sample_indicators, initial_params, W)
+
+        W = get_sample_weights(
+            observations, sample_indicators, initial_params, W, multivariate=mv
+        )
+
     history = [dict(component_params=initial_params, weights=W)]
-    # initial likelihood
-    likelihoods = np.array(
-        [
-            get_likelihood(observations, sample_indicators, initial_params, W)
-            / len(sample_indicators),
-        ]
-    )
-    # Check for bad initialization
+    likelihoods = np.array([
+        get_likelihood(observations, sample_indicators, initial_params, W, multivariate=mv)
+        / len(sample_indicators)
+    ])
+
+    # First iteration
     try:
         updated_component_params, updated_weights = em_iteration(
-            observations,
-            sample_indicators,
-            initial_params,
-            W,
-            constrained,
-            xlims,
-            iterNum=0,
+            observations, sample_indicators, initial_params, W,
+            constrained, xlims, multivariate=mv, iterNum=0
         )
-    except ZeroDivisionError:
-        logging.warning("ZeroDivisionError")
+    except ZeroDivisionError as e:
+        if kwargs.get("raise_on_error", False):
+            raise
+        print(f"[FIRST EM ITER FAILED] ZeroDivisionError: {e}")
         return dict(
-            component_params=initial_params,
-            weights=W,
-            likelihoods=[*likelihoods, -1 * np.inf],
-            kmeans=kmeans,
-            xlims=xlims,
-            times_submerged=[],
+            component_params=initial_params, weights=W,
+            likelihoods=[*likelihoods, -np.inf],
+            kmeans=kmeans, xlims=xlims, times_submerged=[]
         )
-    likelihoods = np.array(
-        [
-            *likelihoods,
-            get_likelihood(
-                observations,
-                sample_indicators,
-                updated_component_params,
-                updated_weights,
-            )
-            / len(sample_indicators),
-        ]
-    )
-    # Run the EM algorithm
+
+    likelihoods = np.array([
+        *likelihoods,
+        get_likelihood(
+            observations, sample_indicators,
+            updated_component_params, updated_weights, multivariate=mv
+        ) / len(sample_indicators)
+    ])
+
     if verbose:
         pbar = tqdm(total=MAX_EM_ITERS, leave=False, desc="EM Iteration")
 
-    try: # return failed fit upon ValueError or ZeroDivisionError
-    
+    try:
         underwater_time = 0
-        times_submerged = [] # only append when coming back up
+        times_submerged = []
         if not constrained and check_submerged_duration:
-            is_underwater = constraints.multicomponent_density_constraint_violated(updated_component_params, xlims)
+            is_underwater = constraints.multicomponent_density_constraint_violated(
+                updated_component_params, xlims, multivariate=mv
+            )
             if is_underwater:
-                underwater_time += 1 # already did step 0 before for loop
-    
-        for i in range(MAX_EM_ITERS):
-            history.append(
-                dict(component_params=updated_component_params, weights=updated_weights)
-            )
+                underwater_time += 1
+
+        for it in range(MAX_EM_ITERS):
+            history.append(dict(
+                component_params=updated_component_params,
+                weights=updated_weights
+            ))
             if np.isnan(likelihoods).any():
-                raise ValueError()
-            if np.isnan(np.concatenate(updated_component_params)).any():
-                raise ValueError()
+                raise ValueError("NaN in likelihoods")
             if np.isnan(updated_weights).any():
-                raise ValueError()
-            if np.isnan(np.concatenate(updated_component_params)).any():
-                raise ValueError(
-                    f"NaN in updated component params at iteration {i}\n{updated_component_params}"
-                )
-            if np.isnan(updated_weights).any():
-                raise ValueError(
-                    f"NaN in updated weights at iteration {i}\n{updated_weights}"
-                )
+                raise ValueError(f"NaN in weights at iteration {it}")
+
             updated_component_params, updated_weights = em_iteration(
-                observations,
-                sample_indicators,
-                updated_component_params,
-                updated_weights,
-                constrained,
-                xlims,
-                iterNum=i + 1,
+                observations, sample_indicators,
+                updated_component_params, updated_weights,
+                constrained, xlims, multivariate=mv, iterNum=it + 1
             )
-            # enforce minimum scale to accommodate numerical errors
-            for i, (a, loc, scale) in enumerate(updated_component_params):
-                if scale < MIN_SCALE:
-                    updated_component_params[i] = (a, loc, max(scale, MIN_SCALE))
-    
+
+            # enforce minimum scale (univariate only)
+            if not mv:
+                for i, (a, loc, scale) in enumerate(updated_component_params):
+                    if scale < MIN_SCALE:
+                        updated_component_params[i] = (a, loc, max(scale, MIN_SCALE))
+
             # check underwater duration
             if not constrained and check_submerged_duration:
-                violated = constraints.multicomponent_density_constraint_violated(updated_component_params, xlims)
-    
-                if is_underwater and violated: # stayed underwater
+                violated = constraints.multicomponent_density_constraint_violated(
+                    updated_component_params, xlims, multivariate=mv
+                )
+                if is_underwater and violated:
                     underwater_time += 1
-                elif is_underwater and not violated: # resurfaced by chance
+                elif is_underwater and not violated:
                     is_underwater = False
                     times_submerged.append(underwater_time)
                     underwater_time = 0
-                elif not is_underwater and violated: # went back underwater
+                elif not is_underwater and violated:
                     is_underwater = True
                     underwater_time += 1
-                elif not is_underwater and not violated: # stayed above water
-                    pass
-    
-            likelihoods = np.array(
-                [
-                    *likelihoods,
-                    get_likelihood(
-                        observations,
-                        sample_indicators,
-                        updated_component_params,
-                        updated_weights,
-                    )
-                    / len(sample_indicators),
-                ]
-            )
-            if i > 0 and (likelihoods[-1] < likelihoods[-2]):
+
+            likelihoods = np.array([
+                *likelihoods,
+                get_likelihood(
+                    observations, sample_indicators,
+                    updated_component_params, updated_weights, multivariate=mv
+                ) / len(sample_indicators)
+            ])
+
+            if it > 0 and likelihoods[-1] < likelihoods[-2]:
                 decrease = likelihoods[-2] - likelihoods[-1]
-                
-                relative_decrease = decrease / abs(likelihoods[-2])
-                
-                is_numerical_error = decrease < 1e-13
-                
-                if not is_numerical_error:
-                    raise ValueError(f"Iteration {i}: Likelihood ({likelihoods[-2]}->{likelihoods[-1]}) decreased by {decrease:.2e} (relative: {relative_decrease:.2e}) - (numerical rounding?)\nParams: {history[-1]['component_params']}-->{updated_component_params}\nWeights: {history[-1]['weights']}-->{updated_weights}")
-                
-            if kwargs.get("verbose", True):
-                pbar.set_postfix({"likelihood": f"{likelihoods[-1]:.6f}"})  # type: ignore
-                pbar.update(1)  # type: ignore
+                if decrease > 1e-13:
+                    raise ValueError(
+                        f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
+                    )
+
+            if verbose:
+                pbar.set_postfix({"likelihood": f"{likelihoods[-1]:.6f}"})
+                pbar.update(1)
+
             if (
                 kwargs.get("early_stopping", True)
-                and i >= 1
-                and (np.abs(likelihoods[-1] - likelihoods[-2]) / abs(likelihoods[-2]) < 1e-8).all() # relative difference < 1e-8
+                and it >= 1
+                and np.abs(likelihoods[-1] - likelihoods[-2]) / abs(likelihoods[-2]) < 1e-8
             ):
                 break
-    
-        
-        # check final if resurfaced
+
+        # final underwater check
         if not constrained and check_submerged_duration:
-            violated = constraints.multicomponent_density_constraint_violated(updated_component_params, xlims)
-    
-            if is_underwater and not violated: # resurfaced by chance on last iteration
-                is_underwater = False
+            violated = constraints.multicomponent_density_constraint_violated(
+                updated_component_params, xlims, multivariate=mv
+            )
+            if is_underwater and not violated:
                 times_submerged.append(underwater_time)
-                underwater_time = 0
-        
-        history.append(
-            dict(component_params=updated_component_params, weights=updated_weights)
-        )
-        if kwargs.get("verbose", True):
-            pbar.close()  # type: ignore
+
+        history.append(dict(
+            component_params=updated_component_params, weights=updated_weights
+        ))
+        if verbose:
+            pbar.close()
         if constrained and constraints.multicomponent_density_constraint_violated(
-            updated_component_params, xlims
+            updated_component_params, xlims, multivariate=mv
         ):
             raise ValueError("Final parameters violate density constraint")
 
-
-    
     except (ValueError, ZeroDivisionError) as e:
-        warnings.warn(f'Failed fit: {e}')
+        if kwargs.get("raise_on_error", False):
+            raise
+        import traceback
+        warnings.warn(f"Failed fit: {e}\n{traceback.format_exc()}")
         return dict(
             component_params=updated_component_params,
             weights=updated_weights,
-            likelihoods=[*likelihoods, -1 * np.inf],
-            kmeans=kmeans,
-            xlims=xlims,
-            times_submerged=[],
+            likelihoods=[*likelihoods, -np.inf],
+            kmeans=kmeans, xlims=xlims, times_submerged=[]
         )
 
     return dict(
@@ -298,5 +260,5 @@ def single_fit(
         kmeans=kmeans,
         xlims=xlims,
         times_submerged=times_submerged,
-        initial_params = initial_params
+        initial_params=initial_params,
     )
