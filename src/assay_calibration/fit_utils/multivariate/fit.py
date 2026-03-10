@@ -207,9 +207,42 @@ def single_fit(
             if it > 0 and likelihoods[-1] < likelihoods[-2]:
                 decrease = likelihoods[-2] - likelihoods[-1]
                 if decrease > 1e-13:
-                    raise ValueError(
-                        f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
-                    )
+                    if mv:
+                        # Available-case M-step doesn't guarantee monotonicity.
+                        # Backtrack: interpolate between old and new params.
+                        old_params = history[-1]['component_params']
+                        old_weights = history[-1]['weights']
+                        alpha = 0.5
+                        for _ in range(10):
+                            bt_params = []
+                            for c in range(len(updated_component_params)):
+                                mu_o, D_o, G_o = old_params[c]
+                                mu_n, D_n, G_n = updated_component_params[c]
+                                mu_bt = (1 - alpha) * mu_o + alpha * mu_n
+                                D_bt = (1 - alpha) * D_o + alpha * D_n
+                                G_bt = (1 - alpha) * G_o + alpha * G_n
+                                G_bt = 0.5 * (G_bt + G_bt.T)
+                                bt_params.append((mu_bt, D_bt, G_bt))
+                            bt_weights = (1 - alpha) * old_weights + alpha * updated_weights
+                            bt_ll = get_likelihood(
+                                observations, sample_indicators,
+                                bt_params, bt_weights, multivariate=mv
+                            ) / len(sample_indicators)
+                            if bt_ll >= likelihoods[-2] - 1e-13:
+                                updated_component_params = bt_params
+                                updated_weights = bt_weights
+                                likelihoods[-1] = bt_ll
+                                break
+                            alpha *= 0.5
+                        else:
+                            # Backtracking failed — revert to old params
+                            updated_component_params = old_params
+                            updated_weights = old_weights
+                            likelihoods[-1] = likelihoods[-2]
+                    else:
+                        raise ValueError(
+                            f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
+                        )
 
             if verbose:
                 pbar.set_postfix({"likelihood": f"{likelihoods[-1]:.6f}"})
