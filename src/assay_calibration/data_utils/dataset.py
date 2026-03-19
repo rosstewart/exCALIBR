@@ -445,7 +445,7 @@ class Scoreset:
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
         clinvar_release = kwargs.get("clinvar_release",'2025')
         self.variants = [Variant(row,min_clinvar_star,clinvar_release) for _, row in self.dataframe.iterrows()]
-        self.synonymous_exclusive = kwargs.get("synonymous_exclusive",True)
+        self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
         self.score_avg = kwargs.get("score_avg",False)
         self._init_matrices(**kwargs)
 
@@ -915,7 +915,7 @@ def summarize_datasets(dataframe_path, **kwargs):
         scoreset = Scoreset(
             ds_df,
             missense_only=kwargs.get("missense_only", False),
-            synonymous_exclusive=kwargs.get("synonymous_exclusive", True),
+            synonymous_exclusive=kwargs.get("synonymous_exclusive", False),
             score_avg=kwargs.get("score_avg", False),
             filter_nonsense=kwargs.get("filter_nonsense", False)
         )
