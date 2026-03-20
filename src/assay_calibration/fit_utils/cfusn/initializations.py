@@ -1,0 +1,364 @@
+"""
+Initialization routines for multivariate skew-normal mixture models.
+
+Supports both restricted MSN (q=1, Delta is a vector) and CFUSN (q>=1, Delta is a matrix).
+
+For CFUSN initialization:
+    - Delta is initialized as (p, q) matrix with small random entries
+    - Gamma is initialized from cluster covariance minus Delta @ Delta.T
+    - The latent dimension q is passed via kwargs["latent_q"]
+"""
+
+from .constraints import (
+    density_constraint_violated,
+    multicomponent_density_constraint_violated,
+)
+import numpy as np
+from sklearn.cluster import KMeans
+import scipy.stats as sps
+import itertools
+
+
+# ══════════════════════════════════════════════
+# Univariate initializations (unchanged)
+# ══════════════════════════════════════════════
+
+def kmeans_init(X, **kwargs):
+    repeat = 0
+    while repeat < 1000:
+        n_clusters = kwargs.get("n_clusters", 2)
+        init = kwargs.get("kmeans_init", "random")
+        kmeans = KMeans(n_clusters=n_clusters, init=init)
+        X = np.array(X).reshape((-1, 1))
+        kmeans.fit(X)
+        cluster_assignments = kmeans.predict(X)
+        component_parameters = []
+        for i in range(n_clusters):
+            X_cluster = X[cluster_assignments == i]
+            loc, scale = sps.norm.fit(X_cluster)
+            a = np.random.uniform(-0.25, 0.25)
+            component_parameters.append((a, float(loc), float(scale)))
+        component_parameters = sorted(component_parameters, key=lambda x: x[1])
+        if kwargs.get("constrained", True):
+            component_parameters = fix_to_satisfy_density_constraint(
+                component_parameters,
+                (X.min(), X.max()),
+                **kwargs,
+            )
+        if len(component_parameters) == 0 or any(
+            len(p) == 0 for p in component_parameters
+        ):
+            repeat += 1
+        else:
+            return component_parameters, kmeans
+    raise ValueError("Failed to initialize")
+
+
+def sn_method_of_moments_init(X):
+    m1 = np.mean(X)
+    m2 = np.var(X)
+    m3 = sps.skew(X)
+    if m2 < 1e-10:
+        return []
+    a1 = np.sqrt(2 / np.pi)
+    b1 = (4 / np.pi - 1) / a1
+    try:
+        delta = np.sign(m3) / np.sqrt(a1**2 + m2 * (b1 / np.abs(m3)) ** (2 / 3))
+        if np.isnan(delta) or np.abs(delta) >= 0.99:
+            return np.random.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
+        denom = 1 - a1**2 * delta**2
+        if denom <= 1e-10:
+            return m3, m1, max(np.sqrt(m2), 1e-6)
+        sigma = max(np.sqrt(m2 / denom), 1e-6)
+        mu = m1 - a1 * delta * sigma
+        if np.any(np.isnan([mu, sigma, m3])) or np.any(np.isinf([mu, sigma, m3])):
+            return []
+        return m3, mu, sigma
+    except (ZeroDivisionError, RuntimeWarning):
+        return []
+
+
+def methodOfMomentsInit(X, n_components, constrained, max_attempts=1000, **kwargs):
+    LambdasTable = list(itertools.product([-1, 1], repeat=n_components))
+    if "lambdaIndex" in kwargs:
+        lambdas = LambdasTable[kwargs["lambdaIndex"]]
+
+    for attempt in range(max_attempts):
+        if np.random.rand() < 0.7:
+            base = np.linspace(0, 100, n_components + 1)[1:-1]
+            iqr = np.percentile(X, 75) - np.percentile(X, 25)
+            jitter = np.random.normal(0, iqr * 0.1, len(base))
+            cutPoints = np.percentile(X, np.sort(np.clip(base + jitter, 1, 99)))
+        else:
+            cutPoints = np.sort(
+                np.random.uniform(
+                    np.percentile(X, 5), np.percentile(X, 95), n_components - 1
+                )
+            )
+
+        component_parameters = []
+        success = True
+        for i in range(n_components):
+            if i == 0:
+                Xc = X[X <= cutPoints[0]]
+            elif i == n_components - 1:
+                Xc = X[X > cutPoints[-1]]
+            else:
+                Xc = X[(X > cutPoints[i - 1]) & (X <= cutPoints[i])]
+            if len(Xc) < max(10, int(0.05 * len(X))):
+                success = False
+                break
+            params = sn_method_of_moments_init(Xc)
+            if len(params) == 0:
+                success = False
+                break
+            params = list(params)
+            params[0] = lambdas[i]
+            component_parameters.append(tuple(params))
+
+        if success and all(len(p) > 0 for p in component_parameters):
+            max_scale = max(p[2] for p in component_parameters)
+            component_parameters = [
+                (p[0], p[1], max_scale) for p in component_parameters
+            ]
+            if constrained:
+                component_parameters = fix_to_satisfy_density_constraint(
+                    component_parameters, (X.min(), X.max()), **kwargs
+                )
+            if len(component_parameters) and all(
+                len(p) > 0 for p in component_parameters
+            ):
+                return component_parameters
+    print("MoM constraint failed")
+    return None
+
+
+def fix_to_satisfy_density_constraint(component_parameters, xlims, **kwargs):
+    n_components = len(component_parameters)
+    param_to_adjust = kwargs.get("init_constraint_adjustment", "scale")
+    assert param_to_adjust == "scale"
+    if any(len(p) == 0 for p in component_parameters):
+        return [[] for _ in range(n_components)]
+    component_parameters = sorted(component_parameters, key=lambda x: x[1])
+    for i in range(n_components):
+        if len(component_parameters[i]) >= 3 and component_parameters[i][2] < 1e-6:
+            component_parameters[i] = list(component_parameters[i])
+            component_parameters[i][2] = 1e-6
+    trial = 0
+    while (
+        multicomponent_density_constraint_violated(
+            xlims=xlims, param_sets=component_parameters
+        )
+        and trial < 300
+    ):
+        for i in range(n_components):
+            p = list(component_parameters[i])
+            p[2] *= 0.95
+            component_parameters[i] = tuple(p)
+            trial += 1
+        if min(p[2] for p in component_parameters) < 1e-6:
+            break
+    if multicomponent_density_constraint_violated(
+        xlims=xlims, param_sets=component_parameters
+    ):
+        return [[] for _ in range(n_components)]
+    return component_parameters
+
+
+# ══════════════════════════════════════════════
+# Multivariate initialization — unified for q=1 and q>1
+# ══════════════════════════════════════════════
+
+def kmeans_init_mv(X, **kwargs):
+    """K-means based initialization for multivariate skew-normal mixtures.
+
+    For CFUSN (q > 1), pass latent_q=q in kwargs. Default q=1 (restricted MSN).
+
+    Parameters
+    ----------
+    X : (N, p) data array, may contain NaN
+    **kwargs :
+        n_clusters : int
+        constrained : bool
+        latent_q : int (default 1) — latent dimension q
+
+    Returns
+    -------
+    component_parameters : list of (mu, Delta, Gamma) tuples
+        Delta is (p,) for q=1, (p, q) for q>1
+    kmeans : fitted KMeans object
+    """
+    n_clusters = kwargs.get("n_clusters", 2)
+    constrained = kwargs.get("constrained", True)
+    latent_q = kwargs.get("latent_q", 1)
+    N, K_dim = X.shape
+
+    complete_mask = ~np.isnan(X).any(axis=1)
+    X_complete = X[complete_mask]
+    min_needed = n_clusters * max(10, K_dim + 2)
+    if len(X_complete) < min_needed:
+        raise ValueError(f"Only {len(X_complete)}/{N} complete rows, need {min_needed}")
+
+    last_error = None
+    for attempt in range(1000):
+        try:
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                init=kwargs.get("kmeans_init", "random"),
+                n_init=1
+            )
+            kmeans.fit(X_complete)
+            labels = np.full(N, -1, dtype=int)
+            labels[complete_mask] = kmeans.predict(X_complete)
+            centers = kmeans.cluster_centers_
+
+            for j in np.where(~complete_mask)[0]:
+                obs = ~np.isnan(X[j])
+                if not obs.any():
+                    labels[j] = np.random.randint(n_clusters)
+                else:
+                    labels[j] = np.argmin([
+                        np.sum((X[j, obs] - centers[c, obs])**2)
+                        for c in range(n_clusters)
+                    ])
+
+            component_parameters = []
+            ok = True
+            for c in range(n_clusters):
+                Xc = X[labels == c]
+                if len(Xc) < max(10, K_dim + 2):
+                    ok = False
+                    last_error = f"Cluster {c}: {len(Xc)} pts"
+                    break
+
+                mu = np.nanmean(Xc, axis=0)
+
+                # Compute covariance handling NaN
+                cov = np.zeros((K_dim, K_dim))
+                for d1 in range(K_dim):
+                    for d2 in range(d1, K_dim):
+                        both = ~np.isnan(Xc[:, d1]) & ~np.isnan(Xc[:, d2])
+                        if both.sum() < 2:
+                            cov[d1, d2] = 1e-2
+                        else:
+                            cov[d1, d2] = np.cov(Xc[both, d1], Xc[both, d2])[0, 1]
+                        cov[d2, d1] = cov[d1, d2]
+                cov += 1e-6 * np.eye(K_dim)
+                eigvals = np.linalg.eigvalsh(cov)
+                if eigvals.min() < 1e-8:
+                    cov += (1e-8 - eigvals.min()) * np.eye(K_dim)
+
+                if latent_q == 1:
+                    # Restricted MSN: Delta is (p,) vector
+                    Delta = np.random.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
+                    Gamma = cov - np.outer(Delta, Delta)
+                    eigvals_G = np.linalg.eigvalsh(Gamma)
+                    if eigvals_G.min() < 1e-8:
+                        Gamma += (1e-8 - eigvals_G.min()) * np.eye(K_dim)
+                else:
+                    # CFUSN: Delta is (p, q) matrix
+                    Delta = _init_delta_matrix(cov, K_dim, latent_q)
+                    Gamma = cov - Delta @ Delta.T
+                    Gamma = 0.5 * (Gamma + Gamma.T)
+                    eigvals_G = np.linalg.eigvalsh(Gamma)
+                    if eigvals_G.min() < 1e-8:
+                        Gamma += (1e-8 - eigvals_G.min()) * np.eye(K_dim)
+
+                component_parameters.append((mu, Delta, Gamma))
+
+            if not ok:
+                continue
+
+            component_parameters.sort(key=lambda p: p[0][0])
+
+            if constrained:
+                result = fix_to_satisfy_density_constraint_mv(
+                    component_parameters, X, **kwargs
+                )
+                if result is None:
+                    last_error = "Constraint failed"
+                    continue
+                component_parameters = result
+
+            if len(component_parameters) == n_clusters:
+                return component_parameters, kmeans
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            continue
+
+    raise ValueError(f"Failed init after 1000 attempts: {last_error}")
+
+
+def _init_delta_matrix(cov, p, q):
+    """Initialize Delta (p, q) matrix for CFUSN.
+
+    Strategy: Use scaled random directions, ensuring that
+    Delta @ Delta.T doesn't dominate cov (so Gamma stays PD).
+
+    The columns of Delta are initialized as small random multiples
+    of eigenvectors of cov, which provides meaningful skewness directions.
+    """
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    # Use top-q eigenvectors as skewness directions
+    top_idx = np.argsort(eigvals)[::-1][:q]
+
+    Delta = np.zeros((p, q))
+    for j, idx in enumerate(top_idx):
+        # Scale so Delta contribution is small relative to cov
+        scale = 0.1 * np.sqrt(eigvals[idx])
+        sign = np.random.choice([-1, 1])
+        Delta[:, j] = sign * scale * eigvecs[:, idx]
+
+    # Add small random perturbation
+    Delta += np.random.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
+
+    # Verify Gamma = cov - Delta @ Delta.T is PD
+    Gamma = cov - Delta @ Delta.T
+    eigvals_G = np.linalg.eigvalsh(Gamma)
+    if eigvals_G.min() < 1e-6:
+        # Shrink Delta
+        shrink = 0.5
+        for _ in range(20):
+            Delta *= shrink
+            Gamma = cov - Delta @ Delta.T
+            if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                break
+            shrink *= 0.5
+
+    return Delta
+
+
+def fix_to_satisfy_density_constraint_mv(component_parameters, X, **kwargs):
+    """Shrink scale matrices until constraint is satisfied.
+
+    Works for both q=1 (Delta is vector) and q>1 (Delta is matrix).
+    """
+    n_components = len(component_parameters)
+    K_dim = component_parameters[0][0].shape[0]
+
+    xlims = tuple(
+        (float(np.nanmin(X[:, d])), float(np.nanmax(X[:, d])))
+        for d in range(K_dim)
+    )
+
+    trial = 0
+    while trial < 300:
+        if not multicomponent_density_constraint_violated(
+            component_parameters, xlims, multivariate=True
+        ):
+            return component_parameters
+        # Shrink: scale Gamma and Delta toward zero
+        shrunk = []
+        for mu, Delta, Gamma in component_parameters:
+            Delta_shrunk = Delta * 0.95
+            Gamma_shrunk = Gamma * 0.95 + 0.05 * np.eye(K_dim) * np.trace(Gamma) / K_dim
+            shrunk.append((mu, Delta_shrunk, Gamma_shrunk))
+        component_parameters = shrunk
+        trial += 1
+
+    if multicomponent_density_constraint_violated(
+        component_parameters, xlims, multivariate=True
+    ):
+        return None
+    return component_parameters

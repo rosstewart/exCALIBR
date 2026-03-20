@@ -1,3 +1,16 @@
+"""
+Fitting routines for skew-normal mixture models.
+
+Supports univariate, restricted multivariate (q=1), and CFUSN (q>=1).
+
+To use CFUSN, pass latent_q=2 (or any q>1) in kwargs to Fit.run() or
+Fit.generate_fit_jobs(). This propagates to initialization and EM steps.
+
+Key kwargs for CFUSN:
+    latent_q : int (default 1) — latent dimension q
+    n_mc_truncated : int (default 500) — MC samples for truncated MVN moments
+"""
+
 import sys
 from pathlib import Path
 import os
@@ -12,9 +25,10 @@ from .evidence_thresholds import get_tavtigian_constant
 import logging
 import sys
 from joblib import Parallel, delayed
-from .multivariate.fit import single_fit
-from .multivariate.density_utils import (
-    get_likelihood, msn_logpdf_alternate_missing, mixture_pdf, log_joint_densities,
+from .cfusn.fit import single_fit
+from .cfusn.density_utils import (
+    get_likelihood, msn_logpdf_alternate_missing, cfusn_logpdf_alternate_missing,
+    mixture_pdf, log_joint_densities, _ensure_matrix_delta, get_q,
 )
 from .utils import serialize_dict
 import time
@@ -110,6 +124,8 @@ class Fit:
         """
         Run fits. For MultiScoreset, automatically routes to multivariate EM.
 
+        For CFUSN, pass latent_q=2 (or higher) in kwargs.
+
         Returns
         -------
         models : list of fit result dicts
@@ -120,7 +136,6 @@ class Fit:
         observations = self.scoreset.scores
         mv = self.multivariate
 
-        # Fallback: detect from data shape
         if not mv and observations.ndim == 2 and observations.shape[1] > 1:
             mv = True
             self.multivariate = True
@@ -132,7 +147,9 @@ class Fit:
             kwargs["score_max"] = max(
                 kwargs.get("score_max", observations.max()), observations.max()
             )
-        # else: xlims are per-dimension, handled inside single_fit
+
+        # Propagate latent_q for CFUSN
+        latent_q = kwargs.get("latent_q", 1)
 
         sample_assignments = self.scoreset.sample_assignments
         if kwargs.get("verbose", False):
@@ -140,10 +157,11 @@ class Fit:
         sample_assignments = makeOneHot(sample_assignments)
         if kwargs.get("verbose", False):
             print(f"sample counts (after one-hot): {sample_assignments.sum(0)}")
+            if latent_q > 1:
+                print(f"CFUSN mode: latent_q={latent_q}")
 
         # Filter invalid rows
         if mv:
-            # Keep rows where at least one dimension is non-NaN AND assigned to a sample
             include = sample_assignments.any(axis=1) & ~np.all(np.isnan(observations), axis=1)
         else:
             include = sample_assignments.any(axis=1) & ~np.isnan(observations)
@@ -166,7 +184,7 @@ class Fit:
             init_methods = np.full(NUM_FITS, init_method)
         else:
             if mv:
-                init_methods = np.full(NUM_FITS, "kmeans")  # MoM not yet for MV
+                init_methods = np.full(NUM_FITS, "kmeans")
             else:
                 init_methods = np.random.choice(
                     ["kmeans", "method_of_moments"], size=NUM_FITS
@@ -214,12 +232,10 @@ class Fit:
 
         # Select best model
         def _safe_ll(obs, sa, m):
-            """Compute likelihood, returning -inf for failed fits."""
             params = m.get("component_params")
             weights = m.get("weights")
             if params is None or weights is None:
                 return -np.inf
-            # Check for empty or malformed params
             if isinstance(params, list) and (
                 len(params) == 0
                 or any(isinstance(p, (list, tuple)) and len(p) == 0 for p in params)
@@ -237,7 +253,6 @@ class Fit:
             best_idx = int(np.nanargmax(val_lls))
             return models, best_idx, val_lls[best_idx]
 
-        # No bootstrap: select by training likelihood
         train_lls = [_safe_ll(train_observations, train_sample_assignments, m) for m in models]
         best_idx = int(np.nanargmax(train_lls))
         return models, best_idx, train_lls[best_idx]
@@ -265,15 +280,30 @@ class Fit:
         if self.multivariate:
             results = []
             for k, (p, w) in enumerate(zip(params, weights)):
-                # p should be (mu, Delta, Gamma) — a 3-tuple of arrays
-                if not (isinstance(p, (list, tuple)) and len(p) == 3):
-                    raise ValueError(
-                        f"Component {k} params malformed: expected (mu, Delta, Gamma), "
-                        f"got {type(p)} of length {len(p) if hasattr(p, '__len__') else '?'}"
-                    )
                 mu, Delta, Gamma = p
-                log_pdf = msn_logpdf_alternate_missing(np.atleast_2d(x), mu, Delta, Gamma)
-                results.append(w * np.exp(log_pdf))
+                Delta_arr = np.asarray(Delta)
+
+                if Delta_arr.ndim == 2 and Delta_arr.shape[1] > 1:
+                    # CFUSN path
+                    from .cfusn.density_utils import cfusn_logpdf_alternate_missing
+                    x_2d = np.atleast_2d(x)
+                    if np.isnan(x_2d).any():
+                        log_pdf = cfusn_logpdf_alternate_missing(x_2d, mu, Delta, Gamma)
+                    else:
+                        from .cfusn.density_utils import cfusn_logpdf_alternate
+                        log_pdf = cfusn_logpdf_alternate(x_2d, mu, Delta, Gamma)
+                    results.append(w * np.exp(log_pdf))
+                else:
+                    # Restricted MSN (q=1)
+                    if not (isinstance(p, (list, tuple)) and len(p) == 3):
+                        raise ValueError(
+                            f"Component {k} params malformed: expected (mu, Delta, Gamma), "
+                            f"got {type(p)} of length {len(p) if hasattr(p, '__len__') else '?'}"
+                        )
+                    from .cfusn.density_utils import msn_logpdf_alternate_missing
+                    Delta_vec = np.asarray(Delta).ravel()
+                    log_pdf = msn_logpdf_alternate_missing(np.atleast_2d(x), mu, Delta_vec, Gamma)
+                    results.append(w * np.exp(log_pdf))
             return np.array(results)
         else:
             return np.array([
@@ -285,8 +315,6 @@ class Fit:
         self._eval_metrics = {}
         for sampleNum, (sample_scores, sample_name) in enumerate(self.scoreset.samples):
             if self.multivariate:
-                # Evaluate CDF per dimension is not straightforward for MV;
-                # store per-dimension marginal CDFs
                 self._eval_metrics[sample_name] = {"note": "multivariate — per-dim eval TBD"}
             else:
                 u = np.unique(sample_scores)
@@ -339,16 +367,13 @@ class Fit:
 
         scores = self.scoreset.scores
         if self.multivariate:
-            # For MV: evaluate LR along observed scores (N, D)
             log_LR = self.get_log_lrPlus(scores)
-            # Sum log-LR across components, result is (K, N) → sum over K → (N,)
             log_lr_sum = log_LR.sum(axis=0)
-            # Sort by aggregate LR for threshold finding
             order = np.argsort(log_lr_sum)
-            uscores_1d = np.arange(len(order))  # proxy 1-d scores
+            uscores_1d = np.arange(len(order))
             score_ranges_p, score_ranges_b, C = calculate_score_ranges(
                 log_lr_sum[order], log_lr_sum[order],
-                prior, scores[order] if not self.multivariate else uscores_1d,
+                prior, uscores_1d,
                 point_values
             )
             return score_ranges_p, score_ranges_b
@@ -365,10 +390,18 @@ class Fit:
         return {
             **model_params,
             "multivariate": self.multivariate,
+            "latent_q": self._get_latent_q(),
             "eval_metrics": {
                 k: v for k, v in getattr(self, "_eval_metrics", {}).items()
             },
         }
+
+    def _get_latent_q(self):
+        """Determine latent dimension q from fitted params."""
+        params = self.fit_result.get("component_params", [])
+        if params and self.multivariate:
+            return get_q(params)
+        return 1
 
     # ──────────────────────────────────────
     # Job generation for distributed fitting
@@ -486,7 +519,7 @@ class Fit:
 
 
 # ══════════════════════════════════════════════
-# Utility functions (unchanged from original)
+# Utility functions
 # ══════════════════════════════════════════════
 
 def prior_from_weights(weights, population_idx=2, controls_idx=1, pathogenic_idx=0, inverted=False):
@@ -574,7 +607,6 @@ def assign_points(scores, point_score_ranges):
             if scores.ndim == 1:
                 mask = (scores >= score_range[0]) & (scores <= score_range[1])
             else:
-                # For multivariate, this is an index-based range
                 mask = (np.arange(len(scores)) >= score_range[0]) & (np.arange(len(scores)) <= score_range[1])
             points[mask] = points_key
     return points
