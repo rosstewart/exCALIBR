@@ -13,33 +13,6 @@ def single_fit(
     observations, sample_indicators, N_components, constrained,
     init_method, init_constraint_adjustment, multivariate=False, **kwargs
 ):
-    """
-    Fit a mixture model using EM.
-
-    Parameters
-    ----------
-    observations : np.ndarray
-        (N,) for univariate, (N, K) for multivariate.
-    sample_indicators : np.ndarray
-        (N, S) one-hot sample membership.
-    N_components : int
-    constrained : bool
-    init_method : str  ("kmeans" or "method_of_moments")
-    init_constraint_adjustment : str
-    multivariate : bool
-        Whether data/model is multivariate.
-
-    Additional kwargs for CFUSN
-    ---------------------------
-    latent_q : int (default 1)
-        Latent dimension q. q=1 gives restricted MSN, q>1 gives CFUSN.
-    n_mc_truncated : int (default 500)
-        Number of MC samples for truncated multivariate normal moments.
-
-    Returns
-    -------
-    dict with component_params, weights, likelihoods, history, etc.
-    """
     MAX_EM_ITERS = kwargs.get("max_em_iters", 10000)
     verbose = kwargs.get("verbose", True)
     check_submerged_duration = kwargs.get("check_submerged_duration", False)
@@ -50,9 +23,7 @@ def single_fit(
     if kwargs.get("submerge_steps") is not None:
         raise NotImplementedError("submerge_steps is deprecated")
 
-    # Determine xlims
     if mv:
-        # per-dimension bounds — use nanmin/nanmax since data has NaN
         xlims = tuple(
             (float(np.nanmin(observations[:, d])), float(np.nanmax(observations[:, d])))
             for d in range(observations.shape[1])
@@ -74,8 +45,6 @@ def single_fit(
             raise ValueError(f"Initial weights shape {W.shape} mismatch")
         if len(initial_params) != N_components:
             raise ValueError(f"Initial params length {len(initial_params)} mismatch")
-
-        # If CFUSN, ensure Delta is (p, q) matrix in initial params
         if mv and latent_q > 1:
             initial_params = _ensure_cfusn_params(initial_params, latent_q)
     else:
@@ -130,20 +99,22 @@ def single_fit(
             observations, sample_indicators, initial_params, W, multivariate=mv
         )
 
-    # Build em_kwargs: extra arguments passed into em_iteration
     em_kwargs = {}
     if mv and latent_q > 1:
         em_kwargs["n_mc_truncated"] = kwargs.get("n_mc_truncated", 500)
 
     history = [dict(component_params=initial_params, weights=W)]
+    # Initial likelihood: no em_iteration has run yet so we must evaluate explicitly.
     likelihoods = np.array([
         get_likelihood(observations, sample_indicators, initial_params, W, multivariate=mv)
         / len(sample_indicators)
     ])
 
-    # First iteration
+    # ---- First EM iteration ----
+    # em_iteration now returns a 3-tuple (params, weights, normalised_ll),
+    # so no separate get_likelihood call is needed.
     try:
-        updated_component_params, updated_weights = em_iteration(
+        updated_component_params, updated_weights, ll = em_iteration(
             observations, sample_indicators, initial_params, W,
             constrained, xlims, multivariate=mv, iterNum=0, **em_kwargs
         )
@@ -157,13 +128,7 @@ def single_fit(
             kmeans=kmeans, xlims=xlims, times_submerged=[]
         )
 
-    likelihoods = np.array([
-        *likelihoods,
-        get_likelihood(
-            observations, sample_indicators,
-            updated_component_params, updated_weights, multivariate=mv
-        ) / len(sample_indicators)
-    ])
+    likelihoods = np.append(likelihoods, ll)
 
     if verbose:
         q_label = f" (CFUSN q={latent_q})" if mv and latent_q > 1 else ""
@@ -189,19 +154,18 @@ def single_fit(
             if np.isnan(updated_weights).any():
                 raise ValueError(f"NaN in weights at iteration {it}")
 
-            updated_component_params, updated_weights = em_iteration(
+            # em_iteration returns (params, weights, ll) — no get_likelihood needed.
+            updated_component_params, updated_weights, ll = em_iteration(
                 observations, sample_indicators,
                 updated_component_params, updated_weights,
                 constrained, xlims, multivariate=mv, iterNum=it + 1, **em_kwargs
             )
 
-            # enforce minimum scale (univariate only)
             if not mv:
                 for i, (a, loc, scale) in enumerate(updated_component_params):
                     if scale < MIN_SCALE:
                         updated_component_params[i] = (a, loc, max(scale, MIN_SCALE))
 
-            # check underwater duration
             if not constrained and check_submerged_duration:
                 violated = constraints.multicomponent_density_constraint_violated(
                     updated_component_params, xlims, multivariate=mv
@@ -216,21 +180,15 @@ def single_fit(
                     is_underwater = True
                     underwater_time += 1
 
-            likelihoods = np.array([
-                *likelihoods,
-                get_likelihood(
-                    observations, sample_indicators,
-                    updated_component_params, updated_weights, multivariate=mv
-                ) / len(sample_indicators)
-            ])
+            likelihoods = np.append(likelihoods, ll)
 
             if it > 0 and likelihoods[-1] < likelihoods[-2]:
                 decrease = likelihoods[-2] - likelihoods[-1]
                 if decrease > 1e-13:
                     if mv:
-                        # Available-case M-step (and MC E-step for CFUSN)
-                        # don't guarantee monotonicity.
-                        # Backtrack: interpolate between old and new params.
+                        # Backtracking: get_likelihood is kept here because it
+                        # evaluates candidate params that aren't stored anywhere
+                        # and are different on each alpha step.
                         old_params = history[-1]['component_params']
                         old_weights = history[-1]['weights']
                         alpha = 0.5
@@ -250,7 +208,6 @@ def single_fit(
                                 break
                             alpha *= 0.5
                         else:
-                            # Backtracking failed — revert to old params
                             updated_component_params = old_params
                             updated_weights = old_weights
                             likelihoods[-1] = likelihoods[-2]
@@ -270,7 +227,6 @@ def single_fit(
             ):
                 break
 
-        # final underwater check
         if not constrained and check_submerged_duration:
             violated = constraints.multicomponent_density_constraint_violated(
                 updated_component_params, xlims, multivariate=mv

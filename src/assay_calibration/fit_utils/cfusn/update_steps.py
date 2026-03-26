@@ -26,6 +26,9 @@ from typing import List, Tuple, Any
 import numpy as np
 import scipy.stats as sps
 from scipy.stats import truncnorm
+from scipy.special import logsumexp
+from scipy.linalg import cho_factor, cho_solve
+from scipy.stats import norm
 
 
 # ══════════════════════════════════════════════
@@ -206,132 +209,77 @@ def _gibbs_sample_tn_q(mean, cov, n_samples, n_burnin=50, rng=None):
 
 #     return eta, Psi
 
+
 def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
-    """
-    Compute E[T] and E[TT'] for T ~ TN_q(mean_j, cov, R^q_+)
-    for each observation j.
+    """E[T] and E[TT'] for T ~ TN_q(mean_j, cov, R^q_+).
 
-    For q = 2, uses deterministic approximation (fast, low-noise).
-    For q != 2, falls back to original MC implementation.
+    q=2 KEY FIX: fully vectorized over N — zero Python loop.
+    The approximation (independent marginals + correlation correction for
+    the off-diagonal of Psi) is unchanged from the original; only the loop
+    is removed.
 
-    Parameters
-    ----------
-    means : (N, q)
-    cov : (q, q)
-    n_mc : int
-    rng : np.random.RandomState
-
-    Returns
-    -------
-    eta : (N, q)
-    Psi : (N, q, q)
+    For q != 2 the original MC path is used unchanged.
     """
     if rng is None:
         rng = np.random.RandomState(42)
 
     N, q = means.shape
 
-    # ============================================================
-    # FAST PATH: q == 2 (deterministic approximation)
-    # ============================================================
+    # ── q=2 fast path — vectorized ──────────────────────────────────────
     if q == 2:
-        eta = np.zeros((N, 2))
-        Psi = np.zeros((N, 2, 2))
-
-        # Ensure symmetry / PD
-        cov = 0.5 * (cov + cov.T)
-        eig = np.linalg.eigvalsh(cov)
+        cov  = 0.5 * (cov + cov.T)
+        eig  = np.linalg.eigvalsh(cov)
         if eig.min() < 1e-12:
             cov = cov + (1e-12 - eig.min() + 1e-12) * np.eye(2)
 
-        # Precompute
-        std = np.sqrt(np.diag(cov))
-        corr = cov[0, 1] / (std[0] * std[1] + 1e-15)
-        corr = np.clip(corr, -0.9999, 0.9999)
+        std  = np.sqrt(np.diag(cov))                          # (2,)
+        corr = np.clip(cov[0, 1] / (std[0] * std[1] + 1e-15), -0.9999, 0.9999)
 
-        # We'll approximate using conditional expectations:
-        # T1 | T2 ~ truncated normal, integrate over T2 marginal
-        from scipy.stats import norm
+        # All (N, 2) operations — no Python loop
+        alpha   = means / std[None, :]                        # (N, 2)
+        phi_a   = norm.pdf(alpha)                             # (N, 2)
+        Phi_a   = norm.cdf(alpha)                             # (N, 2)
+        safe    = Phi_a > 1e-12
+        ratio   = np.where(safe,
+                           phi_a / np.where(safe, Phi_a, 1.0),
+                           np.abs(alpha))                     # (N, 2)
 
-        # Simple quadrature grid (fixed, fast, stable)
-        grid_size = 20
-        gh_x, gh_w = np.polynomial.hermite.hermgauss(grid_size)
+        eta     = means + std[None, :] * ratio                # (N, 2)
+        diag_Ps = std[None, :]**2 + means**2 + std[None, :] * means * ratio  # (N, 2)
+        cross   = eta[:, 0] * eta[:, 1] + corr * std[0] * std[1]             # (N,)
 
-        for j in range(N):
-            m = means[j]
-
-            # Transform to standard normal space
-            mu_std = m / std
-
-            # Approximate via product of independent truncated normals
-            # with correlation correction (works well for q=2)
-            alpha = mu_std
-            phi = norm.pdf(alpha)
-            Phi = norm.cdf(alpha)
-
-            # Safe ratio
-            ratio = np.zeros_like(phi)
-            mask = Phi > 1e-12
-            ratio[mask] = phi[mask] / Phi[mask]
-            ratio[~mask] = np.abs(alpha[~mask])
-
-            # First moments (approx)
-            eta_j = m + std * ratio
-
-            # Second moments (approx)
-            second = (
-                (std ** 2)
-                + m**2
-                + std * m * ratio
-            )
-
-            # Build Psi
-            Psi_j = np.zeros((2, 2))
-            Psi_j[0, 0] = second[0]
-            Psi_j[1, 1] = second[1]
-
-            # Cross term approximation using correlation
-            Psi_j[0, 1] = (
-                eta_j[0] * eta_j[1]
-                + corr * std[0] * std[1]
-            )
-            Psi_j[1, 0] = Psi_j[0, 1]
-
-            eta[j] = eta_j
-            Psi[j] = Psi_j
-
+        Psi             = np.zeros((N, 2, 2))
+        Psi[:, 0, 0]    = diag_Ps[:, 0]
+        Psi[:, 1, 1]    = diag_Ps[:, 1]
+        Psi[:, 0, 1]    = cross
+        Psi[:, 1, 0]    = cross
         return eta, Psi
 
-    # ============================================================
-    # FALLBACK: original Monte Carlo (unchanged)
-    # ============================================================
+    # ── q != 2: original MC path unchanged ──────────────────────────────
     eta = np.zeros((N, q))
     Psi = np.zeros((N, q, q))
-
     try:
         L = np.linalg.cholesky(cov + 1e-12 * np.eye(q))
     except np.linalg.LinAlgError:
-        eigv = np.linalg.eigvalsh(cov)
+        eigv    = np.linalg.eigvalsh(cov)
         cov_reg = cov + (1e-8 - min(eigv.min(), 0)) * np.eye(q)
-        L = np.linalg.cholesky(cov_reg)
+        L       = np.linalg.cholesky(cov_reg)
 
-    oversample = max(n_mc * 10, 2000)
-    Z_batch = rng.randn(oversample, q)
+    oversample      = max(n_mc * 10, 2000)
+    Z_batch         = rng.randn(oversample, q)
     candidates_base = Z_batch @ L.T
 
     for j in range(N):
-        m = means[j]
+        m          = means[j]
         candidates = candidates_base + m
-        valid = (candidates > 0).all(axis=1)
-        n_valid = valid.sum()
-
+        valid      = (candidates > 0).all(axis=1)
+        n_valid    = valid.sum()
         if n_valid >= n_mc:
             good = candidates[valid][:n_mc]
         elif n_valid >= max(20, n_mc // 5):
             good = candidates[valid]
         else:
             good = _gibbs_sample_tn_q(m, cov, n_mc, n_burnin=50, rng=rng)
-
         eta[j] = good.mean(axis=0)
         Psi[j] = (good.T @ good) / len(good)
 
@@ -492,149 +440,100 @@ def get_Gamma_update(updated_loc, updated_Delta, observations, responsibilities,
 # Here eta_j = E[T|x_j], Psi_j = E[TT'|x_j], z_j = responsibility
 # ══════════════════════════════════════════════
 
-def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma, n_mc=500, rng=None):
-    """M-step location update for CFUSN.
+# ── CFUSN M-step helpers — vectorized over p ────────────────────────────────
 
-    mu_new = (sum z_j y_j - Delta sum z_j eta_j) / sum z_j
-
-    Parameters
-    ----------
-    observations : (N, p) with possible NaN
-    responsibilities : (N,)
-    mu, Delta, Gamma : current params (Delta is (p, q))
-
-    Returns
-    -------
-    mu_new : (p,)
-    eta : (N, q) — also returned for reuse
-    Psi : (N, q, q) — also returned for reuse
-    """
-    Delta = density_utils._ensure_matrix_delta(Delta)
-    eta, Psi = get_truncated_normal_moments_cfusn(
+def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
+                               n_mc=500, rng=None):
+    """CFUSN location M-step. Returns (mu_new, eta, Psi) — moments reused downstream."""
+    Delta      = density_utils._ensure_matrix_delta(Delta)
+    eta, Psi   = get_truncated_normal_moments_cfusn(
         observations, mu, Delta, Gamma, n_mc=n_mc, rng=rng
     )
-
-    obs = ~np.isnan(observations)
+    obs    = ~np.isnan(observations)                 # (N, p)
     x_fill = np.where(obs, observations, 0.0)
-    z = responsibilities
+    z      = responsibilities                         # (N,)
 
-    # Per-dimension: mu_d = (sum z_j obs_jd (x_jd - Delta_d . eta_j)) / sum z_j obs_jd
-    p = observations.shape[1]
-    mu_new = np.zeros(p)
-    for d in range(p):
-        mask_d = obs[:, d]
-        z_d = z * mask_d
-        Z_d = z_d.sum()
-        if Z_d < 1e-12:
-            mu_new[d] = mu[d]
-            continue
-        # Delta_d is (q,), eta is (N, q)
-        Delta_eta = eta @ Delta[d]  # (N,) = sum_r Delta[d,r] * eta[:,r]
-        mu_new[d] = (z_d * (x_fill[:, d] - Delta_eta)).sum() / Z_d
+    # KEY FIX: single matrix op replaces per-dimension loop
+    # Delta_eta[j, d] = sum_r Delta[d, r] * eta[j, r]
+    Delta_eta = eta @ Delta.T                         # (N, p)
+    obs_z     = obs * z[:, None]                      # (N, p)
+    numer     = (obs_z * (x_fill - Delta_eta)).sum(0) # (p,)
+    denom     = obs_z.sum(0)                           # (p,)
+    mu_new    = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12), mu)
 
     return mu_new, eta, Psi
 
 
 def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi):
-    """M-step Delta update for CFUSN.
+    """CFUSN Delta M-step.  Returns (p, q).
 
-    Delta_new = (sum z_j (y_j - mu) eta_j') (sum z_j Psi_j)^{-1}
-    Shape: (p, q)
-
-    Handles missing data via available-case accumulation per dimension.
+    KEY FIX: replace per-d einsum loop with two batched einsums, then
+    solve per-dimension (p=2 → only 2 solves of 2×2 systems).
     """
-    N, p = observations.shape
-    q = eta.shape[1]
-    obs = ~np.isnan(observations)
+    obs    = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
-    z = responsibilities
+    z      = responsibilities
+    N, p   = observations.shape
+    q      = eta.shape[1]
 
-    # Numerator: (p, q) = sum_j z_j obs_jd (x_jd - mu_d) eta_j'
-    # Denominator: (q, q) = sum_j z_j Psi_j  (shared, but weight by per-dim availability)
-    # For simplicity, use global denominator; per-dim denominator is over-complicating
-    # and Lin (2009) assumes complete data.
+    obs_z    = obs * z[:, None]                       # (N, p)
+    residuals = x_fill - mu_new                       # (N, p)
 
-    # Global Psi sum: (q, q)
-    Psi_sum = np.einsum('n,nij->ij', z, Psi)
-    # Regularize
-    eig = np.linalg.eigvalsh(Psi_sum)
-    if eig.min() < 1e-10:
-        Psi_sum += (1e-10 - eig.min() + 1e-10) * np.eye(q)
+    # numer[d, r] = sum_n obs_z[n,d] * residuals[n,d] * eta[n,r]
+    numer    = (obs_z * residuals).T @ eta             # (p, q) — one matmul
 
-    Psi_sum_inv = np.linalg.inv(Psi_sum)
+    # Psi_sum[d, i, j] = sum_n obs_z[n,d] * Psi[n, i, j]
+    Psi_sum  = np.einsum('nd,nij->dij', obs_z, Psi)   # (p, q, q)
 
-    # Numerator per dimension
-    residuals = x_fill - mu_new  # (N, p)
     Delta_new = np.zeros((p, q))
-    for d in range(p):
-        mask_d = obs[:, d]
-        z_d = z * mask_d
-        # sum_j z_j r_jd eta_j  → (q,)
-        numer_d = (z_d[:, None] * eta).T @ residuals[:, d]  # (q,)
-        # Use per-dim Psi sum for accuracy
-        Psi_sum_d = np.einsum('n,nij->ij', z_d, Psi)
-        eig_d = np.linalg.eigvalsh(Psi_sum_d)
-        if eig_d.min() < 1e-10:
-            Psi_sum_d += (1e-10 - eig_d.min() + 1e-10) * np.eye(q)
+    for d in range(p):                                 # p=2 → 2 iterations
+        Ps = Psi_sum[d]
+        eig = np.linalg.eigvalsh(Ps)
+        if eig.min() < 1e-10:
+            Ps = Ps + (1e-10 - eig.min() + 1e-10) * np.eye(q)
         try:
-            Delta_new[d] = np.linalg.solve(Psi_sum_d.T, numer_d)
+            Delta_new[d] = np.linalg.solve(Ps, numer[d])
         except np.linalg.LinAlgError:
-            Delta_new[d] = numer_d @ Psi_sum_inv
+            Delta_new[d] = numer[d] / np.maximum(np.diag(Ps), 1e-12)
 
     return Delta_new
 
 
 def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, eta, Psi):
-    """M-step Gamma update for CFUSN.
+    """CFUSN Gamma M-step.  Returns (p, p).
 
-    Gamma_{d1,d2} = (1/Z) sum_j z_j [
-        (y_jd1 - mu_d1 - Delta_d1.eta_j)(y_jd2 - mu_d2 - Delta_d2.eta_j)
-        + Delta_d1 (Psi_j - eta_j eta_j') Delta_d2'
-    ]
-
-    Handles NaN via available-case accumulation.
-
-    Returns
-    -------
-    Gamma_new : (p, p)
+    KEY FIX: precompute Psi_minus once; use vectorized outer-product ops
+    for term1 and a single batched einsum for term2, replacing repeated
+    per-(d1,d2) einsums inside the double loop.
     """
-    N, p = observations.shape
-    q = eta.shape[1]
-    obs = ~np.isnan(observations)
+    obs    = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
-    z = responsibilities
+    z      = responsibilities
+    N, p   = observations.shape
+    q      = eta.shape[1]
 
-    # Precompute adjusted residuals: r_j = x_j - mu - Delta @ eta_j
-    # r_jd = x_jd - mu_d - Delta[d,:] @ eta[j,:]
-    Delta_eta = eta @ Delta_new.T  # (N, p)
-    residuals = x_fill - mu_new - Delta_eta  # (N, p)
+    Delta_eta = eta @ Delta_new.T                             # (N, p)
+    residuals = x_fill - mu_new - Delta_eta                   # (N, p)
+    Psi_minus = Psi - np.einsum('ni,nj->nij', eta, eta)      # (N, q, q) — once
 
-    # Psi_j - eta_j eta_j'  → (N, q, q)
-    Psi_minus_eta_eta = Psi - np.einsum('ni,nj->nij', eta, eta)
+    # Precompute per-(d1,d2) weighted Psi_minus:
+    # obs_both[n,d1,d2] = obs[n,d1] & obs[n,d2]
+    obs_both  = obs[:, :, None] & obs[:, None, :]             # (N, p, p)
+    z_ob      = z[:, None, None] * obs_both                   # (N, p, p)
+    Z_b       = z_ob.sum(0)                                   # (p, p)
 
-    Gamma_new = np.zeros((p, p))
-    for d1 in range(p):
-        for d2 in range(d1, p):
-            both = obs[:, d1] & obs[:, d2]
-            z_b = z[both]
-            Z_b = z_b.sum()
-            if Z_b < 1e-12:
-                continue
+    # term1[d1,d2] = sum_n z_ob[n,d1,d2] * r[n,d1] * r[n,d2]
+    r_outer   = residuals[:, :, None] * residuals[:, None, :] # (N, p, p)
+    term1     = np.einsum('n,nab->ab', z, obs_both * r_outer) # (p, p)
 
-            r1 = residuals[both, d1]
-            r2 = residuals[both, d2]
+    # Psi_corr[d1,d2,i,j] = sum_n z_ob[n,d1,d2] * Psi_minus[n,i,j]
+    Psi_corr  = np.einsum('nab,nij->abij', z_ob, Psi_minus)   # (p,p,q,q)
+    # term2[d1,d2] = Delta[d1,:] @ Psi_corr[d1,d2,:,:] @ Delta[d2,:]
+    term2     = np.einsum('ai,abij,bj->ab', Delta_new, Psi_corr, Delta_new)  # (p,p)
 
-            # Term 1: z_j * r_j,d1 * r_j,d2
-            term1 = (z_b * r1 * r2).sum()
-
-            # Term 2: z_j * Delta[d1,:] (Psi_j - eta_j eta_j') Delta[d2,:]'
-            # = Delta[d1,:] @ (sum z_j (Psi_j - eta eta')) @ Delta[d2,:]
-            Psi_corr = np.einsum('n,nij->ij', z_b, Psi_minus_eta_eta[both])  # (q, q)
-            term2 = Delta_new[d1] @ Psi_corr @ Delta_new[d2]
-
-            Gamma_new[d1, d2] = (term1 + term2) / Z_b
-            Gamma_new[d2, d1] = Gamma_new[d1, d2]
-
+    safe      = Z_b > 1e-12
+    Gamma_new = np.where(safe, (term1 + term2) / np.maximum(Z_b, 1e-12), 0.0)
+    Gamma_new = 0.5 * (Gamma_new + Gamma_new.T)
     return Gamma_new
 
 
@@ -742,6 +641,75 @@ def get_sample_weights(
             )
         updated_weights[i] = uw
     return updated_weights
+
+
+# ── Fused weight update + LL ─────────────────────────────────────────────────
+
+def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
+                               current_weights, multivariate=False):
+    """Compute updated weights AND normalised log-likelihood in a single density pass.
+
+    The original code calls get_sample_weights (density eval) then fit.py calls
+    get_likelihood (identical density eval).  This function caches the log_pdfs
+    from the weight pass and re-weights with the fresh weights to get LL —
+    eliminating one complete density evaluation per EM iteration.
+
+    Returns
+    -------
+    updated_weights : (S, K)
+    normalised_ll   : float   (LL / N, ready to append to likelihoods array)
+    """
+    S, Kc  = current_weights.shape
+    N      = observations.shape[0]
+    upd_w  = np.zeros_like(current_weights)
+    cache  = [None] * S                              # cache (Kc, N_s) log_pdfs
+
+    for i in range(S):
+        mask = sample_indicators[:, i]
+        X    = observations[mask]
+        N_s  = X.shape[0]
+
+        if not multivariate:
+            log_pdfs = np.stack(
+                [sps.skewnorm.logpdf(X.ravel(), *p) for p in updated_params], axis=0
+            )
+        else:
+            X_2d = np.atleast_2d(X)
+            lp_list = []
+            for p in updated_params:
+                lp = density_utils._single_component_logpdf(X_2d, p, multivariate=True)
+                lp = np.atleast_1d(np.asarray(lp, dtype=float)).ravel()
+                if len(lp) != N_s:
+                    lp = np.full(N_s, -np.inf)
+                lp[~np.isfinite(lp)] = -np.inf
+                lp_list.append(lp)
+            log_pdfs = np.stack(lp_list, axis=0)      # (Kc, N_s)
+
+        with np.errstate(divide='ignore'):
+            log_w = np.where(current_weights[i] > 0,
+                             np.log(current_weights[i]), -np.inf)
+        nums  = log_pdfs + log_w[:, None]
+        denom = logsumexp(nums, axis=0)
+        P     = np.exp(nums - denom[None])
+        P[np.isnan(P)] = 0.0
+
+        uw = P.mean(1)
+        if np.isnan(uw).any():
+            bad = np.where(np.isnan(P.T))[0]
+            raise ValueError(
+                f"NaN weight: {uw}\n{X[bad]}\n{updated_params}\n{current_weights[i]}"
+            )
+        upd_w[i] = uw
+        cache[i] = log_pdfs
+
+    # ── LL with updated weights — zero extra density evals ──────────────
+    ll = 0.0
+    for i in range(S):
+        with np.errstate(divide='ignore'):
+            log_w = np.where(upd_w[i] > 0, np.log(upd_w[i]), -np.inf)
+        ll += logsumexp(cache[i] + log_w[:, None], axis=0).sum()
+
+    return upd_w, ll / N
 
 
 # ══════════════════════════════════════════════
@@ -920,17 +888,20 @@ def verify_binary_search_result(
 # EM iteration — unified (supports q=1 and q>1)
 # ══════════════════════════════════════════════
 
-def em_iteration(
-    observations, sample_indicators, current_component_params, current_weights,
-    constrained, xlims, multivariate=False, **kwargs
-):
+def em_iteration(observations, sample_indicators, current_component_params,
+                 current_weights, constrained, xlims, multivariate=False, **kwargs):
+    """EM iteration.
+
+    Returns (updated_params, updated_weights, normalised_ll).
+    The LL is computed for free alongside the weight update — callers in
+    fit.py should NOT call get_likelihood separately after this function.
+    """
     mv = multivariate
     if constrained and multicomponent_density_constraint_violated(
         current_component_params, xlims, multivariate=mv
     ):
         raise ValueError("density constraint violated at start of em iteration")
 
-    N = observations.shape[0]
     S = sample_indicators.shape[1]
     K = len(current_component_params)
     assert current_weights.shape == (S, K)
@@ -942,29 +913,29 @@ def em_iteration(
     )
 
     if not mv:
-        updated_component_params = _em_update_univariate(
+        updated_params = _em_update_univariate(
             observations, responsibilities, current_component_params,
             constrained, xlims, K, **kwargs
         )
     else:
-        # Detect CFUSN vs restricted MSN
         q = density_utils.get_q(current_component_params)
         if q > 1:
-            updated_component_params = _em_update_cfusn(
+            updated_params = _em_update_cfusn(
                 observations, responsibilities, current_component_params,
                 constrained, xlims, K, q=q, **kwargs
             )
         else:
-            updated_component_params = _em_update_multivariate(
+            updated_params = _em_update_multivariate(
                 observations, responsibilities, current_component_params,
                 constrained, xlims, K, **kwargs
             )
 
-    updated_weights = get_sample_weights(
-        observations, sample_indicators, updated_component_params, current_weights,
+    updated_weights, ll = get_sample_weights_and_ll(
+        observations, sample_indicators, updated_params, current_weights,
         multivariate=mv
     )
-    return updated_component_params, updated_weights
+    return updated_params, updated_weights, ll
+
 
 
 def _em_update_univariate(

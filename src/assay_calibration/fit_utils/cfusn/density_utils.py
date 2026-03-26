@@ -25,6 +25,10 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal as mvn, norm
 from scipy.stats._multivariate import _squeeze_output
 from scipy.linalg import sqrtm, inv as linalg_inv
+from scipy.linalg import cho_factor, cho_solve
+
+_LOG2PI = np.log(2 * np.pi)
+_LOG2   = np.log(2.0)
 
 
 # ──────────────────────────────────────────────
@@ -189,31 +193,27 @@ def _mvn_logcdf(upper, mean, cov):
         return -np.inf
 
 
+
 def _mvn_logcdf_batch(uppers, mean, cov):
-    """Batch log-CDF for N observations.
-    uppers: (N, q)
-    mean: (q,) shared
-    cov: (q, q) shared
-    Returns: (N,)
+    """Batch log-CDF  P(X <= uppers[j])  for X ~ N(mean, cov).
+
+    uppers : (N, q)  |  mean : (q,)  |  cov : (q, q)
+    Returns : (N,)
+
+    KEY FIX: scipy mvn.cdf is vectorized over its first axis — pass the
+    entire (N, q) array in one call instead of looping over N rows.
     """
     N, q = uppers.shape
     if q == 1:
-        sigma = np.sqrt(max(float(cov.ravel()[0]) if hasattr(cov, 'ravel') else float(cov), 1e-15))
-        return norm.logcdf((uppers[:, 0] - mean[0]) / sigma)
-
-    # For q >= 2, loop (scipy doesn't vectorize mvn.cdf well)
-    result = np.full(N, -np.inf)
+        s = np.sqrt(max(float(np.asarray(cov).ravel()[0]), 1e-15))
+        return norm.logcdf((uppers[:, 0] - mean[0]) / s)
     try:
-        rv = mvn(mean=mean, cov=cov, allow_singular=True)
+        rv   = mvn(mean=mean, cov=cov, allow_singular=True)
+        vals = rv.cdf(uppers)                        # (N,) — one call, no loop
+        return np.log(np.maximum(vals, 1e-300))
     except Exception:
-        return result
-    for j in range(N):
-        try:
-            val = rv.cdf(uppers[j])
-            result[j] = np.log(max(val, 1e-300))
-        except Exception:
-            result[j] = -np.inf
-    return result
+        return np.full(N, -np.inf)
+
 
 
 # ──────────────────────────────────────────────
@@ -221,85 +221,65 @@ def _mvn_logcdf_batch(uppers, mean, cov):
 # ──────────────────────────────────────────────
 
 def cfusn_logpdf_alternate(x, mu, Delta, Gamma):
-    """Compute CFUSN log-density from alternate params (mu, Delta, Gamma).
+    """CFUSN log-density in alternate params.
 
-    f(x) = 2^q * phi_p(x; mu, Omega) * Phi_q(Delta' Omega^{-1} (x-mu); 0, D)
-    where Omega = Gamma + Delta Delta', D = I_q - Delta' Omega^{-1} Delta
-
-    Parameters
-    ----------
-    x : (N, p) or (p,)
-    mu : (p,)
-    Delta : (p, q) or (p,) for q=1
-    Gamma : (p, p)
-
-    Returns
-    -------
-    (N,) or scalar log-density
+    KEY FIXES vs original:
+      1. Single cho_factor reused for log|Ω|, Mahalanobis, and Ω⁻¹Δ.
+      2. eigvalsh deferred to exception path (only run when Cholesky fails).
+      3. _mvn_logcdf_batch now vectorized (no N-loop inside).
+      4. No scipy mvn object created for the Gaussian part.
     """
-    mu = np.asarray(mu, dtype=float)
+    mu    = np.asarray(mu,    dtype=float)
     Delta = np.asarray(Delta, dtype=float)
     Gamma = np.asarray(Gamma, dtype=float)
 
-    # Handle q=1 vector Delta: delegate to the optimized path
-    if Delta.ndim <= 1:
-        return msn_logpdf_alternate(x, mu, Delta, Gamma)
+    if Delta.ndim <= 1:                              # q=1 fast-path unchanged
+        return msn_logpdf_alternate(x, mu, Delta.ravel(), Gamma)
 
     p, q = Delta.shape
-
-    # Ensure Gamma is 2-d
     if Gamma.ndim < 2:
         Gamma = Gamma.reshape(1, 1)
 
-    Omega = Gamma + Delta @ Delta.T
-    Omega = 0.5 * (Omega + Omega.T)
+    Omega  = Gamma + Delta @ Delta.T
+    Omega += Omega.T; Omega *= 0.5
 
-    # Regularize
-    eigvals = np.linalg.eigvalsh(Omega)
-    if eigvals.min() < 1e-10:
-        Omega += (1e-10 - eigvals.min() + 1e-10) * np.eye(p)
-
-    if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(Omega))):
-        x_arr = np.atleast_2d(x)
-        return np.full(x_arr.shape[0], -np.inf)
-
-    x_arr = np.atleast_2d(x)
+    x_arr = np.atleast_2d(np.asarray(x, dtype=float))
     N = x_arr.shape[0]
 
-    # log phi_p(x; mu, Omega)
-    try:
-        log_phi = mvn(mean=mu, cov=Omega, allow_singular=True).logpdf(x_arr)
-    except (ValueError, np.linalg.LinAlgError):
+    if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(Omega))):
         return np.full(N, -np.inf)
 
-    # Omega^{-1} Delta  → (p, q)
+    # ── single Cholesky covers log|Ω|, maha, and Ω⁻¹Δ ──────────────────
     try:
-        Omega_inv_Delta = np.linalg.solve(Omega, Delta)
+        cf = cho_factor(Omega, lower=True, check_finite=False)
     except np.linalg.LinAlgError:
-        return np.full(N, -np.inf)
+        emin = np.linalg.eigvalsh(Omega).min()       # only on failure
+        Omega += (abs(emin) + 1e-10) * np.eye(p)
+        try:
+            cf = cho_factor(Omega, lower=True, check_finite=False)
+        except np.linalg.LinAlgError:
+            return np.full(N, -np.inf)
 
-    # D = I_q - Delta' Omega^{-1} Delta → (q, q)
-    D = np.eye(q) - Delta.T @ Omega_inv_Delta
-    D = 0.5 * (D + D.T)
-    # Regularize D
-    eig_D = np.linalg.eigvalsh(D)
+    log_det         = 2.0 * np.log(np.diag(cf[0])).sum()
+    residuals       = x_arr - mu                                       # (N, p)
+    sol             = cho_solve(cf, residuals.T, check_finite=False)   # (p, N)
+    maha            = np.einsum('ni,in->n', residuals, sol)             # (N,)
+    log_phi         = -0.5 * (p * _LOG2PI + log_det + maha)
+
+    Omega_inv_Delta = cho_solve(cf, Delta, check_finite=False)          # (p, q)
+    D               = np.eye(q) - Delta.T @ Omega_inv_Delta             # (q, q)
+    D               = 0.5 * (D + D.T)
+    eig_D           = np.linalg.eigvalsh(D)
     if eig_D.min() < 1e-10:
         D += (1e-10 - eig_D.min() + 1e-10) * np.eye(q)
 
-    # argument to Phi_q: Delta' Omega^{-1} (x - mu) → (N, q)
-    residuals = x_arr - mu  # (N, p)
-    eta = residuals @ Omega_inv_Delta  # (N, q)
+    eta     = residuals @ Omega_inv_Delta                               # (N, q)
+    log_Phi = _mvn_logcdf_batch(eta, np.zeros(q), D)                   # (N,) vectorized
 
-    # log Phi_q(eta; 0, D) for each observation
-    log_Phi = _mvn_logcdf_batch(eta, np.zeros(q), D)
-
-    result = q * np.log(2) + log_phi + log_Phi
-    result = np.asarray(result, dtype=float).ravel()
+    result = np.asarray(q * _LOG2 + log_phi + log_Phi, dtype=float).ravel()
     result[~np.isfinite(result)] = -np.inf
+    return result[0] if N == 1 else result
 
-    if N == 1:
-        return result[0]
-    return result
 
 
 def cfusn_logpdf_alternate_missing(x, mu, Delta, Gamma):
@@ -363,55 +343,47 @@ def cfusn_logpdf_alternate_missing(x, mu, Delta, Gamma):
 # Original q=1 MSN density (kept for backward compat & speed)
 # ──────────────────────────────────────────────
 
+# ─── msn_logpdf_alternate (q=1) — same Cholesky treatment ───────────────────
 def msn_logpdf_alternate(x, mu, Delta, Gamma):
-    """MSN log-density for q=1 (restricted case). Delta is (p,) vector."""
-    mu = np.asarray(mu, dtype=float)
+    """q=1 MSN. Cholesky-based, no scipy MVN object, eigvalsh only on failure."""
+    mu    = np.asarray(mu,    dtype=float).ravel()
     Delta = np.asarray(Delta, dtype=float).ravel()
-    Gamma = np.asarray(Gamma, dtype=float)
+    Gamma = np.atleast_2d(np.asarray(Gamma, dtype=float))
+    K     = len(mu)
 
-    if mu.ndim == 0:
-        mu = mu.reshape(1)
-    if Gamma.ndim < 2:
-        Gamma = Gamma.reshape(1, 1)
+    Omega  = Gamma + np.outer(Delta, Delta)
+    Omega += Omega.T; Omega *= 0.5
 
-    K = len(mu)
-    Omega = Gamma + np.outer(Delta, Delta)
-    Omega = 0.5 * (Omega + Omega.T)
-
-    eigvals = np.linalg.eigvalsh(Omega)
-    if eigvals.min() < 1e-10:
-        Omega += (1e-10 - eigvals.min() + 1e-10) * np.eye(K)
-
-    if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(Omega))):
-        x_arr = np.atleast_2d(x)
-        return np.full(x_arr.shape[0], -np.inf)
-
-    x_arr = np.atleast_2d(x)
+    x_arr = np.atleast_2d(np.asarray(x, dtype=float))
     N = x_arr.shape[0]
 
-    try:
-        log_phi = mvn(mean=mu, cov=Omega, allow_singular=True).logpdf(x_arr)
-    except (ValueError, np.linalg.LinAlgError):
+    if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(Omega))):
         return np.full(N, -np.inf)
 
     try:
-        Omega_inv_Delta = np.linalg.solve(Omega, Delta)
+        cf = cho_factor(Omega, lower=True, check_finite=False)
     except np.linalg.LinAlgError:
-        return np.full(N, -np.inf)
+        emin = np.linalg.eigvalsh(Omega).min()
+        Omega += (abs(emin) + 1e-10) * np.eye(K)
+        try:
+            cf = cho_factor(Omega, lower=True, check_finite=False)
+        except np.linalg.LinAlgError:
+            return np.full(N, -np.inf)
 
-    residuals = x_arr - mu
-    eta = residuals @ Omega_inv_Delta
-    sigma_sq = 1.0 - Delta @ Omega_inv_Delta
-    sigma_sq = max(sigma_sq, 1e-12)
-    log_Phi = norm.logcdf(eta / np.sqrt(sigma_sq))
+    log_det         = 2.0 * np.log(np.diag(cf[0])).sum()
+    residuals       = x_arr - mu
+    sol             = cho_solve(cf, residuals.T, check_finite=False)
+    maha            = np.einsum('ni,in->n', residuals, sol)
+    log_phi         = -0.5 * (K * _LOG2PI + log_det + maha)
 
-    result = np.log(2) + log_phi + log_Phi
-    result = np.asarray(result, dtype=float).ravel()
+    Omega_inv_Delta = cho_solve(cf, Delta, check_finite=False)
+    eta             = residuals @ Omega_inv_Delta
+    sigma_sq        = max(1.0 - Delta @ Omega_inv_Delta, 1e-12)
+    log_Phi         = norm.logcdf(eta / np.sqrt(sigma_sq))
+
+    result = np.asarray(_LOG2 + log_phi + log_Phi, dtype=float).ravel()
     result[~np.isfinite(result)] = -np.inf
-
-    if N == 1:
-        return result[0]
-    return result
+    return result[0] if N == 1 else result
 
 
 def msn_logpdf_alternate_missing(x, mu, Delta, Gamma):
