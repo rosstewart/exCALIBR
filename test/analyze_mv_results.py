@@ -25,8 +25,8 @@ from scipy.special import logsumexp
 from collections import defaultdict, Counter
 import pandas as pd
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 import os
+import multiprocessing as mp
 
 
 # ──────────────────────────────────────
@@ -48,6 +48,21 @@ CONFIG_LABELS = {
     '2c_con': '2c constrained', '2c_unc': '2c unconstrained',
     '3c_con': '3c constrained', '3c_unc': '3c unconstrained',
 }
+
+
+# ──────────────────────────────────────
+# Fork-based parallel worker
+# ──────────────────────────────────────
+
+# Set by MVCalibrationAnalysis.run() before forking.
+# Forked workers inherit this reference via copy-on-write — no serialization.
+_fork_self = None
+
+
+def _fork_task(task):
+    """Module-level worker: each forked process accesses _fork_self from COW memory."""
+    fit_raw, partial_patterns, reestimate = task
+    return _fork_self._process_one_bootstrap(fit_raw, partial_patterns, reestimate)
 
 
 # ──────────────────────────────────────
@@ -657,15 +672,19 @@ class MVCalibrationAnalysis:
             boot_items = list(self.raw_boots.items())
             n_total = len(boot_items)
             n_workers = os.cpu_count() if n_jobs == -1 else n_jobs
-            print(f"  Processing {n_total} bootstraps ({n_workers} threads)...")
 
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                parallel_results = list(pool.map(
-                    lambda bd: self._process_one_bootstrap(
-                        bd.get(config), partial_patterns, reestimate_marginal_weights
-                    ),
-                    [bd for _, bd in boot_items],
-                ))
+            # Fork-based pool: workers inherit this object via copy-on-write,
+            # so only the tiny per-task fit_raw is serialized per task.
+            global _fork_self
+            _fork_self = self
+            tasks = [
+                (bd.get(config), partial_patterns, reestimate_marginal_weights)
+                for _, bd in boot_items
+            ]
+            print(f"  Processing {n_total} bootstraps ({n_workers} processes, fork)...")
+            ctx = mp.get_context('fork')
+            with ctx.Pool(n_workers) as pool:
+                parallel_results = pool.map(_fork_task, tasks)
 
             priors = []
             lr_matrix = []
