@@ -98,6 +98,81 @@ def sample_specific_bootstrap(sample_assignments, bootstrap_seed=None):
     return train_indices, eval_indices
 
 
+def pattern_stratified_bootstrap(observations, sample_assignments, bootstrap_seed=None):
+    """Bootstrap stratified by (sample class × missingness pattern).
+
+    For multivariate data with missing values, plain sample-specific
+    bootstrapping lets the proportion of complete vs partial observations
+    vary randomly across bootstraps.  That variation directly changes how
+    much joint vs marginal information the EM sees, inflating variance in
+    the fitted parameters and in downstream LR estimates.
+
+    This function adds a second stratification level: within each sample
+    class the variants are grouped by their missingness pattern (which
+    dimensions are observed), and bootstrap resampling is done
+    independently within each (sample, pattern) stratum.  Every bootstrap
+    therefore has the same composition of complete/partial cases per
+    sample class (up to ±1 due to integer rounding), isolating LR
+    variance to genuine parameter uncertainty rather than data-composition
+    fluctuations.
+
+    Parameters
+    ----------
+    observations : (N, D) ndarray — may contain NaN
+    sample_assignments : (N, S) bool array — one-hot per row
+    bootstrap_seed : int or None
+
+    Returns
+    -------
+    train_indices, eval_indices : 1-D int arrays
+    """
+    rng = np.random.RandomState(bootstrap_seed)
+    N = observations.shape[0]
+
+    # Missingness pattern for each variant: tuple of which dims are observed
+    obs_mask = ~np.isnan(observations)
+    patterns = [tuple(obs_mask[i].tolist()) for i in range(N)]
+
+    train_indices = []
+    eval_indices = []
+
+    for sample_num in range(sample_assignments.shape[1]):
+        sample_idx = np.where(sample_assignments[:, sample_num])[0]
+        if not len(sample_idx):
+            continue
+
+        # Group within this sample by missingness pattern
+        strata: dict = {}
+        for idx in sample_idx:
+            strata.setdefault(patterns[idx], []).append(idx)
+
+        for group in strata.values():
+            group = np.array(group)
+            if len(group) == 1:
+                train_indices.append(group)
+                continue
+
+            # Resample within stratum, require at least one OOB sample
+            fails = 0
+            while fails < 100:
+                g_train = rng.choice(group, size=len(group), replace=True)
+                g_eval = np.setdiff1d(group, g_train)
+                if len(g_eval):
+                    break
+                fails += 1
+            else:
+                g_train = group  # last resort: use all, no eval from this stratum
+                g_eval = np.array([], dtype=int)
+
+            train_indices.append(g_train)
+            if len(g_eval):
+                eval_indices.append(g_eval)
+
+    train_out = np.concatenate(train_indices)
+    eval_out = np.concatenate(eval_indices) if eval_indices else np.array([], dtype=int)
+    return train_out, eval_out
+
+
 class Fit:
     def __init__(self, scoreset):
         """Accept Scoreset, BasicScoreset, or MultiScoreset."""
@@ -201,9 +276,14 @@ class Fit:
         val_indices = np.array([], dtype=int)
         bootstrap_seed = kwargs.get("bootstrap_seed", None)
         if kwargs.get("bootstrap", True):
-            train_indices, val_indices = sample_specific_bootstrap(
-                sample_assignments, bootstrap_seed
-            )
+            if mv:
+                train_indices, val_indices = pattern_stratified_bootstrap(
+                    observations, sample_assignments, bootstrap_seed
+                )
+            else:
+                train_indices, val_indices = sample_specific_bootstrap(
+                    sample_assignments, bootstrap_seed
+                )
 
         constrained = kwargs.get("check_monotonic", True)
 
@@ -534,9 +614,14 @@ class Fit:
         val_indices = np.array([], dtype=int)
         bootstrap_seed = kwargs.get("bootstrap_seed", None)
         if kwargs.get("bootstrap", True):
-            train_indices, val_indices = sample_specific_bootstrap(
-                sample_assignments, bootstrap_seed
-            )
+            if mv:
+                train_indices, val_indices = pattern_stratified_bootstrap(
+                    observations, sample_assignments, bootstrap_seed
+                )
+            else:
+                train_indices, val_indices = sample_specific_bootstrap(
+                    sample_assignments, bootstrap_seed
+                )
 
         constrained = kwargs.get("check_monotonic", True)
 
