@@ -25,6 +25,8 @@ from scipy.special import logsumexp
 from collections import defaultdict, Counter
 import pandas as pd
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 
 # ──────────────────────────────────────
@@ -568,6 +570,45 @@ class MVCalibrationAnalysis:
 
         return log_lr
 
+    def _process_one_bootstrap(self, fit_raw, partial_patterns, reestimate_marginal_weights):
+        """Process a single bootstrap fit.
+
+        Returns (prior, lr_array) on success, or (None, error_str) on failure.
+        Safe to call from multiple threads: all operations on self.ms.scores and
+        self.ms._sample_assignments are read-only, and scipy/numpy release the GIL.
+        """
+        if fit_raw is None:
+            return None, "fit_raw is None"
+        inner = fit_raw.get('fit', fit_raw)
+        fit = self._reconstitute_params(inner)
+        if fit is None:
+            return None, "fit is None"
+
+        params = fit['component_params']
+        weights = fit['weights']
+
+        try:
+            prior = self._compute_prior_em(params, weights)
+        except Exception as e:
+            return None, str(e)
+        if not np.isfinite(prior) or prior <= 0 or prior >= 1:
+            return None, f"invalid prior {prior}"
+
+        try:
+            if reestimate_marginal_weights and partial_patterns:
+                marginal_w = {}
+                for pattern in partial_patterns:
+                    obs_dims = np.array(sorted(pattern))
+                    marginal_w[pattern] = self._reestimate_marginal_weights(
+                        params, weights, obs_dims)
+                lr = self._compute_variant_lr_reestimated(params, weights, marginal_w)
+            else:
+                lr = self._compute_variant_lr(params, weights)
+        except Exception as e:
+            return None, str(e)
+
+        return (prior, lr), None
+
     # ──────────────────────────────────────────────────────────────
     # run() — unchanged logic, uses _sn_logpdf throughout
     # ──────────────────────────────────────────────────────────────
@@ -578,7 +619,8 @@ class MVCalibrationAnalysis:
             path_percentile=5,
             reestimate_marginal_weights=True,
             enforce_marginal_monotonicity=True,
-            liberal_marginal_monotonicity=True):
+            liberal_marginal_monotonicity=True,
+            n_jobs=-1):
         """Run analysis for all configs."""
         ben_percentile = 100 - path_percentile
         scores = self.ms.scores
@@ -612,50 +654,28 @@ class MVCalibrationAnalysis:
             print(f"Config: {config}")
             print(f"{'='*50}")
 
+            boot_items = list(self.raw_boots.items())
+            n_total = len(boot_items)
+            n_workers = os.cpu_count() if n_jobs == -1 else n_jobs
+            print(f"  Processing {n_total} bootstraps ({n_workers} threads)...")
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                parallel_results = list(pool.map(
+                    lambda bd: self._process_one_bootstrap(
+                        bd.get(config), partial_patterns, reestimate_marginal_weights
+                    ),
+                    [bd for _, bd in boot_items],
+                ))
+
             priors = []
             lr_matrix = []
             n_valid = 0
-            n_total = 0
-
-            for boot_key, boot_data in self.raw_boots.items():
-                n_total += 1
-                fit_raw = boot_data.get(config)
-                if fit_raw is None:
-                    warnings.warn("fit_raw is none")
+            for result, err in parallel_results:
+                if result is None:
+                    if err:
+                        warnings.warn(err)
                     continue
-                inner = fit_raw.get('fit', fit_raw)
-                fit = self._reconstitute_params(inner)
-                if fit is None:
-                    warnings.warn("fit is none")
-                    continue
-
-                params = fit['component_params']
-                weights = fit['weights']
-
-                try:
-                    prior = self._compute_prior_em(params, weights)
-                except Exception as e:
-                    warnings.warn(e)
-                    continue
-                if not np.isfinite(prior) or prior <= 0 or prior >= 1:
-                    warnings.warn(f"prior {prior} is invalid")
-                    continue
-
-                try:
-                    if reestimate_marginal_weights and partial_patterns:
-                        marginal_w = {}
-                        for pattern in partial_patterns:
-                            obs_dims = np.array(sorted(pattern))
-                            marginal_w[pattern] = self._reestimate_marginal_weights(
-                                params, weights, obs_dims)
-                        lr = self._compute_variant_lr_reestimated(
-                            params, weights, marginal_w)
-                    else:
-                        lr = self._compute_variant_lr(params, weights)
-                except Exception as e:
-                    warnings.warn(e)
-                    continue
-
+                prior, lr = result
                 priors.append(prior)
                 lr_matrix.append(lr)
                 n_valid += 1
