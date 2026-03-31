@@ -67,6 +67,7 @@ def align_variants(ms, uv_aspa, mv_result):
         complete_both = not np.isnan(scores[i]).any()
         has_dim0 = not np.isnan(scores[i, 0]) if scores.shape[1] > 0 else False
         has_dim1 = not np.isnan(scores[i, 1]) if scores.shape[1] > 1 else False
+        n_dims_present = int((~np.isnan(scores[i])).sum())
 
         records.append({
             "gene": gene, "chrom": chrom_str, "pos": pos, "ref": ref, "alt": alt,
@@ -81,6 +82,7 @@ def align_variants(ms, uv_aspa, mv_result):
             "score_dim0": scores[i, 0], "score_dim1": scores[i, 1],
             "complete_both": complete_both,
             "has_dim0": has_dim0, "has_dim1": has_dim1,
+            "n_dims_present": n_dims_present,
         })
     return pd.DataFrame(records)
 
@@ -115,6 +117,40 @@ def compute_metrics(labels, points, name=""):
         "MCC": ((TP * TN) - (FP * FN)) / np.sqrt(float((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))) if (TP + FP) * (TP + FN) * (TN + FP) * (TN + FN) > 0 else 0,
         "DOR": (TP * TN) / (FP * FN) if FP > 0 and FN > 0 else float("inf"),
     }
+
+
+# ──────────────────────────────────────
+# Meta method
+# ──────────────────────────────────────
+
+def compute_meta_points(comp_df, uv_col="uv_points", mv_col="mv_points"):
+    """Best-of-both-worlds point assignments.
+
+    Uses MV joint points for variants observed in >1 assay dimension
+    (where the joint model has real cross-assay information), and falls
+    back to UV aggregated points for variants observed in only one
+    dimension (where the MV model would just be using a marginal and
+    adding no information over UV).
+
+    Parameters
+    ----------
+    comp_df : DataFrame
+        Output of align_variants().  Must contain ``n_dims_present``,
+        ``mv_points``, and ``uv_points`` columns.
+    uv_col, mv_col : str
+        Column names for UV and MV point assignments.
+
+    Returns
+    -------
+    np.ndarray of int, same length as comp_df.
+    """
+    use_mv = comp_df["n_dims_present"] > 1
+    meta = np.where(
+        use_mv,
+        comp_df[mv_col].values,
+        comp_df[uv_col].fillna(0).values,
+    ).astype(int)
+    return meta
 
 
 # ──────────────────────────────────────
