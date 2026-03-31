@@ -26,7 +26,7 @@ from collections import defaultdict, Counter
 import pandas as pd
 import warnings
 import os
-import multiprocessing as mp
+from joblib import Parallel, delayed
 
 
 # ──────────────────────────────────────
@@ -51,37 +51,126 @@ CONFIG_LABELS = {
 
 
 # ──────────────────────────────────────
-# Fork-based parallel worker
+# Parallel worker (module-level for joblib pickling)
 # ──────────────────────────────────────
 
-# Set by MVCalibrationAnalysis.run() before forking.
-# Forked workers inherit this reference via copy-on-write — no serialization.
-_fork_self = None
+def _bootstrap_job(fit_raw, scores, sa,
+                   p_idx, b_idx, g_idx, s_idx, benign_method,
+                   partial_patterns, reestimate_marginal_weights):
+    """Process one bootstrap fit.  Standalone so joblib loky workers don't
+    need to pickle the full MVCalibrationAnalysis object."""
+    if fit_raw is None:
+        return None, "fit_raw is None"
+    inner = fit_raw.get('fit', fit_raw)
+    if inner is None:
+        return None, "inner fit is None"
 
+    # ---- reconstitute params ----
+    cp = inner.get('component_params', [])
+    if not cp or any(len(p) == 0 for p in cp):
+        return None, "empty component_params"
+    params = []
+    for p in cp:
+        mu = np.array(p[0], dtype=float)
+        Delta = np.array(p[1], dtype=float)
+        Gamma = np.array(p[2], dtype=float)
+        if Delta.ndim == 2 and Delta.shape[1] == 1:
+            Delta = Delta.ravel()
+        params.append((mu, Delta, Gamma))
+    weights = np.array(inner['weights'], dtype=float)
 
-def _worker_init_blas():
-    """Limit each forked worker to 1 BLAS thread.
+    def _benign_w(w):
+        s_valid = s_idx < len(w)
+        if s_valid and benign_method == 'synonymous':
+            return w[s_idx]
+        if s_valid and benign_method == 'avg':
+            return (np.array(w[b_idx]) + np.array(w[s_idx])) / 2
+        return w[b_idx]
 
-    Without this, 72 workers × 72 OpenBLAS threads = 5184 threads which
-    exceeds typical RLIMIT_NPROC.  threadpoolctl can change the count
-    dynamically even after OpenBLAS is already initialised.
-    """
+    # ---- prior EM ----
     try:
-        from threadpoolctl import threadpool_limits
-        threadpool_limits(1)
-    except ImportError:
-        # Fallback: env-var approach works if OpenBLAS respects it at runtime
-        os.environ.update({
-            'OPENBLAS_NUM_THREADS': '1',
-            'OMP_NUM_THREADS': '1',
-            'MKL_NUM_THREADS': '1',
-        })
+        pop_scores = scores[sa[:, g_idx]]
+        K = len(params)
+        w_p, w_b = weights[p_idx], _benign_w(weights)
+        log_fp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(pop_scores, *params[c])
+                            for c in range(K)], axis=0)
+        log_fb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(pop_scores, *params[c])
+                            for c in range(K)], axis=0)
+        fp, fb = np.exp(log_fp), np.exp(log_fb)
+        prior = 0.5
+        for _ in range(10000):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                posteriors = 1 / (1 + (1 - prior) / prior * fb / fp)
+            new_prior = np.nanmean(posteriors)
+            if abs(new_prior - prior) < 1e-6:
+                prior = new_prior
+                break
+            prior = new_prior
+    except Exception as e:
+        return None, str(e)
 
+    if not np.isfinite(prior) or prior <= 0 or prior >= 1:
+        return None, f"invalid prior {prior}"
 
-def _fork_task(task):
-    """Module-level worker: each forked process accesses _fork_self from COW memory."""
-    fit_raw, partial_patterns, reestimate = task
-    return _fork_self._process_one_bootstrap(fit_raw, partial_patterns, reestimate)
+    # ---- LR computation ----
+    try:
+        N, D = scores.shape
+        obs_mask = ~np.isnan(scores)
+        all_dims = frozenset(range(D))
+
+        if reestimate_marginal_weights and partial_patterns:
+            S = weights.shape[0]
+            marginal_w = {}
+            for pattern in partial_patterns:
+                obs_dims = np.array(sorted(pattern))
+                has_obs = np.all(~np.isnan(scores[:, obs_dims]), axis=1)
+                mw = np.zeros_like(weights)
+                for s in range(S):
+                    s_mask = sa[:, s] & has_obs
+                    if not s_mask.any():
+                        mw[s] = weights[s]
+                        continue
+                    x_s = scores[s_mask]
+                    log_dens = np.zeros((K, s_mask.sum()))
+                    for c in range(K):
+                        xm = np.full_like(x_s, np.nan)
+                        xm[:, obs_dims] = x_s[:, obs_dims]
+                        log_dens[c] = _sn_logpdf(xm, *params[c])
+                    lw = log_dens + np.log(weights[s] + 1e-300)[:, None]
+                    resp = np.exp(lw - logsumexp(lw, axis=0))
+                    nw = resp.mean(axis=1)
+                    mw[s] = nw / nw.sum()
+                marginal_w[pattern] = mw
+
+            log_lr = np.full(N, np.nan)
+            pat_groups = {}
+            for j in range(N):
+                key = frozenset(np.where(obs_mask[j])[0])
+                pat_groups.setdefault(key, []).append(j)
+            for obs_key, indices in pat_groups.items():
+                if not obs_key:
+                    continue
+                idx = np.array(indices)
+                w = weights if obs_key == all_dims else marginal_w.get(obs_key, weights)
+                w_p, w_b = w[p_idx], _benign_w(w)
+                x_sub = scores[idx]
+                lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                log_lr[idx] = lfp - lfb
+            lr = log_lr
+        else:
+            w_p, w_b = weights[p_idx], _benign_w(weights)
+            lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(scores, *params[c])
+                             for c in range(K)], axis=0)
+            lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(scores, *params[c])
+                             for c in range(K)], axis=0)
+            lr = lfp - lfb
+    except Exception as e:
+        return None, str(e)
+
+    return (prior, lr), None
 
 
 # ──────────────────────────────────────
@@ -690,20 +779,18 @@ class MVCalibrationAnalysis:
 
             boot_items = list(self.raw_boots.items())
             n_total = len(boot_items)
-            n_workers = os.cpu_count() if n_jobs == -1 else n_jobs
-
-            # Fork-based pool: workers inherit this object via copy-on-write,
-            # so only the tiny per-task fit_raw is serialized per task.
-            global _fork_self
-            _fork_self = self
-            tasks = [
-                (bd.get(config), partial_patterns, reestimate_marginal_weights)
+            scores = self.ms.scores
+            sa = self.ms._sample_assignments
+            print(f"  Processing {n_total} bootstraps (n_jobs={n_jobs})...")
+            parallel_results = Parallel(n_jobs=n_jobs)(
+                delayed(_bootstrap_job)(
+                    bd.get(config), scores, sa,
+                    self.p_idx, self.b_idx, self.g_idx, self.s_idx,
+                    self.benign_method, partial_patterns,
+                    reestimate_marginal_weights,
+                )
                 for _, bd in boot_items
-            ]
-            print(f"  Processing {n_total} bootstraps ({n_workers} processes, fork)...")
-            ctx = mp.get_context('fork')
-            with ctx.Pool(n_workers, initializer=_worker_init_blas) as pool:
-                parallel_results = pool.map(_fork_task, tasks)
+            )
 
             priors = []
             lr_matrix = []
