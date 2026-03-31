@@ -59,6 +59,25 @@ CONFIG_LABELS = {
 _fork_self = None
 
 
+def _worker_init_blas():
+    """Limit each forked worker to 1 BLAS thread.
+
+    Without this, 72 workers × 72 OpenBLAS threads = 5184 threads which
+    exceeds typical RLIMIT_NPROC.  threadpoolctl can change the count
+    dynamically even after OpenBLAS is already initialised.
+    """
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+    except ImportError:
+        # Fallback: env-var approach works if OpenBLAS respects it at runtime
+        os.environ.update({
+            'OPENBLAS_NUM_THREADS': '1',
+            'OMP_NUM_THREADS': '1',
+            'MKL_NUM_THREADS': '1',
+        })
+
+
 def _fork_task(task):
     """Module-level worker: each forked process accesses _fork_self from COW memory."""
     fit_raw, partial_patterns, reestimate = task
@@ -683,7 +702,7 @@ class MVCalibrationAnalysis:
             ]
             print(f"  Processing {n_total} bootstraps ({n_workers} processes, fork)...")
             ctx = mp.get_context('fork')
-            with ctx.Pool(n_workers) as pool:
+            with ctx.Pool(n_workers, initializer=_worker_init_blas) as pool:
                 parallel_results = pool.map(_fork_task, tasks)
 
             priors = []
