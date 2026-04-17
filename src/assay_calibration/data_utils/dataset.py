@@ -446,7 +446,7 @@ class Scoreset:
         clinvar_release = kwargs.get("clinvar_release",'2025')
         self.variants = [Variant(row,min_clinvar_star,clinvar_release) for _, row in self.dataframe.iterrows()]
         self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
-        self.score_avg = kwargs.get("score_avg",False)
+        self.score_avg = kwargs.get("score_avg",True)
         self._init_matrices(**kwargs)
 
     def filter_invalid(self):
