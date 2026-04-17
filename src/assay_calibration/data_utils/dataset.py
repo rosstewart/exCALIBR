@@ -578,10 +578,22 @@ class Scoreset:
                 self._aa_subs[idx] = None
 
             
-            try:
-                self._variant_codes.append([getattr(variants[0], group) for group in group_cols])
-            except (ValueError, TypeError):
-                self._variant_codes.append(None)
+            # Store ALL unique nucleotide-level group_col tuples for this
+            # variant group (not just variants[0]).  Protein-level assays
+            # group many nucleotide substitutions under a single protein-level
+            # ID; saving all of them allows MultiScoreset to match this entry
+            # against any of the underlying nucleotide variants in other assays.
+            codes = []
+            seen_codes: set = set()
+            for v in variants:
+                try:
+                    code = tuple(getattr(v, g) for g in group_cols)
+                    if code not in seen_codes:
+                        seen_codes.add(code)
+                        codes.append(code)
+                except (ValueError, TypeError):
+                    pass
+            self._variant_codes.append(codes if codes else None)
             
             if any([variant.is_synonymous for variant in variants]):
                 self._sample_assignments[idx, 3] = True
@@ -996,6 +1008,28 @@ def csv_to_vcf(input_filepath, output_filepath):
 
 
 
+class _UnionFind:
+    """Path-compressed union-find for hashable elements."""
+    def __init__(self):
+        self._parent: dict = {}
+
+    def add(self, x):
+        if x not in self._parent:
+            self._parent[x] = x
+
+    def find(self, x):
+        self.add(x)
+        while self._parent[x] != x:
+            self._parent[x] = self._parent[self._parent[x]]  # path halving
+            x = self._parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[rb] = ra
+
+
 class MultiScoreset:
     """Combine D Scoresets into a single (N, D) score matrix for multivariate fitting.
 
@@ -1069,8 +1103,9 @@ class MultiScoreset:
                 f"{getattr(scoreset, 'scoreset_name', '?')}"
             )
 
-        # Convert to hashable tuples — return a plain Python list,
-        # NOT a numpy object array (which breaks set hashing).
+        # Return a frozenset of group_col tuples per variant.
+        # New format: code is a list of tuples [(gene,chrom,pos,ref,alt), ...]
+        # Old format (backward compat): code is a flat list [gene,chrom,pos,ref,alt]
         keys = []
         for code in kept_codes:
             if code is None:
@@ -1078,7 +1113,12 @@ class MultiScoreset:
                     f"None variant code in {getattr(scoreset, 'scoreset_name', '?')}; "
                     f"ensure group columns {self.group_cols} are present."
                 )
-            keys.append(tuple(code))
+            if code and isinstance(code[0], tuple):
+                # New format: list of tuples
+                keys.append(frozenset(code))
+            else:
+                # Old format: flat list of values → single tuple
+                keys.append(frozenset([tuple(code)]))
 
         return keys
 
@@ -1087,27 +1127,20 @@ class MultiScoreset:
     # ──────────────────────────────────────
 
     def _build(self):
-        variant_set = set()
-        variant_keys = []
+        variant_keys = []   # per assay: list[frozenset[tuple]]
         scores_list = []
         samples_list = []
 
         for s in self.scoresets:
-            keys = self._get_variant_keys(s)
-            scores = s.scores  # (n_kept,) — already filtered
+            keys = self._get_variant_keys(s)   # list[frozenset[tuple]]
+            scores = s.scores
 
-            # Use _sample_assignments (always 4 columns), NOT the
-            # .sample_assignments property which drops empty columns.
-            # _sample_assignments is already filtered by keep_mask
-            # inside Scoreset._init_matrices.
             if hasattr(s, '_sample_assignments'):
                 samples = s._sample_assignments
-                # Pad to 4 columns if fewer (shouldn't happen for Scoreset, but safety)
                 if samples.shape[1] < 4:
                     pad = np.zeros((samples.shape[0], 4 - samples.shape[1]), dtype=bool)
                     samples = np.hstack([samples, pad])
             else:
-                # Fallback for BasicScoreset or similar
                 sa = s.sample_assignments
                 if sa.shape[1] < 4:
                     pad = np.zeros((sa.shape[0], 4 - sa.shape[1]), dtype=bool)
@@ -1124,50 +1157,80 @@ class MultiScoreset:
             variant_keys.append(keys)
             scores_list.append(scores)
             samples_list.append(samples)
-            variant_set.update(keys)
 
-        # Build union of all variants — sort by string repr to handle mixed types
-        all_variants = sorted(variant_set, key=lambda t: tuple(str(x) for x in t))
-        n_variants = len(all_variants)
-        variant_to_idx = {v: i for i, v in enumerate(all_variants)}
+        # ── Union-find: merge variants that share any group_col tuple ──────────
+        # Each individual group_col tuple (gene,chrom,pos,ref,alt) is a node.
+        # Within a single assay's variant entry, all tuples in its frozenset
+        # represent the same biological entity → union them.
+        # Across assays, if any tuple appears in both entries → same variant.
+        uf = _UnionFind()
 
-        # Allocate matrices
+        # First pass: register every atom and union within each frozenset
+        for assay_keys in variant_keys:
+            for fset in assay_keys:
+                atoms = list(fset)
+                for a in atoms:
+                    uf.add(a)
+                for i in range(1, len(atoms)):
+                    uf.union(atoms[0], atoms[i])
+
+        # Collect canonical roots and assign a sequential variant index
+        # Use a representative atom per biological variant as the canonical key
+        root_to_idx: dict = {}
+        canonical: list = []   # one representative atom per merged cluster
+
+        def _get_or_create(fset):
+            root = uf.find(next(iter(fset)))
+            if root not in root_to_idx:
+                root_to_idx[root] = len(canonical)
+                canonical.append(root)
+            return root_to_idx[root]
+
+        n_variants = 0
+        assay_row_idx = []   # per assay: list of global variant indices
+        for assay_keys in variant_keys:
+            row_indices = []
+            for fset in assay_keys:
+                idx = _get_or_create(fset)
+                row_indices.append(idx)
+            assay_row_idx.append(row_indices)
+            n_variants = max(n_variants, max(row_indices) + 1 if row_indices else 0)
+
+        # ── Allocate and fill matrices ─────────────────────────────────────────
         scores_matrix = np.full((n_variants, self.d), np.nan)
         sample_assignments = np.zeros((n_variants, 4), dtype=bool)
 
-        # Fill from each assay
         for assay_i in range(self.d):
-            keys = variant_keys[assay_i]
+            row_indices = assay_row_idx[assay_i]
             scores = scores_list[assay_i]
             samples = samples_list[assay_i]
-            for k in range(len(keys)):
-                v = keys[k]
-                idx = variant_to_idx[v]
+            for k, idx in enumerate(row_indices):
                 scores_matrix[idx, assay_i] = scores[k]
-                # Merge sample assignments via OR across assays.
-                # A variant is pathogenic/benign/etc if ANY assay flags it.
                 sample_assignments[idx] |= samples[k]
 
-        # Filter: keep variants with at least one non-NaN score
+        # ── Keep only variants with at least one observed score ────────────────
         missing_mask = np.isnan(scores_matrix)
         keep_mask = ~np.all(missing_mask, axis=1)
+
+        # Build _variants_kept: one representative group_col tuple per variant
+        # (the canonical atom chosen by union-find).  Stored as a tuple matching
+        # group_cols so downstream code (e.g. align_variants) can unpack it.
+        all_canonical = canonical   # list of group_col tuples, one per variant
+        self._variants_kept = [all_canonical[i] for i in range(n_variants) if keep_mask[i]]
 
         self._scores_matrix = scores_matrix
         self._missing_mask = missing_mask
         self._keep_mask = keep_mask
         self._scores = scores_matrix[keep_mask]
         self._missing = missing_mask[keep_mask]
-        self.variants = all_variants  # list of tuples
-        self._variants_kept = [all_variants[i] for i in range(n_variants) if keep_mask[i]]
+        self.variants = all_canonical
         self._sample_assignments = sample_assignments[keep_mask]
         self.n_variants = self._scores.shape[0]
 
-        # Per-dimension xlims (ignoring NaN)
         self._xlims = tuple(
             (np.nanmin(self._scores[:, dim]), np.nanmax(self._scores[:, dim]))
             for dim in range(self.d)
         )
-
         self.sample_counts = self._sample_assignments.sum(axis=0)
 
     # ──────────────────────────────────────

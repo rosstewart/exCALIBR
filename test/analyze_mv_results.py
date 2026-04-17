@@ -79,6 +79,14 @@ def _bootstrap_job(fit_raw, scores, sa,
         params.append((mu, Delta, Gamma))
     weights = np.array(inner['weights'], dtype=float)
 
+    # Guard: weights must have one row per sample class matching sa
+    if weights.shape[0] != sa.shape[1]:
+        return None, (
+            f"weights.shape={weights.shape} incompatible with "
+            f"sa.shape={sa.shape}: stored fit has {weights.shape[0]} sample "
+            f"classes but current scoreset has {sa.shape[1]}"
+        )
+
     def _benign_w(w):
         s_valid = s_idx < len(w)
         if s_valid and benign_method == 'synonymous':
@@ -89,7 +97,7 @@ def _bootstrap_job(fit_raw, scores, sa,
 
     # ---- prior EM ----
     try:
-        pop_scores = scores[sa[:, g_idx]]
+        pop_scores = scores[sa[:, g_idx].astype(bool)]
         K = len(params)
         w_p, w_b = weights[p_idx], _benign_w(weights)
         log_fp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(pop_scores, *params[c])
@@ -107,7 +115,8 @@ def _bootstrap_job(fit_raw, scores, sa,
                 break
             prior = new_prior
     except Exception as e:
-        return None, str(e)
+        import traceback
+        return None, f"prior EM: {e}\n{traceback.format_exc()}"
 
     if not np.isfinite(prior) or prior <= 0 or prior >= 1:
         return None, f"invalid prior {prior}"
@@ -168,7 +177,8 @@ def _bootstrap_job(fit_raw, scores, sa,
                              for c in range(K)], axis=0)
             lr = lfp - lfb
     except Exception as e:
-        return None, str(e)
+        import traceback
+        return None, f"LR computation: {e}\n{traceback.format_exc()}"
 
     return (prior, lr), None
 

@@ -226,10 +226,12 @@ class Fit:
         # Propagate latent_q for CFUSN
         latent_q = kwargs.get("latent_q", 1)
 
+        bootstrap_seed = kwargs.get("bootstrap_seed", None)
+        onehot_rng = np.random.RandomState(bootstrap_seed)
         sample_assignments = self.scoreset.sample_assignments
         if kwargs.get("verbose", False):
             print(f"sample counts: {sample_assignments.sum(0)}")
-        sample_assignments = makeOneHot(sample_assignments)
+        sample_assignments = makeOneHot(sample_assignments, rng=onehot_rng)
         if kwargs.get("verbose", False):
             print(f"sample counts (after one-hot): {sample_assignments.sum(0)}")
             if latent_q > 1:
@@ -570,8 +572,10 @@ class Fit:
                 kwargs.get("score_max", observations.max()), observations.max()
             )
 
+        bootstrap_seed = kwargs.get("bootstrap_seed", None)
+        onehot_rng = np.random.RandomState(bootstrap_seed)
         sample_assignments = self.scoreset.sample_assignments
-        sample_assignments = makeOneHot(sample_assignments)
+        sample_assignments = makeOneHot(sample_assignments, rng=onehot_rng)
 
         if mv:
             include = sample_assignments.any(axis=1) & ~np.all(np.isnan(observations), axis=1)
@@ -790,7 +794,9 @@ def calculate_score_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores, point_v
     return pathogenic_ranges, benign_ranges, C
 
 
-def makeOneHot(sample_assignments):
+def makeOneHot(sample_assignments, rng=None):
+    if rng is None:
+        rng = np.random.RandomState()
     assert np.all(sample_assignments.any(axis=0))
     sample_assignments = np.array(sample_assignments)
     onehot = np.zeros_like(sample_assignments)
@@ -798,7 +804,7 @@ def makeOneHot(sample_assignments):
         for i in range(sample_assignments.shape[0]):
             true_indices = np.where(sample_assignments[i])[0]
             if len(true_indices) > 0:
-                selected = np.random.choice(true_indices)
+                selected = rng.choice(true_indices)
                 onehot[i] = False
                 onehot[i, selected] = True
     assert np.all(np.any(onehot, axis=0))

@@ -50,19 +50,22 @@ def sn_method_of_moments_init(X):
     if m2 < 1e-10:
         return []
     a1 = np.sqrt(2 / np.pi)
-    b1 = (4 / np.pi - 1) / a1
+    c = (4 - np.pi) / 2
     try:
-        delta = np.sign(m3) / np.sqrt(a1**2 + m2 * (b1 / np.abs(m3)) ** (2 / 3))
+        if np.abs(m3) < 1e-10:
+            return np.random.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
+        delta = np.sign(m3) / np.sqrt(a1**2 * (1 + (c / np.abs(m3)) ** (2/3)))
         if np.isnan(delta) or np.abs(delta) >= 0.99:
             return np.random.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
         denom = 1 - a1**2 * delta**2
         if denom <= 1e-10:
-            return m3, m1, max(np.sqrt(m2), 1e-6)
+            return np.random.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
         sigma = max(np.sqrt(m2 / denom), 1e-6)
         mu = m1 - a1 * delta * sigma
-        if np.any(np.isnan([mu, sigma, m3])) or np.any(np.isinf([mu, sigma, m3])):
+        alpha = delta / np.sqrt(max(1 - delta**2, 1e-12))
+        if np.any(np.isnan([mu, sigma, alpha])) or np.any(np.isinf([mu, sigma, alpha])):
             return []
-        return m3, mu, sigma
+        return alpha, mu, sigma
     except (ZeroDivisionError, RuntimeWarning):
         return []
 
