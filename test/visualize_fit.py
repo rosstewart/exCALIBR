@@ -18,6 +18,7 @@ from matplotlib.lines import Line2D
 from scipy.special import logsumexp
 from scipy.stats import multivariate_normal as mvn, norm
 from scipy.ndimage import uniform_filter1d
+from joblib import Parallel, delayed
 
 
 # ──────────────────────────────────────
@@ -210,6 +211,96 @@ def _collect_valid_fits(analysis, config):
     return all_fits
 
 
+def _eval_fit_on_grid(fit, grid_pts, p_idx, b_idx, s_idx, benign_method):
+    """Evaluate LR+ for one bootstrap fit on a pre-built grid of points.
+
+    Module-level so joblib loky workers can pickle it by name.
+    Returns (lr_flat,) — 1-D array of length n_grid_pts.
+    """
+    params = fit['component_params']
+    weights = fit['weights']
+    K = len(params)
+
+    w_p = weights[p_idx]
+    s_valid = s_idx is not None and s_idx < len(weights)
+    if s_valid and benign_method == 'synonymous':
+        w_b = weights[s_idx]
+    elif s_valid and benign_method == 'avg':
+        w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+    else:
+        w_b = weights[b_idx]
+
+    log_fp = logsumexp(
+        [np.log(w_p[c] + 1e-300) + _sn_logpdf(grid_pts, *params[c]) for c in range(K)],
+        axis=0,
+    )
+    log_fb = logsumexp(
+        [np.log(w_b[c] + 1e-300) + _sn_logpdf(grid_pts, *params[c]) for c in range(K)],
+        axis=0,
+    )
+    return log_fp - log_fb
+
+
+def _eval_fit_sample_densities(fit, grid_pts, n_samples):
+    """Evaluate per-sample log-density for one bootstrap fit on a grid.
+
+    Returns list of length n_samples, each a 1-D log-density array.
+    """
+    params = fit['component_params']
+    weights = fit['weights']
+    K = len(params)
+    comp_logs = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+    result = []
+    for s in range(n_samples):
+        w_s = weights[s]
+        result.append(logsumexp(
+            [np.log(w_s[c] + 1e-300) + comp_logs[c] for c in range(K)],
+            axis=0,
+        ))
+    return result
+
+
+def _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S):
+    """Evaluate LR+ and per-sample densities for one bootstrap on a 1-D marginal grid.
+
+    Module-level so joblib loky workers can pickle it by name.
+
+    Returns
+    -------
+    lr_1d : (n,) log-LR array
+    sample_logs : list of S arrays, each (n,)
+    comp_logs_per_sample : list of S lists, each a list of K (n,) arrays
+    """
+    params = fit['component_params']
+    weights = fit['weights']
+    K = len(params)
+
+    comp_log = [_sn_logpdf(x_2d, *params[c]) for c in range(K)]
+
+    sample_logs = []
+    comp_logs_per_sample = []
+    for s in range(S):
+        w_s = weights[s]
+        log_d = logsumexp([np.log(w_s[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        sample_logs.append(log_d)
+        comp_logs_per_sample.append([np.log(w_s[c] + 1e-300) + comp_log[c] for c in range(K)])
+
+    w_p = weights[p_idx]
+    s_valid = s_idx is not None and s_idx < len(weights)
+    if s_valid and benign_method == 'synonymous':
+        w_b = weights[s_idx]
+    elif s_valid and benign_method == 'avg':
+        w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+    else:
+        w_b = weights[b_idx]
+
+    log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+    log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+    lr_1d = log_fp - log_fb
+
+    return lr_1d, sample_logs, comp_logs_per_sample
+
+
 def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g):
     """
     Compute conservative discrete point grid from bootstrap LR+ percentiles.
@@ -236,24 +327,15 @@ def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g):
     n_grid = len(grid_pts)
     grid_shape = (len(x1g), len(x2g))
 
-    lr_all = []
-    for fit in all_fits:
-        params = fit['component_params']
-        weights = fit['weights']
-        K = len(params)
-        w_p = weights[analysis.p_idx]
-        w_b = analysis._get_benign_weights(weights)
+    p_idx = analysis.p_idx
+    b_idx = analysis.b_idx
+    s_idx = getattr(analysis, 's_idx', None)
+    benign_method = analysis.benign_method
 
-        log_fp = logsumexp([
-            np.log(w_p[c] + 1e-300) + _sn_logpdf(grid_pts, *params[c])
-            for c in range(K)
-        ], axis=0)
-        log_fb = logsumexp([
-            np.log(w_b[c] + 1e-300) + _sn_logpdf(grid_pts, *params[c])
-            for c in range(K)
-        ], axis=0)
-        lr_all.append(log_fp - log_fb)
-
+    lr_all = Parallel(n_jobs=-1)(
+        delayed(_eval_fit_on_grid)(fit, grid_pts, p_idx, b_idx, s_idx, benign_method)
+        for fit in all_fits
+    )
     lr_arr = np.array(lr_all)
 
     lr_p5 = np.nanpercentile(lr_arr, path_pctile, axis=0)
@@ -315,51 +397,44 @@ def _compute_bootstrap_marginal_lr(analysis, config, dim, x_grid):
     x_2d[:, dim] = x_grid
 
     S = analysis.ms._sample_assignments.shape[1]
-    sample_logs = {s: [] for s in range(S)}
-    component_logs = {s: {} for s in range(S)}
-    lr_list = []
-
     path_pctile = analysis.results[config].get('path_percentile', 5)
     ben_pctile = analysis.results[config].get('ben_percentile', 95)
 
+    p_idx = analysis.p_idx
+    b_idx = analysis.b_idx
+    s_idx = getattr(analysis, 's_idx', None)
+    benign_method = analysis.benign_method
+
+    # Pre-collect valid reconstituted fits (fast — no heavy computation)
+    valid_fits = []
     for boot_key, boot_data in analysis.raw_boots.items():
         fit_raw = boot_data.get(config)
         if fit_raw is None:
             continue
         inner = fit_raw.get('fit', fit_raw)
         fit = analysis._reconstitute_params(inner)
-        if fit is None:
-            continue
+        if fit is not None:
+            valid_fits.append(fit)
 
-        params = fit['component_params']
-        weights = fit['weights']
-        K = len(params)
-
-        comp_log = []
-        for c in range(K):
-            comp_log.append(_sn_logpdf(x_2d, *params[c]))
-
-        for s in range(S):
-            w_s = weights[s]
-            log_d = logsumexp([
-                np.log(w_s[c] + 1e-300) + comp_log[c]
-                for c in range(K)
-            ], axis=0)
-            sample_logs[s].append(log_d)
-
-            for c in range(K):
-                component_logs[s].setdefault(c, []).append(
-                    np.log(w_s[c] + 1e-300) + comp_log[c])
-
-        w_p = weights[analysis.p_idx]
-        w_b = analysis._get_benign_weights(weights)
-        log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
-        log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
-        lr_list.append(log_fp - log_fb)
-
-    n_used = len(lr_list)
+    n_used = len(valid_fits)
     if n_used == 0:
         return None, None, None, 0
+
+    # Parallel evaluation across bootstraps
+    results = Parallel(n_jobs=-1)(
+        delayed(_eval_marginal_fit)(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S)
+        for fit in valid_fits
+    )
+
+    # Aggregate results
+    lr_list = [r[0] for r in results]
+    sample_logs = {s: [r[1][s] for r in results] for s in range(S)}
+    component_logs = {s: {} for s in range(S)}
+    for r in results:
+        comp_logs_per_sample = r[2]
+        for s in range(S):
+            for c, clog in enumerate(comp_logs_per_sample[s]):
+                component_logs[s].setdefault(c, []).append(clog)
 
     lr_arr = np.array(lr_list)
     lr_percentiles = {
