@@ -729,14 +729,17 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
 
             obs_p = scores[sa[:, analysis.p_idx], dim]
             obs_p = obs_p[~np.isnan(obs_p)]
-            obs_b = scores[sa[:, analysis.b_idx], dim]
-            obs_b = obs_b[~np.isnan(obs_b)]
             if len(obs_p) > 0:
                 ax.plot(obs_p, np.full(len(obs_p), ylim_bound * 0.97),
                         '|', color='#CA7682', alpha=0.3, ms=3, mew=0.3)
-            if len(obs_b) > 0:
-                ax.plot(obs_b, np.full(len(obs_b), -ylim_bound * 0.97),
-                        '|', color='#1D7AAB', alpha=0.3, ms=3, mew=0.3)
+            # Use benign if present, fall back to synonymous for bottom rug ticks
+            neg_rug_idx = analysis.b_idx if analysis.b_idx is not None else analysis.s_idx
+            if neg_rug_idx is not None:
+                obs_b = scores[sa[:, neg_rug_idx], dim]
+                obs_b = obs_b[~np.isnan(obs_b)]
+                if len(obs_b) > 0:
+                    ax.plot(obs_b, np.full(len(obs_b), -ylim_bound * 0.97),
+                            '|', color='#1D7AAB', alpha=0.3, ms=3, mew=0.3)
 
             ax.set_ylim(-ylim_bound, ylim_bound)
 
