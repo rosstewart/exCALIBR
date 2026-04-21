@@ -35,8 +35,14 @@ MISCLASS_MARKERS = {'FP': 'X', 'FN': 'X'}  # wrong-direction marker
 # Alignment
 # ──────────────────────────────────────
 
-def align_variants(ms, uv_aspa, mv_result):
+def align_variants(ms, uv_aspa, mv_result, points_col="points", use_2018_uv_points=False):
     """Build per-variant comparison table."""
+
+    points_col, evidence_col = "points", "evidence"
+    if use_2018_uv_points:
+        points_col += "_clinvar_2018"
+        evidence_col += "_clinvar_2018"
+    
     uv_aspa = uv_aspa.copy()
     uv_aspa["POS"] = pd.to_numeric(uv_aspa["POS"], errors="coerce")
     uv_aspa["#CHROM"] = uv_aspa["#CHROM"].astype(str)
@@ -47,8 +53,8 @@ def align_variants(ms, uv_aspa, mv_result):
     for _, row in uv_aspa.iterrows():
         key = (str(row["#CHROM"]), float(row["POS"]), str(row["REF"]), str(row["ALT"]))
         uv_lookup[key] = {
-            "uv_points": row.get("points", np.nan),
-            "uv_evidence": row.get("evidence", ""),
+            "uv_points": row.get(points_col, np.nan),
+            "uv_evidence": row.get(evidence_col, ""),
             "uv_dataset": row.get("dataset_highest_evidence", ""),
             "protein_variant": row.get("protein_variant", ""),
         }

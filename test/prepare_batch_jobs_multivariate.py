@@ -14,6 +14,61 @@ from collections import defaultdict
 from src.assay_calibration.fit_utils.fit import Fit
 from src.assay_calibration.data_utils.dataset import Scoreset, MultiScoreset
 
+# keep dedup_same_aa_sub false for the univariate case, since dedup happens
+def generate_predictor_datasets(gene=None, predictor=None):
+    from collections import defaultdict
+
+    wd = '/data/ross/assay_calibration'
+    df_with_predictor_scores = pd.read_csv(f"{wd}/dataframe/integrated_variant_effect_dataset_analysis.csv.gz")
+    
+    # contains score col and training set label col
+    predictor_info = {
+        "REVEL": ("REVEL", "REVEL_train"),
+        "MutPred2": ("MutPred2", "MP2_train"),
+        "AlphaMissense": ("AM_score", None)
+    }
+
+    if predictor is not None:
+        assert predictor in ["REVEL", "MutPred2", "AlphaMissense"]
+        predictor_info = {predictor: predictor_info[predictor]}
+    
+    predictor_datasets = defaultdict(dict)
+    for predictor, (score_col, training_set_col) in predictor_info.items():
+
+        if gene is None:
+            sg_calibration_genes = ["BRCA1","BRCA2","JAG1","MSH2","SCN5A","TP53","TSC2"]
+            if predictor != "MutPred2":
+                sg_calibration_genes.insert(2, "F9")
+        else:
+            sg_calibration_genes = [gene]
+    
+        df_predictor = df_with_predictor_scores[~df_with_predictor_scores[score_col].isna()]
+        mask = df_predictor.Gene.isin(sg_calibration_genes)
+        if training_set_col is not None:
+            mask &= (df_predictor[training_set_col] == False)
+        df_predictor = df_predictor[mask]
+
+        # make IDs consistent within the same protein variant
+        # dataset.py will ensure they are correctly:
+        #    - deduplicated in single calibration
+        #    - matched across all variant instances in multivariate, e.g. not deduplicated with SGE but deduplicated with VAMP-Seq
+        missense_group_cols = ["Gene", "Ensembl Transcript ID", "aa_pos", "aa_ref", "aa_alt"]
+        df_predictor["ID"] = (
+            df_predictor[missense_group_cols]
+            .astype(str)
+            .agg("|".join, axis=1)
+        )
+
+        # also ensure the dataset is updated
+        df_predictor["Dataset"] = (
+            df_predictor["Gene"].astype(str) + f"_{predictor}"
+        )
+                
+        for gene in sg_calibration_genes:
+            predictor_datasets[predictor][gene] = {"df": df_predictor[df_predictor.Gene == gene], "score_col": score_col}
+
+    return predictor_datasets
+    
 
 # ============================================================================
 # STEP 0: Discover multi-assay gene groups
@@ -42,10 +97,10 @@ def discover_gene_groups(df, max_dimensions=None, manual_groups=None):
     )
 
     meta_analyses = ["F9_Popp_2025_model",
-                     "HMBS_van_Loggerenberg_2023_combined",
-                     "TP53_Fayer_2021_meta",
-                     "TP53_Fortuno_2021_Kato_meta",
-                     "TP53_Giacomelli_2018_combined_score"]
+                     # "HMBS_van_Loggerenberg_2023_combined",
+                     "TP53_Fayer_2021_meta",]
+                     # "TP53_Fortuno_2021_Kato_meta",
+                     # "TP53_Giacomelli_2018_combined_score"]
 
     gene_to_datasets = defaultdict(list)
     for _, row in dataset_gene.iterrows():
@@ -311,12 +366,14 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
     print(f"  Bootstraps: {N_BOOTSTRAPS}")
     print(f"  Fits per config: {NUM_FITS}")
 
+    genes_2018 = ["BRCA1", "MSH2", "PTEN", "TP53"]
+    
     # Process each gene group
     print(f"\nGenerating jobs ({n_jobs} workers)...")
     all_jobs_by_gene = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(process_gene_group)(
             df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
-            clinvar_release="2025", component_range=component_range,
+            clinvar_release="2025" if gene not in genes_2018 else "2018", component_range=component_range,
             constraint_modes=constraint_modes,
         )
         for gene, datasets in gene_groups.items()
@@ -536,6 +593,7 @@ Examples:
         "--genes", nargs="+", default=None,
         help="Specific gene(s) to process. If omitted, all multi-assay genes are used."
     )
+    ## TODO: ADD DATASET-SPECIFICITY PER GENE (ALONG WITH PREDICTORS)
     parser.add_argument(
         "--components", nargs="+", type=int, default=None,
         help="Component counts to fit (default: 2 3). E.g. --components 4 5 6"
@@ -561,6 +619,10 @@ Examples:
     parser.add_argument(
         "--max-dimensions", type=int, default=None,
         help="Skip genes with more datasets than this"
+    )
+    parser.add_argument(
+        "--predictors", type=str, default=None,
+        help="Add REVEL, MutPred2, or AlphaMissense scores as additional dimensions"
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,

@@ -426,17 +426,27 @@ class Scoreset:
             raise ValueError("dataframe must contain only one dataset")
         if not len(dataframe):
             raise ValueError("dataframe must contain at least one row")
-        # drop rows with NaN in auth_reported_score
+                
+        self.score_col = kwargs.get("score_col", "auth_reported_score")
+        
+        score_col = self.score_col
+        
+        # ensure numeric conversion
         dataframe = dataframe.assign(
-            auth_reported_score=pd.to_numeric(
-                dataframe.auth_reported_score, errors="coerce"
-            )
+            **{
+                score_col: pd.to_numeric(dataframe[score_col], errors="coerce")
+            }
         )
-        dataframe = dataframe.dropna(subset=["auth_reported_score"])
+        
+        # drop NaNs in chosen score column
+        dataframe = dataframe.dropna(subset=[score_col])
+        
+        # (this does nothing by default)
         dataframe = Scoreset.remove_outliers(dataframe, **kwargs)
+        
         if not len(dataframe):
             raise ValueError(
-                "dataframe must contain at least one row with a non-NaN auth_reported_score"
+                f"dataframe must contain at least one row with a non-NaN {score_col}"
             )
         self.dataframe = dataframe
         self.filter_nonsense = kwargs.get("filter_nonsense",False)
@@ -444,7 +454,7 @@ class Scoreset:
         self.splicing_filter(**kwargs)
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
         clinvar_release = kwargs.get("clinvar_release",'2025')
-        self.variants = [Variant(row,min_clinvar_star,clinvar_release) for _, row in self.dataframe.iterrows()]
+        self.variants = [Variant(row,min_clinvar_star,clinvar_release,score_col) for _, row in self.dataframe.iterrows()]
         self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
         self.score_avg = kwargs.get("score_avg",True)
         self._init_matrices(**kwargs)
@@ -475,12 +485,10 @@ class Scoreset:
             self.dataframe = self.dataframe[
                 self.dataframe.simplified_consequence.str.lower() != "splice_site_variant"
             ]
-            self.dataframe = self.dataframe[
-                (self.dataframe["spliceAI_DS_AG"] < 0.2) &
-                (self.dataframe["spliceAI_DS_AL"] < 0.2) &
-                (self.dataframe["spliceAI_DS_DG"] < 0.2) &
-                (self.dataframe["spliceAI_DS_DL"] < 0.2)
-            ]
+            spliceai_cols = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
+            
+            mask = self.dataframe[spliceai_cols].lt(0.2) | self.dataframe[spliceai_cols].isna()
+            self.dataframe = self.dataframe[mask.all(axis=1)]
 
     @staticmethod
     def remove_outliers(dataframe, **kwargs):
@@ -502,11 +510,12 @@ class Scoreset:
         pd.DataFrame
             The dataframe with outliers removed (1.5 IQR Rule)
         """
+        score_col = kwargs.get("score_col", "auth_reported_score")
         quantile_min = kwargs.get("quantile_min", 0.0)
         quantile_max = kwargs.get("quantile_max", 1.0)
-        lowerbound = dataframe.auth_reported_score.quantile(quantile_min)
-        upperbound = dataframe.auth_reported_score.quantile(quantile_max)
-        scores = dataframe.auth_reported_score
+        lowerbound = dataframe[score_col].quantile(quantile_min)
+        upperbound = dataframe[score_col].quantile(quantile_max)
+        scores = dataframe[score_col]
         include = (scores >= lowerbound) & (scores <= upperbound)
         return dataframe[include]
 
@@ -561,16 +570,16 @@ class Scoreset:
             self._ids.append(_id)
 
             if self.score_avg:
-                variants[0].auth_reported_score = np.mean([v.auth_reported_score for v in variants])
+                variants[0].assay_score = np.mean([v.assay_score for v in variants])
             
-            self._scores[idx] = variants[0].auth_reported_score
+            self._scores[idx] = variants[0].assay_score
             self._auth_labels[idx] = variants[0].auth_label
             if variants[0].is_snv:
-                self._snv_scores.append(variants[0].auth_reported_score)
-            self._all_scores.append(variants[0].auth_reported_score)
+                self._snv_scores.append(variants[0].assay_score)
+            self._all_scores.append(variants[0].assay_score)
             
             if any([variant.is_vus for variant in variants]):
-                self._vus_scores.append(variants[0].auth_reported_score)
+                self._vus_scores.append(variants[0].assay_score)
             
             try:
                 self._aa_subs[idx] = variants[0].aa_ref + str(int(variants[0].aa_pos)) + variants[0].aa_alt
@@ -742,18 +751,19 @@ class Scoreset:
 
 
 class Variant:
-    def __init__(self, variant_info: pd.Series, min_clinvar_star: int, clinvar_release: str):
+    def __init__(self, variant_info: pd.Series, min_clinvar_star: int, clinvar_release: str, score_col: str):
         self.min_clinvar_star = min_clinvar_star
         self.clinvar_release = clinvar_release
+        self.score_col = score_col
         self.row = variant_info
-        self._init_variant_info(variant_info)
+        self._init_variant_info(variant_info, score_col)
 
-    def _init_variant_info(self, variant_info: pd.Series):
+    def _init_variant_info(self, variant_info: pd.Series, score_col: str):
         self.ID = None
         self.simplified_consequence = None
         self.clinvar_star = None
         self.gnomad_MAF = None
-        self.auth_reported_score = None
+        self.assay_score = variant_info[score_col]
         self.transcript_ref = ""
         self.transcript_alt = ""
         self.aa_ref = np.nan
@@ -890,7 +900,7 @@ class Variant:
 
     @property
     def score(self):
-        return self.auth_reported_score
+        return self.assay_score
 
     @staticmethod
     def is_nan(value):
@@ -929,6 +939,7 @@ def summarize_datasets(dataframe_path, **kwargs):
             missense_only=kwargs.get("missense_only", False),
             synonymous_exclusive=kwargs.get("synonymous_exclusive", False),
             score_avg=kwargs.get("score_avg", False),
+            score_col=kwargs.get("score_col", "auth_reported_score"),
             filter_nonsense=kwargs.get("filter_nonsense", False)
         )
         f.write(f"{dataset_name}\n")
