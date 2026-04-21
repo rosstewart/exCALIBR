@@ -640,7 +640,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
     ben_pctile  = r.get('ben_percentile', 95)
     max_pt      = max(analysis.point_values)
     pt_norm     = TwoSlopeNorm(vmin=-max_pt, vcenter=0, vmax=max_pt)
-    ylim_bound  = max(abs(tau_p_log[-1]), abs(tau_b_log[-1])) * 1.05
+    ylim_bound  = max(abs(tau_p_log[-1]), abs(tau_b_log[-1]))
     missing_frac = 1.0 - (~np.isnan(scores).any(axis=1)).mean()
     pad = 0.5
 
@@ -748,14 +748,14 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
         obs_p = scores[sa[:, analysis.p_idx], dim]
         obs_p = obs_p[~np.isnan(obs_p)]
         if len(obs_p):
-            ax.plot(obs_p, np.full(len(obs_p), ylim_bound * 0.97),
+            ax.plot(obs_p, np.full(len(obs_p), ylim_bound),
                     '|', color='#CA7682', alpha=0.3, ms=3, mew=0.3)
         neg_idx = analysis.b_idx if analysis.b_idx is not None else analysis.s_idx
         if neg_idx is not None:
             obs_b = scores[sa[:, neg_idx], dim]
             obs_b = obs_b[~np.isnan(obs_b)]
             if len(obs_b):
-                ax.plot(obs_b, np.full(len(obs_b), -ylim_bound * 0.97),
+                ax.plot(obs_b, np.full(len(obs_b), -ylim_bound),
                         '|', color='#1D7AAB', alpha=0.3, ms=3, mew=0.3)
         ax.set_ylim(-ylim_bound, ylim_bound)
     ax.set_xlabel(dataset_names[dim], fontsize=7)
