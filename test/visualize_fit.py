@@ -399,7 +399,7 @@ def _compute_bootstrap_marginal_lr(analysis, config, dim, x_grid):
     x_2d = np.full((n, D), np.nan)
     x_2d[:, dim] = x_grid
 
-    S = analysis.ms._sample_assignments.shape[1]
+    S = analysis.ms.sample_assignments.shape[1]
     path_pctile = analysis.results[config].get('path_percentile', 5)
     ben_pctile = analysis.results[config].get('ben_percentile', 95)
 
@@ -501,11 +501,12 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
 
     ms = analysis.ms
     scores = ms.scores
-    sa = ms._sample_assignments
+    sa = ms.sample_assignments
     N, D = scores.shape
     S = sa.shape[1]
     dataset_names = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
-    sample_names = getattr(ms, 'sample_names', SAMPLE_NAMES_DEFAULT[:S])
+    _sn_raw = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    sample_names = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}' for i in range(S)]
 
     # Detect model type for display
     latent_q = r.get('latent_q', getattr(analysis, '_latent_q', 1))
@@ -604,7 +605,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
         if not mask.any():
             continue
         ax.scatter(scores[mask, 0], scores[mask, 1],
-                   c=SAMPLE_COLORS[s_idx], s=8, alpha=0.4,
+                   c=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], s=8, alpha=0.4,
                    edgecolors='none',
                    marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)],
                    label=f"{sample_names[s_idx]} ({mask.sum()})")
@@ -650,7 +651,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             mask = sa[:, s_idx] & complete
             if mask.any():
                 ax.scatter(scores[mask, 0], scores[mask, 1],
-                           c=SAMPLE_COLORS[s_idx], s=4, alpha=0.3,
+                           c=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], s=4, alpha=0.3,
                            edgecolors='none')
 
             _plot_component_means(ax, all_fits, s_idx)
@@ -661,7 +662,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             n_s = sa[:, s_idx].sum()
             ax.set_title(f'{sample_names[s_idx]} (n={n_s})',
                          fontsize=8, fontweight='bold',
-                         color=SAMPLE_COLORS[s_idx])
+                         color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)])
             ax.grid(lw=0.2, alpha=0.2)
 
     for c_idx in range(S, n_cols):
@@ -707,7 +708,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             obs_dim = obs_dim[~np.isnan(obs_dim)]
             if len(obs_dim) > 0:
                 ax.hist(obs_dim, bins=40, density=True, alpha=0.2,
-                        color=SAMPLE_COLORS[s_idx], edgecolor='white',
+                        color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], edgecolor='white',
                         linewidth=0.3)
 
             n_s_dim = (~np.isnan(scores[sa[:, s_idx], dim])).sum()
@@ -715,7 +716,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             ax.set_ylabel('Density', fontsize=7)
             ax.set_title(f'{sample_names[s_idx]} — {dataset_names[dim]} (n={n_s_dim})',
                          fontsize=7, fontweight='bold',
-                         color=SAMPLE_COLORS[s_idx])
+                         color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)])
             ax.grid(lw=0.2, alpha=0.2)
 
         # ── Last column: Marginal LR+ percentiles ──

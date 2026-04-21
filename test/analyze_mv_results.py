@@ -460,27 +460,29 @@ class MVCalibrationAnalysis:
         self.point_values = point_values or list(range(1, 9))
         self.benign_method = benign_method
 
-        n_sa = ms._sample_assignments.shape[1]
+        # Map fixed role indices (0=path,1=ben,2=gnomad,3=syn) to effective indices
+        # in ms.sample_assignments (public property, drops empty-sample columns).
+        # This ensures our indices match the weight rows in stored fits.
+        present = np.where(ms.sample_counts > 0)[0]  # fixed-role indices that have data
 
-        def _clamp_idx(name, idx):
-            if idx is None:
-                return None
-            if idx >= n_sa:
-                warnings.warn(
-                    f"{name} index {idx} out of range for {n_sa} sample classes — treating as absent"
-                )
-                return None
-            return idx
+        def _eff_idx(role_name, fixed_idx):
+            pos = np.searchsorted(present, fixed_idx)
+            if pos < len(present) and present[pos] == fixed_idx:
+                return int(pos)
+            warnings.warn(f"{role_name} (role {fixed_idx}) has no observations — treating as absent")
+            return None
 
-        self.p_idx = pathogenic_idx  # pathogenic must always be present
-        self.b_idx = _clamp_idx("benign", benign_idx)
-        self.g_idx = _clamp_idx("gnomad", gnomad_idx)
-        self.s_idx = _clamp_idx("synonymous", synonymous_idx)
+        self.p_idx = _eff_idx("pathogenic", pathogenic_idx)
+        self.b_idx = _eff_idx("benign", benign_idx)
+        self.g_idx = _eff_idx("gnomad", gnomad_idx)
+        self.s_idx = _eff_idx("synonymous", synonymous_idx)
 
+        if self.p_idx is None:
+            raise ValueError(f"Pathogenic sample (role {pathogenic_idx}) has no observations.")
         if self.b_idx is None and self.s_idx is None:
             raise ValueError(
-                f"Neither benign (idx={benign_idx}) nor synonymous (idx={synonymous_idx}) "
-                f"index is valid for {n_sa} sample classes."
+                f"Neither benign (role {benign_idx}) nor synonymous (role {synonymous_idx}) "
+                f"has observations."
             )
 
         print(f"Loading results from {results_path}...")
@@ -568,7 +570,7 @@ class MVCalibrationAnalysis:
         """EM prior estimation using population scores."""
         if self.g_idx is None or self.g_idx >= weights.shape[0]:
             return 0.5  # no population sample — neutral prior
-        pop_mask = self.ms._sample_assignments[:, self.g_idx]
+        pop_mask = self.ms.sample_assignments[:, self.g_idx]
         pop_scores = self.ms.scores[pop_mask]
         K = len(params)
         w_p = weights[self.p_idx]
@@ -668,7 +670,7 @@ class MVCalibrationAnalysis:
     def _reestimate_marginal_weights(self, params, weights, obs_dims):
         """Re-estimate sample-specific component weights using marginal density."""
         obs_dims = np.atleast_1d(obs_dims)
-        sa = self.ms._sample_assignments
+        sa = self.ms.sample_assignments
         scores = self.ms.scores
         K = len(params)
         S = weights.shape[0]
@@ -747,7 +749,7 @@ class MVCalibrationAnalysis:
 
         Returns (prior, lr_array) on success, or (None, error_str) on failure.
         Safe to call from multiple threads: all operations on self.ms.scores and
-        self.ms._sample_assignments are read-only, and scipy/numpy release the GIL.
+        self.ms.sample_assignments are read-only, and scipy/numpy release the GIL.
         """
         if fit_raw is None:
             return None, "fit_raw is None"
@@ -796,7 +798,7 @@ class MVCalibrationAnalysis:
         """Run analysis for all configs."""
         ben_percentile = 100 - path_percentile
         scores = self.ms.scores
-        sa = self.ms._sample_assignments
+        sa = self.ms.sample_assignments
         N, D = scores.shape
 
         obs_mask = ~np.isnan(scores)
@@ -829,7 +831,7 @@ class MVCalibrationAnalysis:
             boot_items = list(self.raw_boots.items())
             n_total = len(boot_items)
             scores = self.ms.scores
-            sa = self.ms._sample_assignments
+            sa = self.ms.sample_assignments
             print(f"  Processing {n_total} bootstraps (n_jobs={n_jobs})...")
             parallel_results = Parallel(n_jobs=n_jobs)(
                 delayed(_bootstrap_job)(
@@ -1069,7 +1071,7 @@ class MVCalibrationAnalysis:
 
         n_configs = len(valid_configs)
         scores = self.ms.scores
-        sa = self.ms._sample_assignments
+        sa = self.ms.sample_assignments
         dataset_names = getattr(self.ms, 'dataset_names', ['Dim 0', 'Dim 1'])
 
         if figsize is None:
@@ -1392,7 +1394,7 @@ class MVCalibrationAnalysis:
     def _infer_score_directions(self):
         """Determine pathogenic direction (+1 or -1) for each score dimension."""
         scores = self.ms.scores
-        sa = self.ms._sample_assignments
+        sa = self.ms.sample_assignments
         K = scores.shape[1]
         path_mask = sa[:, self.p_idx]
         ben_mask = sa[:, self.b_idx] if self.b_idx is not None else np.zeros(len(scores), bool)
