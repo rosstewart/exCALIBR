@@ -312,7 +312,8 @@ def _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S):
     return lr_1d, sample_logs, comp_logs_per_sample
 
 
-def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g):
+def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g,
+                                   dim_i=0, dim_j=1, total_dims=None):
     """
     Compute conservative discrete point grid from bootstrap LR+ percentiles.
 
@@ -321,6 +322,9 @@ def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g):
       - Use path_percentile (e.g. 5th) for positive LR+ → pathogenic evidence
       - Use ben_percentile (e.g. 95th) for negative LR+ → benign evidence
       - Convert to discrete points using pre-computed thresholds
+
+    dim_i, dim_j  : which dimensions to plot on x and y axes
+    total_dims    : full model dimensionality (inferred from first fit if None)
 
     Returns
     -------
@@ -333,8 +337,13 @@ def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g):
     path_pctile = r.get('path_percentile', 5)
     ben_pctile = r.get('ben_percentile', 95)
 
+    if total_dims is None:
+        total_dims = analysis.ms.scores.shape[1]
+
     X1, X2 = np.meshgrid(x1g, x2g, indexing='ij')
-    grid_pts = np.column_stack([X1.ravel(), X2.ravel()])
+    grid_pts = np.full((X1.size, total_dims), np.nan)
+    grid_pts[:, dim_i] = X1.ravel()
+    grid_pts[:, dim_j] = X2.ravel()
     n_grid = len(grid_pts)
     grid_shape = (len(x1g), len(x2g))
 
@@ -363,10 +372,16 @@ def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g):
     return grid_points_flat.reshape(grid_shape), lr_conservative.reshape(grid_shape)
 
 
-def _compute_sample_density_grid(all_fits, s_idx, x1g, x2g):
+def _compute_sample_density_grid(all_fits, s_idx, x1g, x2g, dim_i=0, dim_j=1, total_dims=None):
     """Compute mean density for sample s_idx on a 2D grid."""
+    if total_dims is None and all_fits:
+        total_dims = all_fits[0]['component_params'][0][0].shape[0]
+    if total_dims is None:
+        total_dims = 2
     X1, X2 = np.meshgrid(x1g, x2g, indexing='ij')
-    grid_pts = np.column_stack([X1.ravel(), X2.ravel()])
+    grid_pts = np.full((X1.size, total_dims), np.nan)
+    grid_pts[:, dim_i] = X1.ravel()
+    grid_pts[:, dim_j] = X2.ravel()
     grid_shape = (len(x1g), len(x2g))
 
     densities = []
@@ -661,11 +676,12 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
         )
     else:
         fig, info = _plot_mv_hd(
-            analysis, config, marginal_data, x_grids,
+            analysis, config, all_fits, marginal_data, x_grids,
             scores, sa, N, D, S, dataset_names, sample_names,
             points, tau_p_log, tau_b_log, median_prior, C_path, C_ben,
             path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound,
-            model_label, n_boots_used, figsize, suptitle,
+            model_label, n_boots_used, pad, n_grid, contour_levels,
+            figsize, suptitle,
         )
 
     return fig, info
@@ -861,76 +877,72 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
     return fig, info
 
 
-def _plot_mv_hd(analysis, config, marginal_data, x_grids,
+def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                 scores, sa, N, D, S, dataset_names, sample_names,
                 points, tau_p_log, tau_b_log, median_prior, C_path, C_ben,
                 path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound,
-                model_label, n_boots_used, figsize, suptitle):
+                model_label, n_boots_used, pad, n_grid, contour_levels,
+                figsize, suptitle):
     """Layout for D>2.
 
-    Row 0 (full width): LR+ distribution violin per sample.
-    Rows 1..D: per-dimension marginals — [S sample density plots] + [marginal LR+].
+    Row 0: D-1 pairwise LR+ grids — dim 0 vs dim 1, dim 0 vs dim 2, …
+    Rows 1..D: per-dimension marginals — [S sample density panels] + [marginal LR+].
     """
-    n_cols = max(S, 2) + 1
-    n_rows = 1 + D
+    n_pairs = D - 1   # dim 0 vs dim 1, dim 0 vs dim 2, …
+    n_cols  = max(max(S, 2) + 1, n_pairs)
+    n_rows  = 1 + D
     if figsize is None:
-        figsize = (4.5 * n_cols, 3.5 + 3.0 * D)
+        figsize = (max(4.5 * n_cols, 4.5 * n_pairs), 4.0 + 3.0 * D)
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(n_rows, n_cols, figure=fig,
-                           height_ratios=[1.4] + [0.9] * D,
+                           height_ratios=[1.6] + [0.9] * D,
                            hspace=0.50, wspace=0.35)
 
-    # ═══════════════════════════════════════
-    # Row 0: log LR+ distribution per sample (spans all columns)
-    # ═══════════════════════════════════════
-    ax_lr = fig.add_subplot(gs[0, :])
-    lr_by_sample = {}
-    for s_idx in range(S):
-        mask = sa[:, s_idx].astype(bool)
-        if not mask.any():
-            continue
-        lr_vals = points[mask].astype(float)
-        if np.isfinite(lr_vals).any():
-            lr_by_sample[s_idx] = lr_vals
+    complete = ~np.isnan(scores).any(axis=1)
 
-    if lr_by_sample:
-        positions = sorted(lr_by_sample.keys())
-        vp = ax_lr.violinplot(
-            [lr_by_sample[s] for s in positions],
-            positions=positions,
-            showmedians=True, showextrema=True,
+    # ═══════════════════════════════════════
+    # Row 0: pairwise LR+ grids — dim 0 vs dim k, k=1..D-1
+    # ═══════════════════════════════════════
+    for k, dim_j in enumerate(range(1, D)):
+        xig = x_grids[0]
+        xjg = x_grids[dim_j]
+        xi_range = (xig[0], xig[-1])
+        xj_range = (xjg[0], xjg[-1])
+
+        print(f"  Computing LR+ grid: dim 0 vs dim {dim_j}...")
+        grid_points, lr_conservative = _compute_conservative_lr_grid(
+            analysis, config, all_fits, xig, xjg,
+            dim_i=0, dim_j=dim_j, total_dims=D,
         )
-        for i, body in enumerate(vp['bodies']):
-            body.set_facecolor(SAMPLE_COLORS[positions[i] % len(SAMPLE_COLORS)])
-            body.set_alpha(0.45)
-        vp['cmedians'].set_color('black')
-        vp['cmins'].set_color('gray'); vp['cmaxes'].set_color('gray')
-        vp['cbars'].set_color('gray')
 
-        # Jitter scatter overlay
-        for s_idx in positions:
-            jitter = np.random.normal(s_idx, 0.06, size=len(lr_by_sample[s_idx]))
-            ax_lr.scatter(jitter, lr_by_sample[s_idx],
-                          color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
-                          s=4, alpha=0.25, edgecolors='none')
+        ax = fig.add_subplot(gs[0, k])
+        im = ax.pcolormesh(xig, xjg, grid_points.T, cmap=POINT_CMAP,
+                           norm=pt_norm, shading='auto', alpha=0.7)
+        plt.colorbar(im, ax=ax, label='Points', shrink=0.8)
+        ax.contour(xig, xjg, lr_conservative.T, levels=[0],
+                   colors='black', linewidths=0.8)
 
-        # Threshold lines
-        for pv in [1, max_pt]:
-            if pv - 1 < len(tau_p_log):
-                ax_lr.axhline(tau_p_log[pv - 1], color='red',  ls=':', lw=0.8, alpha=0.5,
-                              label=f'+{pv} pts' if pv == 1 else None)
-                ax_lr.axhline(tau_b_log[pv - 1], color='blue', ls=':', lw=0.8, alpha=0.5,
-                              label=f'-{pv} pts' if pv == 1 else None)
-        ax_lr.axhline(0, color='gray', lw=0.8, alpha=0.4)
+        for s_idx in range(S):
+            mask = sa[:, s_idx] & complete
+            if not mask.any():
+                continue
+            ax.scatter(scores[mask, 0], scores[mask, dim_j],
+                       c=points[mask], cmap=POINT_CMAP, norm=pt_norm,
+                       s=8, alpha=0.5,
+                       edgecolors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                       linewidths=0.3,
+                       marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
 
-    ax_lr.set_xticks(list(lr_by_sample.keys()))
-    ax_lr.set_xticklabels([sample_names[s] for s in lr_by_sample.keys()],
-                           fontsize=8, rotation=15, ha='right')
-    ax_lr.set_ylabel('Evidence points', fontsize=8)
-    ax_lr.set_title(f'Evidence assignment distribution ({model_label})\n'
-                    f'prior={median_prior:.4f}, C_p={C_path:.1f}, C_b={C_ben:.1f}',
-                    fontsize=9, fontweight='bold')
-    ax_lr.grid(axis='y', lw=0.2, alpha=0.3)
+        ax.set_xlabel(dataset_names[0], fontsize=7)
+        ax.set_ylabel(dataset_names[dim_j], fontsize=7)
+        ax.set_xlim(xi_range); ax.set_ylim(xj_range)
+        ax.set_title(f'{dataset_names[0]} vs {dataset_names[dim_j]}',
+                     fontsize=8, fontweight='bold')
+        ax.grid(lw=0.2, alpha=0.3)
+
+    # blank remaining columns in row 0
+    for c_idx in range(n_pairs, n_cols):
+        fig.add_subplot(gs[0, c_idx]).axis('off')
 
     # ═══════════════════════════════════════
     # Rows 1..D: per-dimension marginals
