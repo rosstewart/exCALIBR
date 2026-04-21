@@ -79,41 +79,57 @@ def _bootstrap_job(fit_raw, scores, sa,
         params.append((mu, Delta, Gamma))
     weights = np.array(inner['weights'], dtype=float)
 
-    # Guard: weights must have one row per sample class matching sa
-    if weights.shape[0] != sa.shape[1]:
+    # Soft-clamp indices to the rows available in this fit's weights.
+    # Fits trained with fewer samples (e.g. no synonymous) have fewer weight rows;
+    # any index beyond that is treated as absent for this bootstrap.
+    n_w = weights.shape[0]
+    n_sa = sa.shape[1]
+    eff_p = p_idx if p_idx is not None and p_idx < n_w else None
+    eff_b = b_idx if b_idx is not None and b_idx < n_w else None
+    eff_g = g_idx if (g_idx is not None and g_idx < n_w and g_idx < n_sa) else None
+    eff_s = s_idx if s_idx is not None and s_idx < n_w else None
+
+    if eff_p is None:
+        return None, f"pathogenic index {p_idx} out of range for weights with {n_w} rows"
+    if eff_b is None and eff_s is None:
         return None, (
-            f"weights.shape={weights.shape} incompatible with "
-            f"sa.shape={sa.shape}: stored fit has {weights.shape[0]} sample "
-            f"classes but current scoreset has {sa.shape[1]}"
+            f"neither benign ({b_idx}) nor synonymous ({s_idx}) valid for "
+            f"weights with {n_w} rows"
         )
 
     def _benign_w(w):
-        s_valid = s_idx < len(w)
-        if s_valid and benign_method == 'synonymous':
-            return w[s_idx]
-        if s_valid and benign_method == 'avg':
-            return (np.array(w[b_idx]) + np.array(w[s_idx])) / 2
-        return w[b_idx]
+        b_ok = eff_b is not None and eff_b < len(w)
+        s_ok = eff_s is not None and eff_s < len(w)
+        if s_ok and benign_method == 'synonymous':
+            return w[eff_s]
+        if s_ok and b_ok and benign_method == 'avg':
+            return (np.array(w[eff_b]) + np.array(w[eff_s])) / 2
+        if b_ok:
+            return w[eff_b]
+        return w[eff_s]  # benign absent, fall back to synonymous
 
     # ---- prior EM ----
     try:
-        pop_scores = scores[sa[:, g_idx].astype(bool)]
-        K = len(params)
-        w_p, w_b = weights[p_idx], _benign_w(weights)
-        log_fp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(pop_scores, *params[c])
-                            for c in range(K)], axis=0)
-        log_fb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(pop_scores, *params[c])
-                            for c in range(K)], axis=0)
-        fp, fb = np.exp(log_fp), np.exp(log_fb)
-        prior = 0.5
-        for _ in range(10000):
-            with np.errstate(divide='ignore', invalid='ignore'):
-                posteriors = 1 / (1 + (1 - prior) / prior * fb / fp)
-            new_prior = np.nanmean(posteriors)
-            if abs(new_prior - prior) < 1e-6:
+        if eff_g is None:
+            prior = 0.5
+        else:
+            pop_scores = scores[sa[:, eff_g].astype(bool)]
+            K = len(params)
+            w_p, w_b = weights[eff_p], _benign_w(weights)
+            log_fp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(pop_scores, *params[c])
+                                for c in range(K)], axis=0)
+            log_fb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(pop_scores, *params[c])
+                                for c in range(K)], axis=0)
+            fp, fb = np.exp(log_fp), np.exp(log_fb)
+            prior = 0.5
+            for _ in range(10000):
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    posteriors = 1 / (1 + (1 - prior) / prior * fb / fp)
+                new_prior = np.nanmean(posteriors)
+                if abs(new_prior - prior) < 1e-6:
+                    prior = new_prior
+                    break
                 prior = new_prior
-                break
-            prior = new_prior
     except Exception as e:
         import traceback
         return None, f"prior EM: {e}\n{traceback.format_exc()}"
@@ -127,6 +143,7 @@ def _bootstrap_job(fit_raw, scores, sa,
         obs_mask = ~np.isnan(scores)
         all_dims = frozenset(range(D))
 
+        K = len(params)
         if reestimate_marginal_weights and partial_patterns:
             S = weights.shape[0]
             marginal_w = {}
@@ -161,7 +178,7 @@ def _bootstrap_job(fit_raw, scores, sa,
                     continue
                 idx = np.array(indices)
                 w = weights if obs_key == all_dims else marginal_w.get(obs_key, weights)
-                w_p, w_b = w[p_idx], _benign_w(w)
+                w_p, w_b = w[eff_p], _benign_w(w)
                 x_sub = scores[idx]
                 lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
                                  for c in range(K)], axis=0)
@@ -170,7 +187,7 @@ def _bootstrap_job(fit_raw, scores, sa,
                 log_lr[idx] = lfp - lfb
             lr = log_lr
         else:
-            w_p, w_b = weights[p_idx], _benign_w(weights)
+            w_p, w_b = weights[eff_p], _benign_w(weights)
             lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(scores, *params[c])
                              for c in range(K)], axis=0)
             lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(scores, *params[c])
@@ -447,11 +464,30 @@ class MVCalibrationAnalysis:
                  benign_method='benign'):
         self.ms = ms
         self.point_values = point_values or list(range(1, 9))
-        self.p_idx = pathogenic_idx
-        self.b_idx = benign_idx
-        self.g_idx = gnomad_idx
-        self.s_idx = synonymous_idx
         self.benign_method = benign_method
+
+        n_sa = ms._sample_assignments.shape[1]
+
+        def _clamp_idx(name, idx):
+            if idx is None:
+                return None
+            if idx >= n_sa:
+                warnings.warn(
+                    f"{name} index {idx} out of range for {n_sa} sample classes — treating as absent"
+                )
+                return None
+            return idx
+
+        self.p_idx = pathogenic_idx  # pathogenic must always be present
+        self.b_idx = _clamp_idx("benign", benign_idx)
+        self.g_idx = _clamp_idx("gnomad", gnomad_idx)
+        self.s_idx = _clamp_idx("synonymous", synonymous_idx)
+
+        if self.b_idx is None and self.s_idx is None:
+            raise ValueError(
+                f"Neither benign (idx={benign_idx}) nor synonymous (idx={synonymous_idx}) "
+                f"index is valid for {n_sa} sample classes."
+            )
 
         print(f"Loading results from {results_path}...")
         with gzip.open(results_path, 'rt', encoding='utf-8') as f:
@@ -516,19 +552,28 @@ class MVCalibrationAnalysis:
                 'latent_q': fit_dict.get('latent_q', _detect_q(params))}
 
     def _get_benign_weights(self, weights):
-        s_valid = False
-        if self.s_idx < len(weights):
-            s_valid = True
-        
-        if s_valid and self.benign_method == 'synonymous' and self.s_idx is not None:
+        n_w = len(weights)
+        b_valid = self.b_idx is not None and self.b_idx < n_w
+        s_valid = self.s_idx is not None and self.s_idx < n_w
+
+        if s_valid and self.benign_method == 'synonymous':
             return weights[self.s_idx]
-        elif s_valid and self.benign_method == 'avg' and self.b_idx is not None and self.s_idx is not None:
+        if s_valid and b_valid and self.benign_method == 'avg':
             return (np.array(weights[self.b_idx]) + np.array(weights[self.s_idx])) / 2
-        else:
+        if b_valid:
             return weights[self.b_idx]
+        if s_valid:
+            # benign absent — fall back to synonymous
+            return weights[self.s_idx]
+        raise ValueError(
+            f"No valid benign or synonymous index (b_idx={self.b_idx}, "
+            f"s_idx={self.s_idx}, weights rows={n_w})"
+        )
 
     def _compute_prior_em(self, params, weights):
         """EM prior estimation using population scores."""
+        if self.g_idx is None or self.g_idx >= weights.shape[0]:
+            return 0.5  # no population sample — neutral prior
         pop_mask = self.ms._sample_assignments[:, self.g_idx]
         pop_scores = self.ms.scores[pop_mask]
         K = len(params)
