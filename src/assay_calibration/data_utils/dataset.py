@@ -7,6 +7,7 @@ import logging
 from io import StringIO
 from tqdm import tqdm
 import json
+from joblib import Parallel, delayed  # noqa: F401
 
 logging.basicConfig()
 logging.root.setLevel(logging.NOTSET)
@@ -454,7 +455,18 @@ class Scoreset:
         self.splicing_filter(**kwargs)
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
         clinvar_release = kwargs.get("clinvar_release",'2025')
-        self.variants = [Variant(row,min_clinvar_star,clinvar_release,score_col) for _, row in self.dataframe.iterrows()]
+        n_jobs = kwargs.get("n_jobs", 1)
+        rows = self.dataframe.to_dict('records')
+        if n_jobs == 1:
+            self.variants = [
+                Variant(row, min_clinvar_star, clinvar_release, score_col)
+                for row in rows
+            ]
+        else:
+            self.variants = Parallel(n_jobs=n_jobs, prefer='threads')(
+                delayed(Variant)(row, min_clinvar_star, clinvar_release, score_col)
+                for row in rows
+            )
         self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
         self.score_avg = kwargs.get("score_avg",True)
         self._init_matrices(**kwargs)
@@ -564,36 +576,37 @@ class Scoreset:
         self._ids = []
         self.parse_population_type(**kwargs)
         group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
+        is_pop = self.is_population_member  # avoid repeated self-lookup in tight loop
         for idx, (_id, variants) in enumerate(variants_by_id.items()):
 
-                
             self._ids.append(_id)
 
+            v0 = variants[0]
             if self.score_avg:
-                variants[0].assay_score = np.mean([v.assay_score for v in variants])
-            
-            self._scores[idx] = variants[0].assay_score
-            self._auth_labels[idx] = variants[0].auth_label
-            if variants[0].is_snv:
-                self._snv_scores.append(variants[0].assay_score)
-            self._all_scores.append(variants[0].assay_score)
-            
-            if any([variant.is_vus for variant in variants]):
-                self._vus_scores.append(variants[0].assay_score)
-            
+                v0.assay_score = np.mean([v.assay_score for v in variants])
+
+            score0 = v0.assay_score
+            self._scores[idx] = score0
+            self._auth_labels[idx] = v0.auth_label
+            if v0.is_snv:
+                self._snv_scores.append(score0)
+            self._all_scores.append(score0)
+
+            if any(v.is_vus for v in variants):
+                self._vus_scores.append(score0)
+
             try:
-                self._aa_subs[idx] = variants[0].aa_ref + str(int(variants[0].aa_pos)) + variants[0].aa_alt
+                self._aa_subs[idx] = v0.aa_ref + str(int(v0.aa_pos)) + v0.aa_alt
             except (ValueError, TypeError):
                 self._aa_subs[idx] = None
 
-            
             # Store ALL unique nucleotide-level group_col tuples for this
-            # variant group (not just variants[0]).  Protein-level assays
+            # variant group (not just v0).  Protein-level assays
             # group many nucleotide substitutions under a single protein-level
             # ID; saving all of them allows MultiScoreset to match this entry
             # against any of the underlying nucleotide variants in other assays.
-            codes = []
             seen_codes: set = set()
+            codes = []
             for v in variants:
                 try:
                     code = tuple(getattr(v, g) for g in group_cols)
@@ -603,16 +616,16 @@ class Scoreset:
                 except (ValueError, TypeError):
                     pass
             self._variant_codes.append(codes if codes else None)
-            
-            if any([variant.is_synonymous for variant in variants]):
+
+            if any(v.is_synonymous for v in variants):
                 self._sample_assignments[idx, 3] = True
                 if self.synonymous_exclusive:
                     continue
-            if any([self.is_population_member(variant) for variant in variants]):
+            if any(is_pop(v) for v in variants):
                 self._sample_assignments[idx, 2] = True
-            if any([variant.is_pathogenic for variant in variants]):
+            if any(v.is_pathogenic for v in variants):
                 self._sample_assignments[idx, 0] = True
-            if any([variant.is_benign for variant in variants]):
+            if any(v.is_benign for v in variants):
                 self._sample_assignments[idx, 1] = True
         
         keep_mask = self._sample_assignments.any(axis=1)
@@ -666,10 +679,8 @@ class Scoreset:
             A dictionary where keys are unique Variant.ID values and values are lists of Variant objects with that ID
         """
         variants_by_id = {}
-        for variant_id in set(variant.ID for variant in self.variants):
-            variants_by_id[variant_id] = [
-                variant for variant in self.variants if variant.ID == variant_id
-            ]
+        for variant in self.variants:
+            variants_by_id.setdefault(variant.ID, []).append(variant)
         return variants_by_id
 
     @property
@@ -751,14 +762,15 @@ class Scoreset:
 
 
 class Variant:
-    def __init__(self, variant_info: pd.Series, min_clinvar_star: int, clinvar_release: str, score_col: str):
+    def __init__(self, variant_info, min_clinvar_star: int, clinvar_release: str, score_col: str):
         self.min_clinvar_star = min_clinvar_star
         self.clinvar_release = clinvar_release
         self.score_col = score_col
-        self.row = variant_info
-        self._init_variant_info(variant_info, score_col)
+        # Accept both pd.Series and plain dict (dict is faster from to_dict('records'))
+        self.row = variant_info if isinstance(variant_info, dict) else dict(variant_info)
+        self._init_variant_info(self.row, score_col)
 
-    def _init_variant_info(self, variant_info: pd.Series, score_col: str):
+    def _init_variant_info(self, variant_info, score_col: str):
         self.ID = None
         self.simplified_consequence = None
         self.clinvar_star = None
@@ -769,10 +781,9 @@ class Variant:
         self.aa_ref = np.nan
         self.aa_alt = ""
         self.hgvs_p = ""
-        for k, v in variant_info.items():
-            setattr(self, str(k), v)
-        self.clinvar_sig = getattr(variant_info,f"clinvar_sig_{self.clinvar_release}")
-        self.clinvar_star = getattr(variant_info,f"clinvar_star_{self.clinvar_release}")
+        self.__dict__.update({str(k): v for k, v in variant_info.items()})
+        self.clinvar_sig = variant_info[f"clinvar_sig_{self.clinvar_release}"]
+        self.clinvar_star = variant_info[f"clinvar_star_{self.clinvar_release}"]
         self.parse_gnomAD_MAF()
         self.parse_clinvar_sig()
         self.parse_consequences()
