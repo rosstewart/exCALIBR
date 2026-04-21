@@ -217,24 +217,18 @@ def _detect_q(params):
 
 def _mvn_logcdf_batch(uppers, mean, cov):
     """Batch log-CDF of multivariate normal for (N, q) upper limits.
-    For q=1, uses fast scalar path. For q>=2, loops over observations.
+    For q=1, uses fast scalar path. For q>=2, vectorised scipy call.
     """
     N, q = uppers.shape
     if q == 1:
         sigma = np.sqrt(max(float(np.asarray(cov).ravel()[0]), 1e-15))
         return norm.logcdf((uppers[:, 0] - mean[0]) / sigma)
-    result = np.full(N, -np.inf)
     try:
         rv = mvn(mean=mean, cov=cov, allow_singular=True)
+        vals = rv.cdf(uppers)   # vectorised: (N,) in one C-level call
+        return np.log(np.maximum(vals, 1e-300))
     except Exception:
-        return result
-    for j in range(N):
-        try:
-            val = rv.cdf(uppers[j])
-            result[j] = np.log(max(val, 1e-300))
-        except Exception:
-            result[j] = -np.inf
-    return result
+        return np.full(N, -np.inf)
 
 
 def _sn_logpdf(x, mu, Delta, Gamma):

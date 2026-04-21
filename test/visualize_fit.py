@@ -47,18 +47,12 @@ def _mvn_logcdf_batch(uppers, mean, cov):
     if q == 1:
         sigma = np.sqrt(max(float(np.asarray(cov).ravel()[0]), 1e-15))
         return norm.logcdf((uppers[:, 0] - mean[0]) / sigma)
-    result = np.full(N, -np.inf)
     try:
         rv = mvn(mean=mean, cov=cov, allow_singular=True)
+        vals = rv.cdf(uppers)   # vectorised: (N,) in one C-level call
+        return np.log(np.maximum(vals, 1e-300))
     except Exception:
-        return result
-    for j in range(N):
-        try:
-            val = rv.cdf(uppers[j])
-            result[j] = np.log(max(val, 1e-300))
-        except Exception:
-            result[j] = -np.inf
-    return result
+        return np.full(N, -np.inf)
 
 
 def _sn_logpdf(x, mu, Delta, Gamma):
