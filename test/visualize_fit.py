@@ -268,18 +268,23 @@ def _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S):
     Returns
     -------
     lr_1d : (n,) log-LR array
-    sample_logs : list of S arrays, each (n,)
-    comp_logs_per_sample : list of S lists, each a list of K (n,) arrays
+    sample_logs : list of S arrays, each (n,), or None if sample absent in this fit
+    comp_logs_per_sample : list of S lists (or None for absent samples)
     """
     params = fit['component_params']
     weights = fit['weights']
     K = len(params)
+    n_w = len(weights)
 
     comp_log = [_sn_logpdf(x_2d, *params[c]) for c in range(K)]
 
     sample_logs = []
     comp_logs_per_sample = []
     for s in range(S):
+        if s >= n_w:
+            sample_logs.append(None)
+            comp_logs_per_sample.append(None)
+            continue
         w_s = weights[s]
         log_d = logsumexp([np.log(w_s[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
         sample_logs.append(log_d)
@@ -362,6 +367,8 @@ def _compute_sample_density_grid(all_fits, s_idx, x1g, x2g):
     for fit in all_fits:
         params = fit['component_params']
         weights = fit['weights']
+        if s_idx >= len(weights):
+            continue
         K = len(params)
         w_s = weights[s_idx]
         log_d = logsumexp([
@@ -370,6 +377,8 @@ def _compute_sample_density_grid(all_fits, s_idx, x1g, x2g):
         ], axis=0)
         densities.append(log_d)
 
+    if not densities:
+        return None
     arr = np.array(densities)
     mean_log = logsumexp(arr, axis=0) - np.log(arr.shape[0])
     linear = np.exp(arr)
@@ -426,13 +435,15 @@ def _compute_bootstrap_marginal_lr(analysis, config, dim, x_grid):
         for fit in valid_fits
     )
 
-    # Aggregate results
+    # Aggregate results (some fits may have fewer weight rows than S)
     lr_list = [r[0] for r in results]
-    sample_logs = {s: [r[1][s] for r in results] for s in range(S)}
+    sample_logs = {s: [r[1][s] for r in results if r[1][s] is not None] for s in range(S)}
     component_logs = {s: {} for s in range(S)}
     for r in results:
         comp_logs_per_sample = r[2]
         for s in range(S):
+            if comp_logs_per_sample[s] is None:
+                continue
             for c, clog in enumerate(comp_logs_per_sample[s]):
                 component_logs[s].setdefault(c, []).append(clog)
 
@@ -445,7 +456,11 @@ def _compute_bootstrap_marginal_lr(analysis, config, dim, x_grid):
 
     sample_marginals = {}
     for s in range(S):
-        arr = np.array(sample_logs[s])
+        logs = sample_logs[s]
+        if not logs:
+            sample_marginals[s] = None
+            continue
+        arr = np.array(logs)
         mean_log = logsumexp(arr, axis=0) - np.log(arr.shape[0])
         linear = np.exp(arr)
         sample_marginals[s] = {
@@ -455,6 +470,9 @@ def _compute_bootstrap_marginal_lr(analysis, config, dim, x_grid):
 
     component_marginals = {}
     for s in range(S):
+        if not component_logs[s]:
+            component_marginals[s] = None
+            continue
         component_marginals[s] = []
         K = len(component_logs[s])
         for c in range(K):
@@ -613,24 +631,27 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
         for s_idx in range(min(S, n_cols)):
             ax = fig.add_subplot(gs[1, s_idx])
             d = _compute_sample_density_grid(all_fits, s_idx, x1g, x2g)
-            d_mean = d['mean']
-            d_std = d['std']
 
-            levels = np.linspace(d_mean.max() * 0.01, d_mean.max() * 0.95,
-                                 contour_levels)
-            cmap_name = 'Greens' if s_idx >= 2 else ('Reds' if s_idx == 0 else 'Blues')
-            if levels[-1] > levels[0]:
-                ax.contourf(x1g, x2g, d_mean.T, levels=levels,
-                            cmap=cmap_name, alpha=0.4)
-                ax.contour(x1g, x2g, d_mean.T, levels=levels,
-                           colors=SAMPLE_COLORS[s_idx], linewidths=0.5, alpha=0.6)
+            if d is not None:
+                d_mean = d['mean']
+                d_std = d['std']
 
-            outer = levels[1] if len(levels) > 1 else levels[0]
-            for bound, ls in [(np.maximum(d_mean - d_std, 0), ':'),
-                              (d_mean + d_std, ':')]:
-                ax.contour(x1g, x2g, bound.T, levels=[outer],
-                           colors=SAMPLE_COLORS[s_idx], linewidths=0.3,
-                           linestyles=ls, alpha=0.3)
+                levels = np.linspace(d_mean.max() * 0.01, d_mean.max() * 0.95,
+                                     contour_levels)
+                cmap_name = 'Greens' if s_idx >= 2 else ('Reds' if s_idx == 0 else 'Blues')
+                if levels[-1] > levels[0]:
+                    ax.contourf(x1g, x2g, d_mean.T, levels=levels,
+                                cmap=cmap_name, alpha=0.4)
+                    ax.contour(x1g, x2g, d_mean.T, levels=levels,
+                               colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                               linewidths=0.5, alpha=0.6)
+
+                outer = levels[1] if len(levels) > 1 else levels[0]
+                for bound, ls in [(np.maximum(d_mean - d_std, 0), ':'),
+                                  (d_mean + d_std, ':')]:
+                    ax.contour(x1g, x2g, bound.T, levels=[outer],
+                               colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                               linewidths=0.3, linestyles=ls, alpha=0.3)
 
             mask = sa[:, s_idx] & complete
             if mask.any():
@@ -663,21 +684,26 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
         for s_idx in range(min(S, n_cols - 1)):
             ax = fig.add_subplot(gs[row, s_idx])
 
-            if md['sample'] is not None:
-                total_mean = md['sample'][s_idx]['mean']
-                total_std = md['sample'][s_idx]['std']
-                ax.plot(x_marg, total_mean, color=SAMPLE_COLORS[s_idx],
+            s_data = md['sample'][s_idx] if md['sample'] is not None else None
+            if s_data is not None:
+                total_mean = s_data['mean']
+                total_std = s_data['std']
+                ax.plot(x_marg, total_mean,
+                        color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
                         lw=1.5, zorder=3)
                 ax.fill_between(x_marg,
                                 np.maximum(total_mean - total_std, 0),
                                 total_mean + total_std,
-                                color=SAMPLE_COLORS[s_idx], alpha=0.08)
+                                color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                                alpha=0.08)
 
-                if md['components'] is not None:
-                    n_comp = len(md['components'][s_idx])
+                c_data = (md['components'][s_idx]
+                          if md['components'] is not None else None)
+                if c_data is not None:
+                    n_comp = len(c_data)
                     comp_colors = plt.cm.Set2(np.linspace(0, 1, max(n_comp, 3)))
                     for c in range(n_comp):
-                        c_mean = md['components'][s_idx][c]['mean']
+                        c_mean = c_data[c]['mean']
                         if c_mean.max() < total_mean.max() * 0.005:
                             continue
                         ax.plot(x_marg, c_mean, color=comp_colors[c],
