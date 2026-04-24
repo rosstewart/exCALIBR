@@ -191,20 +191,39 @@ def process_component_fits(
     elif benign_idx is None and (config.benign_method == 'avg' or config.benign_method == 'benign'):
         logger.warning(f"  No benign sample, setting benign_method from {config.benign_method} to synonymous")
         config.benign_method = 'synonymous'
-    
-    # Adjust indices if benign is missing
-    if benign_idx is None:
-        gnomad_idx -= 1
-        if synonymous_idx is not None:
-            synonymous_idx -= 1
-    
-    # Adjust indices if pathogenic is missing
-    if pathogenic_idx is None:
-        gnomad_idx -= 1
-        if benign_idx is not None:
-            benign_idx -= 1
-        if synonymous_idx is not None:
-            synonymous_idx -= 1
+
+    # Adjust indices to match fit weight arrays.
+    # Scoreset (IGVF format) always has columns for all 4 sample types, but
+    # fits only include weights for non-empty samples, so indices must shift.
+    # BasicScoreset columns already match fit weights directly — no adjustment.
+    if not isinstance(scoreset, BasicScoreset):
+        if benign_idx is None:
+            gnomad_idx -= 1
+            if synonymous_idx is not None:
+                synonymous_idx -= 1
+        if pathogenic_idx is None:
+            gnomad_idx -= 1
+            if benign_idx is not None:
+                benign_idx -= 1
+            if synonymous_idx is not None:
+                synonymous_idx -= 1
+
+    # Validate indices against actual fit weight length
+    n_weights = len(fits[0]['fit']['weights'])
+    for name, idx in [("pathogenic", pathogenic_idx), ("benign", benign_idx),
+                      ("gnomad", gnomad_idx), ("synonymous", synonymous_idx)]:
+        if idx is not None and idx >= n_weights:
+            logger.warning(f"  {name}_idx={idx} exceeds fit weights length ({n_weights}), setting to None")
+            if name == "synonymous":
+                synonymous_idx = None
+            elif name == "benign":
+                benign_idx = None
+
+    # Re-check benign_method after validation
+    if synonymous_idx is None and config.benign_method == 'avg':
+        config.benign_method = 'benign'
+    elif benign_idx is None and config.benign_method == 'avg':
+        config.benign_method = 'synonymous'
     
     logger.info(f"  Sample indices: P={pathogenic_idx}, B={benign_idx}, G={gnomad_idx}, S={synonymous_idx}")
     
