@@ -245,7 +245,11 @@ def run_calibration_pipeline(config: PipelineConfig):
         logger.info(f"\nCompleted {len(bootstrap_results)} bootstrap iterations")
 
     # Step 2: Model selection (if fitting multiple components)
-    selected_components = {}
+    # Always process ALL fitted components; model selection annotates the
+    # preferred one (saved to *_model_selection.json) but does not filter.
+    selected_components = {f"{c}c": c for c in config.components}
+    selected_k = None
+
     if len(config.components) > 1 and config.auto_select_model:
         logger.info("\n" + "="*80)
         logger.info("STEP 2: Model Selection")
@@ -266,18 +270,13 @@ def run_calibration_pipeline(config: PipelineConfig):
 
             if config.use_conservative_selection:
                 selected_k = test_result['conservative_k']
-                logger.info(f"\nUsing conservative selection (5th percentile): {selected_k}c")
+                logger.info(f"\nModel selection (conservative): {selected_k}c")
             else:
                 selected_k = test_result['selected_k']
-                logger.info(f"\nUsing p-value selection: {selected_k}c")
+                logger.info(f"\nModel selection (p-value): {selected_k}c")
 
-            selected_components = {f"{selected_k}c": selected_k}
-        else:
-            # Just use all fitted components
-            selected_components = {f"{c}c": c for c in config.components}
+            logger.info(f"  Processing all components: {list(selected_components.keys())}")
     else:
-        # Use all fitted components
-        selected_components = {f"{c}c": c for c in config.components}
         logger.info(f"\nUsing fitted components: {list(selected_components.keys())}")
 
     # Step 3a: Generate visualizations and export
@@ -321,7 +320,8 @@ def run_calibration_pipeline(config: PipelineConfig):
         results=results,
         bootstrap_results=bootstrap_results if fits_are_fresh else None,
         config=config,
-        logger=logger
+        logger=logger,
+        selected_k=selected_k,
     )
 
     logger.info("\n" + "="*80)

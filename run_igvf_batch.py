@@ -80,7 +80,15 @@ def run_single_dataset(
     args,
     dataset_splits: Optional[Dict] = None,
 ) -> Optional[Dict]:
-    """Run calibration for a single dataset within the batch."""
+    """Run calibration for a single dataset within the batch.
+
+    Parameters
+    ----------
+    n_c : str
+        Component key, e.g. ``"2c"`` or ``"3c"``.  The special value
+        ``"all"`` processes both 2c and 3c (with model selection saved
+        but all components output).
+    """
 
     dataset_df = df[df["Dataset"] == dataset_name.replace("_clinvar_2018", "")]
     if len(dataset_df) == 0:
@@ -92,15 +100,18 @@ def run_single_dataset(
     if "not_clinvar_2018" in dataset_name:
         clinvar_release = "2025"
 
-    # Parse component count
-    n_components = int(n_c.replace("c", ""))
+    # Build component list
+    if n_c == "all":
+        component_list = [2, 3]
+    else:
+        component_list = [int(n_c.replace("c", ""))]
 
     # Build per-dataset config
     config = PipelineConfig(
         dataset_csv=args.dataset,
         dataset_name=dataset_name,
         output_dir=os.path.join(args.output_dir, dataset_name),
-        components=[n_components],
+        components=component_list,
         use_median_prior=True,
         use_2c_equation=False,
         liberal_monotonicity=overrides.get("liberal_monotonicity", True),
@@ -126,13 +137,29 @@ def run_single_dataset(
 
         n_samples = len([s for s in scoreset.samples])
         logger.info(f"Dataset {dataset_name}: {len(scoreset.scores)} variants, "
-                     f"{n_samples} samples, {n_c} {benign_method}")
+                     f"{n_samples} samples, components={component_list} {benign_method}")
 
-        # Select component key
-        component_key = n_c if n_c.endswith("c") else f"{n_c}c"
-        selected_components = {component_key: n_components}
+        # Build selected_components dict
+        selected_components = {f"{c}c": c for c in component_list}
 
-        # Generate calibration
+        # Model selection (when processing multiple components)
+        selected_k = None
+        if len(component_list) > 1:
+            try:
+                test_result = bootstrap_paired_test(
+                    bootstrap_results, verbose=False
+                )
+                selected_k = test_result["conservative_k"]
+                logger.info(f"  Model selection: {selected_k}c")
+
+                # Save model selection result
+                test_file = output_dir / f"{dataset_name}_model_selection.json"
+                with open(test_file, "w") as f:
+                    json.dump(test_result, f, indent=2)
+            except Exception as e:
+                logger.warning(f"  Model selection failed: {e}")
+
+        # Generate calibration for ALL components
         results = generate_visualizations(
             bootstrap_results=bootstrap_results,
             config=config,
@@ -164,6 +191,7 @@ def run_single_dataset(
             bootstrap_results=None,
             config=config,
             logger=logger,
+            selected_k=selected_k,
         )
 
         return results
@@ -183,8 +211,10 @@ def main():
 
     parser.add_argument("--dataset", required=True,
                        help="Path to input CSV/TSV with all datasets (must have 'Dataset' column)")
-    parser.add_argument("--dataset-configs", required=True,
-                       help="Path to JSON config mapping dataset names to [n_c, benign_method, {overrides}]")
+    parser.add_argument("--dataset-configs", default=None,
+                       help="Path to JSON config mapping dataset names to [n_c, benign_method, {overrides}]. "
+                            "If omitted, all datasets in --precomputed-fits are processed with "
+                            "default settings (2c+3c, avg, model selection enabled).")
     parser.add_argument("--precomputed-fits", required=True,
                        help="Path to precomputed bootstrap fits (gzipped JSON)")
     parser.add_argument("--output-dir", default="./igvf_output",
@@ -222,24 +252,34 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print("IGVF BATCH CALIBRATION PIPELINE")
+    print("BATCH CALIBRATION PIPELINE")
     print("=" * 80)
-
-    # Load dataset configs
-    with open(args.dataset_configs, "r") as f:
-        dataset_configs = json.load(f)
-    print(f"\nLoaded {len(dataset_configs)} dataset configurations")
-
-    # Filter to requested datasets
-    if args.datasets:
-        dataset_configs = {k: v for k, v in dataset_configs.items() if k in args.datasets}
-        print(f"Filtered to {len(dataset_configs)} requested datasets")
 
     # Load precomputed fits
     print(f"\nLoading precomputed fits from {args.precomputed_fits}...")
     with gzip.open(args.precomputed_fits, "rt", encoding="utf-8") as f:
         all_bootstrap_results = json.load(f)
     print(f"Loaded fits for {len(all_bootstrap_results)} datasets")
+
+    # Load dataset configs (or auto-discover from precomputed fits)
+    if args.dataset_configs is not None:
+        with open(args.dataset_configs, "r") as f:
+            dataset_configs = json.load(f)
+        print(f"\nLoaded {len(dataset_configs)} dataset configurations")
+    else:
+        # No config provided: auto-discover all datasets from precomputed fits
+        # Default: process both 2c and 3c with model selection, avg benign method
+        print(f"\nNo --dataset-configs provided; using defaults for all "
+              f"{len(all_bootstrap_results)} datasets (both 2c+3c, model selection)")
+        dataset_configs = {
+            name: ["all", "avg"]  # "all" = process 2c+3c with model selection
+            for name in all_bootstrap_results
+        }
+
+    # Filter to requested datasets
+    if args.datasets:
+        dataset_configs = {k: v for k, v in dataset_configs.items() if k in args.datasets}
+        print(f"Filtered to {len(dataset_configs)} requested datasets")
 
     # Load input data
     sep = "\t" if args.dataset.endswith((".tsv", ".tsv.gz")) else ","
@@ -266,8 +306,9 @@ def main():
 
         n_c, benign_method, overrides = parse_dataset_config(config_entry)
 
-        # Auto-select model if requested
-        if args.auto_select_model:
+        # Auto-select model if requested (only when config specifies a single n_c;
+        # "all" already handles model selection inside run_single_dataset)
+        if args.auto_select_model and n_c != "all":
             try:
                 test_result = bootstrap_paired_test(
                     all_bootstrap_results[dataset_name], verbose=False

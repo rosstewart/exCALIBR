@@ -64,7 +64,8 @@ def save_results(
     results: Dict,
     bootstrap_results: Optional[Dict],
     config: PipelineConfig,
-    logger: logging.Logger
+    logger: logging.Logger,
+    selected_k: Optional[int] = None,
 ):
     """Save calibration results and optionally bootstrap fits.
 
@@ -98,6 +99,7 @@ def save_results(
             'clinvar_2018': config.clinvar_release == '2018',
             'scoreset_flipped': calibration.get('scoreset_flipped', False),
             'uncalibratable_reason': None,
+            'model_selected': (component_key == f"{selected_k}c") if selected_k is not None else None,
         }
 
         json_file = output_dir / f"{config.dataset_name}_{component_key}_calibration.json"
