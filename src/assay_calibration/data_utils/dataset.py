@@ -222,7 +222,14 @@ class BasicScoreset:
         self.validate_sample_assignments()
         self.sample_counts = self._sample_assignments.sum(axis=0)
         self.scoreset_name = kwargs.get("scoreset_name", "BasicScoreset")
-        self.sample_names = kwargs.get("sample_names",["Pathogenic/Likely Pathogenic","Benign/Likely Benign","gnomAD","Synonymous"])[:self.n_samples]
+        _default_names_4 = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD", "Synonymous"]
+        _default_names_3 = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD"]
+        if "sample_names" in kwargs:
+            self.sample_names = kwargs["sample_names"]
+        elif self.n_samples == 3:
+            self.sample_names = _default_names_3
+        else:
+            self.sample_names = _default_names_4[:self.n_samples]
 
     def validate_inputs(self):
         n_observations = self.scores.shape[0]
@@ -249,7 +256,7 @@ class BasicScoreset:
                 print(
                     "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."
                 )
-                unique_samples = list(set(sample_vals))
+                unique_samples = sorted(set(sample_vals))
                 self._sample_assignments = np.zeros(
                     (len(sample_vals), len(unique_samples)), dtype=bool
                 )
