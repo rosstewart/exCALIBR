@@ -234,16 +234,27 @@ class BasicScoreset:
     def validate_sample_assignments(self):
         ndim = self._sample_assignments.ndim
         if ndim == 1:
-            print(
-                "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."
-            )
-            sample_ids = np.array(self._sample_assignments)
-            unique_samples = list(set(sample_ids))
-            self._sample_assignments = np.zeros(
-                (len(sample_ids), len(unique_samples)), dtype=bool
-            )
-            for sampleNum, sample_id in enumerate(unique_samples):
-                self._sample_assignments[:, sampleNum] = sample_ids == sample_id
+            sample_vals = np.array(self._sample_assignments)
+            # Check if values are comma-separated strings (e.g. "0,1")
+            if sample_vals.dtype.kind in ('U', 'O') and any(',' in str(v) for v in sample_vals[:min(10, len(sample_vals))]):
+                all_keys = sorted({k for v in sample_vals for k in str(v).split(',')})
+                self._sample_assignments = np.zeros(
+                    (len(sample_vals), len(all_keys)), dtype=bool
+                )
+                key_to_idx = {k: i for i, k in enumerate(all_keys)}
+                for row, v in enumerate(sample_vals):
+                    for k in str(v).split(','):
+                        self._sample_assignments[row, key_to_idx[k]] = True
+            else:
+                print(
+                    "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."
+                )
+                unique_samples = list(set(sample_vals))
+                self._sample_assignments = np.zeros(
+                    (len(sample_vals), len(unique_samples)), dtype=bool
+                )
+                for sampleNum, sample_id in enumerate(unique_samples):
+                    self._sample_assignments[:, sampleNum] = sample_vals == sample_id
         elif ndim != 2:
             raise ValueError(
                 f"sample_assignments must be a 1D list of sample ids or 2D array of one-hot vectors, got {ndim} dimensions"

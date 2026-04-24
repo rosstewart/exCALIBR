@@ -194,12 +194,25 @@ def load_dataset_from_df(df, config):
     # Filter to specific dataset if needed
     if "Dataset" in df.columns:
         df = df[df["Dataset"] == config.dataset_name]
-        
+
     if "scores" in df.columns and "sample_assignments" in df.columns:
-        return BasicScoreset(df["scores"], df["sample_assignments"])
-        
+        return BasicScoreset(df["scores"].values, df["sample_assignments"].values)
+
+    # Detect score column: IGVF datasets use "auth_reported_score",
+    # standalone datasets use "score"
+    if "auth_reported_score" in df.columns:
+        score_col = "auth_reported_score"
+    elif "score" in df.columns:
+        score_col = "score"
+    else:
+        raise KeyError(
+            f"Dataset must have an 'auth_reported_score' or 'score' column. "
+            f"Found columns: {list(df.columns)}"
+        )
+
     return Scoreset(
         df,
+        score_col=score_col,
         clinvar_release=config.clinvar_release,
         min_clinvar_star=config.min_clinvar_star,
         population_type=config.population_type,
