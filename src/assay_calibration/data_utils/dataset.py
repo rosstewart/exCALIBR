@@ -339,6 +339,33 @@ class Scoreset:
             output_path.parent.mkdir(parents=True, exist_ok=True)
         self.dataframe.to_json(output_path, orient="records", lines=True)
 
+    def to_csv(self, output_path: Path | str):
+        """
+        Save the scoreset to a simple output CSV.
+
+        Parameters
+        ----------
+        output_path : Path|str
+            The path to save the CSV file to
+
+        Returns
+        -------
+        None
+        """
+        output_path = Path(output_path)
+        if not output_path.parent.exists():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        rows, cols = np.where(self.sample_assignments)
+        sample_assignments_str = [
+            ",".join(map(str, cols[rows == i])) 
+            for i in range(self.sample_assignments.shape[0])
+        ]
+
+        output_df = pd.DataFrame({"score": self.scores, "sample": sample_assignments_str})
+        
+        output_df.to_csv(output_path, index=False)
+
     @classmethod
     def from_dataframe(cls, dataframe: pd.DataFrame, **kwargs):
         """
