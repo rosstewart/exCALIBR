@@ -21,7 +21,7 @@ sys.path.append(str(Path(os.getcwd()).parent))
 #     Scoreset as Scoreset_clinvar_func,
 # )
 from src.assay_calibration.data_utils.dataset import (
-    Scoreset,
+    BasicScoreset,
 )
 import json
 import glob
@@ -33,7 +33,7 @@ import pandas as pd
 # STEP 1: Generate consolidated job manifest
 # ============================================================================
 
-def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2025"):
+def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, score_col, clinvar_release="2025"):
     """Process a single dataset and return consolidated jobs (one per bootstrap)."""
     if clinvar_release == "2025":
         dataset_name = dataset
@@ -42,10 +42,16 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_rel
     save_dir = f'{output_dir}/{dataset_name}'
     os.makedirs(save_dir, exist_ok=True)
 
+    onehot = (
+        df["sample_assignments"]
+        .str.get_dummies(sep=",")
+        .reindex(columns=["0", "1", "2"], fill_value=0)
+        .astype(bool)
+        .to_numpy()
+    )
+    
     try:
-        ds = Scoreset(df[df["Dataset"] == dataset],
-                            clinvar_release=clinvar_release,
-                            min_clinvar_star=1)
+        ds = BasicScoreset(scores=df["score"], sample_assignments=onehot)
     except ValueError as e:
         print(f"{dataset} skipping: {e}")
         return
@@ -159,13 +165,34 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_rel
     return all_jobs
 
 def requires_2018(df, dataset):
-    genes_2018 = ['BRCA1', 'PTEN', 'MSH2', 'TP53']
-    gene = df[df["Dataset"] == dataset]["Gene"].iloc[0]
+    return False
+    # genes_2018 = ['BRCA1', 'PTEN', 'MSH2', 'TP53']
+    # gene = df[df["Dataset"] == dataset]["Gene"].iloc[0]
 
-    return gene in genes_2018
+    # return gene in genes_2018
+
+def generate_single_predictor_datasets():
+    from collections import defaultdict
+
+    wd = '/data/ross/assay_calibration'
+    data_dir = f"{wd}/predictor_scores/single_gene_calibration_data"
+
+    sg_calibration_genes = ["BRCA1","BRCA2", "F9","JAG1","MSH2","SCN5A","TP53","TSC2"]
+    predictors = ("REVEL", "MP2", "AM")
+
+    
+    predictor_datasets = defaultdict(dict)
+    for gene in sg_calibration_genes:
+        for predictor in predictors:
+            out_path = f"{data_dir}/{gene}/{gene}_{predictor}.csv.gz"
+
+            # cols protein_variant, score, and sample_assignemnts
+            predictor_datasets[predictor][gene] = pd.read_csv(out_path, compression="gzip")
+
+    return predictor_datasets
     
 
-def generate_job_manifest(target_array_size=1000, n_jobs=30, run_downsample_discordance=False):
+def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30):
     """
     Generate job manifest optimized for MAX_ARRAY_SIZE limit.
     
@@ -174,28 +201,40 @@ def generate_job_manifest(target_array_size=1000, n_jobs=30, run_downsample_disc
         n_jobs: Number of parallel workers for job generation
     """
     
-    output_dir = "/data/ross/assay_calibration/explorer_jobs_multivariate"
     jobs_dir = f"{output_dir}/jobs"
     os.makedirs(jobs_dir, exist_ok=True)
     
     N_BOOTSTRAPS = 1000
     NUM_FITS = 100  # fits per bootstrap per component
     
-    df = pd.read_csv("/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz", sep='\t')
-    datasets = df.Dataset.unique()
+    # dataset_files = glob.glob("/data/ross/assay_calibration/scoresets_12_04_25_rerun/*.json")
+    # df = pd.read_csv("/data/ross/assay_calibration/scoresets_12_01_25/final_pillar_data_with_clinvar_18_25_gnomad_wREVEL_wAM_wspliceAI_wMutpred2_wtrainvar_expanded_111225.csv")
+    # df = pd.read_csv("/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz", sep='\t')
+    # datasets = df.Dataset.unique()
+    predictor_datasets = generate_single_predictor_datasets()
+    
     
     # print(f"Generating consolidated jobs from {len(dataset_files)} datasets...")
     print(f"Target array size: {target_array_size}")
     print(f"Parallel workers: {n_jobs if n_jobs > 0 else 'all CPUs'}")
+
     
     # Process all datasets in parallel
     print("\nLoading datasets and generating jobs...")
+    
     all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(process_dataset)(
-            df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2025" if not requires_2018(df,dataset) else "2018"
-        ) for dataset in datasets #requires_2018(df, dataset)
+            dataset,                 # The actual data object
+            f"{pred}_{gene}",        # The combined name
+            output_dir, 
+            N_BOOTSTRAPS, 
+            NUM_FITS, 
+            None
+        ) 
+        for pred, gene_map in predictor_datasets.items()     # Outer loop: Predictor level
+        for gene, dataset in gene_map.items()                # Inner loop: Gene level
     )
-    
+        
     # Flatten
     print("\nFlattening and organizing jobs...")
     all_jobs = []
@@ -485,17 +524,13 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Setup HPC job array for bootstrap fits')
+    parser.add_argument('output_dir', type=str,
+                       help='Output directory')
     parser.add_argument('--target-array-size', type=int, default=1000,
                        help='Target number of array tasks (default: 1000, cluster MAX_ARRAY_SIZE)')
     parser.add_argument('--n-jobs', type=int, default=30,
                        help='Number of parallel workers for job generation (default: 30)')
-    parser.add_argument('--n-jobs', type=int, default=30,
-                       help='Number of parallel workers for job generation (default: 30)')
-    parser.add_argument('--run_downsample_discordance', action='store_true',
-                   help='Generate jobs for downsampling and discordance analyses (default: False)')
     args = parser.parse_args()
-    
-    output_dir = "/data/ross/assay_calibration/explorer_jobs_multivariate"
     
     print("="*80)
     print("HPC Job Array Setup - Consolidated Bootstrap Fits")
@@ -503,9 +538,9 @@ if __name__ == "__main__":
     
     # Generate all jobs and scripts
     total_jobs, num_arrays = generate_job_manifest(
+        args.output_dir,
         target_array_size=args.target_array_size,
-        n_jobs=args.n_jobs,
-        run_downsample_discordance=args.run_downsample_discordance
+        n_jobs=args.n_jobs
     )
     # create_worker_script(output_dir)
     # create_status_checker(output_dir)

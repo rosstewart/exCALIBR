@@ -629,52 +629,52 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     
     return fig
 
-
 def plot_scores_only(dataset, scoreset):
     n_samples = len([s for s in scoreset.samples])
     score_range = [min(scoreset.scores), max(scoreset.scores)]
     
-    # Create figure: 3 rows, n_samples columns (all square)
     fig, ax = plt.subplots(1, n_samples, figsize=(7*n_samples, 6), 
                            squeeze=False, gridspec_kw={'hspace': 0.3, 'wspace': 0.3})
-
     
-    # ===== Row 0: Sample fits =====
+    COLORS = {0: '#CA7682', 1: '#1D7AAB', 2: '#A0A0A0', 3: '#6BAA75'}
+    ALPHAS  = {0: 0.6,      1: 0.6,      2: 0.3,      3: 0.5}
+
     num_skipped = 0
     for sample_num in range(len(scoreset.sample_counts)):
         if scoreset.sample_counts[sample_num] == 0:
             num_skipped += 1
             continue
-        ax_fit = ax[0, sample_num-num_skipped]
-        
-        # Get sample mask
-        sample_mask = scoreset.sample_assignments[:,sample_num-num_skipped]
-        
-        # Plot based on sample number (which category)
-        if sample_num == 0:  # P/LP
-            sns.histplot(scoreset.scores[sample_mask], 
-                         stat='density', ax=ax_fit, alpha=0.6, color='#CA7682')
-        elif sample_num == 1:  # B/LB
-            sns.histplot(scoreset.scores[sample_mask], 
-                         stat='density', ax=ax_fit, alpha=0.6, color='#1D7AAB')
-        elif sample_num == 2:  # gnomAD
-            sns.histplot(scoreset.scores[sample_mask], 
-                         stat='density', ax=ax_fit, alpha=0.3, color='#A0A0A0')
-        elif sample_num == 3:  # Synonymous
-            sns.histplot(scoreset.scores[sample_mask], 
-                         stat='density', ax=ax_fit, alpha=0.5, color='#6BAA75')
-    
-        max_hist_density = max([patch.get_height() for patch in ax_fit.patches]) if ax_fit.patches else 1.0
+        ax_fit = ax[0, sample_num - num_skipped]
+        sample_mask = scoreset.sample_assignments[:, sample_num - num_skipped]
+        sample_scores = scoreset.scores[sample_mask]
+        n = sample_mask.sum()
 
-        
-        ax_fit.set_title(f"{scoreset.sample_names[sample_num].replace('population','gnomAD')}\n(n={scoreset.sample_assignments[:,sample_num-num_skipped].sum():,d})")
+        # Adaptive bin count: sqrt(n) with floor=5, cap=30
+        n_bins = int(np.clip(np.sqrt(n), 5, 30))
+
+        sns.histplot(
+            sample_scores,
+            bins=n_bins,
+            binrange=score_range,   # pin to global range for comparability
+            stat='density',
+            ax=ax_fit,
+            alpha=ALPHAS.get(sample_num, 0.5),
+            color=COLORS.get(sample_num, '#888888'),
+        )
+
+        max_hist_density = (
+            max(p.get_height() for p in ax_fit.patches)
+            if ax_fit.patches else 1.0
+        )
+
+        label = scoreset.sample_names[sample_num].replace('population', 'gnomAD')
+        ax_fit.set_title(f"{label}\n(n={n:,d})")
         ax_fit.set_xlabel("Score")
         ax_fit.set_ylabel("Density")
         ax_fit.set_ylim([0, max_hist_density * 1.1])
         ax_fit.grid(linewidth=0.5, alpha=0.3)
-        
-    fig.suptitle(dataset)
-    
+
+    fig.suptitle(dataset, fontsize=18, fontweight="heavy", y=1.02)
     return fig
 
 def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, score_range, config, n_c, n_samples, relax=False, flipped=False, debug=False):

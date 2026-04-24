@@ -469,6 +469,12 @@ class Scoreset:
             )
         self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
         self.score_avg = kwargs.get("score_avg",True)
+
+        # for discordance and downsampling analyses
+        self.discordance_pct = kwargs.get("discordance_pct",0.0)
+        self.downsample_n_variants = kwargs.get("downsample_n_variants",None)
+        self.downsample_seed = kwargs.get("downsample_seed",None)
+        
         self._init_matrices(**kwargs)
 
     def filter_invalid(self):
@@ -546,7 +552,6 @@ class Scoreset:
         
         """
         self.has_synomyous = any([variant.is_synonymous for variant in self.variants])
-        # if self.has_synomyous:
         self.NSamples = 4
         self.sample_names = [
             "Pathogenic/Likely Pathogenic",
@@ -554,13 +559,6 @@ class Scoreset:
             "population",
             "Synonymous",
         ]
-        # else:
-        #     self.NSamples = 3
-        #     self.sample_names = [
-        #         "Pathogenic/Likely Pathogenic",
-        #         "Benign/Likely Benign",
-        #         "population",
-        #     ]
         variants_by_id = self.get_variants_by_id()
         self.n_variants = len(variants_by_id)
         self._sample_assignments = np.zeros(
@@ -633,11 +631,82 @@ class Scoreset:
         self._scores = self.scores[keep_mask]
         self._sample_assignments = self._sample_assignments[keep_mask]
         self._auth_labels = self._auth_labels[keep_mask]
+        self._aa_subs = self._aa_subs[keep_mask]
+
+        
+        if self.discordance_pct != 0:
+            self._sample_assignments = self.add_label_noise(self._sample_assignments, self.discordance_pct)
+        
+        if self.downsample_n_variants is not None:
+            keep_mask_downsample = self.downsample_controls(self._sample_assignments, self.downsample_n_variants, self.downsample_seed)
+            self._keep_mask_downsample = keep_mask_downsample
+            self._scores = self._scores[keep_mask_downsample]
+            self._sample_assignments = self._sample_assignments[keep_mask_downsample]
+            self._auth_labels = self._auth_labels[keep_mask_downsample]
+            self._aa_subs = self._aa_subs[keep_mask_downsample]
+
         self.n_variants = len(self._scores)
         self.sample_counts = self._sample_assignments.sum(axis=0)
         self._snv_scores = np.array(self._snv_scores)
         self._vus_scores = np.array(self._vus_scores)
         self._all_scores = np.array(self._all_scores)
+
+    
+
+    def add_label_noise(self, sample_assignments, discordance_pct):
+        """
+        Introduces label noise by overwriting a discordance_pct fraction of pathogenic
+        (col 0) rows with randomly sampled benign rows, and vice versa. Each class is
+        treated independently, so 1% discordance means exactly 1% of P and 1% of B
+        are affected. Sampling is done from the original assignments to avoid
+        order-dependency. Seed is deterministic based on discordance_pct.
+        """
+        assert 0 <= discordance_pct <= 0.5, (
+            f"discordance_pct must be between 0 and 0.5 inclusive, got {discordance_pct}"
+        )
+        rng = np.random.default_rng(seed=int(discordance_pct * 1e6))
+        assignments = sample_assignments.copy()
+    
+        path_idx = np.where(assignments[:, 0])[0]
+        ben_idx  = np.where(assignments[:, 1])[0]
+    
+        n_path_flip = int(discordance_pct * len(path_idx))
+        n_ben_flip  = int(discordance_pct * len(ben_idx))
+    
+        # Overwrite P->B: selected pathogenic rows get a randomly sampled benign row
+        flip_path = rng.choice(path_idx, size=n_path_flip, replace=False)
+        src_ben   = rng.choice(ben_idx,  size=n_path_flip, replace=True)
+        assignments[flip_path] = sample_assignments[src_ben]
+    
+        # Overwrite B->P: selected benign rows get a randomly sampled pathogenic row
+        flip_ben  = rng.choice(ben_idx,  size=n_ben_flip,  replace=False)
+        src_path  = rng.choice(path_idx, size=n_ben_flip,  replace=True)
+        assignments[flip_ben] = sample_assignments[src_path]
+    
+        return assignments
+
+
+    def downsample_controls(self, sample_assignments, downsample_n_variants, downsample_seed):
+        """
+        Downsample pathogenic (col 0) and benign (col 1) variants each to at most
+        downsample_n_variants, keeping all non-control rows intact.
+        Returns a boolean keep mask over the input arrays.
+        Seed is deterministic based on downsample_seed.
+        """
+        assert downsample_seed is not None, f"downsample_seed must be set to enforce multiple reproducible runs"
+        
+        rng = np.random.default_rng(seed=int(downsample_seed))
+        keep = np.ones(len(sample_assignments), dtype=bool)
+    
+        for col in (0, 1):          # 0 = pathogenic, 1 = benign
+            idx = np.where(sample_assignments[:, col])[0]
+            if len(idx) > downsample_n_variants:
+                drop = rng.choice(idx, size=len(idx) - downsample_n_variants, replace=False)
+                keep[drop] = False
+    
+        return keep
+    
+    
 
     def parse_population_type(self,**kwargs):
         population_type = kwargs.get("population_type",'gnomAD')
@@ -740,7 +809,7 @@ class Scoreset:
         return self._keep_mask
 
     def __repr__(self):
-        out = f"{self.scoreset_name}: {len(self)} total variants\n"
+        out = f"{self.scoreset_name}: {len(self.scores)} total variants\n"
         for sample_scores, sample_name in self.samples:
             out += f"\t{sample_name}: {len(sample_scores)} variants\n"
 
@@ -951,6 +1020,9 @@ def summarize_datasets(dataframe_path, **kwargs):
             synonymous_exclusive=kwargs.get("synonymous_exclusive", False),
             score_avg=kwargs.get("score_avg", False),
             score_col=kwargs.get("score_col", "auth_reported_score"),
+            discordance_pct = kwargs.get("discordance_pct",0.0),
+            downsample_n_variants = kwargs.get("downsample_n_variants",None),
+            downsample_seed = kwargs.get("downsample_seed",None),
             filter_nonsense=kwargs.get("filter_nonsense", False)
         )
         f.write(f"{dataset_name}\n")
