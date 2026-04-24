@@ -211,4 +211,7 @@ def load_dataset_from_df(df, config):
             f"'score' + 'sample_assignments' columns. Found: {list(df.columns)}"
         )
 
-    return BasicScoreset(df["score"].values, df["sample_assignments"].values)
+    kwargs = {}
+    if config.sample_names is not None:
+        kwargs["sample_names"] = config.sample_names
+    return BasicScoreset(df["score"].values, df["sample_assignments"].values, **kwargs)

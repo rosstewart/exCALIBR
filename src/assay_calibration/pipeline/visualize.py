@@ -226,7 +226,20 @@ def process_component_fits(
         config.benign_method = 'synonymous'
     
     logger.info(f"  Sample indices: P={pathogenic_idx}, B={benign_idx}, G={gnomad_idx}, S={synonymous_idx}")
-    
+
+    # Debug: sample names, counts, and mean scores per sample
+    if config.debug:
+        logger.info("  [DEBUG] Sample detection:")
+        for i, name in enumerate(scoreset.sample_names):
+            count = scoreset.sample_counts[i]
+            if count > 0:
+                mean_sc = np.mean(scoreset.scores[scoreset._sample_assignments[:, i]])
+                logger.info(f"    col {i}: '{name}' — {count} variants, mean score = {mean_sc:.4f}")
+            else:
+                logger.info(f"    col {i}: '{name}' — 0 variants (empty)")
+        logger.info(f"    isinstance(BasicScoreset): {isinstance(scoreset, BasicScoreset)}")
+        logger.info(f"    benign_method: {config.benign_method}")
+
     if config.manual_prior is not None:
         # Use manually specified prior — skip estimation
         prior = config.manual_prior
@@ -336,7 +349,12 @@ def process_component_fits(
         Cs.append(C)
     
     log_lr_plus = log_fp - log_fb
-    
+
+    if config.debug:
+        logger.info(f"  [DEBUG] LR+ stats: shape={log_lr_plus.shape}")
+        logger.info(f"    log_lr_plus[0] range: [{np.nanmin(log_lr_plus[0]):.4f}, {np.nanmax(log_lr_plus[0]):.4f}]")
+        logger.info(f"    Prior: {prior:.6f}, fit_priors range: [{np.nanmin(fit_priors):.6f}, {np.nanmax(fit_priors):.6f}]")
+
     # Compute C range
     C = np.array([np.nanpercentile(Cs, 5), np.nanpercentile(Cs, 95)])
     
@@ -373,6 +391,17 @@ def process_component_fits(
         scoreset_flipped = config.scoreset_flipped_override
 
     logger.info(f"  Scoreset flipped: {scoreset_flipped}")
+
+    if config.debug:
+        logger.info(f"  [DEBUG] Flip detection: path_mean={path_mean_score:.4f}, ben_mean={ben_mean_score:.4f}")
+        logger.info(f"    path_mean > ben_mean => flipped={path_mean_score > ben_mean_score}")
+        if config.scoreset_flipped_override is not None:
+            logger.info(f"    Override applied: {config.scoreset_flipped_override}")
+        # Example fit params
+        fit0 = fits[0]['fit']
+        logger.info(f"  [DEBUG] Example fit (bootstrap 0):")
+        logger.info(f"    weights: {fit0['weights']}")
+        logger.info(f"    component_params: {fit0.get('component_params', 'N/A')}")
     
     # Compute point ranges - exclude score positions where ALL fits are NaN
     nan_counts = np.isnan(log_lr_plus).sum(0)
@@ -450,7 +479,12 @@ def process_component_fits(
     
     # Check for insufficient bootstrap coverage
     percent_no_evidence = {point: 0.0 for point in config.point_values + list(-1 * np.array(config.point_values))}
-    
+
+    if config.debug:
+        logger.info("  [DEBUG] Point ranges BEFORE enforce_monotonicity:")
+        for k in sorted(point_ranges.keys(), key=lambda x: -x):
+            logger.info(f"    {k:+d}: {point_ranges[k]}")
+
     # Enforce monotonicity (first pass)
     enforce_monotonicity_point_ranges(
         point_ranges,
@@ -460,6 +494,11 @@ def process_component_fits(
         liberal=config.liberal_monotonicity
     )
 
+    if config.debug:
+        logger.info("  [DEBUG] Point ranges AFTER first enforce_monotonicity:")
+        for k in sorted(point_ranges.keys(), key=lambda x: -x):
+            logger.info(f"    {k:+d}: {point_ranges[k]}")
+
     # Extend to limits
     extend_points_to_xlims(
         point_ranges,
@@ -467,6 +506,11 @@ def process_component_fits(
         score_range[range_subset],
         scoreset_flipped
     )
+
+    if config.debug:
+        logger.info("  [DEBUG] Point ranges AFTER extend_points_to_xlims:")
+        for k in sorted(point_ranges.keys(), key=lambda x: -x):
+            logger.info(f"    {k:+d}: {point_ranges[k]}")
 
     # Enforce monotonicity again after extending (matches assign_points.py)
     enforce_monotonicity_point_ranges(
@@ -476,6 +520,11 @@ def process_component_fits(
         scoreset_flipped=scoreset_flipped,
         liberal=config.liberal_monotonicity
     )
+
+    if config.debug:
+        logger.info("  [DEBUG] Point ranges AFTER second enforce_monotonicity (final):")
+        for k in sorted(point_ranges.keys(), key=lambda x: -x):
+            logger.info(f"    {k:+d}: {point_ranges[k]}")
 
     logger.info(f"  Final point ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
     

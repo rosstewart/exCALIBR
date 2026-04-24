@@ -33,6 +33,12 @@ class PipelineConfig:
     # Per-dataset overrides (used in IGVF batch mode)
     scoreset_flipped_override: Optional[bool] = None  # Force flip state
 
+    # BasicScoreset sample name override (order must match column ordering in data)
+    sample_names: Optional[List[str]] = None
+
+    # Debug mode: verbose logging of component params, weights, flip detection, point ranges
+    debug: bool = False
+
     # OOB evidence
     compute_oob: bool = False
     oob_min_samples: int = 10

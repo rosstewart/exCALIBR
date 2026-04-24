@@ -91,6 +91,11 @@ Examples:
     parser.add_argument("--scoreset-flipped-override", type=str, default=None,
                        choices=["true", "false"],
                        help="Override automatic scoreset flip detection")
+    parser.add_argument("--sample-names", type=str, nargs="+", default=None,
+                       help="Explicit sample names matching column order in data "
+                            "(e.g. 'Pathogenic/Likely Pathogenic' 'Benign/Likely Benign' gnomAD Synonymous)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging (component params, weights, flip detection, point ranges)")
 
     # OOB evidence
     parser.add_argument("--oob", action="store_true",
@@ -176,6 +181,8 @@ Examples:
         save_bootstrap_fits=args.save_fits,
         clinvar_release=args.clinvar_release,
         min_clinvar_star=args.min_clinvar_star,
+        sample_names=args.sample_names,
+        debug=args.debug,
     )
 
     # Run pipeline
