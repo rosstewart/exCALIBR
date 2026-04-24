@@ -1,22 +1,26 @@
 """
 Configuration for Assay Calibration Pipeline
 """
-from dataclasses import dataclass
-from typing import List, Literal
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional
 
 @dataclass
 class PipelineConfig:
     """Main configuration for the calibration pipeline"""
-    
+
     # Input/Output
     dataset_csv: str
     dataset_name: str
     output_dir: str = "./calibration_output"
-    
+
+    # Precomputed fits (skip bootstrap fitting)
+    precomputed_fits: Optional[str] = None  # Path to gzipped JSON of bootstrap fits
+    splits_file: Optional[str] = None       # Path to precomputed splits pickle (for OOB)
+
     # Bootstrap parameters
     n_bootstraps: int = 1000
     num_fits_per_bootstrap: int = 100
-    
+
     # Model parameters
     components: List[int] = None  # [2], [3], or [2, 3]
     use_median_prior: bool = True
@@ -25,15 +29,18 @@ class PipelineConfig:
     benign_method: Literal["benign", "avg", "synonymous"] = "avg"
     manual_prior: float = None  # If set, skip prior estimation and use this value
     population_type: str = "gnomAD"
-    
+
+    # Per-dataset overrides (used in IGVF batch mode)
+    scoreset_flipped_override: Optional[bool] = None  # Force flip state
+
     # OOB evidence
     compute_oob: bool = False
     oob_min_samples: int = 10
-    
+
     # Execution parameters
     execution_mode: Literal["slurm", "parallel", "single"] = "parallel"
     n_jobs: int = -1  # -1 uses all available CPUs
-    
+
     # SLURM parameters (only used if execution_mode="slurm")
     slurm_account: str = "default"
     slurm_partition: str = "short"
@@ -42,36 +49,36 @@ class PipelineConfig:
     slurm_cpus_per_task: int = 12
     slurm_conda_env: str = "assay_calibration"
     slurm_module_commands: List[str] = None
-    
+
     # Model selection (only used if components=[2,3])
     auto_select_model: bool = True
     model_selection_alpha: float = 0.05
     use_conservative_selection: bool = True  # Use 5th percentile test
-    
+
     # Output options
     save_bootstrap_fits: bool = False
     save_visualizations: bool = True
     point_values: List[int] = None
-    
+
     # ClinVar parameters
     clinvar_release: str = "2025"
     min_clinvar_star: int = 1
-    
+
     def __post_init__(self):
         if self.components is None:
             self.components = [2, 3]
         if self.point_values is None:
             self.point_values = [1, 2, 3, 4, 5, 6, 7, 8]
-        
+
         # Validate components
         if not all(c in [2, 3, 4] for c in self.components):
             raise ValueError("Components must be 2, 3, or 4")
-        
+
         # Validate manual_prior
         if self.manual_prior is not None:
             if not (0 < self.manual_prior < 1):
                 raise ValueError(f"manual_prior must be in (0, 1), got {self.manual_prior}")
-        
+
         # Validate population_type
         valid_pop_types = {
             'all_variants', 'all_nsSNV', 'all_missense_nsSNV',
@@ -80,7 +87,7 @@ class PipelineConfig:
         if self.population_type not in valid_pop_types:
             raise ValueError(f"population_type must be one of {valid_pop_types}, got {self.population_type}")
 
-        
+
         # If using SLURM, adjust job count
         if self.execution_mode == "slurm" and self.n_jobs == -1:
             self.n_jobs = 30  # Reasonable default for job generation

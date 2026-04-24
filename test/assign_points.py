@@ -38,7 +38,61 @@ import pickle
 import pandas as pd
 
 
-            
+def summarize_scoreset(fits,scoreset,save_filepath,use_median_prior,use_2c_equation,n_c,benign_method,oob_only, **kwargs):
+    """
+    Summarizes a scoreset based on the provided arguments.
+    Args:
+        args: An object containing the following attributes:
+            - fits (List[Dict]) : List of fit results
+            - scoreset_name (str) : Name of the scoreset to summarize
+            - df (pandas.DataFrame, optional): A pandas DataFrame to be summarized. 
+              If provided, this will be used directly.
+            - pillar_df_filepath (str, optional): A file path to a CSV file. If `df` 
+              is not provided, the CSV file at this path will be read into a pandas 
+              DataFrame and used for summarization.
+            - use_median_prior (bool). Whether to use median prior or 5-th percentile most conservative bootstrap for each threshold.
+            - use_2c_equation (bool). Whether to use prior equation rather than EM for 2c.
+    Optional Keyword Args:
+        - point_values (List[int], optional): List of point values to assign. Defaults to 
+          [1,2,3,4,5,6,7,8].
+        - pathogenic_idx (int, optional): Index of the pathogenic component. Defaults to 0.
+        - benign_idx (int, optional): Index of the benign component. Defaults to 1.
+        - tolerance (float, optional): Tolerance for convergence in prior estimation. Defaults to 1e-4.
+        - max_em_steps (int, optional): Maximum number of EM steps for prior estimation. Defaults to 10000.
+
+    Note:
+        Either `df` or `pillar_df_filepath` must be provided in `args`. If both are 
+        provided, `df` takes precedence.
+    """
+    priors, prior, point_ranges, score_range, log_fp, log_fb, all_path_ranges, all_ben_ranges, C, variant_to_oob_points = process_fits(fits,scoreset,use_median_prior,use_2c_equation,benign_method,Path(save_filepath), oob_only)
+    results = dict(prior=prior,
+                   point_ranges=point_ranges,
+                   priors=priors,
+                   score_range=score_range,
+                   log_lr_plus=log_fp - log_fb,
+                   C=C,
+                   all_path_ranges=all_path_ranges,
+                   all_ben_ranges=all_ben_ranges)
+    results = serialize_dict(results)
+    save_filepath = Path(save_filepath)
+    save_filepath.parent.mkdir(exist_ok=True,parents=True)
+    # with open(save_filepath,'w') as f:
+    #     json.dump(results,f,indent=2)
+    # save_filepath_compact = save_filepath.parent / f"{save_filepath.stem}_compact.json"
+    # with open(save_filepath_compact,'w') as f:
+    #     json.dump({k: results[k] for k in ['prior','point_ranges']},
+    #               f,indent=2)
+    # scoreset_fit_figure = plot_scoreset(scoreset, results, fits,score_range, use_median_prior, use_2c_equation, n_c, benign_method, C)
+    # figure_filepath = save_filepath.parent / f"{save_filepath.stem}_figure_fits.png"
+    # scoreset_fit_figure.savefig(figure_filepath,bbox_inches='tight',dpi=300)
+    # plt.close(scoreset_fit_figure) 
+    # summary_fig = plot_summary(scoreset, fits, results, score_range, log_fp, log_fb, use_median_prior, use_2c_equation, n_c, benign_method, C, dataset)
+    
+    # summary_figure_filepath = save_filepath.parent / f"{save_filepath.stem}_figure_summary.png"
+    # summary_fig.savefig(summary_figure_filepath,bbox_inches='tight',dpi=300)
+    # plt.close(summary_fig)
+
+    return scoreset, results, fits, score_range, f"({'equation' if use_2c_equation else 'em'}, {'median' if use_median_prior else '5-percentile'}, {benign_method})", n_c, variant_to_oob_points            
 
 
 def process_fits(fits, scoreset, use_median_prior, use_2c_equation, benign_method, save_filepath, oob_only, **kwargs)->Tuple[np.ndarray,Dict[int,List[Tuple[float,float]]],np.ndarray,np.ndarray,np.ndarray,List[Dict[int,List[Tuple[float,float]]]],List[Dict[int,List[Tuple[float,float]]]]]:

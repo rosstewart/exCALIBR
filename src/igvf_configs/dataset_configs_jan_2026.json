@@ -133,11 +133,13 @@
   ],
   "DDX3X_Radford_2023_cLFC_day15": [
     "2c",
-    "avg"
+    "avg",
+    {"liberal_monotonicity": false}
   ],
   "DDX3X_Radford_2023_cLFC_day15_clinvar_2018": [
     "2c",
-    "avg"
+    "avg",
+    {"liberal_monotonicity": false}
   ],
   "F9_Popp_2025_carboxy_F9_specific": [
     "3c",
@@ -149,7 +151,8 @@
   ],
   "F9_Popp_2025_heavy_chain": [
     "3c",
-    "benign"
+    "benign",
+    {"liberal_monotonicity": false}
   ],
   "F9_Popp_2025_light_chain": [
     "3c",
@@ -169,7 +172,8 @@
   ],
   "GCK_Gersing_2023_complementation": [
     "3c",
-    "avg"
+    "avg",
+    {"liberal_monotonicity": false}
   ],
   "GCK_Gersing_2024_abundance": [
     "2c",
@@ -309,7 +313,8 @@
   ],
   "TARDBP_Bolognesi_Faure_2019": [
     "2c",
-    "avg"
+    "avg",
+    {"scoreset_flipped_override": true}
   ],
   "TP53_Boettcher_2019": [
     "2c",

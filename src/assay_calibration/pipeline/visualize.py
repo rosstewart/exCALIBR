@@ -3,6 +3,7 @@ Visualization and calibration result generation
 """
 import sys
 import os
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -30,38 +31,67 @@ from ..plot_utils.utils import plot_scoreset_example_publication
 from .config import PipelineConfig
 from .utils import load_dataset_from_df
 
+def load_precomputed_fits(fits_path: str, dataset_name: str) -> Dict:
+    """
+    Load precomputed bootstrap fits from gzipped JSON.
+
+    The expected format (matching assign_points.py) is::
+
+        {dataset_name: {bootstrap_key: {"2c": {...}, "3c": {...}}, ...}}
+
+    Each fit entry has ``fit``, ``val_ll``, etc.
+    Returns the inner dict: ``{bootstrap_key: {"2c": fit, "3c": fit}}``.
+    """
+    import gzip
+
+    with gzip.open(fits_path, 'rt', encoding='utf-8') as f:
+        all_results = json.load(f)
+
+    if dataset_name not in all_results:
+        available = list(all_results.keys())[:10]
+        raise KeyError(
+            f"Dataset '{dataset_name}' not found in precomputed fits. "
+            f"Available: {available}{'...' if len(all_results) > 10 else ''}"
+        )
+
+    return all_results[dataset_name]
+
+
 def generate_visualizations(
     bootstrap_results: Dict,
     config: PipelineConfig,
     selected_components: Dict,
-    logger: logging.Logger
+    logger: logging.Logger,
+    scoreset=None,
 ) -> Dict:
     """
     Generate visualizations and calibration results
-    
+
     Args:
         bootstrap_results: Dict of bootstrap fits
         config: Pipeline configuration
         selected_components: Dict mapping component keys to component counts
         logger: Logger instance
-    
+        scoreset: Pre-loaded Scoreset (optional; loaded from CSV if None)
+
     Returns:
         Dict with calibration results
     """
-    
-    # Load dataset
-    df = pd.read_csv(config.dataset_csv)
-    scoreset = load_dataset_from_df(df, config)
+
+    # Load dataset if not provided
+    if scoreset is None:
+        df = pd.read_csv(config.dataset_csv)
+        scoreset = load_dataset_from_df(df, config)
     results = {}
-    
+
     # Process each selected component count
     for component_key, n_c in selected_components.items():
         logger.info(f"\nProcessing {component_key}...")
-        
+
         # Extract fits for this component count
         fits = []
         bootstrap_seeds = []
-        for bootstrap_idx in sorted(bootstrap_results.keys(), key=int):
+        for bootstrap_idx in sorted(bootstrap_results.keys(), key=lambda k: int(k)):
             if component_key in bootstrap_results[bootstrap_idx]:
                 fit_result = bootstrap_results[bootstrap_idx][component_key]
                 if fit_result is not None:
@@ -183,12 +213,13 @@ def process_component_fits(
         prior = config.manual_prior
         fit_priors = np.full(len(fits), prior)
         valid_bootstrap_seeds = bootstrap_seeds  # no filtering
+        valid_mask = np.ones(len(fits), dtype=bool)
         logger.info(f"  Using manual prior: {prior:.6f}")
     else:
         # Compute priors - PASS ALL INDICES
         if not config.use_2c_equation or n_c != 2:
             # Use EM estimation
-            n_cores = os.cpu_count() or 1
+            n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
             fit_priors = np.array(Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
                 delayed(get_fit_prior)(
                     fit, scoreset, config.benign_method,
@@ -245,8 +276,8 @@ def process_component_fits(
     observed_scores = scoreset.scores[scoreset._sample_assignments.any(1)]
     score_range = np.linspace(*np.percentile(observed_scores, [0, 100]), 10000)
     
-    # Compute log likelihood ratios - USE NEW PARALLEL FUNCTION
-    n_cores = os.cpu_count() or 1
+    # Compute log likelihood ratios
+    n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
     results_fpfb = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
         delayed(compute_single_fit_log_densities)(
             fit, prior, score_range, config.benign_method,
@@ -317,12 +348,16 @@ def process_component_fits(
     
     if path_mean_score > ben_mean_score:
         scoreset_flipped = True
-    
+
+    # Per-dataset override (e.g. TARDBP_Bolognesi_Faure_2019)
+    if config.scoreset_flipped_override is not None:
+        scoreset_flipped = config.scoreset_flipped_override
+
     logger.info(f"  Scoreset flipped: {scoreset_flipped}")
     
-    # Compute point ranges
+    # Compute point ranges - exclude score positions where ALL fits are NaN
     nan_counts = np.isnan(log_lr_plus).sum(0)
-    range_subset = nan_counts < log_lr_plus.shape[1]
+    range_subset = nan_counts < log_lr_plus.shape[0]
     
     if config.use_median_prior:
         # Use median prior for unified thresholds
@@ -335,6 +370,9 @@ def process_component_fits(
             config.point_values,
         )
         point_ranges = {**point_ranges_pathogenic, **point_ranges_benign}
+        if prior <= 0 or prior >= 1:
+            for point in point_ranges:
+                point_ranges[point] = []
     else:
         # Use 5th percentile conservative thresholds
         logger.info("  Using 5th percentile conservative thresholds")
@@ -394,7 +432,7 @@ def process_component_fits(
     # Check for insufficient bootstrap coverage
     percent_no_evidence = {point: 0.0 for point in config.point_values + list(-1 * np.array(config.point_values))}
     
-    # Enforce monotonicity
+    # Enforce monotonicity (first pass)
     enforce_monotonicity_point_ranges(
         point_ranges,
         config.point_values,
@@ -402,7 +440,7 @@ def process_component_fits(
         scoreset_flipped=scoreset_flipped,
         liberal=config.liberal_monotonicity
     )
-    
+
     # Extend to limits
     extend_points_to_xlims(
         point_ranges,
@@ -410,7 +448,16 @@ def process_component_fits(
         score_range[range_subset],
         scoreset_flipped
     )
-    
+
+    # Enforce monotonicity again after extending (matches assign_points.py)
+    enforce_monotonicity_point_ranges(
+        point_ranges,
+        config.point_values,
+        score_range[range_subset],
+        scoreset_flipped=scoreset_flipped,
+        liberal=config.liberal_monotonicity
+    )
+
     logger.info(f"  Final point ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
     
     # Serialize and return
@@ -418,6 +465,7 @@ def process_component_fits(
         'prior': prior,
         'priors': fit_priors,
         'valid_bootstrap_seeds': valid_bootstrap_seeds,
+        'valid_mask': valid_mask,
         'point_ranges': point_ranges,
         'score_range': score_range[range_subset],
         'log_lr_plus': log_lr_plus[:, range_subset],

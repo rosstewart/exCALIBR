@@ -4,6 +4,7 @@ Per-variant evidence assignment (standard and out-of-bag).
 Standard: assigns points using the global calibration (point_ranges) for every variant.
 OOB: for each variant, rebuilds calibration using only bootstrap iterations where
      that variant was held out (validation set), then assigns points.
+     This matches the full processing logic from assign_points.py.
 """
 import os
 import numpy as np
@@ -39,7 +40,7 @@ def _flatten_point_ranges(point_ranges: Dict) -> Dict:
             elif len(ranges) == 2 and not isinstance(ranges[0], (list, np.ndarray)):
                 flat[key] = list(ranges)  # already flat
             else:
-                # multiple sub-ranges – take bounding interval
+                # multiple sub-ranges -- take bounding interval
                 all_lo = min(r[0] for r in ranges)
                 all_hi = max(r[1] for r in ranges)
                 flat[key] = [all_lo, all_hi]
@@ -166,7 +167,7 @@ def _build_oob_mapping(
           f"matched a scoreset variant")
 
     if n_val_obs_total > 0 and n_val_obs_matched == 0:
-        # Diagnose key mismatch — compare types and sample values
+        # Diagnose key mismatch
         sample_split_key = None
         for seed in list(dataset_splits.keys())[:1]:
             if seed in seed_to_filtered:
@@ -207,8 +208,20 @@ def _process_variant_oob(
     liberal: bool,
     min_samples: int = 1,
 ) -> Tuple[int, Optional[Dict]]:
-    """Compute OOB evidence for one variant (runs in worker process).
-    
+    """
+    Compute OOB evidence for one variant using FULL in-bag processing logic.
+
+    This matches _process_single_variant_oob_full in point_ranges.py:
+    1. Subset to OOB bootstraps
+    2. Filter invalid priors
+    3. Compute OOB median prior
+    4. Compute OOB LR+ and filter NaN columns
+    5. calculate_score_ranges (median prior, 5th/95th percentile LR+)
+    6. enforce_monotonicity_point_ranges (first pass)
+    7. extend_points_to_xlims
+    8. enforce_monotonicity_point_ranges (second pass)
+    9. Flatten and assign points
+
     Returns (variant_idx, result_dict) or (variant_idx, {"_fail": reason}).
     """
 
@@ -219,6 +232,7 @@ def _process_variant_oob(
     oob_fp = log_fp[oob_indices]
     oob_fb = log_fb[oob_indices]
 
+    # Filter invalid priors
     valid = ~np.isnan(oob_priors) & (oob_priors > 0) & (oob_priors < 1)
     n_valid = int(valid.sum())
     oob_priors, oob_fp, oob_fb = oob_priors[valid], oob_fp[valid], oob_fb[valid]
@@ -230,16 +244,18 @@ def _process_variant_oob(
     if prior <= 0 or prior >= 1:
         return variant_idx, {"_fail": f"invalid_median_prior ({prior})"}
 
+    # Compute OOB LR+
     lr_plus = oob_fp - oob_fb
     nan_counts = np.isnan(lr_plus).sum(0)
     subset = nan_counts < lr_plus.shape[0]
     if not np.any(subset):
-        return variant_idx, {"_fail": f"all_lr_nan (shape={lr_plus.shape}, all_nan_cols={int((nan_counts >= lr_plus.shape[0]).sum())})"}
+        return variant_idx, {"_fail": f"all_lr_nan (shape={lr_plus.shape})"}
 
     vsr = score_range[subset]
     vlr = lr_plus[:, subset]
 
     try:
+        # Step 5: calculate_score_ranges (same as in-bag median_prior branch)
         pr_p, pr_b, C = calculate_score_ranges(
             np.nanpercentile(vlr, 5, axis=0),
             np.nanpercentile(vlr, 95, axis=0),
@@ -247,10 +263,21 @@ def _process_variant_oob(
         )
         pr = {**pr_p, **pr_b}
 
-        enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
-        extend_points_to_xlims(pr, point_values, vsr, flipped)
+        # Check if prior is valid (matches in-bag check)
+        if prior <= 0 or prior >= 1:
+            for point in pr:
+                pr[point] = []
+
+        # Step 6: enforce monotonicity (first pass)
         enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
+        # Step 7: extend to xlims
+        extend_points_to_xlims(pr, point_values, vsr, flipped)
+
+        # Step 8: enforce monotonicity (second pass)
+        enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
+
+        # Step 9: flatten and assign
         pts = _assign_points(score, _flatten_point_ranges(pr))
     except Exception as e:
         return variant_idx, {"_fail": f"exception: {type(e).__name__}: {str(e)[:200]}"}
@@ -308,7 +335,6 @@ def _compute_oob_evidence(
         if result is None:
             fail_reasons["returned_None"] += 1
         elif "_fail" in result:
-            # Extract the category before any parenthetical detail
             reason = result["_fail"].split(" (")[0].split(":")[0]
             fail_reasons[reason] += 1
         else:
@@ -321,7 +347,6 @@ def _compute_oob_evidence(
         for reason, count in sorted(fail_reasons.items(), key=lambda x: -x[1]):
             log(f"    {reason}: {count}")
 
-        # Log a few example failures for debugging
         examples = [(vidx, r) for vidx, r in raw if r is not None and "_fail" in r][:5]
         if examples:
             log(f"  Example failures:")
@@ -397,4 +422,3 @@ def compute_variant_table(
                     f"({100*agree/len(both):.1f}%)")
 
     return df
-

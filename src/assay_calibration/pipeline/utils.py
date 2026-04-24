@@ -66,58 +66,69 @@ def save_results(
     config: PipelineConfig,
     logger: logging.Logger
 ):
-    """Save calibration results and optionally bootstrap fits"""
-    
+    """Save calibration results and optionally bootstrap fits.
+
+    Always saves per-component:
+      - ``<name>_<comp>_calibration.json`` — compact point-range output
+        matching the format of ``example/BRCA1_Findlay_2018.json``
+      - ``<name>_<comp>_lr_values.json.gz`` — likelihood-ratio interpolation
+        over the full score range (``score_range`` + ``log_lr_plus`` matrix)
+
+    When *bootstrap_results* is not ``None`` (i.e., fits were computed fresh,
+    not loaded from precomputed), also saves:
+      - ``<name>_bootstrap_fits.json.gz`` — gzipped JSON in the same format
+        as the precomputed-fits input (``{seed: {"2c": {...}, "3c": {...}}}``).
+    """
+
     output_dir = Path(config.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
-    
-    # Save calibration JSON for each component
+
+    # ------------------------------------------------------------------
+    # Per-component outputs
+    # ------------------------------------------------------------------
     for component_key, calibration in results.items():
-        # Prepare calibration output (compact version with only essential data)
+        # 1. Compact calibration JSON (matches example/BRCA1_Findlay_2018.json)
         calibration_compact = {
-            'dataset': config.dataset_name,
-            'component': component_key,
             'prior': calibration['prior'],
             'point_ranges': calibration['point_ranges'],
+            'dataset': config.dataset_name,
+            'relax': config.liberal_monotonicity,
+            'n_c': component_key,
+            'benign_method': config.benign_method,
+            'clinvar_2018': config.clinvar_release == '2018',
             'scoreset_flipped': calibration.get('scoreset_flipped', False),
-            'n_valid_fits': calibration.get('n_valid_fits', 0),
-            'config': {
-                'n_bootstraps': config.n_bootstraps,
-                'num_fits_per_bootstrap': config.num_fits_per_bootstrap,
-                'use_median_prior': config.use_median_prior,
-                'use_2c_equation': config.use_2c_equation,
-                'benign_method': config.benign_method,
-                'clinvar_release': config.clinvar_release,
-            }
+            'uncalibratable_reason': None,
         }
-        
-        # Save compact JSON
+
         json_file = output_dir / f"{config.dataset_name}_{component_key}_calibration.json"
         with open(json_file, 'w') as f:
             json.dump(serialize_dict(calibration_compact), f, indent=2)
-        
         logger.info(f"  Saved calibration: {json_file}")
-        
-        # Save full results (if requested)
-        if config.save_bootstrap_fits:
-            # Convert numpy arrays to lists for JSON compatibility
-            calibration_full = serialize_dict(calibration)
-            
-            # Save as compressed JSON
-            json_gz_file = output_dir / f"{config.dataset_name}_{component_key}_full.json.gz"
-            with gzip.open(json_gz_file, 'wt', encoding='utf-8') as f:
-                json.dump(serialize_dict(calibration_full), f, indent=2)
-            
-            logger.info(f"  Saved full results: {json_gz_file}")
-    
-    # Save bootstrap fits (if requested)
+
+        # 2. LR interpolation over score range (always saved)
+        if 'score_range' in calibration and 'log_lr_plus' in calibration:
+            lr_data = {
+                'dataset': config.dataset_name,
+                'n_c': component_key,
+                'score_range': calibration['score_range'],
+                'log_lr_plus': calibration['log_lr_plus'],
+            }
+            lr_file = output_dir / f"{config.dataset_name}_{component_key}_lr_values.json.gz"
+            with gzip.open(lr_file, 'wt', encoding='utf-8') as f:
+                json.dump(serialize_dict(lr_data), f)
+            lr_size_mb = lr_file.stat().st_size / 1e6
+            logger.info(f"  Saved LR values: {lr_file} ({lr_size_mb:.1f} MB)")
+
+    # ------------------------------------------------------------------
+    # Bootstrap fits (gzipped JSON, only when computed fresh)
+    # ------------------------------------------------------------------
     if bootstrap_results is not None:
-        pkl_file = output_dir / f"{config.dataset_name}_bootstrap_fits.pkl"
-        with open(pkl_file, 'wb') as f:
-            pickle.dump(bootstrap_results, f)
-        
-        logger.info(f"  Saved bootstrap fits: {pkl_file}")
-        logger.info(f"    Size: {pkl_file.stat().st_size / 1e6:.1f} MB")
+        fits_file = output_dir / f"{config.dataset_name}_bootstrap_fits.json.gz"
+        with gzip.open(fits_file, 'wt', encoding='utf-8') as f:
+            json.dump(serialize_dict(bootstrap_results), f)
+
+        fits_size_mb = fits_file.stat().st_size / 1e6
+        logger.info(f"  Saved bootstrap fits: {fits_file} ({fits_size_mb:.1f} MB)")
 
 def collect_slurm_results(jobs_dir: Path, config: PipelineConfig) -> Dict:
     """Collect results from completed SLURM jobs"""
