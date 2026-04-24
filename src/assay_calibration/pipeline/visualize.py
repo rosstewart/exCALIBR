@@ -293,7 +293,7 @@ def process_component_fits(
     
     # Setup score range
     observed_scores = scoreset.scores[scoreset._sample_assignments.any(1)]
-    score_range = np.linspace(*np.percentile(observed_scores, [0, 100]), 10000)
+    score_range = np.linspace(*np.percentile(observed_scores, [0, 100]), config.score_range_points)
     
     # Compute log likelihood ratios
     n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)

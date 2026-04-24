@@ -59,6 +59,7 @@ class PipelineConfig:
     save_bootstrap_fits: bool = False
     save_visualizations: bool = True
     point_values: List[int] = None
+    score_range_points: int = 2000  # Number of interpolation points for score range
 
     # ClinVar parameters
     clinvar_release: str = "2025"

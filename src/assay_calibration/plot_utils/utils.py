@@ -705,30 +705,30 @@ def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, sco
     fig, axes = plt.subplots(n_samples, 1, figsize=(2*scale, scale*n_samples), squeeze=False)
     axes = axes.flatten()
     
-    # Get point ranges for threshold plotting
-    point_ranges = indv_summary['point_ranges']
+    # Get point ranges for threshold plotting — normalize keys to int
+    point_ranges = {int(k): v for k, v in indv_summary['point_ranges'].items()}
 
     # Plot each sample in its own subplot
-    num_skipped = 0
+    plot_idx = 0
     for sample_num in range(len(scoreset.sample_counts)):
         if scoreset.sample_counts[sample_num] == 0:
-            num_skipped += 1
             continue
-        ax = axes[sample_num-num_skipped]
-        sample_mask = scoreset.sample_assignments[:, sample_num-num_skipped]
+        ax = axes[plot_idx]
+        sample_mask = scoreset.sample_assignments[:, plot_idx]
         sample_name = scoreset.sample_names[sample_num]
-        
+        color_idx = min(sample_num, len(sample_colors) - 1)
+
         # Plot histogram for this sample
-        sns.histplot(scoreset.scores[sample_mask], 
-                     stat='density', ax=ax, 
-                     alpha=sample_alphas[sample_num], 
-                     color=sample_colors[sample_num])
+        sns.histplot(scoreset.scores[sample_mask],
+                     stat='density', ax=ax,
+                     alpha=sample_alphas[color_idx],
+                     color=sample_colors[color_idx])
                      # label=sample_name)
         
         max_hist_density = max([patch.get_height() for patch in ax.patches]) if ax.patches else 1.0
-        
+
         # Plot fitted density curves with matching color
-        density_sample = sample_density(score_range, fits, sample_num-num_skipped)
+        density_sample = sample_density(score_range, fits, plot_idx)
         
         # Plot sum of components
         d = np.nansum(density_sample, axis=1)
@@ -788,7 +788,7 @@ def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, sco
         if sample_name == "population":
             sample_name = "gnomAD"
 
-        if sample_num - num_skipped == 0:
+        if plot_idx == 0:
             ax.set_title(dataset, fontsize=12, fontweight='bold', pad=8)
         
         # if sample_name != "gnomAD":
@@ -796,9 +796,7 @@ def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, sco
         # else:
         #     ax.set_title(f"{sample_name} (n={sample_mask.sum():,d}, prior={indv_summary['prior']:.3f})", fontsize=16, fontweight='bold')
 
-        last_sample = False
-        if sample_num == len(scoreset.sample_counts)-1 or (sample_num == len(scoreset.sample_counts)-2 and scoreset.sample_counts[-1] == 0):
-            last_sample = True
+        last_sample = (plot_idx == n_samples - 1)
 
         if last_sample:
             ax.set_xlabel("Assay score", fontsize=14)
@@ -814,7 +812,7 @@ def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, sco
         
         # Create histogram legend handle
         hist_patch = Patch(
-            facecolor=sample_colors[sample_num],
+            facecolor=sample_colors[color_idx],
             alpha=0.4,
             edgecolor='none'
         )
@@ -851,7 +849,8 @@ def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, sco
             )
         
         ax.grid(linewidth=0.5, alpha=0.3)
-    
+        plot_idx += 1
+
     plt.tight_layout()
     
     return fig
