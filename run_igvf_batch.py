@@ -125,6 +125,8 @@ def run_single_dataset(
         min_clinvar_star=args.min_clinvar_star,
         population_type=args.population_type,
         point_values=[1, 2, 3, 4, 5, 6, 7, 8],
+        sample_names=args.sample_names if hasattr(args, "sample_names") else None,
+        debug=args.debug if hasattr(args, "debug") else False,
     )
 
     output_dir = Path(config.output_dir)
@@ -248,6 +250,12 @@ def main():
     # Model selection override
     parser.add_argument("--auto-select-model", action="store_true",
                        help="Use bootstrap paired test to auto-select n_c instead of config")
+    parser.add_argument("--sample-names", type=str, nargs="+", default=None,
+                       help="Explicit sample names matching column order in data "
+                            "(applied to all datasets; e.g. 'Pathogenic/Likely Pathogenic' "
+                            "'Benign/Likely Benign' gnomAD Synonymous)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging (component params, flip detection, point ranges)")
 
     args = parser.parse_args()
 
