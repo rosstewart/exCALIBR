@@ -215,7 +215,7 @@ def standardize_auth_label(
 
 
 class BasicScoreset:
-    def __init__(self, scores: np.ndarray, sample_assignments: np.ndarray,**kwargs):
+    def __init__(self, scores: np.ndarray, sample_assignments,**kwargs):
         self.scores = scores
         self._sample_assignments = sample_assignments
         self.validate_inputs()
@@ -242,16 +242,18 @@ class BasicScoreset:
         ndim = self._sample_assignments.ndim
         if ndim == 1:
             sample_vals = np.array(self._sample_assignments)
-            # Check if values are comma-separated strings (e.g. "0,1")
-            if sample_vals.dtype.kind in ('U', 'O') and any(',' in str(v) for v in sample_vals[:min(10, len(sample_vals))]):
-                all_keys = sorted({k for v in sample_vals for k in str(v).split(',')})
-                self._sample_assignments = np.zeros(
-                    (len(sample_vals), len(all_keys)), dtype=bool
+            if sample_vals.dtype.kind in ('U', 'O'):
+                print(
+                    "Assuming sample_assignments is list of comma-separated strings"
                 )
+                # Always split on comma — single values like "2" split fine into ["2"]
+                all_keys = sorted({k for v in sample_vals for k in str(v).split(',')})
                 key_to_idx = {k: i for i, k in enumerate(all_keys)}
+                result = np.zeros((len(sample_vals), len(all_keys)), dtype=bool)
                 for row, v in enumerate(sample_vals):
                     for k in str(v).split(','):
-                        self._sample_assignments[row, key_to_idx[k]] = True
+                        result[row, key_to_idx[k]] = True
+                self._sample_assignments = result
             else:
                 print(
                     "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."

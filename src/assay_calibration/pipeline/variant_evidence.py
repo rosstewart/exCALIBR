@@ -272,7 +272,7 @@ def _process_variant_oob(
         enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
         # Step 7: extend to xlims
-        extend_points_to_xlims(pr, point_values, vsr, flipped)
+        extend_points_to_xlims(pr, point_values, vsr, flipped, inf=True)
 
         # Step 8: enforce monotonicity (second pass)
         enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)

@@ -504,7 +504,8 @@ def process_component_fits(
         point_ranges,
         config.point_values,
         score_range[range_subset],
-        scoreset_flipped
+        scoreset_flipped,
+        inf=True
     )
 
     if config.debug:
