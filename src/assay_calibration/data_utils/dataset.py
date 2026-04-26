@@ -243,9 +243,9 @@ class BasicScoreset:
         if ndim == 1:
             sample_vals = np.array(self._sample_assignments)
             if sample_vals.dtype.kind in ('U', 'O'):
-                print(
-                    "Assuming sample_assignments is list of comma-separated strings"
-                )
+                # print(
+                #     "Assuming sample_assignments is list of comma-separated strings"
+                # )
                 # Always split on comma — single values like "2" split fine into ["2"]
                 all_keys = sorted({k for v in sample_vals for k in str(v).split(',')})
                 key_to_idx = {k: i for i, k in enumerate(all_keys)}
@@ -255,9 +255,9 @@ class BasicScoreset:
                         result[row, key_to_idx[k]] = True
                 self._sample_assignments = result
             else:
-                print(
-                    "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."
-                )
+                # print(
+                #     "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."
+                # )
                 unique_samples = sorted(set(sample_vals))
                 self._sample_assignments = np.zeros(
                     (len(sample_vals), len(unique_samples)), dtype=bool
