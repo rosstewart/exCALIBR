@@ -134,56 +134,35 @@ def _normalize_point_ranges(point_ranges):
 
 def build_calibration_intervals(point_ranges, x_min, x_max, flipped):
     """
-    Build a list of (point_value, start, end) intervals for a calibration bar,
-    *including* the indeterminate (point=0) gap.
+    Build a list of (point_value, start, end) intervals for a calibration bar.
+
+    Any region of [x_min, x_max] not covered by an explicit (non-zero) point
+    range is filled with indeterminate (point=0) intervals.
 
     `point_ranges` is the FLAT format {pv: [start, end]} or {pv: []}.
     Infinities and out-of-range bounds are clipped to [x_min, x_max].
     """
-    if not point_ranges:
-        return []
-
     intervals = []
-    for pv in sorted(p for p in point_ranges if p != 0):
-        rng = point_ranges[pv]
-        if not rng or len(rng) != 2:
-            continue
-        start = _clip_finite(rng[0], x_min, x_max)
-        end   = _clip_finite(rng[1], x_min, x_max)
-        if end <= start:
-            continue
-        intervals.append((pv, start, end))
+    if point_ranges:
+        for pv in sorted(p for p in point_ranges if p != 0):
+            rng = point_ranges[pv]
+            if not rng or len(rng) != 2:
+                continue
+            start = _clip_finite(rng[0], x_min, x_max)
+            end   = _clip_finite(rng[1], x_min, x_max)
+            if end <= start:
+                continue
+            intervals.append((pv, start, end))
 
-    # Indeterminate gap
-    neg = [(pv, s, e) for pv, s, e in intervals if pv < 0]
-    pos = [(pv, s, e) for pv, s, e in intervals if pv > 0]
-    neg_sorted = sorted(neg, key=lambda x: x[2]) if neg else None
-    pos_sorted = sorted(pos, key=lambda x: x[1]) if pos else None
-
-    if neg_sorted and pos_sorted:
-        if flipped:
-            ir_start = neg_sorted[-1][2]
-            ir_end   = pos_sorted[0][1]
-        else:
-            ir_start = pos_sorted[-1][2]
-            ir_end   = neg_sorted[0][1]
-    elif not neg_sorted and not pos_sorted:
-        ir_start, ir_end = x_min, x_max
-    else:
-        ir_start, ir_end = x_min, x_max
-        if flipped:
-            if pos_sorted:
-                ir_end   = pos_sorted[0][1]
-            elif neg_sorted:
-                ir_start = neg_sorted[-1][2]
-        else:
-            if pos_sorted:
-                ir_start = pos_sorted[-1][2]
-            elif neg_sorted:
-                ir_end   = neg_sorted[0][1]
-
-    if ir_end > ir_start:
-        intervals.append((0, ir_start, ir_end))
+    # Fill every uncovered slice of [x_min, x_max] with indeterminate.
+    nonzero_sorted = sorted(intervals, key=lambda x: x[1])
+    cursor = x_min
+    for _pv, s, e in nonzero_sorted:
+        if s > cursor:
+            intervals.append((0, cursor, s))
+        cursor = max(cursor, e)
+    if cursor < x_max:
+        intervals.append((0, cursor, x_max))
 
     return sorted(intervals, key=lambda x: x[1])
 
