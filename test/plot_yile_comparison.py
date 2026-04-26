@@ -450,9 +450,9 @@ def _draw_dataset_panel(
         ax_excalibr, intervals_exc, population_scores, x_min, x_max,
         fontsize_count=fontsize_count,
     )
-    if is_full:
-        ax_excalibr.set_title('Gene-specific calibration', loc='left',
-                              pad=3, fontsize=title_fs)
+    # if is_full:
+    #     ax_excalibr.set_title('Gene-specific calibration', loc='left',
+    #                           pad=3, fontsize=title_fs)
     ax_excalibr.set_ylabel('ExCALIBR', fontsize=side_label_fs, rotation=0,
                            ha='right', va='center', labelpad=side_label_pad)
     ax_excalibr.tick_params(axis='x', bottom=False, labelbottom=False)
@@ -471,7 +471,7 @@ def _draw_dataset_panel(
                        ha='right', va='center', labelpad=side_label_pad)
 
     if show_xlabel:
-        ax_yile.set_xlabel('Assay Score',
+        ax_yile.set_xlabel('Predictor Score',
                            fontsize=fontsize_subtitle if is_full else 8)
         ax_yile.tick_params(axis='x', labelsize=fontsize_tick)
     else:
