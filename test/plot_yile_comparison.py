@@ -190,16 +190,18 @@ def _build_thresholds(point_ranges, flipped,
         return out
     for idx, pv in enumerate(point_values):
         ls = linestyles[idx]
-        # Benign side
+        # Benign side: threshold = score at which -pv evidence first applies
+        # (upper bound of -pv when not flipped, lower bound when flipped).
         rng = point_ranges.get(-pv)
         if rng and len(rng) == 2:
-            tscore = rng[0] if not flipped else rng[1]
+            tscore = rng[1] if not flipped else rng[0]
             if math.isfinite(tscore):
                 out.append((-pv, tscore, '#2166AC', ls, 1.0))
-        # Pathogenic side
+        # Pathogenic side: threshold = score at which +pv evidence first applies
+        # (lower bound of +pv when not flipped, upper bound when flipped).
         rng = point_ranges.get(pv)
         if rng and len(rng) == 2:
-            tscore = rng[1] if not flipped else rng[0]
+            tscore = rng[0] if not flipped else rng[1]
             if math.isfinite(tscore):
                 out.append((pv, tscore, '#B2182B', ls, 1.0))
     return out
