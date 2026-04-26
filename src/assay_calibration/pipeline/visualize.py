@@ -129,7 +129,7 @@ def generate_visualizations(
                 scoreset=scoreset,
                 indv_summary=calibration,
                 fits=fits,
-                score_range=calibration['score_range'],
+                score_range=np.asarray(calibration['score_range']),
                 config=f"({config.benign_method})",
                 n_c=component_key,
                 n_samples=len([s for s in scoreset.samples]),

@@ -174,6 +174,10 @@ def run_single_dataset(
             logger.warning(f"  No results for {dataset_name}")
             return None
 
+        if getattr(args, "viz_only", False):
+            logger.info("  --viz-only: skipping variant table and calibration save")
+            return results
+
         # Per-variant evidence table
         for comp_key, calibration in results.items():
             variant_df = compute_variant_table(
@@ -256,6 +260,9 @@ def main():
                             "'Benign/Likely Benign' gnomAD Synonymous)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging (component params, flip detection, point ranges)")
+    parser.add_argument("--viz-only", action="store_true",
+                       help="Regenerate visualizations only — skip variant tables and calibration JSON save "
+                            "(useful for rerunning after fixing a plot bug)")
 
     args = parser.parse_args()
 

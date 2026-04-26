@@ -229,6 +229,7 @@ def plot_scoreset_compare_point_assignments(dataset, scoresets, summary, scorese
 
 
 def sample_density(x, fits, sampleNum):
+    x = np.asarray(x)
     _density = np.stack([density_utils.joint_densities(x, _fit['fit']['component_params'],_fit['fit']['weights'][sampleNum])
                         for _fit in fits])
     density = np.full(_density.shape,np.nan)

@@ -39,6 +39,9 @@ class PipelineConfig:
     # Debug mode: verbose logging of component params, weights, flip detection, point ranges
     debug: bool = False
 
+    # Viz-only mode: skip variant table + calibration save, only regenerate plots
+    viz_only: bool = False
+
     # OOB evidence
     compute_oob: bool = False
     oob_min_samples: int = 10

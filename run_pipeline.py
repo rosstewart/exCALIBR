@@ -96,6 +96,8 @@ Examples:
                             "(e.g. 'Pathogenic/Likely Pathogenic' 'Benign/Likely Benign' gnomAD Synonymous)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging (component params, weights, flip detection, point ranges)")
+    parser.add_argument("--viz-only", action="store_true",
+                       help="Regenerate visualizations only — skip variant tables and calibration JSON save")
 
     # OOB evidence
     parser.add_argument("--oob", action="store_true",
@@ -183,6 +185,7 @@ Examples:
         min_clinvar_star=args.min_clinvar_star,
         sample_names=args.sample_names,
         debug=args.debug,
+        viz_only=args.viz_only,
     )
 
     # Run pipeline
@@ -297,6 +300,11 @@ def run_calibration_pipeline(config: PipelineConfig):
         selected_components=selected_components,
         logger=logger
     )
+
+    if getattr(config, "viz_only", False):
+        logger.info("\n--viz-only: skipping variant tables and calibration save")
+        logger.info("\nPIPELINE COMPLETE (visualizations only)")
+        return
 
     # Step 3b: Per-variant evidence table
     logger.info("\n" + "="*80)

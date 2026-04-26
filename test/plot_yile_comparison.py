@@ -213,7 +213,12 @@ def _build_thresholds(point_ranges, flipped,
 
 def _plot_calibration_bar(ax, intervals, scores_for_count, x_min, x_max,
                           *, fontsize_count, min_label_frac=0.06):
-    """Render one evidence-strength colored bar with per-bin counts."""
+    """Render one evidence-strength colored bar with per-bin counts.
+
+    When no intervals are provided, the entire bar is treated as indeterminate.
+    """
+    if not intervals:
+        intervals = [(0, x_min, x_max)]
     for pv, start, end in intervals:
         ax.axvspan(start, end, color=STRENGTH_COLOR[pv], alpha=1.0)
         count = int(((scores_for_count >= start) & (scores_for_count < end)).sum())
@@ -305,9 +310,9 @@ def _draw_dataset_panel(
         fit_lw            = 1.5
         title_fs          = 9
 
-    x_min = float(score_range[0])
-    x_max = float(score_range[-1])
-    bin_width = (x_max - x_min) / bin_div if x_max > x_min else 1.0
+    x_min = 0.0
+    x_max = 1.0
+    bin_width = (x_max - x_min) / bin_div
 
     population_scores = _get_sample_scores(scoreset, sample_num=2)
     excalibr_thresholds = _build_thresholds(point_ranges_excalibr, flipped)
@@ -463,21 +468,10 @@ def _draw_dataset_panel(
         point_ranges_yile, x_min, x_max, flipped) \
         if point_ranges_yile is not None else []
 
-    if intervals_yile:
-        _plot_calibration_bar(
-            ax_yile, intervals_yile, population_scores, x_min, x_max,
-            fontsize_count=fontsize_count,
-        )
-    else:
-        # Show greyed-out placeholder
-        ax_yile.axvspan(x_min, x_max, color=STRENGTH_COLOR[0], alpha=0.4)
-        ax_yile.text(0.5, 0.5, 'Yile thresholds unavailable',
-                     transform=ax_yile.transAxes,
-                     ha='center', va='center',
-                     fontsize=fontsize_count, color='dimgray', style='italic')
-        ax_yile.set_xlim(x_min, x_max)
-        ax_yile.set_ylim(0, 1)
-        ax_yile.set_yticks([])
+    _plot_calibration_bar(
+        ax_yile, intervals_yile, population_scores, x_min, x_max,
+        fontsize_count=fontsize_count,
+    )
 
     ax_yile.set_ylabel('Yile', fontsize=side_label_fs, rotation=0,
                        ha='right', va='center', labelpad=side_label_pad)
