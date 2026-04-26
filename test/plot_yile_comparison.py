@@ -142,7 +142,7 @@ def build_calibration_intervals(point_ranges, x_min, x_max, flipped):
     `point_ranges` is the FLAT format {pv: [start, end]} or {pv: []}.
     Infinities and out-of-range bounds are clipped to [x_min, x_max].
     """
-    intervals = []
+    nonzero = []
     if point_ranges:
         for pv in sorted(p for p in point_ranges if p != 0):
             rng = point_ranges[pv]
@@ -152,12 +152,27 @@ def build_calibration_intervals(point_ranges, x_min, x_max, flipped):
             end   = _clip_finite(rng[1], x_min, x_max)
             if end <= start:
                 continue
-            intervals.append((pv, start, end))
+            nonzero.append((pv, start, end))
 
-    # Fill every uncovered slice of [x_min, x_max] with indeterminate.
-    nonzero_sorted = sorted(intervals, key=lambda x: x[1])
+    # Snap tiny gaps between adjacent non-zero intervals (e.g. Yile thresholds
+    # quoted to 3 decimals leave ~0.001 slivers between consecutive ranges).
+    nonzero.sort(key=lambda x: x[1])
+    snap_tol = (x_max - x_min) * 0.01
+    snapped = []
+    for entry in nonzero:
+        if snapped:
+            prev_pv, prev_s, prev_e = snapped[-1]
+            gap = entry[1] - prev_e
+            if 0 < gap < snap_tol:
+                mid = (prev_e + entry[1]) / 2
+                snapped[-1] = (prev_pv, prev_s, mid)
+                entry = (entry[0], mid, entry[2])
+        snapped.append(entry)
+
+    # Fill every remaining uncovered slice of [x_min, x_max] with indeterminate.
+    intervals = list(snapped)
     cursor = x_min
-    for _pv, s, e in nonzero_sorted:
+    for _pv, s, e in snapped:
         if s > cursor:
             intervals.append((0, cursor, s))
         cursor = max(cursor, e)
