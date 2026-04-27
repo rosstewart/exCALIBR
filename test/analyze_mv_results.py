@@ -16,6 +16,7 @@ Usage:
 
 import json
 import gzip
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -27,6 +28,18 @@ import pandas as pd
 import warnings
 import os
 from joblib import Parallel, delayed
+
+# Make canonical src/ importable so this module reuses the production
+# density and threshold helpers instead of maintaining parallel copies.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
+from src.assay_calibration.fit_utils.cfusn.density_utils import (
+    _single_component_logpdf,
+    get_q,
+)
 
 
 # ──────────────────────────────────────
@@ -204,173 +217,18 @@ def _bootstrap_job(fit_raw, scores, sa,
 # Density helpers
 # ──────────────────────────────────────
 
-def _detect_q(params):
-    """Detect latent dimension q from component params list."""
-    if not params:
-        return 1
-    _, Delta, _ = params[0]
-    Delta = np.asarray(Delta)
-    if Delta.ndim == 2 and Delta.shape[1] > 1:
-        return Delta.shape[1]
-    return 1
-
-
-def _mvn_logcdf_batch(uppers, mean, cov):
-    """Batch log-CDF of multivariate normal for (N, q) upper limits.
-    For q=1, uses fast scalar path. For q>=2, vectorised scipy call.
-    """
-    N, q = uppers.shape
-    if q == 1:
-        sigma = np.sqrt(max(float(np.asarray(cov).ravel()[0]), 1e-15))
-        return norm.logcdf((uppers[:, 0] - mean[0]) / sigma)
-    try:
-        rv = mvn(mean=mean, cov=cov, allow_singular=True)
-        vals = rv.cdf(uppers)   # vectorised: (N,) in one C-level call
-        return np.log(np.maximum(vals, 1e-300))
-    except Exception:
-        return np.full(N, -np.inf)
-
-
 def _sn_logpdf(x, mu, Delta, Gamma):
-    """Unified skew-normal log-density handling both q=1 and q>1.
+    """Skew-normal log-density wrapper.
 
-    Dispatches to _msn_logpdf_q1 or _cfusn_logpdf based on Delta shape.
-    Handles NaN via marginal property.
+    Delegates to the canonical implementation in
+    ``src/assay_calibration/fit_utils/cfusn/density_utils.py`` so the
+    analysis path uses the exact same density evaluation as the EM
+    fitter. Auto-dispatches between q=1 (restricted MSN) and q>1
+    (CFUSN) based on Delta shape, and handles NaN via the CFUSN
+    marginal property.
     """
-    Delta = np.asarray(Delta, dtype=float)
-    if Delta.ndim == 2 and Delta.shape[1] > 1:
-        return _cfusn_logpdf(x, mu, Delta, Gamma)
-    else:
-        return _msn_logpdf_q1(x, mu, np.atleast_1d(Delta).ravel(), Gamma)
-
-
-def _msn_logpdf_q1(x, mu, Delta, Gamma):
-    """MSN log-density for q=1 (Delta is a p-vector). Handles NaN via marginals."""
-    mu = np.asarray(mu, float)
-    Delta = np.asarray(Delta, float).ravel()
-    Gamma = np.asarray(Gamma, float)
-    x = np.atleast_2d(np.asarray(x, float))
-    N, K = x.shape
-    log_pdf = np.zeros(N)
-    obs_mask = ~np.isnan(x)
-    patterns = {}
-    for j in range(N):
-        key = tuple(obs_mask[j])
-        patterns.setdefault(key, []).append(j)
-    for pat, indices in patterns.items():
-        obs_dims = np.array([i for i, o in enumerate(pat) if o])
-        if len(obs_dims) == 0:
-            continue
-        idx = np.array(indices)
-        mu_s = mu[obs_dims]
-        Delta_s = Delta[obs_dims]
-        Gamma_s = Gamma[np.ix_(obs_dims, obs_dims)]
-        Omega_s = Gamma_s + np.outer(Delta_s, Delta_s)
-        Omega_s = 0.5 * (Omega_s + Omega_s.T)
-        eigv = np.linalg.eigvalsh(Omega_s)
-        if eigv.min() < 1e-10:
-            Omega_s += (1e-10 - eigv.min() + 1e-10) * np.eye(len(obs_dims))
-        try:
-            log_phi = mvn(mean=mu_s, cov=Omega_s, allow_singular=True).logpdf(
-                x[np.ix_(idx, obs_dims)])
-            Oid = np.linalg.solve(Omega_s, Delta_s)
-            eta = (x[np.ix_(idx, obs_dims)] - mu_s) @ Oid
-            s2 = max(1.0 - Delta_s @ Oid, 1e-12)
-            log_Phi = norm.logcdf(eta / np.sqrt(s2))
-            lp = np.log(2) + log_phi + log_Phi
-            lp = np.atleast_1d(np.asarray(lp, float))
-            lp[~np.isfinite(lp)] = -np.inf
-            log_pdf[idx] = lp
-        except Exception:
-            log_pdf[idx] = -np.inf
-    return log_pdf
-
-
-def _cfusn_logpdf(x, mu, Delta, Gamma):
-    """CFUSN log-density for q>=1 (Delta is a p×q matrix). Handles NaN via marginals.
-
-    f(x) = 2^q * phi_p(x; mu, Omega) * Phi_q(Delta' Omega^{-1} (x-mu); 0, D)
-    where Omega = Gamma + Delta Delta', D = I_q - Delta' Omega^{-1} Delta
-
-    Marginal property: for observed set S,
-        X_S ~ CFUSN(mu_S, Delta_S, Gamma_{SS})
-    where Delta_S is the row-subset of Delta.
-    """
-    mu = np.asarray(mu, float)
-    Delta = np.asarray(Delta, float)
-    Gamma = np.asarray(Gamma, float)
-    x = np.atleast_2d(np.asarray(x, float))
-    N, p = x.shape
-    q = Delta.shape[1]
-    log_pdf = np.zeros(N)
-
-    obs_mask = ~np.isnan(x)
-    patterns = {}
-    for j in range(N):
-        key = tuple(obs_mask[j])
-        patterns.setdefault(key, []).append(j)
-
-    for pat, indices in patterns.items():
-        obs_dims = np.array([i for i, o in enumerate(pat) if o])
-        if len(obs_dims) == 0:
-            continue
-        idx = np.array(indices)
-        p_s = len(obs_dims)
-
-        mu_s = mu[obs_dims]
-        Delta_s = Delta[obs_dims, :]  # (p_s, q)
-        Gamma_s = Gamma[np.ix_(obs_dims, obs_dims)]
-
-        Omega_s = Gamma_s + Delta_s @ Delta_s.T
-        Omega_s = 0.5 * (Omega_s + Omega_s.T)
-        eigv = np.linalg.eigvalsh(Omega_s)
-        if eigv.min() < 1e-10:
-            Omega_s += (1e-10 - eigv.min() + 1e-10) * np.eye(p_s)
-
-        try:
-            log_phi = mvn(mean=mu_s, cov=Omega_s, allow_singular=True).logpdf(
-                x[np.ix_(idx, obs_dims)])
-        except Exception:
-            log_pdf[idx] = -np.inf
-            continue
-
-        try:
-            Omega_s_inv_Delta_s = np.linalg.solve(Omega_s, Delta_s)  # (p_s, q)
-        except np.linalg.LinAlgError:
-            log_pdf[idx] = -np.inf
-            continue
-
-        D_s = np.eye(q) - Delta_s.T @ Omega_s_inv_Delta_s  # (q, q)
-        D_s = 0.5 * (D_s + D_s.T)
-        eig_D = np.linalg.eigvalsh(D_s)
-        if eig_D.min() < 1e-10:
-            D_s += (1e-10 - eig_D.min() + 1e-10) * np.eye(q)
-
-        residuals = x[np.ix_(idx, obs_dims)] - mu_s  # (n_idx, p_s)
-        eta = residuals @ Omega_s_inv_Delta_s  # (n_idx, q)
-
-        log_Phi = _mvn_logcdf_batch(eta, np.zeros(q), D_s)
-
-        lp = q * np.log(2) + log_phi + log_Phi
-        lp = np.atleast_1d(np.asarray(lp, float))
-        lp[~np.isfinite(lp)] = -np.inf
-        log_pdf[idx] = lp
-
-    return log_pdf
-
-
-def _log_mixture(x, params, weights):
-    """Log mixture density for (N,K) obs with NaN. Auto-detects q."""
-    x = np.atleast_2d(x)
-    components = []
-    for c, (p, w) in enumerate(zip(params, weights)):
-        if w < 1e-300:
-            continue
-        lp = _sn_logpdf(x, *p) + np.log(w)
-        components.append(lp)
-    if not components:
-        return np.full(x.shape[0], -np.inf)
-    return logsumexp(np.array(components), axis=0)
+    lp = _single_component_logpdf(x, (mu, Delta, Gamma), multivariate=True)
+    return np.atleast_1d(np.asarray(lp, dtype=float))
 
 
 def _marginal_params(mu, Delta, Gamma, dim):
@@ -412,10 +270,6 @@ def _marginal_params(mu, Delta, Gamma, dim):
         lam = delta / np.sqrt(1 - delta ** 2 + 1e-12)
         return lam, mu_d, omega
 
-
-import sys
-sys.path.append('..')
-from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
 
 def _thresholds(prior, point_values):
     """
@@ -518,7 +372,7 @@ class MVCalibrationAnalysis:
                 inner = fit_raw.get('fit', fit_raw)
                 fit = self._reconstitute_params(inner)
                 if fit is not None:
-                    return _detect_q(fit['component_params'])
+                    return get_q(fit['component_params'])
         return 1
 
     def _reconstitute_params(self, fit_dict):
@@ -545,7 +399,7 @@ class MVCalibrationAnalysis:
         weights = np.array(fit_dict['weights'], dtype=float)
         return {'component_params': params, 'weights': weights,
                 'xlims': fit_dict.get('xlims'),
-                'latent_q': fit_dict.get('latent_q', _detect_q(params))}
+                'latent_q': fit_dict.get('latent_q', get_q(params))}
 
     def _get_benign_weights(self, weights):
         n_w = len(weights)
@@ -865,6 +719,32 @@ class MVCalibrationAnalysis:
 
             priors = np.array(priors)
             lr_matrix = np.array(lr_matrix)
+
+            # ── Prior stability across bootstraps ─────────────────────
+            print(f"  Prior across boots: median={np.nanmedian(priors):.4f}, "
+                  f"mean={np.nanmean(priors):.4f}, std={np.nanstd(priors):.4f}, "
+                  f"5/95={np.nanpercentile(priors, 5):.4f}/"
+                  f"{np.nanpercentile(priors, 95):.4f}, "
+                  f"min/max={np.nanmin(priors):.4f}/{np.nanmax(priors):.4f}")
+
+            # ── LR+ underflow / non-finite diagnostics ───────────────
+            n_nan_lr  = int(np.isnan(lr_matrix).sum())
+            n_neg_inf = int(np.isneginf(lr_matrix).sum())
+            n_pos_inf = int(np.isposinf(lr_matrix).sum())
+            if n_nan_lr or n_neg_inf or n_pos_inf:
+                n_var_any  = int((~np.isfinite(lr_matrix)).any(axis=0).sum())
+                n_var_all  = int((~np.isfinite(lr_matrix)).all(axis=0).sum())
+                print(f"  LR+ matrix non-finite: {n_nan_lr} NaN, "
+                      f"{n_neg_inf} -inf, {n_pos_inf} +inf "
+                      f"(of {lr_matrix.size} entries)")
+                print(f"    variants with any non-finite LR+: {n_var_any}, "
+                      f"all non-finite: {n_var_all}")
+            # Magnitude of finite extremes — flags log_fp/log_fb underflow
+            finite = lr_matrix[np.isfinite(lr_matrix)]
+            if finite.size:
+                print(f"  LR+ finite range: min={finite.min():.2f}, "
+                      f"max={finite.max():.2f} "
+                      f"(|LR+|>50: {int((np.abs(finite) > 50).sum())} entries)")
 
             median_prior = np.nanmedian(priors)
             tau_p_log, tau_b_log, C_path, C_ben = _thresholds(
