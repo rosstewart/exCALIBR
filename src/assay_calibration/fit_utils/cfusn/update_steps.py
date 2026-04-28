@@ -516,20 +516,19 @@ def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, et
     residuals = x_fill - mu_new - Delta_eta                   # (N, p)
     Psi_minus = Psi - np.einsum('ni,nj->nij', eta, eta)      # (N, q, q) — once
 
-    # Precompute per-(d1,d2) weighted Psi_minus:
-    # obs_both[n,d1,d2] = obs[n,d1] & obs[n,d2]
-    obs_both  = obs[:, :, None] & obs[:, None, :]             # (N, p, p)
-    z_ob      = z[:, None, None] * obs_both                   # (N, p, p)
-    Z_b       = z_ob.sum(0)                                   # (p, p)
+    obs_f   = obs.astype(residuals.dtype)                     # (N, p)
+    Z_b     = (z[:, None, None] * obs[:, :, None] * obs[:, None, :]).sum(0)  # (p, p)
 
-    # term1[d1,d2] = sum_n z_ob[n,d1,d2] * r[n,d1] * r[n,d2]
-    r_outer   = residuals[:, :, None] * residuals[:, None, :] # (N, p, p)
-    term1     = np.einsum('n,nab->ab', z, obs_both * r_outer) # (p, p)
+    # term1[a,b] = sum_n z[n] · obs[n,a] · obs[n,b] · r[n,a] · r[n,b]
+    #           = (z · obs · r).T @ (obs · r)         — gemm, no (N,p,p) intermediate
+    masked_r = obs_f * residuals                              # (N, p), zero where unobserved
+    term1    = (z[:, None] * masked_r).T @ masked_r           # (p, p)
 
-    # Psi_corr[d1,d2,i,j] = sum_n z_ob[n,d1,d2] * Psi_minus[n,i,j]
-    Psi_corr  = np.einsum('nab,nij->abij', z_ob, Psi_minus)   # (p,p,q,q)
-    # term2[d1,d2] = Delta[d1,:] @ Psi_corr[d1,d2,:,:] @ Delta[d2,:]
-    term2     = np.einsum('ai,abij,bj->ab', Delta_new, Psi_corr, Delta_new)  # (p,p)
+    # Psi_corr[a,b,i,j] = sum_n z[n] · obs[n,a] · obs[n,b] · Psi_minus[n,i,j]
+    z_ob     = z[:, None, None] * obs[:, :, None] * obs[:, None, :]  # (N, p, p)
+    Psi_corr = np.einsum('nab,nij->abij', z_ob, Psi_minus)    # (p,p,q,q)
+    # term2[a,b] = Delta[a,:] @ Psi_corr[a,b,:,:] @ Delta[b,:]
+    term2    = np.einsum('ai,abij,bj->ab', Delta_new, Psi_corr, Delta_new)  # (p,p)
 
     safe      = Z_b > 1e-12
     Gamma_new = np.where(safe, (term1 + term2) / np.maximum(Z_b, 1e-12), 0.0)
@@ -607,8 +606,20 @@ def validate_indicators(Indicators):
 
 
 def sample_specific_responsibilities(
-    observations, sample_indicators, component_params, weights, multivariate=False
+    observations, sample_indicators, component_params, weights, multivariate=False,
+    cached_log_pdfs=None,
 ):
+    """E-step responsibilities.
+
+    Parameters
+    ----------
+    cached_log_pdfs : list[ndarray] or None
+        Optional per-sample (K, N_s) log-pdf matrices, indexed parallel to
+        ``sample_indicators.T``. When supplied, density re-evaluation is
+        skipped — used to reuse the log-pdfs computed by the previous
+        iteration's ``get_sample_weights_and_ll`` (which are computed on
+        the same iterate that this E-step needs).
+    """
     N_samples = sample_indicators.shape[1]
     N_components = len(component_params)
     N_observations = observations.shape[0]
@@ -616,8 +627,11 @@ def sample_specific_responsibilities(
     responsibilities = np.zeros((N_components, N_observations))
     for i, mask in enumerate(sample_indicators.T):
         X = observations[mask]
+        cached_i = (cached_log_pdfs[i]
+                    if cached_log_pdfs is not None else None)
         responsibilities[:, mask] = density_utils.component_posteriors(
-            X, component_params, weights[i], multivariate=multivariate
+            X, component_params, weights[i], multivariate=multivariate,
+            cached_log_pdfs=cached_i,
         )
     return responsibilities
 
@@ -646,7 +660,8 @@ def get_sample_weights(
 # ── Fused weight update + LL ─────────────────────────────────────────────────
 
 def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
-                               current_weights, multivariate=False):
+                               current_weights, multivariate=False,
+                               return_log_pdfs=False):
     """Compute updated weights AND normalised log-likelihood in a single density pass.
 
     The original code calls get_sample_weights (density eval) then fit.py calls
@@ -654,10 +669,20 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
     from the weight pass and re-weights with the fresh weights to get LL —
     eliminating one complete density evaluation per EM iteration.
 
+    Parameters
+    ----------
+    return_log_pdfs : bool
+        If True, additionally returns the per-sample list of (K, N_s)
+        log-pdf matrices computed on ``updated_params``. The caller can
+        feed these into the *next* iteration's
+        :func:`sample_specific_responsibilities` (via its
+        ``cached_log_pdfs`` arg) to avoid redoing the same density work.
+
     Returns
     -------
     updated_weights : (S, K)
     normalised_ll   : float   (LL / N, ready to append to likelihoods array)
+    log_pdfs_per_sample : list[ndarray]   (only if return_log_pdfs=True)
     """
     S, Kc  = current_weights.shape
     N      = observations.shape[0]
@@ -709,6 +734,8 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
             log_w = np.where(upd_w[i] > 0, np.log(upd_w[i]), -np.inf)
         ll += logsumexp(cache[i] + log_w[:, None], axis=0).sum()
 
+    if return_log_pdfs:
+        return upd_w, ll / N, cache
     return upd_w, ll / N
 
 
@@ -889,12 +916,28 @@ def verify_binary_search_result(
 # ══════════════════════════════════════════════
 
 def em_iteration(observations, sample_indicators, current_component_params,
-                 current_weights, constrained, xlims, multivariate=False, **kwargs):
+                 current_weights, constrained, xlims, multivariate=False,
+                 cached_log_pdfs=None, return_log_pdfs=False, **kwargs):
     """EM iteration.
 
-    Returns (updated_params, updated_weights, normalised_ll).
-    The LL is computed for free alongside the weight update — callers in
-    fit.py should NOT call get_likelihood separately after this function.
+    Returns (updated_params, updated_weights, normalised_ll) by default,
+    or (updated_params, updated_weights, normalised_ll, new_log_pdfs)
+    when ``return_log_pdfs=True``. The LL is computed for free alongside
+    the weight update — callers in fit.py should NOT call get_likelihood
+    separately after this function.
+
+    Parameters
+    ----------
+    cached_log_pdfs : list[ndarray] or None
+        Per-sample (K, N_s) log-pdf matrices computed on
+        ``current_component_params`` by the previous iteration's weight/LL
+        pass. When supplied, the E-step skips the redundant density
+        evaluation. Pass ``None`` for the first iteration or after a
+        backtracking revert.
+    return_log_pdfs : bool
+        When True, also returns the freshly computed per-sample log-pdf
+        matrices on ``updated_params`` so the caller can thread them
+        forward as ``cached_log_pdfs`` for the next iteration.
     """
     mv = multivariate
     if constrained and multicomponent_density_constraint_violated(
@@ -909,7 +952,7 @@ def em_iteration(observations, sample_indicators, current_component_params,
 
     responsibilities = sample_specific_responsibilities(
         observations, sample_indicators, current_component_params, current_weights,
-        multivariate=mv
+        multivariate=mv, cached_log_pdfs=cached_log_pdfs,
     )
 
     if not mv:
@@ -930,9 +973,16 @@ def em_iteration(observations, sample_indicators, current_component_params,
                 constrained, xlims, K, **kwargs
             )
 
+    if return_log_pdfs:
+        updated_weights, ll, new_log_pdfs = get_sample_weights_and_ll(
+            observations, sample_indicators, updated_params, current_weights,
+            multivariate=mv, return_log_pdfs=True,
+        )
+        return updated_params, updated_weights, ll, new_log_pdfs
+
     updated_weights, ll = get_sample_weights_and_ll(
         observations, sample_indicators, updated_params, current_weights,
-        multivariate=mv
+        multivariate=mv,
     )
     return updated_params, updated_weights, ll
 

@@ -154,7 +154,7 @@ def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
 
 def generate_manifest(output_dir, data_dir, target_array_size=1000, n_jobs=30,
                       genes=None, component_range=None, constraint_modes=None,
-                      N_BOOTSTRAPS=1000, NUM_FITS=100):
+                      N_BOOTSTRAPS=200, NUM_FITS=100):
     if component_range is None:
         component_range = [2, 3]
     if constraint_modes is None:
@@ -387,7 +387,7 @@ Examples:
                         help="Directory containing {gene}/{gene}_{predictor}.csv.gz")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory (default: auto from args).")
-    parser.add_argument("--n-bootstraps", type=int, default=1000)
+    parser.add_argument("--n-bootstraps", type=int, default=200)
     parser.add_argument("--num-fits", type=int, default=100)
     args = parser.parse_args()
 

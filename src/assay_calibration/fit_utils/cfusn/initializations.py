@@ -186,6 +186,9 @@ def kmeans_init_mv(X, **kwargs):
         n_clusters : int
         constrained : bool
         latent_q : int (default 1) — latent dimension q
+        lambdaIndex : int — encodes sign patterns for all clusters; for q=2,
+            cluster c uses pattern (lambdaIndex // 4**c) % 4, with bits mapping
+            to +/-1 per latent direction. Defaults to 0.
 
     Returns
     -------
@@ -196,6 +199,8 @@ def kmeans_init_mv(X, **kwargs):
     n_clusters = kwargs.get("n_clusters", 2)
     constrained = kwargs.get("constrained", True)
     latent_q = kwargs.get("latent_q", 1)
+    lambdaIndex = kwargs.get("lambdaIndex", 0)
+    n_sign_per_cluster = 2 ** latent_q  # 4 for q=2
     N, K_dim = X.shape
 
     complete_mask = ~np.isnan(X).any(axis=1)
@@ -261,8 +266,16 @@ def kmeans_init_mv(X, **kwargs):
                     if eigvals_G.min() < 1e-8:
                         Gamma += (1e-8 - eigvals_G.min()) * np.eye(K_dim)
                 else:
+                    # Decode lambdaIndex for cluster c: each cluster uses q bits of
+                    # an n_sign_per_cluster-ary digit at position c.
+                    cluster_pattern_idx = (lambdaIndex // (n_sign_per_cluster ** c)) % n_sign_per_cluster
+                    cluster_sign_pattern = np.array([
+                        ((cluster_pattern_idx >> j) & 1) * 2 - 1
+                        for j in range(latent_q)
+                    ])
                     # CFUSN: Delta is (p, q) matrix
-                    Delta = _init_delta_matrix(cov, K_dim, latent_q)
+                    Delta = _init_delta_matrix(cov, K_dim, latent_q,
+                                               Xc=Xc, cluster_sign_pattern=cluster_sign_pattern)
                     Gamma = cov - Delta @ Delta.T
                     Gamma = 0.5 * (Gamma + Gamma.T)
                     eigvals_G = np.linalg.eigvalsh(Gamma)
@@ -295,34 +308,51 @@ def kmeans_init_mv(X, **kwargs):
     raise ValueError(f"Failed init after 1000 attempts: {last_error}")
 
 
-def _init_delta_matrix(cov, p, q):
+def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None):
     """Initialize Delta (p, q) matrix for CFUSN.
 
-    Strategy: Use scaled random directions, ensuring that
-    Delta @ Delta.T doesn't dominate cov (so Gamma stays PD).
+    Uses the top-q eigenvectors of cov as skewness directions. Each column j
+    gets a sign determined by:
+      1. Base sign: sign of marginal skewness of cluster data projected onto
+         eigenvector j (uses complete rows of Xc; falls back to +1 if too few).
+      2. Enumerated flip: multiplied by cluster_sign_pattern[j] ∈ {-1, +1},
+         which comes from decoding lambdaIndex in the caller.
 
-    The columns of Delta are initialized as small random multiples
-    of eigenvectors of cov, which provides meaningful skewness directions.
+    If cluster_sign_pattern is None, a random sign is used (original behaviour).
     """
     eigvals, eigvecs = np.linalg.eigh(cov)
-    # Use top-q eigenvectors as skewness directions
     top_idx = np.argsort(eigvals)[::-1][:q]
 
     Delta = np.zeros((p, q))
     for j, idx in enumerate(top_idx):
-        # Scale so Delta contribution is small relative to cov
         scale = 0.1 * np.sqrt(eigvals[idx])
-        sign = np.random.choice([-1, 1])
-        Delta[:, j] = sign * scale * eigvecs[:, idx]
+        evec = eigvecs[:, idx]
+
+        # Base sign from marginal skewness of cluster data along this eigenvector
+        skew_sign = 1
+        if Xc is not None:
+            complete_rows = ~np.isnan(Xc).any(axis=1)
+            Xc_comp = Xc[complete_rows]
+            if len(Xc_comp) >= 8:
+                sk = sps.skew(Xc_comp @ evec)
+                if abs(sk) > 1e-6:
+                    skew_sign = int(np.sign(sk))
+
+        # Enumerated flip from lambdaIndex (or random if not provided)
+        enum_sign = (
+            int(cluster_sign_pattern[j])
+            if cluster_sign_pattern is not None
+            else np.random.choice([-1, 1])
+        )
+        Delta[:, j] = skew_sign * enum_sign * scale * evec
 
     # Add small random perturbation
     Delta += np.random.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
 
-    # Verify Gamma = cov - Delta @ Delta.T is PD
+    # Verify Gamma = cov - Delta @ Delta.T is PD; shrink Delta if needed
     Gamma = cov - Delta @ Delta.T
     eigvals_G = np.linalg.eigvalsh(Gamma)
     if eigvals_G.min() < 1e-6:
-        # Shrink Delta
         shrink = 0.5
         for _ in range(20):
             Delta *= shrink

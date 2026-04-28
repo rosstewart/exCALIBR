@@ -322,7 +322,7 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
     jobs_dir = f"{output_dir}/jobs"
     os.makedirs(jobs_dir, exist_ok=True)
 
-    N_BOOTSTRAPS = 1000
+    N_BOOTSTRAPS = 200
     NUM_FITS = 100
     if component_range is None:
         component_range = [2, 3]

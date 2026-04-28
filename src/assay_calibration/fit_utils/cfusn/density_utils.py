@@ -311,17 +311,15 @@ def cfusn_logpdf_alternate_missing(x, mu, Delta, Gamma):
     N, p_dim = x.shape
     log_pdf = np.zeros(N)
 
+    # Vectorised pattern partition (was a per-row Python dict loop).
     obs_mask = ~np.isnan(x)
-    patterns = {}
-    for j in range(N):
-        key = tuple(obs_mask[j])
-        patterns.setdefault(key, []).append(j)
+    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
 
-    for pattern_key, indices in patterns.items():
-        obs_dims = np.array([i for i, o in enumerate(pattern_key) if o])
+    for pi, pattern in enumerate(patterns):
+        obs_dims = np.where(pattern)[0]
         if len(obs_dims) == 0:
             continue
-        idx = np.array(indices)
+        idx = np.where(inverse == pi)[0]
 
         mu_s = mu[obs_dims]
         Delta_s = Delta[obs_dims, :]          # (|S|, q)
@@ -395,17 +393,15 @@ def msn_logpdf_alternate_missing(x, mu, Delta, Gamma):
     N, K = x.shape
     log_pdf = np.zeros(N)
 
+    # Vectorised pattern partition (was a per-row Python dict loop).
     obs_mask = ~np.isnan(x)
-    patterns = {}
-    for j in range(N):
-        key = tuple(obs_mask[j])
-        patterns.setdefault(key, []).append(j)
+    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
 
-    for pattern_key, indices in patterns.items():
-        obs_dims = np.array([i for i, o in enumerate(pattern_key) if o])
+    for pi, pattern in enumerate(patterns):
+        obs_dims = np.where(pattern)[0]
         if len(obs_dims) == 0:
             continue
-        idx = np.array(indices)
+        idx = np.where(inverse == pi)[0]
         mu_s = mu[obs_dims]
         Delta_s = Delta[obs_dims]
         Gamma_s = Gamma[np.ix_(obs_dims, obs_dims)]
@@ -542,11 +538,23 @@ def log_joint_densities(x, params, weights, multivariate=False):
 # Responsibilities
 # ──────────────────────────────────────────────
 
-def component_posteriors(X, canonical_params, individual_sample_weights, multivariate=False):
+def component_posteriors(X, canonical_params, individual_sample_weights,
+                          multivariate=False, cached_log_pdfs=None):
+    """Compute responsibilities P(component | x).
+
+    Parameters
+    ----------
+    cached_log_pdfs : (K, N_s) array or None
+        If provided, skips the density evaluation (which is the dominant
+        cost) and reuses the supplied log-pdfs. Caller is responsible for
+        ensuring the cache matches ``X`` and ``canonical_params``.
+    """
     individual_sample_weights = np.array(individual_sample_weights)[:, None]
     assert len(canonical_params) == individual_sample_weights.shape[0]
 
-    if not multivariate:
+    if cached_log_pdfs is not None:
+        log_pdfs = cached_log_pdfs
+    elif not multivariate:
         log_pdfs = np.stack(
             [sps.skewnorm.logpdf(X.ravel(), *p) for p in canonical_params], axis=0
         )

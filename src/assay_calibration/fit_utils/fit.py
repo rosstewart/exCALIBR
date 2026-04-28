@@ -207,13 +207,22 @@ class Fit:
         best_idx : int or None
         best_val_ll : float or None
         """
-        NUM_FITS = kwargs.get("num_fits", 100)
         observations = self.scoreset.scores
         mv = self.multivariate
 
         if not mv and observations.ndim == 2 and observations.shape[1] > 1:
             mv = True
             self.multivariate = True
+
+        if mv:
+            # For CFUSN q=2: 4^K distinct sign patterns (K = max components).
+            # Default NUM_FITS = min(4^K, 100); can be overridden by caller.
+            _latent_q = kwargs.get("latent_q", 2)
+            _max_K = max(component_range)
+            _default_fits = min((2 ** _latent_q) ** _max_K, 100)
+            NUM_FITS = kwargs.get("num_fits", _default_fits)
+        else:
+            NUM_FITS = kwargs.get("num_fits", 100)
 
         if not mv:
             kwargs["score_min"] = min(
@@ -313,11 +322,20 @@ class Fit:
 
         core_limit = kwargs.get("core_limit", -1)
 
+        def _lambda_index(i, num_components, mv, latent_q):
+            if mv:
+                n_patterns = min((2 ** latent_q) ** num_components, 100)
+            else:
+                n_patterns = 2 ** num_components
+            return i % n_patterns
+
+        _latent_q_run = kwargs.get("latent_q", 2)
+
         if core_limit == 1:
             models = []
             for num_components in component_range:
                 for i in range(NUM_FITS):
-                    kwargs["lambdaIndex"] = i % (2 ** num_components)
+                    kwargs["lambdaIndex"] = _lambda_index(i, num_components, mv, _latent_q_run)
                     models.append(tryToFit(
                         train_observations, train_sample_assignments,
                         num_components, constrained,
@@ -334,7 +352,7 @@ class Fit:
                     num_components, constrained,
                     init_methods[i], init_constraint_adjustments[i],
                     **{**kwargs, "multivariate": mv,
-                       "lambdaIndex": i % (2 ** num_components)}
+                       "lambdaIndex": _lambda_index(i, num_components, mv, _latent_q_run)}
                 )
                 for i in range(NUM_FITS)
                 for num_components in component_range
@@ -558,11 +576,18 @@ class Fit:
     # ──────────────────────────────────────
 
     def generate_fit_jobs(self, component_range, **kwargs):
-        NUM_FITS = kwargs.get("num_fits", 100)
         observations = self.scoreset.scores
         mv = self.multivariate
         if not mv and observations.ndim == 2 and observations.shape[1] > 1:
             mv = True
+
+        if mv:
+            _latent_q = kwargs.get("latent_q", 2)
+            _max_K = max(component_range)
+            _default_fits = min((2 ** _latent_q) ** _max_K, 100)
+            NUM_FITS = kwargs.get("num_fits", _default_fits)
+        else:
+            NUM_FITS = kwargs.get("num_fits", 100)
 
         if not mv:
             kwargs["score_min"] = min(
@@ -642,10 +667,16 @@ class Fit:
         init_constraint_adjustment = "scale"
         init_constraint_adjustments = np.full(NUM_FITS, init_constraint_adjustment)
 
+        _latent_q_jobs = kwargs.get("latent_q", 2)
+
         jobs = []
         for i in range(NUM_FITS):
             for num_components in component_range:
-                kwargs["lambdaIndex"] = i % (2 ** num_components)
+                if mv:
+                    n_patterns = min((2 ** _latent_q_jobs) ** num_components, 100)
+                else:
+                    n_patterns = 2 ** num_components
+                kwargs["lambdaIndex"] = i % n_patterns
                 job = {
                     "job_id": f"b{bootstrap_seed}_f{i}_c{num_components}",
                     "bootstrap_seed": bootstrap_seed,

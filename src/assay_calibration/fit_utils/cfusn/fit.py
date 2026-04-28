@@ -73,7 +73,6 @@ def single_fit(
                         observations, n_clusters=N_components,
                         constrained=constrained,
                         init_constraint_adjustment=init_constraint_adjustment,
-                        latent_q=latent_q,
                         **kwargs
                     )
                 else:
@@ -111,12 +110,15 @@ def single_fit(
     ])
 
     # ---- First EM iteration ----
-    # em_iteration now returns a 3-tuple (params, weights, normalised_ll),
-    # so no separate get_likelihood call is needed.
+    # em_iteration now also returns the per-sample log_pdf cache computed on
+    # the *updated* params; we feed it back as cached_log_pdfs to the next
+    # iteration's E-step (whose current_params == this iteration's
+    # updated_params), eliminating one full density pass per iteration.
     try:
-        updated_component_params, updated_weights, ll = em_iteration(
+        updated_component_params, updated_weights, ll, cached_log_pdfs = em_iteration(
             observations, sample_indicators, initial_params, W,
-            constrained, xlims, multivariate=mv, iterNum=0, **em_kwargs
+            constrained, xlims, multivariate=mv, iterNum=0,
+            return_log_pdfs=True, **em_kwargs,
         )
     except ZeroDivisionError as e:
         if kwargs.get("raise_on_error", False):
@@ -154,17 +156,24 @@ def single_fit(
             if np.isnan(updated_weights).any():
                 raise ValueError(f"NaN in weights at iteration {it}")
 
-            # em_iteration returns (params, weights, ll) — no get_likelihood needed.
-            updated_component_params, updated_weights, ll = em_iteration(
+            # em_iteration returns (params, weights, ll, log_pdfs_cache) — no
+            # separate get_likelihood needed. The cache is the log_pdfs on the
+            # *just-updated* params, which is exactly what next iter's E-step
+            # needs (its current_params == this iter's updated_params).
+            updated_component_params, updated_weights, ll, cached_log_pdfs = em_iteration(
                 observations, sample_indicators,
                 updated_component_params, updated_weights,
-                constrained, xlims, multivariate=mv, iterNum=it + 1, **em_kwargs
+                constrained, xlims, multivariate=mv, iterNum=it + 1,
+                cached_log_pdfs=cached_log_pdfs,
+                return_log_pdfs=True, **em_kwargs,
             )
 
             if not mv:
                 for i, (a, loc, scale) in enumerate(updated_component_params):
                     if scale < MIN_SCALE:
                         updated_component_params[i] = (a, loc, max(scale, MIN_SCALE))
+                # Univariate: scale clamp invalidates log-pdf cache for that comp
+                cached_log_pdfs = None
 
             if not constrained and check_submerged_duration:
                 violated = constraints.multicomponent_density_constraint_violated(
@@ -184,7 +193,12 @@ def single_fit(
 
             if it > 0 and likelihoods[-1] < likelihoods[-2]:
                 decrease = likelihoods[-2] - likelihoods[-1]
-                if decrease > 1e-13:
+                # Trigger backtracking only on a decrease that exceeds floating-
+                # point noise on the LL. The original 1e-13 absolute threshold
+                # fires on every plateau iteration once EM has converged,
+                # wasting up to 10 LL evaluations per iteration on noise.
+                bt_threshold = 1e-8 * abs(likelihoods[-2])
+                if decrease > bt_threshold:
                     if mv:
                         # Backtracking: get_likelihood is kept here because it
                         # evaluates candidate params that aren't stored anywhere
@@ -211,6 +225,10 @@ def single_fit(
                             updated_component_params = old_params
                             updated_weights = old_weights
                             likelihoods[-1] = likelihoods[-2]
+                        # Backtracking modified the iterate after em_iteration's
+                        # weight/LL pass cached log_pdfs on pre-backtrack params.
+                        # Force next iter's E-step to recompute density.
+                        cached_log_pdfs = None
                     else:
                         raise ValueError(
                             f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
