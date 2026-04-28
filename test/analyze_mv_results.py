@@ -309,7 +309,20 @@ class MVCalibrationAnalysis:
                  point_values=None,
                  pathogenic_idx=0, benign_idx=1,
                  gnomad_idx=2, synonymous_idx=3,
-                 benign_method='benign'):
+                 benign_method='benign',
+                 dataset_name=None, dataset_suffix='_mv'):
+        """
+        Parameters
+        ----------
+        dataset_name : str or None
+            Explicit results-JSON key. Overrides the auto-built
+            ``f"{gene}{dataset_suffix}"`` if given.
+        dataset_suffix : str
+            Suffix appended to ``gene`` to form the results key when
+            ``dataset_name`` is not provided. Use ``'_predictors_mv'``
+            for predictor-driven runs (matches predictor_mv_utils.
+            DATASET_SUFFIX) and ``'_mv'`` (default) for assay runs.
+        """
         self.ms = ms
         self.point_values = point_values or list(range(1, 9))
         self.benign_method = benign_method
@@ -344,9 +357,14 @@ class MVCalibrationAnalysis:
             raw = json.load(f)
         print(f"Genes available: {raw.keys()}")
 
-        self.dataset_name = f"{gene}_mv"
+        self.dataset_name = dataset_name or f"{gene}{dataset_suffix}"
+        if self.dataset_name not in raw:
+            raise KeyError(
+                f"Results JSON has no key '{self.dataset_name}'. "
+                f"Available: {sorted(raw.keys())}"
+            )
         self.raw_boots = raw[self.dataset_name]
-        print(f"  Multiple datasets found, using gene {self.dataset_name}")
+        print(f"  Using gene key: {self.dataset_name}")
 
         sample_boot = next(iter(self.raw_boots.values()))
         self.configs = sorted([k for k in sample_boot.keys() if sample_boot[k] is not None])

@@ -215,9 +215,17 @@ def standardize_auth_label(
 
 
 class BasicScoreset:
-    def __init__(self, scores: np.ndarray, sample_assignments,**kwargs):
-        self.scores = scores
-        self._sample_assignments = sample_assignments
+    def __init__(self, scores, sample_assignments, ids=None, **kwargs):
+        self.scores = np.asarray(scores)
+        self._sample_assignments = np.asarray(sample_assignments)
+        if ids is not None:
+            ids = np.asarray(list(ids))
+            if len(ids) != len(self.scores):
+                raise ValueError(
+                    f"ids length {len(ids)} does not match scores length "
+                    f"{len(self.scores)}"
+                )
+        self._ids = ids
         self.validate_inputs()
         self.validate_sample_assignments()
         self.sample_counts = self._sample_assignments.sum(axis=0)
@@ -276,6 +284,10 @@ class BasicScoreset:
     @property
     def n_samples(self):
         return self._sample_assignments.shape[1]
+
+    @property
+    def ids(self):
+        return self._ids
 
     @property
     def samples(self):
@@ -1472,6 +1484,201 @@ class MultiScoreset:
 
     def __len__(self):
         return self.n_variants
+
+
+class BasicMultiScoreset:
+    """Combine D BasicScoresets into a single (N, D) score matrix using
+    explicit per-variant IDs to align across assays.
+
+    Each input BasicScoreset must have its ``ids`` attribute populated.
+    Variants are aligned by ID (typically a protein-variant string). The
+    union of IDs across all inputs is taken; for each ID, missing
+    dimensions are filled with NaN. Sample assignments are merged (OR).
+
+    Exposes the same interface as MultiScoreset so it is a drop-in for
+    Fit() and the analysis scripts.
+    """
+
+    def __init__(self, scoresets, dataset_names=None, **kwargs):
+        if len(scoresets) == 0:
+            raise ValueError("scoresets cannot be empty")
+        for i, s in enumerate(scoresets):
+            if getattr(s, "_ids", None) is None:
+                raise ValueError(
+                    f"BasicScoreset {i} ({getattr(s, 'scoreset_name', '?')}) "
+                    f"has no ids; pass ids= when constructing each "
+                    f"BasicScoreset before combining."
+                )
+
+        self.scoresets = scoresets
+        self.d = len(scoresets)
+        self._init_kwargs = dict(kwargs)
+
+        if dataset_names is None:
+            dataset_names = [
+                getattr(s, "scoreset_name", f"assay_{i}")
+                for i, s in enumerate(scoresets)
+            ]
+        if len(dataset_names) != self.d:
+            raise ValueError("dataset_names must match number of scoresets")
+        self.dataset_names = dataset_names
+
+        s_total = max(s._sample_assignments.shape[1] for s in scoresets)
+        self._n_samples_total = s_total
+
+        default = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign",
+                   "population", "Synonymous"]
+        names = kwargs.get("sample_names", default[:s_total])
+        if len(names) < s_total:
+            names = list(names) + [
+                f"sample_{i}" for i in range(len(names), s_total)
+            ]
+        self._sample_names = names
+
+        self._build()
+
+    def _build(self):
+        # Union of IDs preserving first-seen order
+        seen: dict = {}
+        for s in self.scoresets:
+            for vid in s._ids:
+                if vid not in seen:
+                    seen[vid] = len(seen)
+        all_ids = list(seen.keys())
+        N = len(all_ids)
+
+        scores_matrix = np.full((N, self.d), np.nan)
+        sample_assignments = np.zeros((N, self._n_samples_total), dtype=bool)
+
+        for assay_i, s in enumerate(self.scoresets):
+            ids = s._ids
+            scores = np.asarray(s.scores)
+            samples = np.asarray(s._sample_assignments)
+            S_s = samples.shape[1]
+            for k, vid in enumerate(ids):
+                idx = seen[vid]
+                scores_matrix[idx, assay_i] = scores[k]
+                sample_assignments[idx, :S_s] |= samples[k]
+
+        missing_mask = np.isnan(scores_matrix)
+        keep_mask = ~np.all(missing_mask, axis=1)
+
+        self._all_ids = all_ids
+        self._variants_kept = [all_ids[i] for i in range(N) if keep_mask[i]]
+        self._scores_matrix = scores_matrix
+        self._missing_mask = missing_mask
+        self._keep_mask = keep_mask
+        self._scores = scores_matrix[keep_mask]
+        self._missing = missing_mask[keep_mask]
+        self._sample_assignments = sample_assignments[keep_mask]
+        self.n_variants = self._scores.shape[0]
+
+        self._xlims = tuple(
+            (np.nanmin(self._scores[:, dim]), np.nanmax(self._scores[:, dim]))
+            for dim in range(self.d)
+        )
+        self.sample_counts = self._sample_assignments.sum(axis=0)
+
+    # ── Scoreset/MultiScoreset-compatible API ────────────────────────
+
+    @property
+    def scores(self):
+        return self._scores
+
+    @property
+    def full_scores(self):
+        return self._scores_matrix
+
+    @property
+    def missing(self):
+        return self._missing
+
+    @property
+    def keep_mask(self):
+        return self._keep_mask
+
+    @property
+    def kept_variants(self):
+        return self._variants_kept
+
+    @property
+    def sample_assignments(self):
+        return self._sample_assignments[:, self.sample_counts > 0]
+
+    @property
+    def n_samples(self):
+        return int((self.sample_counts > 0).sum())
+
+    @property
+    def scoreset_name(self):
+        return " + ".join(self.dataset_names)
+
+    @property
+    def sample_names(self):
+        return [
+            self._sample_names[i]
+            for i in range(min(len(self._sample_names), len(self.sample_counts)))
+            if self.sample_counts[i] > 0
+        ]
+
+    @property
+    def xlims(self):
+        return self._xlims
+
+    @property
+    def n_assays(self):
+        return self.d
+
+    @property
+    def is_multivariate(self):
+        return True
+
+    @property
+    def samples(self):
+        for si in range(min(len(self._sample_names),
+                            self._sample_assignments.shape[1])):
+            if self.sample_counts[si] > 0:
+                mask = self._sample_assignments[:, si]
+                yield self._scores[mask], self._sample_names[si]
+
+    @property
+    def pathogenic_mask(self):
+        return self._sample_assignments[:, 0]
+
+    @property
+    def benign_mask(self):
+        if self._sample_assignments.shape[1] > 1:
+            return self._sample_assignments[:, 1]
+        return np.zeros(self.n_variants, dtype=bool)
+
+    @property
+    def population_mask(self):
+        if self._sample_assignments.shape[1] > 2:
+            return self._sample_assignments[:, 2]
+        return np.zeros(self.n_variants, dtype=bool)
+
+    @property
+    def synonymous_mask(self):
+        if self._sample_assignments.shape[1] > 3:
+            return self._sample_assignments[:, 3]
+        return np.zeros(self.n_variants, dtype=bool)
+
+    def __repr__(self):
+        out = f"BasicMultiScoreset: {self.scoreset_name}\n"
+        out += f"  {self.n_variants} variants, {self.d} assays\n"
+        for dim in range(self.d):
+            n_obs = (~np.isnan(self._scores[:, dim])).sum()
+            out += (f"  Dim {dim} ({self.dataset_names[dim]}): "
+                    f"{n_obs}/{self.n_variants} observed\n")
+        miss_pct = self._missing.mean() * 100
+        out += f"  Overall: {miss_pct:.1f}% missing entries\n"
+        for scores, name in self.samples:
+            out += f"  {name}: {len(scores)} variants\n"
+        return out
+
+    def __len__(self):
+        return self.n_variants
+
 
 if __name__ == "__main__":
     Fire()
