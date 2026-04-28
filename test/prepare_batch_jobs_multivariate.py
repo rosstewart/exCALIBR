@@ -175,7 +175,7 @@ def build_multi_scoreset(df, gene, datasets, clinvar_release="2025", **kwargs):
 
 def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
                        clinvar_release="2025", component_range=None,
-                       constraint_modes=None):
+                       constraint_modes=None, latent_q=2):
     """
     Process a single gene group: build MultiScoreset and generate consolidated jobs.
 
@@ -225,11 +225,14 @@ def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
             for constrained in constrained_flags:
                 mode_key = f"{nc}c_{'con' if constrained else 'unc'}"
                 try:
+                    fit_kwargs = {"latent_q": latent_q}
+                    if NUM_FITS is not None:
+                        fit_kwargs["num_fits"] = NUM_FITS
                     jobs = fitter.generate_fit_jobs(
                         component_range=[nc],
                         bootstrap_seed=bootstrap_iter,
                         check_monotonic=constrained,
-                        num_fits=NUM_FITS,
+                        **fit_kwargs,
                     )
                 except Exception as e:
                     print(f"  Bootstrap {bootstrap_iter}, {mode_key}: job generation failed ({e})")
@@ -323,7 +326,8 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
     os.makedirs(jobs_dir, exist_ok=True)
 
     N_BOOTSTRAPS = 200
-    NUM_FITS = 100
+    NUM_FITS = None  # dynamic: min(4^K, 100) per component count (q=2 default)
+    LATENT_Q = 2
     if component_range is None:
         component_range = [2, 3]
     if constraint_modes is None:
@@ -364,7 +368,11 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
     print(f"  Components: [{modes_str}]")
     print(f"  Constraints: [{constraint_str}]")
     print(f"  Bootstraps: {N_BOOTSTRAPS}")
-    print(f"  Fits per config: {NUM_FITS}")
+    if NUM_FITS is None:
+        print(f"  Fits per config: dynamic (min(4^K,100) for q={LATENT_Q}; "
+              + ", ".join(f"K={nc}→{min((2**LATENT_Q)**nc,100)}" for nc in component_range) + ")")
+    else:
+        print(f"  Fits per config: {NUM_FITS} (override)")
 
     genes_2018 = ["BRCA1", "MSH2", "PTEN", "TP53"]
     
@@ -373,8 +381,10 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
     all_jobs_by_gene = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(process_gene_group)(
             df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
-            clinvar_release="2025" if gene not in genes_2018 else "2018", component_range=component_range,
+            clinvar_release="2025" if gene not in genes_2018 else "2018",
+            component_range=component_range,
             constraint_modes=constraint_modes,
+            latent_q=LATENT_Q,
         )
         for gene, datasets in gene_groups.items()
     )
@@ -434,7 +444,7 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
                 "jobs_per_array": jobs_per_array,
                 "component_range": component_range,
                 "constraint_modes": constraint_modes,
-                "fits_per_component": NUM_FITS,
+                "fits_per_component": NUM_FITS if NUM_FITS is not None else "dynamic",
                 "gene_groups": {g: ds for g, ds in gene_groups.items()},
                 "job_index": job_index,
             },
@@ -452,9 +462,12 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
         ndim = gene_groups[gene]
         print(f"  {gene}: {count:,} jobs ({len(ndim)} assays, {len(ndim)}D)")
 
-    # SLURM script
+    # SLURM script — use dynamic expected fits for timing when not overridden
+    timing_fits = NUM_FITS if NUM_FITS is not None else max(
+        min((2 ** LATENT_Q) ** nc, 100) for nc in component_range
+    )
     create_mv_slurm_script(output_dir, num_arrays, jobs_per_array,
-                           NUM_FITS, component_range)
+                           timing_fits, component_range)
 
     return total_jobs, num_arrays
 

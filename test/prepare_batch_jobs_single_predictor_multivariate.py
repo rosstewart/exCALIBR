@@ -46,7 +46,7 @@ from predictor_mv_utils import (
 # ============================================================================
 
 def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
-                 component_range, constraint_modes):
+                 component_range, constraint_modes, latent_q=2):
     gene_label = predictor_dataset_label(gene)
     save_dir = f"{output_dir}/{gene_label}"
     os.makedirs(save_dir, exist_ok=True)
@@ -79,12 +79,15 @@ def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
         for nc in component_range:
             for constrained in constrained_flags:
                 mode_key = f"{nc}c_{'con' if constrained else 'unc'}"
+                fit_kwargs = {"latent_q": latent_q}
+                if NUM_FITS is not None:
+                    fit_kwargs["num_fits"] = NUM_FITS
                 try:
                     jobs = fitter.generate_fit_jobs(
                         component_range=[nc],
                         bootstrap_seed=bootstrap_iter,
                         check_monotonic=constrained,
-                        num_fits=NUM_FITS,
+                        **fit_kwargs,
                     )
                 except Exception as e:
                     print(f"  Bootstrap {bootstrap_iter}, {mode_key}: "
@@ -143,8 +146,12 @@ def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
 
     modes_str = " × ".join([f"{nc}c" for nc in component_range])
     constraint_str = "/".join(constraint_modes)
+    if NUM_FITS is None:
+        fits_str = f"dynamic ({', '.join(f'K={nc}:{min((2**latent_q)**nc,100)}' for nc in component_range)})"
+    else:
+        fits_str = str(NUM_FITS)
     print(f"  Generated {len(all_jobs)} bootstrap jobs "
-          f"({NUM_FITS} fits × [{modes_str}] × {{{constraint_str}}} each)")
+          f"({fits_str} fits × [{modes_str}] × {{{constraint_str}}} each)")
     return all_jobs
 
 
@@ -154,7 +161,7 @@ def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
 
 def generate_manifest(output_dir, data_dir, target_array_size=1000, n_jobs=30,
                       genes=None, component_range=None, constraint_modes=None,
-                      N_BOOTSTRAPS=200, NUM_FITS=100):
+                      N_BOOTSTRAPS=200, NUM_FITS=None, latent_q=2):
     if component_range is None:
         component_range = [2, 3]
     if constraint_modes is None:
@@ -179,13 +186,17 @@ def generate_manifest(output_dir, data_dir, target_array_size=1000, n_jobs=30,
     print(f"  Components: {component_range}")
     print(f"  Constraints: {constraint_modes}")
     print(f"  Bootstraps: {N_BOOTSTRAPS}")
-    print(f"  Fits per config: {NUM_FITS}")
+    if NUM_FITS is None:
+        print(f"  Fits per config: dynamic (min(4^K,100) for q={latent_q}; "
+              + ", ".join(f"K={nc}→{min((2**latent_q)**nc,100)}" for nc in component_range) + ")")
+    else:
+        print(f"  Fits per config: {NUM_FITS} (override)")
 
     print(f"\nGenerating jobs ({n_jobs} workers)...")
     all_jobs_by_gene = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(process_gene)(
             gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
-            component_range, constraint_modes,
+            component_range, constraint_modes, latent_q=latent_q,
         )
         for gene, predictor_dfs in by_gene.items()
     )
@@ -234,7 +245,7 @@ def generate_manifest(output_dir, data_dir, target_array_size=1000, n_jobs=30,
             "jobs_per_array": jobs_per_array,
             "component_range": component_range,
             "constraint_modes": constraint_modes,
-            "fits_per_component": NUM_FITS,
+            "fits_per_component": NUM_FITS if NUM_FITS is not None else "dynamic",
             "predictors": list(PREDICTORS),
             "job_index": job_index,
         }, f, indent=2)
@@ -247,7 +258,11 @@ def generate_manifest(output_dir, data_dir, target_array_size=1000, n_jobs=30,
     for gene, cnt in sorted(counts.items()):
         print(f"  {gene}: {cnt:,} jobs")
 
-    create_slurm_script(output_dir, num_arrays, jobs_per_array, NUM_FITS,
+    # Use dynamic expected fits for timing estimate when NUM_FITS not overridden
+    timing_fits = NUM_FITS if NUM_FITS is not None else max(
+        min((2 ** latent_q) ** nc, 100) for nc in component_range
+    )
+    create_slurm_script(output_dir, num_arrays, jobs_per_array, timing_fits,
                         component_range)
     return total_jobs, num_arrays
 
@@ -388,7 +403,8 @@ Examples:
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory (default: auto from args).")
     parser.add_argument("--n-bootstraps", type=int, default=200)
-    parser.add_argument("--num-fits", type=int, default=100)
+    parser.add_argument("--num-fits", type=int, default=None,
+                        help="Override dynamic NUM_FITS (default: min(4^K,100) per component count).")
     args = parser.parse_args()
 
     constraint_modes = set()
