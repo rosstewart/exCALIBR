@@ -583,14 +583,30 @@ def component_posteriors(X, canonical_params, individual_sample_weights,
 # Likelihood
 # ──────────────────────────────────────────────
 
-def get_likelihood(observations, sample_indicators, component_params, weights, multivariate=False):
+def get_likelihood(observations, sample_indicators, component_params, weights,
+                   multivariate=False, sample_weights=None):
+    """Total log-likelihood under the mixture.
+
+    When ``sample_weights`` (per-obs, length N) is given, returns the
+    sample-weighted LL  ``Σ_n sw_n · log Σ_k W[s(n),k] f_k(x_n)``. With
+    ``sw_n = 1`` this reduces to the standard LL — bit-identical
+    behaviour for callers that don't pass the kwarg.
+
+    Used by EM under ``sample_balance_beta>0``: the M-step then
+    maximises the same weighted Q-function we evaluate here, restoring
+    the standard EM monotonicity guarantee on this objective.
+    """
     if component_params is None or weights is None:
         return -np.inf
     L = 0.0
     for s, mask in enumerate(sample_indicators.T):
         X = observations[mask]
         lw = log_joint_densities(X, component_params, weights[s], multivariate=multivariate)
-        L += logsumexp(lw, axis=0).sum()
+        log_mix = logsumexp(lw, axis=0)
+        if sample_weights is not None:
+            L += float(np.sum(np.asarray(sample_weights)[mask] * log_mix))
+        else:
+            L += float(log_mix.sum())
     return L
 
 

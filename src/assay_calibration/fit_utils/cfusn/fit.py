@@ -132,9 +132,13 @@ def single_fit(
 
     history = [dict(component_params=initial_params, weights=W)]
     # Initial likelihood: no em_iteration has run yet so we must evaluate explicitly.
+    # Pass sample_weights so the initial LL is on the same (weighted) objective
+    # the M-step will optimise — preserves monotonicity under β>0.
     likelihoods = np.array([
-        get_likelihood(observations, sample_indicators, initial_params, W, multivariate=mv)
-        / len(sample_indicators)
+        get_likelihood(
+            observations, sample_indicators, initial_params, W,
+            multivariate=mv, sample_weights=sample_weights_per_obs,
+        ) / len(sample_indicators)
     ])
 
     # ---- First EM iteration ----
@@ -241,7 +245,8 @@ def single_fit(
                             bt_weights = (1 - alpha) * old_weights + alpha * updated_weights
                             bt_ll = get_likelihood(
                                 observations, sample_indicators,
-                                bt_params, bt_weights, multivariate=mv
+                                bt_params, bt_weights, multivariate=mv,
+                                sample_weights=sample_weights_per_obs,
                             ) / len(sample_indicators)
                             if bt_ll >= likelihoods[-2] - 1e-13:
                                 updated_component_params = bt_params

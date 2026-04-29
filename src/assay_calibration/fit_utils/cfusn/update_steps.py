@@ -676,7 +676,7 @@ def get_sample_weights(
 
 def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
                                current_weights, multivariate=False,
-                               return_log_pdfs=False):
+                               return_log_pdfs=False, sample_weights=None):
     """Compute updated weights AND normalised log-likelihood in a single density pass.
 
     The original code calls get_sample_weights (density eval) then fit.py calls
@@ -743,11 +743,23 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
         cache[i] = log_pdfs
 
     # ── LL with updated weights — zero extra density evals ──────────────
+    # When sample_weights is given, evaluate the per-obs *weighted* LL
+    # Σ_n sw_n · log Σ_k W[s(n),k] f_k(x_n) — this matches the M-step's
+    # Q-function under sample_balance_beta>0, so EM monotonicity holds.
+    # Note: the W[s,k] update above (P.mean(1)) is unchanged because
+    # sw_n is constant within sample s, so it factors out of the W
+    # argmax and the standard mean-responsibility formula remains
+    # optimal under the weighted Q.
+    sw = None if sample_weights is None else np.asarray(sample_weights)
     ll = 0.0
     for i in range(S):
         with np.errstate(divide='ignore'):
             log_w = np.where(upd_w[i] > 0, np.log(upd_w[i]), -np.inf)
-        ll += logsumexp(cache[i] + log_w[:, None], axis=0).sum()
+        log_mix = logsumexp(cache[i] + log_w[:, None], axis=0)
+        if sw is not None:
+            ll += float(np.sum(sw[sample_indicators[:, i]] * log_mix))
+        else:
+            ll += float(log_mix.sum())
 
     if return_log_pdfs:
         return upd_w, ll / N, cache
@@ -988,16 +1000,17 @@ def em_iteration(observations, sample_indicators, current_component_params,
                 constrained, xlims, K, **kwargs
             )
 
+    sw = kwargs.get("sample_weights", None)
     if return_log_pdfs:
         updated_weights, ll, new_log_pdfs = get_sample_weights_and_ll(
             observations, sample_indicators, updated_params, current_weights,
-            multivariate=mv, return_log_pdfs=True,
+            multivariate=mv, return_log_pdfs=True, sample_weights=sw,
         )
         return updated_params, updated_weights, ll, new_log_pdfs
 
     updated_weights, ll = get_sample_weights_and_ll(
         observations, sample_indicators, updated_params, current_weights,
-        multivariate=mv,
+        multivariate=mv, sample_weights=sw,
     )
     return updated_params, updated_weights, ll
 
