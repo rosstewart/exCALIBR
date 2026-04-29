@@ -794,10 +794,12 @@ def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None):
 def fix_to_satisfy_density_constraint_mv(component_parameters, X, **kwargs):
     """Shrink scale matrices until constraint is satisfied.
 
-    Works for both q=1 (Delta is vector) and q>1 (Delta is matrix).
+    Works for both q=1 (Delta is vector) and q>1 (Delta is matrix), and
+    honours ``constraint_mode`` ('line' or 'marginal').
     """
     n_components = len(component_parameters)
     K_dim = component_parameters[0][0].shape[0]
+    constraint_mode = kwargs.get("constraint_mode", "line")
 
     xlims = tuple(
         (float(np.nanmin(X[:, d])), float(np.nanmax(X[:, d])))
@@ -807,7 +809,7 @@ def fix_to_satisfy_density_constraint_mv(component_parameters, X, **kwargs):
     trial = 0
     while trial < 300:
         if not multicomponent_density_constraint_violated(
-            component_parameters, xlims, multivariate=True
+            component_parameters, xlims, multivariate=True, mode=constraint_mode,
         ):
             return component_parameters
         # Shrink: scale Gamma and Delta toward zero
@@ -820,7 +822,7 @@ def fix_to_satisfy_density_constraint_mv(component_parameters, X, **kwargs):
         trial += 1
 
     if multicomponent_density_constraint_violated(
-        component_parameters, xlims, multivariate=True
+        component_parameters, xlims, multivariate=True, mode=constraint_mode,
     ):
         return None
     return component_parameters

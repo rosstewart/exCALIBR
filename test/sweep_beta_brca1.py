@@ -43,7 +43,8 @@ from predictor_mv_utils import load_predictor_ms
 
 
 def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,
-                   anchor_centroid_mode="contrastive", anchor_centroid_verbose=False):
+                   anchor_centroid_mode="contrastive", anchor_centroid_verbose=False,
+                   check_monotonic=False, constraint_mode="line"):
     """Run the standard fit set for one (β, init) config and return the best.
 
     With ``bootstrap=False``, Fit.run uses the whole dataset and picks
@@ -54,11 +55,13 @@ def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,
     if init_strategy == "anchored":
         extra["anchor_centroid_mode"] = anchor_centroid_mode
         extra["anchor_centroid_verbose"] = anchor_centroid_verbose
+    if check_monotonic:
+        extra["constraint_mode"] = constraint_mode
     t0 = time.perf_counter()
     models, best_idx, best_ll = fitter.run(
         component_range=[K],
         bootstrap=False,
-        check_monotonic=False,         # unconstrained (production setting)
+        check_monotonic=check_monotonic,
         init_strategy=init_strategy,
         sample_balance_beta=beta,
         latent_q=latent_q,
@@ -79,12 +82,15 @@ def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,
         or not np.isfinite(best_ll)
     )
     if all_failed:
-        print(f"  [FAIL] init={init_strategy} β={beta:g}: "
+        print(f"  [FAIL] init={init_strategy} β={beta:g} "
+              f"constrained={check_monotonic}/{constraint_mode if check_monotonic else 'none'}: "
               f"all {len(models)} fits failed", flush=True)
         return {
             "beta": float(beta),
             "init_strategy": init_strategy,
             "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
+            "check_monotonic": bool(check_monotonic),
+            "constraint_mode": constraint_mode if check_monotonic else None,
             "best_ll": None,
             "best_idx": int(best_idx) if best_idx is not None else -1,
             "n_iters": 0,
@@ -104,6 +110,8 @@ def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,
         "beta": float(beta),
         "init_strategy": init_strategy,
         "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
+        "check_monotonic": bool(check_monotonic),
+        "constraint_mode": constraint_mode if check_monotonic else None,
         "best_ll": float(best_ll),
         "best_idx": int(best_idx),
         "n_iters": int(len(best.get("likelihoods", []))),
@@ -146,6 +154,18 @@ def main():
     parser.add_argument("--anchor-debug", action="store_true",
                         help="Print which branch (mean/dominant/contrastive) chose μ "
                              "for each anchored component.")
+    parser.add_argument("--check-monotonic", action="store_true",
+                        help="Enable density-ratio monotonicity constraint during EM "
+                             "(default: off, matching production MV setting). "
+                             "When on, see --constraint-mode for the variant.")
+    parser.add_argument("--constraint-mode",
+                        default="line",
+                        choices=["line", "marginal"],
+                        help="Constraint variant for --check-monotonic. "
+                             "'line' = 1-D probe through component means (necessary "
+                             "but not sufficient; weak). 'marginal' = per-dim CFUSN "
+                             "marginal monotonicity (stricter; recommended for "
+                             "predictor calibration). Default 'line'.")
     parser.add_argument("-K", "--components", type=int, default=3,
                         help="Number of mixture components (default: 3).")
     parser.add_argument("--latent-q", type=int, default=2,
@@ -185,8 +205,11 @@ def main():
     n_jobs = args.n_jobs if args.n_jobs > 0 else min(len(configs), os.cpu_count() or 4)
     print(f"\nSweeping {len(configs)} configs (βs={args.betas}, inits={args.init_strategies}) "
           f"with {n_jobs} parallel workers")
+    cnstr_str = (
+        f"constrained ({args.constraint_mode})" if args.check_monotonic else "unconstrained"
+    )
     print(f"  K={args.components}, latent_q={args.latent_q}, "
-          f"unconstrained, no bootstrap (whole-dataset fit)")
+          f"{cnstr_str}, no bootstrap (whole-dataset fit)")
     if "anchored" in args.init_strategies:
         print(f"  anchor centroid mode: {args.anchor_mode}"
               + (" (debug logging on)" if args.anchor_debug else ""))
@@ -203,6 +226,8 @@ def main():
             K=args.components, latent_q=args.latent_q, num_fits=args.num_fits,
             anchor_centroid_mode=args.anchor_mode,
             anchor_centroid_verbose=args.anchor_debug,
+            check_monotonic=args.check_monotonic,
+            constraint_mode=args.constraint_mode,
         )
         for (beta, init_strategy) in configs
     )

@@ -21,7 +21,12 @@ References:
 """
 
 from . import density_utils
-from .constraints import multicomponent_density_constraint_violated
+from .constraints import (
+    multicomponent_density_constraint_violated,
+    build_constraint_grids,
+    _logpdf_for_check,
+    _adjacent_pair_violated,
+)
 from typing import List, Tuple, Any
 import numpy as np
 import scipy.stats as sps
@@ -862,35 +867,113 @@ def get_constrained_update_mv(
     component_num, current_component_params, updated_component_params,
     xlims, multivariate=True, **kwargs
 ):
-    """Line-search constraint enforcement. Works for both q=1 and q>1."""
-    candidate = (candidate_mu, candidate_Delta, candidate_Gamma)
+    """Line-search constraint enforcement (q=1 and q>1).
 
-    test = _mv_build_constraint_params(
+    Optimisations vs. the previous implementation:
+      1. Probe grids built once from the alpha=1 candidate (rather than
+         re-derived from the test param set on every binary-search step).
+      2. Log-pdfs of the K-1 *static* components (not being modified by
+         this M-step pass) computed once and cached.  Each binary-search
+         step only re-evaluates the variable component.  This is roughly
+         a K× speedup on the density-eval cost — the dominant CFUSN cost.
+      3. Binary search capped at 20 iterations with 1e-4 tolerance
+         (was 50/1e-6).  The EM doesn't need atomic-precision frontier.
+
+    ``constraint_mode`` (kwarg, default 'line') is passed via kwargs;
+    'marginal' enables the per-dim CFUSN marginal check from
+    constraints.build_constraint_grids.
+    """
+    candidate = (candidate_mu, candidate_Delta, candidate_Gamma)
+    K = len(current_component_params)
+    constraint_mode = kwargs.get("constraint_mode", "line")
+    max_iters = kwargs.get("constraint_bsearch_max_iters", 20)
+    tol = kwargs.get("constraint_bsearch_tol", 1e-4)
+
+    # Build the candidate-at-alpha=1 param set; used both for the early-exit
+    # check and as the basis for fixing the probe grid.
+    test1 = _mv_build_constraint_params(
         component_num, current_component_params, updated_component_params,
         candidate, alpha=1.0
     )
-    if not multicomponent_density_constraint_violated(test, xlims, multivariate=multivariate):
+
+    if not multivariate:
+        # Univariate path is handled by binary_search elsewhere; defensive
+        # fallback that preserves previous behaviour if invoked here.
+        if not multicomponent_density_constraint_violated(
+            test1, xlims, multivariate=False
+        ):
+            return candidate_mu, candidate_Delta, candidate_Gamma
+
+    # Probe grid(s) — fixed across the binary search.  In 'line' mode the
+    # direction technically depends on means (which include the candidate);
+    # we freeze it at alpha=1 so static-component logpdfs can be cached.
+    grids = build_constraint_grids(test1, xlims, mode=constraint_mode)
+
+    # Pre-compute log-pdfs for components other than ``component_num``.
+    # These are alpha-invariant: ki<c uses updated_params[ki], ki>c uses
+    # current_params[ki]; both are fixed during this binary search.
+    static_lps = {}  # {grid_id: {k: logpdf_array}}
+    for grid_id, x_grid in grids:
+        per_k = {}
+        for k in range(K):
+            if k == component_num:
+                continue
+            p_k = (
+                updated_component_params[k] if k < component_num
+                else current_component_params[k]
+            )
+            try:
+                lp = _logpdf_for_check(x_grid, p_k, multivariate=True)
+                lp = np.asarray(lp, dtype=float)
+                lp[~np.isfinite(lp)] = -np.inf
+            except Exception:
+                # If a static component's density blows up, treat the whole
+                # check as violated → roll back to alpha=0.
+                return current_component_params[component_num]
+            per_k[k] = lp
+        static_lps[grid_id] = per_k
+
+    cur_alt = current_component_params[component_num]
+
+    def _interp_at(alpha):
+        mu_i = (1 - alpha) * cur_alt[0] + alpha * candidate[0]
+        Delta_i = (1 - alpha) * cur_alt[1] + alpha * candidate[1]
+        Gamma_i = (1 - alpha) * cur_alt[2] + alpha * candidate[2]
+        Gamma_i = 0.5 * (Gamma_i + Gamma_i.T)
+        return (mu_i, Delta_i, Gamma_i)
+
+    def _violated_at(alpha):
+        var_p = _interp_at(alpha)
+        for grid_id, x_grid in grids:
+            try:
+                var_lp = _logpdf_for_check(x_grid, var_p, multivariate=True)
+                var_lp = np.asarray(var_lp, dtype=float)
+                var_lp[~np.isfinite(var_lp)] = -np.inf
+            except Exception:
+                return True
+            log_pdfs = []
+            for k in range(K):
+                log_pdfs.append(
+                    var_lp if k == component_num else static_lps[grid_id][k]
+                )
+            if _adjacent_pair_violated(log_pdfs):
+                return True
+        return False
+
+    if not _violated_at(1.0):
         return candidate_mu, candidate_Delta, candidate_Gamma
 
     lo, hi = 0.0, 1.0
-    for _ in range(50):
-        mid = (lo + hi) / 2
-        test = _mv_build_constraint_params(
-            component_num, current_component_params, updated_component_params,
-            candidate, alpha=mid
-        )
-        if multicomponent_density_constraint_violated(test, xlims, multivariate=multivariate):
+    for _ in range(max_iters):
+        mid = 0.5 * (lo + hi)
+        if _violated_at(mid):
             hi = mid
         else:
             lo = mid
-        if hi - lo < 1e-6:
+        if hi - lo < tol:
             break
 
-    final = _mv_build_constraint_params(
-        component_num, current_component_params, updated_component_params,
-        candidate, alpha=lo
-    )
-    return final[component_num]
+    return _interp_at(lo)
 
 
 # ══════════════════════════════════════════════
@@ -970,8 +1053,9 @@ def em_iteration(observations, sample_indicators, current_component_params,
         forward as ``cached_log_pdfs`` for the next iteration.
     """
     mv = multivariate
+    constraint_mode = kwargs.get("constraint_mode", "line")
     if constrained and multicomponent_density_constraint_violated(
-        current_component_params, xlims, multivariate=mv
+        current_component_params, xlims, multivariate=mv, mode=constraint_mode
     ):
         raise ValueError("density constraint violated at start of em iteration")
 
@@ -1110,7 +1194,8 @@ def _em_update_multivariate(
             test_params = [*updated[:c + 1], *current_component_params[c + 1:]]
             try:
                 violated = multicomponent_density_constraint_violated(
-                    test_params, xlims, multivariate=True
+                    test_params, xlims, multivariate=True,
+                    mode=kwargs.get("constraint_mode", "line"),
                 )
             except Exception:
                 violated = False
@@ -1191,7 +1276,8 @@ def _em_update_cfusn(
             test_params = [*updated[:c + 1], *current_component_params[c + 1:]]
             try:
                 violated = multicomponent_density_constraint_violated(
-                    test_params, xlims, multivariate=True
+                    test_params, xlims, multivariate=True,
+                    mode=kwargs.get("constraint_mode", "line"),
                 )
             except Exception:
                 violated = False

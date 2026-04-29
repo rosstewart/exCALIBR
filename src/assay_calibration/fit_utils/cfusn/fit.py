@@ -22,6 +22,7 @@ def single_fit(
     MIN_SCALE = 1e-100
     mv = multivariate
     latent_q = kwargs.get("latent_q", 2)
+    constraint_mode = kwargs.get("constraint_mode", "line")
 
     if kwargs.get("submerge_steps") is not None:
         raise NotImplementedError("submerge_steps is deprecated")
@@ -134,6 +135,7 @@ def single_fit(
         )
 
     em_kwargs = {}
+    em_kwargs["constraint_mode"] = constraint_mode
     if mv and latent_q > 1:
         em_kwargs["n_mc_truncated"] = kwargs.get("n_mc_truncated", 500)
     if sample_weights_per_obs is not None:
@@ -182,7 +184,7 @@ def single_fit(
         times_submerged = []
         if not constrained and check_submerged_duration:
             is_underwater = constraints.multicomponent_density_constraint_violated(
-                updated_component_params, xlims, multivariate=mv
+                updated_component_params, xlims, multivariate=mv, mode=constraint_mode,
             )
             if is_underwater:
                 underwater_time += 1
@@ -295,7 +297,7 @@ def single_fit(
 
         if not constrained and check_submerged_duration:
             violated = constraints.multicomponent_density_constraint_violated(
-                updated_component_params, xlims, multivariate=mv
+                updated_component_params, xlims, multivariate=mv, mode=constraint_mode,
             )
             if is_underwater and not violated:
                 times_submerged.append(underwater_time)
@@ -306,7 +308,7 @@ def single_fit(
         if verbose:
             pbar.close()
         if constrained and constraints.multicomponent_density_constraint_violated(
-            updated_component_params, xlims, multivariate=mv
+            updated_component_params, xlims, multivariate=mv, mode=constraint_mode,
         ):
             raise ValueError("Final parameters violate density constraint")
 
