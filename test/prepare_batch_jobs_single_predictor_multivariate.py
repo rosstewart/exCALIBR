@@ -46,7 +46,8 @@ from predictor_mv_utils import (
 # ============================================================================
 
 def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
-                 component_range, constraint_modes, latent_q=2):
+                 component_range, constraint_modes, latent_q=2,
+                 init_strategy="anchored", sample_balance_beta=0.5):
     gene_label = predictor_dataset_label(gene)
     save_dir = f"{output_dir}/{gene_label}"
     os.makedirs(save_dir, exist_ok=True)
@@ -79,7 +80,11 @@ def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
         for nc in component_range:
             for constrained in constrained_flags:
                 mode_key = f"{nc}c_{'con' if constrained else 'unc'}"
-                fit_kwargs = {"latent_q": latent_q}
+                fit_kwargs = {
+                    "latent_q": latent_q,
+                    "init_strategy": init_strategy,
+                    "sample_balance_beta": sample_balance_beta,
+                }
                 if NUM_FITS is not None:
                     fit_kwargs["num_fits"] = NUM_FITS
                 try:
@@ -161,7 +166,8 @@ def process_gene(gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
 
 def generate_manifest(output_dir, data_dir, target_array_size=1000, n_jobs=30,
                       genes=None, component_range=None, constraint_modes=None,
-                      N_BOOTSTRAPS=200, NUM_FITS=None, latent_q=2):
+                      N_BOOTSTRAPS=200, NUM_FITS=None, latent_q=2,
+                      init_strategy="anchored", sample_balance_beta=0.5):
     if component_range is None:
         component_range = [2, 3]
     if constraint_modes is None:
@@ -191,12 +197,15 @@ def generate_manifest(output_dir, data_dir, target_array_size=1000, n_jobs=30,
               + ", ".join(f"K={nc}→{min((2**latent_q)**nc,100)}" for nc in component_range) + ")")
     else:
         print(f"  Fits per config: {NUM_FITS} (override)")
+    print(f"  Init strategy: {init_strategy}")
+    print(f"  Sample-balance β: {sample_balance_beta}")
 
     print(f"\nGenerating jobs ({n_jobs} workers)...")
     all_jobs_by_gene = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(process_gene)(
             gene, predictor_dfs, output_dir, N_BOOTSTRAPS, NUM_FITS,
             component_range, constraint_modes, latent_q=latent_q,
+            init_strategy=init_strategy, sample_balance_beta=sample_balance_beta,
         )
         for gene, predictor_dfs in by_gene.items()
     )
@@ -405,6 +414,13 @@ Examples:
     parser.add_argument("--n-bootstraps", type=int, default=200)
     parser.add_argument("--num-fits", type=int, default=None,
                         help="Override dynamic NUM_FITS (default: min(4^K,100) per component count).")
+    parser.add_argument("--init-strategy", type=str, default="anchored",
+                        choices=["anchored", "kmeans"],
+                        help="Initialization strategy. 'anchored' (default) initialises each "
+                             "component from its anchor sample; 'kmeans' uses joint k-means.")
+    parser.add_argument("--sample-balance-beta", type=float, default=0.5,
+                        help="Sample-balanced M-step strength β ∈ [0,1]. 0=off (status quo), "
+                             "1=each sample contributes equally to component params. Default: 0.5.")
     args = parser.parse_args()
 
     constraint_modes = set()
@@ -446,6 +462,8 @@ Examples:
         constraint_modes=constraint_modes,
         N_BOOTSTRAPS=args.n_bootstraps,
         NUM_FITS=args.num_fits,
+        init_strategy=args.init_strategy,
+        sample_balance_beta=args.sample_balance_beta,
     )
 
     print(f"\n{'=' * 80}")

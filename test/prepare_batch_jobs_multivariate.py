@@ -175,7 +175,8 @@ def build_multi_scoreset(df, gene, datasets, clinvar_release="2025", **kwargs):
 
 def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
                        clinvar_release="2025", component_range=None,
-                       constraint_modes=None, latent_q=2):
+                       constraint_modes=None, latent_q=2,
+                       init_strategy="kmeans", sample_balance_beta=0.0):
     """
     Process a single gene group: build MultiScoreset and generate consolidated jobs.
 
@@ -225,7 +226,11 @@ def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
             for constrained in constrained_flags:
                 mode_key = f"{nc}c_{'con' if constrained else 'unc'}"
                 try:
-                    fit_kwargs = {"latent_q": latent_q}
+                    fit_kwargs = {
+                        "latent_q": latent_q,
+                        "init_strategy": init_strategy,
+                        "sample_balance_beta": sample_balance_beta,
+                    }
                     if NUM_FITS is not None:
                         fit_kwargs["num_fits"] = NUM_FITS
                     jobs = fitter.generate_fit_jobs(
@@ -305,7 +310,8 @@ def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
 def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
                               max_dimensions=np.inf, manual_groups=None,
                               genes=None, component_range=None,
-                              constraint_modes=None, output_dir=None):
+                              constraint_modes=None, output_dir=None,
+                              init_strategy="kmeans", sample_balance_beta=0.0):
     """
     Generate job manifest for multivariate calibration.
 
@@ -373,6 +379,8 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
               + ", ".join(f"K={nc}→{min((2**LATENT_Q)**nc,100)}" for nc in component_range) + ")")
     else:
         print(f"  Fits per config: {NUM_FITS} (override)")
+    print(f"  Init strategy: {init_strategy}")
+    print(f"  Sample-balance β: {sample_balance_beta}")
 
     genes_2018 = ["BRCA1", "MSH2", "PTEN", "TP53"]
     
@@ -385,6 +393,8 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
             component_range=component_range,
             constraint_modes=constraint_modes,
             latent_q=LATENT_Q,
+            init_strategy=init_strategy,
+            sample_balance_beta=sample_balance_beta,
         )
         for gene, datasets in gene_groups.items()
     )
@@ -641,6 +651,20 @@ Examples:
         "--output-dir", type=str, default=None,
         help="Override output directory (default: auto-generated from arguments)"
     )
+    parser.add_argument(
+        "--init-strategy", type=str, default="kmeans",
+        choices=["kmeans", "anchored"],
+        help="Initialization strategy. 'kmeans' (default) uses joint k-means; "
+             "'anchored' initialises each component from its anchor sample. "
+             "Anchored is recommended for predictor-style imbalanced data; "
+             "for functional assays the default kmeans is usually fine."
+    )
+    parser.add_argument(
+        "--sample-balance-beta", type=float, default=0.0,
+        help="Sample-balanced M-step strength β ∈ [0,1]. 0=off (default; status quo), "
+             "1=each sample contributes equally to component params. Increase for "
+             "imbalanced sample sizes (e.g. predictor data)."
+    )
     args = parser.parse_args()
 
     # Resolve constraint modes
@@ -711,6 +735,8 @@ Examples:
         component_range=component_range,
         constraint_modes=constraint_modes,
         output_dir=output_dir,
+        init_strategy=args.init_strategy,
+        sample_balance_beta=args.sample_balance_beta,
     )
 
     print(f"\n{'=' * 80}")

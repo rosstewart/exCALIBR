@@ -308,6 +308,148 @@ def kmeans_init_mv(X, **kwargs):
     raise ValueError(f"Failed init after 1000 attempts: {last_error}")
 
 
+def default_anchor_groups(K, S):
+    """Sample-index groups whose observations init each component.
+
+    Returns a list of length min(K, S); element c is the list of sample
+    column indices to pool when initialising component c.
+
+    Special case: full assay layout (S == 4 → [pathogenic, benign,
+    population, synonymous]) with K <= 3 merges synonymous (idx 3) into
+    the benign anchor (idx 1). Both represent neutral variants and
+    benefit from being modelled by the same component when there are
+    fewer components than samples.
+
+    All other (K, S) configurations use 1:1 anchoring.
+    """
+    if S == 4 and K <= 3:
+        return [[0], [1, 3], [2]][:K]
+    return [[c] for c in range(min(K, S))]
+
+
+def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
+    """Anchored multivariate init: each component is initialised from
+    the union of observations across its anchor sample(s).
+
+    Parameters
+    ----------
+    X : (N, p) ndarray, may contain NaN
+    sample_indicators : (N, S) bool ndarray (one-hot per row)
+    **kwargs :
+        n_clusters : int (K)
+        constrained : bool
+        latent_q : int (default 1) — latent dimension q
+        lambdaIndex : int — encodes per-cluster sign patterns (see
+            kmeans_init_mv).
+        anchor_groups : list[list[int]] (optional) — override default
+            mapping from component index to sample indices.
+
+    For component c with group [s_a, s_b, ...], pools
+    X[sample_indicators[:, s_a] | sample_indicators[:, s_b] | ...] and
+    computes (mu, Delta, Gamma) from that pool. Components with index >=
+    min(K, S) are filled in from the global k-means init on remaining
+    observations.
+
+    Returns
+    -------
+    component_parameters : list of (mu, Delta, Gamma) tuples
+    kmeans : fitted sklearn KMeans (or None if all components anchored)
+    """
+    n_clusters = kwargs.get("n_clusters", 2)
+    constrained = kwargs.get("constrained", True)
+    latent_q = kwargs.get("latent_q", 1)
+    lambdaIndex = kwargs.get("lambdaIndex", 0)
+    n_sign_per_cluster = 2 ** latent_q
+
+    N, K_dim = X.shape
+    S = sample_indicators.shape[1]
+    anchor_groups = kwargs.get("anchor_groups") or default_anchor_groups(n_clusters, S)
+
+    component_parameters = []
+    for c in range(min(n_clusters, len(anchor_groups))):
+        group = anchor_groups[c]
+        # Pool observations from all samples in this anchor group
+        mask = np.zeros(N, dtype=bool)
+        for s in group:
+            mask |= sample_indicators[:, s].astype(bool)
+        Xc = X[mask]
+        # Drop rows where every dim is NaN
+        Xc = Xc[~np.all(np.isnan(Xc), axis=1)]
+        if len(Xc) < max(10, K_dim + 2):
+            raise ValueError(
+                f"Anchored init: component {c} group {group} has only "
+                f"{len(Xc)} usable observations (need at least {max(10, K_dim+2)})"
+            )
+
+        mu = np.nanmean(Xc, axis=0)
+
+        # NaN-aware pairwise covariance (mirrors kmeans_init_mv)
+        cov = np.zeros((K_dim, K_dim))
+        for d1 in range(K_dim):
+            for d2 in range(d1, K_dim):
+                both = ~np.isnan(Xc[:, d1]) & ~np.isnan(Xc[:, d2])
+                if both.sum() < 2:
+                    cov[d1, d2] = 1e-2
+                else:
+                    cov[d1, d2] = np.cov(Xc[both, d1], Xc[both, d2])[0, 1]
+                cov[d2, d1] = cov[d1, d2]
+        cov += 1e-6 * np.eye(K_dim)
+        eigvals = np.linalg.eigvalsh(cov)
+        if eigvals.min() < 1e-8:
+            cov += (1e-8 - eigvals.min()) * np.eye(K_dim)
+
+        if latent_q == 1:
+            Delta = np.random.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
+            Gamma = cov - np.outer(Delta, Delta)
+            eigvals_G = np.linalg.eigvalsh(Gamma)
+            if eigvals_G.min() < 1e-8:
+                Gamma += (1e-8 - eigvals_G.min()) * np.eye(K_dim)
+        else:
+            cluster_pattern_idx = (lambdaIndex // (n_sign_per_cluster ** c)) % n_sign_per_cluster
+            cluster_sign_pattern = np.array([
+                ((cluster_pattern_idx >> j) & 1) * 2 - 1
+                for j in range(latent_q)
+            ])
+            Delta = _init_delta_matrix(
+                cov, K_dim, latent_q, Xc=Xc,
+                cluster_sign_pattern=cluster_sign_pattern,
+            )
+            Gamma = cov - Delta @ Delta.T
+            Gamma = 0.5 * (Gamma + Gamma.T)
+            eigvals_G = np.linalg.eigvalsh(Gamma)
+            if eigvals_G.min() < 1e-8:
+                Gamma += (1e-8 - eigvals_G.min()) * np.eye(K_dim)
+
+        component_parameters.append((mu, Delta, Gamma))
+
+    # Fill any unanchored components (c >= min(K, S)) via plain kmeans init
+    kmeans = None
+    if len(component_parameters) < n_clusters:
+        n_remaining = n_clusters - len(component_parameters)
+        # Reuse kmeans_init_mv on the full data with reduced n_clusters; we'll
+        # take its first n_remaining components (sort-by-mu downstream gives
+        # a consistent ordering).
+        extra_kwargs = {**kwargs, "n_clusters": n_remaining}
+        try:
+            extra_params, kmeans = kmeans_init_mv(X, **extra_kwargs)
+            component_parameters.extend(extra_params[:n_remaining])
+        except Exception:
+            # If unanchored init fails, raise (caller will catch and retry)
+            raise
+
+    component_parameters.sort(key=lambda p: p[0][0])
+
+    if constrained:
+        result = fix_to_satisfy_density_constraint_mv(
+            component_parameters, X, **kwargs
+        )
+        if result is None:
+            raise ValueError("Anchored init: constraint enforcement failed")
+        component_parameters = result
+
+    return component_parameters, kmeans
+
+
 def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None):
     """Initialize Delta (p, q) matrix for CFUSN.
 

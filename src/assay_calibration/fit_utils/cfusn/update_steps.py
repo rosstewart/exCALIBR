@@ -403,22 +403,27 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
 # Univariate update rules (unchanged)
 # ══════════════════════════════════════════════
 
-def get_location_update(observations, responsibilities, component_params):
+def get_location_update(observations, responsibilities, component_params,
+                        sample_weights=None):
     assert observations.shape == responsibilities.shape
     v, w = get_truncated_normal_moments(observations, component_params)
     (_, Delta, Gamma) = density_utils.canonical_to_alternate(*component_params)
     m = observations - v * Delta
-    return (m * responsibilities).sum() / responsibilities.sum()
+    r = responsibilities if sample_weights is None else responsibilities * sample_weights
+    return (m * r).sum() / r.sum()
 
 
-def get_Delta_update(updated_loc, observations, responsibilities, component_params):
+def get_Delta_update(updated_loc, observations, responsibilities, component_params,
+                     sample_weights=None):
     assert observations.shape == responsibilities.shape
     v, w = get_truncated_normal_moments(observations, component_params)
     d = v * (observations - updated_loc)
-    return (d * responsibilities).sum() / (w * responsibilities).sum()
+    r = responsibilities if sample_weights is None else responsibilities * sample_weights
+    return (d * r).sum() / (w * r).sum()
 
 
-def get_Gamma_update(updated_loc, updated_Delta, observations, responsibilities, component_params):
+def get_Gamma_update(updated_loc, updated_Delta, observations, responsibilities, component_params,
+                    sample_weights=None):
     assert observations.shape == responsibilities.shape
     v, w = get_truncated_normal_moments(observations, component_params)
     g = (
@@ -426,7 +431,8 @@ def get_Gamma_update(updated_loc, updated_Delta, observations, responsibilities,
         - 2 * updated_Delta * v * (observations - updated_loc)
         + updated_Delta**2 * w
     )
-    return (g * responsibilities).sum() / responsibilities.sum()
+    r = responsibilities if sample_weights is None else responsibilities * sample_weights
+    return (g * r).sum() / r.sum()
 
 
 # ══════════════════════════════════════════════
@@ -443,7 +449,7 @@ def get_Gamma_update(updated_loc, updated_Delta, observations, responsibilities,
 # ── CFUSN M-step helpers — vectorized over p ────────────────────────────────
 
 def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
-                               n_mc=500, rng=None):
+                               n_mc=500, rng=None, sample_weights=None):
     """CFUSN location M-step. Returns (mu_new, eta, Psi) — moments reused downstream."""
     Delta      = density_utils._ensure_matrix_delta(Delta)
     eta, Psi   = get_truncated_normal_moments_cfusn(
@@ -452,11 +458,12 @@ def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
     obs    = ~np.isnan(observations)                 # (N, p)
     x_fill = np.where(obs, observations, 0.0)
     z      = responsibilities                         # (N,)
+    z_eff  = z if sample_weights is None else z * sample_weights
 
     # KEY FIX: single matrix op replaces per-dimension loop
     # Delta_eta[j, d] = sum_r Delta[d, r] * eta[j, r]
     Delta_eta = eta @ Delta.T                         # (N, p)
-    obs_z     = obs * z[:, None]                      # (N, p)
+    obs_z     = obs * z_eff[:, None]                  # (N, p)
     numer     = (obs_z * (x_fill - Delta_eta)).sum(0) # (p,)
     denom     = obs_z.sum(0)                           # (p,)
     mu_new    = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12), mu)
@@ -464,7 +471,8 @@ def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
     return mu_new, eta, Psi
 
 
-def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi):
+def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
+                           sample_weights=None):
     """CFUSN Delta M-step.  Returns (p, q).
 
     KEY FIX: replace per-d einsum loop with two batched einsums, then
@@ -473,10 +481,11 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi):
     obs    = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
     z      = responsibilities
+    z_eff  = z if sample_weights is None else z * sample_weights
     N, p   = observations.shape
     q      = eta.shape[1]
 
-    obs_z    = obs * z[:, None]                       # (N, p)
+    obs_z    = obs * z_eff[:, None]                   # (N, p)
     residuals = x_fill - mu_new                       # (N, p)
 
     # numer[d, r] = sum_n obs_z[n,d] * residuals[n,d] * eta[n,r]
@@ -499,7 +508,8 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi):
     return Delta_new
 
 
-def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, eta, Psi):
+def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, eta, Psi,
+                           sample_weights=None):
     """CFUSN Gamma M-step.  Returns (p, p).
 
     KEY FIX: precompute Psi_minus once; use vectorized outer-product ops
@@ -509,6 +519,7 @@ def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, et
     obs    = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
     z      = responsibilities
+    z_eff  = z if sample_weights is None else z * sample_weights
     N, p   = observations.shape
     q      = eta.shape[1]
 
@@ -517,15 +528,15 @@ def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, et
     Psi_minus = Psi - np.einsum('ni,nj->nij', eta, eta)      # (N, q, q) — once
 
     obs_f   = obs.astype(residuals.dtype)                     # (N, p)
-    Z_b     = (z[:, None, None] * obs[:, :, None] * obs[:, None, :]).sum(0)  # (p, p)
+    Z_b     = (z_eff[:, None, None] * obs[:, :, None] * obs[:, None, :]).sum(0)  # (p, p)
 
     # term1[a,b] = sum_n z[n] · obs[n,a] · obs[n,b] · r[n,a] · r[n,b]
     #           = (z · obs · r).T @ (obs · r)         — gemm, no (N,p,p) intermediate
     masked_r = obs_f * residuals                              # (N, p), zero where unobserved
-    term1    = (z[:, None] * masked_r).T @ masked_r           # (p, p)
+    term1    = (z_eff[:, None] * masked_r).T @ masked_r       # (p, p)
 
     # Psi_corr[a,b,i,j] = sum_n z[n] · obs[n,a] · obs[n,b] · Psi_minus[n,i,j]
-    z_ob     = z[:, None, None] * obs[:, :, None] * obs[:, None, :]  # (N, p, p)
+    z_ob     = z_eff[:, None, None] * obs[:, :, None] * obs[:, None, :]  # (N, p, p)
     Psi_corr = np.einsum('nab,nij->abij', z_ob, Psi_minus)    # (p,p,q,q)
     # term2[a,b] = Delta[a,:] @ Psi_corr[a,b,:,:] @ Delta[b,:]
     term2    = np.einsum('ai,abij,bj->ab', Delta_new, Psi_corr, Delta_new)  # (p,p)
@@ -540,38 +551,42 @@ def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, et
 # Restricted MSN (q=1) multivariate update rules (kept for backward compat)
 # ══════════════════════════════════════════════
 
-def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma):
+def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma,
+                           sample_weights=None):
     """mu update for q=1 restricted MSN. Delta is (p,) vector."""
     v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     obs = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
     Delta_vec = np.asarray(Delta).ravel()
     m = x_fill - v[:, None] * Delta_vec[None, :]
-    z = responsibilities[:, None]
+    r = responsibilities if sample_weights is None else responsibilities * sample_weights
+    z = r[:, None]
     numer = (m * z * obs).sum(axis=0)
     denom = (z * obs).sum(axis=0)
     return numer / np.maximum(denom, 1e-12)
 
 
-def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, Gamma):
+def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, Gamma,
+                       sample_weights=None):
     """Delta update for q=1 restricted MSN. Returns (p,) vector."""
     v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     obs = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
     residuals = x_fill - updated_mu[None, :]
-    z = responsibilities
+    z = responsibilities if sample_weights is None else responsibilities * sample_weights
     numer = (z[:, None] * v[:, None] * residuals * obs).sum(axis=0)
     denom = (z[:, None] * w[:, None] * obs).sum(axis=0)
     return numer / np.maximum(denom, 1e-12)
 
 
-def get_Gamma_update_mv(updated_mu, updated_Delta, observations, responsibilities, mu, Delta, Gamma):
+def get_Gamma_update_mv(updated_mu, updated_Delta, observations, responsibilities, mu, Delta, Gamma,
+                        sample_weights=None):
     """Gamma update for q=1 restricted MSN. Returns (p, p)."""
     v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     N, K = observations.shape
     obs = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
-    z = responsibilities
+    z = responsibilities if sample_weights is None else responsibilities * sample_weights
     updated_Delta = np.asarray(updated_Delta).ravel()
     residuals = x_fill - updated_mu[None, :]
     Gamma_new = np.zeros((K, K))
@@ -993,24 +1008,28 @@ def _em_update_univariate(
     constrained, xlims, K, **kwargs
 ):
     """One M-step for all components, univariate case."""
+    sample_weights = kwargs.get("sample_weights", None)
     updated = [None] * K
     for c in range(K):
         z = responsibilities[c]
         cp = current_component_params[c]
 
-        loc_cand = get_location_update(observations, z, cp)
+        loc_cand = get_location_update(observations, z, cp,
+                                       sample_weights=sample_weights)
         if constrained:
             loc_cand = get_constrained_location_update(
                 loc_cand, c, current_component_params, updated, xlims, **kwargs
             )
 
-        Delta_cand = get_Delta_update(loc_cand, observations, z, cp)
+        Delta_cand = get_Delta_update(loc_cand, observations, z, cp,
+                                      sample_weights=sample_weights)
         if constrained:
             Delta_cand = get_constrained_Delta_update(
                 Delta_cand, loc_cand, c, current_component_params, updated, xlims, **kwargs
             )
 
-        Gamma_cand = get_Gamma_update(loc_cand, Delta_cand, observations, z, cp)
+        Gamma_cand = get_Gamma_update(loc_cand, Delta_cand, observations, z, cp,
+                                      sample_weights=sample_weights)
         if constrained:
             Gamma_cand = get_constrained_Gamma_update(
                 Gamma_cand, loc_cand, Delta_cand, c,
@@ -1036,15 +1055,19 @@ def _em_update_multivariate(
     """One M-step for all components, restricted MSN (q=1) case.
     component_params in alternate form: (mu, Delta_vec, Gamma_mat).
     """
+    sample_weights = kwargs.get("sample_weights", None)
     updated = [None] * K
     for c in range(K):
         z = responsibilities[c]
         mu_old, Delta_old, Gamma_old = current_component_params[c]
 
-        mu_cand = get_location_update_mv(observations, z, mu_old, Delta_old, Gamma_old)
-        Delta_cand = get_Delta_update_mv(mu_cand, observations, z, mu_old, Delta_old, Gamma_old)
+        mu_cand = get_location_update_mv(observations, z, mu_old, Delta_old, Gamma_old,
+                                         sample_weights=sample_weights)
+        Delta_cand = get_Delta_update_mv(mu_cand, observations, z, mu_old, Delta_old, Gamma_old,
+                                         sample_weights=sample_weights)
         Gamma_cand = get_Gamma_update_mv(
-            mu_cand, Delta_cand, observations, z, mu_old, Delta_old, Gamma_old
+            mu_cand, Delta_cand, observations, z, mu_old, Delta_old, Gamma_old,
+            sample_weights=sample_weights,
         )
 
         eigvals = np.linalg.eigvalsh(Gamma_cand)
@@ -1100,6 +1123,7 @@ def _em_update_cfusn(
     where Delta_mat is (p, q).
     """
     n_mc = kwargs.get("n_mc_truncated", 500)
+    sample_weights = kwargs.get("sample_weights", None)
     updated = [None] * K
 
     for c in range(K):
@@ -1112,14 +1136,17 @@ def _em_update_cfusn(
         # --- M-step using Lin (2009) equations ---
         # Step 1: location + compute eta, Psi
         mu_cand, eta, Psi = get_location_update_cfusn(
-            observations, z, mu_old, Delta_old, Gamma_old, n_mc=n_mc, rng=rng
+            observations, z, mu_old, Delta_old, Gamma_old, n_mc=n_mc, rng=rng,
+            sample_weights=sample_weights,
         )
 
         # Step 2: Delta (p, q)
-        Delta_cand = get_Delta_update_cfusn(mu_cand, observations, z, eta, Psi)
+        Delta_cand = get_Delta_update_cfusn(mu_cand, observations, z, eta, Psi,
+                                            sample_weights=sample_weights)
 
         # Step 3: Gamma (p, p)
-        Gamma_cand = get_Gamma_update_cfusn(mu_cand, Delta_cand, observations, z, eta, Psi)
+        Gamma_cand = get_Gamma_update_cfusn(mu_cand, Delta_cand, observations, z, eta, Psi,
+                                            sample_weights=sample_weights)
 
         # Enforce positive-definiteness of Gamma
         eigvals = np.linalg.eigvalsh(Gamma_cand)

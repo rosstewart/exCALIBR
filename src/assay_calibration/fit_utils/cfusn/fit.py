@@ -1,6 +1,8 @@
 from .update_steps import em_iteration, get_sample_weights
 from .density_utils import get_likelihood, get_q, _ensure_matrix_delta
-from .initializations import kmeans_init, methodOfMomentsInit, kmeans_init_mv
+from .initializations import (
+    kmeans_init, methodOfMomentsInit, kmeans_init_mv, kmeans_init_mv_anchored,
+)
 from . import constraints
 
 import numpy as np
@@ -32,6 +34,22 @@ def single_fit(
         xlims = (observations.min(), observations.max())
 
     N_samples = sample_indicators.shape[1]
+
+    # ---- Per-observation sample-balance weights (M-step reweighting) ----
+    # When sample_balance_beta > 0, each observation's M-step contribution is
+    # multiplied by (N_ref / N_{s(n)})^beta where N_ref = min_s N_s. beta=0
+    # reproduces standard EM (no balancing); beta=1 makes each sample
+    # contribute equally to every component's parameter update.
+    beta = float(kwargs.get("sample_balance_beta", 0.0))
+    if beta > 0 and N_samples > 1:
+        N_per_sample = sample_indicators.sum(axis=0).astype(float)  # (S,)
+        N_ref = N_per_sample[N_per_sample > 0].min() if (N_per_sample > 0).any() else 1.0
+        per_sample_w = np.where(
+            N_per_sample > 0, (N_ref / np.maximum(N_per_sample, 1.0)) ** beta, 0.0
+        )  # (S,)
+        sample_weights_per_obs = (sample_indicators.astype(float) * per_sample_w).sum(axis=1)
+    else:
+        sample_weights_per_obs = None  # no balancing
 
     # ---- Initialization ----
     if (
@@ -68,7 +86,15 @@ def single_fit(
                       f"NaN count={np.isnan(observations).sum()}, "
                       f"xlims={xlims}{q_str}")
             try:
-                if mv:
+                if mv and init_method == "anchored":
+                    initial_params, kmeans = kmeans_init_mv_anchored(
+                        observations, sample_indicators,
+                        n_clusters=N_components,
+                        constrained=constrained,
+                        init_constraint_adjustment=init_constraint_adjustment,
+                        **kwargs
+                    )
+                elif mv:
                     initial_params, kmeans = kmeans_init_mv(
                         observations, n_clusters=N_components,
                         constrained=constrained,
@@ -101,6 +127,8 @@ def single_fit(
     em_kwargs = {}
     if mv and latent_q > 1:
         em_kwargs["n_mc_truncated"] = kwargs.get("n_mc_truncated", 500)
+    if sample_weights_per_obs is not None:
+        em_kwargs["sample_weights"] = sample_weights_per_obs
 
     history = [dict(component_params=initial_params, weights=W)]
     # Initial likelihood: no em_iteration has run yet so we must evaluate explicitly.
