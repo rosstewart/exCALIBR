@@ -571,10 +571,13 @@ def component_posteriors(X, canonical_params, individual_sample_weights,
             log_pdfs_list.append(lp)
         log_pdfs = np.stack(log_pdfs_list, axis=0)
 
-    with np.errstate(divide="ignore"):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # invalid='ignore' suppresses the (-inf) - (-inf) = NaN warning that
+        # fires when an observation has zero density under all components;
+        # the `P[np.isnan(P)] = 0` line below is the canonical fix.
         numerators = log_pdfs + np.log(individual_sample_weights)
-    denom = logsumexp(numerators, axis=0)
-    P = np.exp(numerators - denom[None])
+        denom = logsumexp(numerators, axis=0)
+        P = np.exp(numerators - denom[None])
     P[np.isnan(P)] = 0
     return P
 

@@ -725,12 +725,15 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
                 lp_list.append(lp)
             log_pdfs = np.stack(lp_list, axis=0)      # (Kc, N_s)
 
-        with np.errstate(divide='ignore'):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # invalid='ignore' suppresses (-inf) - (-inf) = NaN when an
+            # observation has zero density under all components; the
+            # `P[np.isnan(P)] = 0.0` below is the canonical fix.
             log_w = np.where(current_weights[i] > 0,
                              np.log(current_weights[i]), -np.inf)
-        nums  = log_pdfs + log_w[:, None]
-        denom = logsumexp(nums, axis=0)
-        P     = np.exp(nums - denom[None])
+            nums  = log_pdfs + log_w[:, None]
+            denom = logsumexp(nums, axis=0)
+            P     = np.exp(nums - denom[None])
         P[np.isnan(P)] = 0.0
 
         uw = P.mean(1)

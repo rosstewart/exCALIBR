@@ -42,7 +42,8 @@ from src.assay_calibration.fit_utils.fit import Fit
 from predictor_mv_utils import load_predictor_ms
 
 
-def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None):
+def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,
+                   anchor_centroid_mode="contrastive", anchor_centroid_verbose=False):
     """Run the standard fit set for one (β, init) config and return the best.
 
     With ``bootstrap=False``, Fit.run uses the whole dataset and picks
@@ -50,6 +51,9 @@ def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None):
     """
     fitter = Fit(ms)
     extra = {"num_fits": num_fits} if num_fits is not None else {}
+    if init_strategy == "anchored":
+        extra["anchor_centroid_mode"] = anchor_centroid_mode
+        extra["anchor_centroid_verbose"] = anchor_centroid_verbose
     t0 = time.perf_counter()
     models, best_idx, best_ll = fitter.run(
         component_range=[K],
@@ -72,6 +76,7 @@ def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None):
     return {
         "beta": float(beta),
         "init_strategy": init_strategy,
+        "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
         "best_ll": float(best_ll) if best_ll is not None else None,
         "best_idx": int(best_idx),
         "n_iters": int(len(best.get("likelihoods", []))),
@@ -95,16 +100,30 @@ def main():
                                 "single_gene_calibration_data",
                         help="Directory containing {gene}/{gene}_{predictor}.csv.gz.")
     parser.add_argument("--betas", nargs="+", type=float,
-                        default=[0.0, 0.25, 0.5, 0.75, 1.0],
-                        help="β values to sweep (default: 0 0.25 0.5 0.75 1.0).")
+                        default=[0.0, 0.5, 1.0],
+                        help="β values to sweep (default: 0 0.5 1).")
+    parser.add_argument("--init-strategies", nargs="+",
+                        default=["anchored", "kmeans"],
+                        choices=["anchored", "kmeans"],
+                        help="Init strategies to compare (default: anchored kmeans). "
+                             "Full grid β × init is run.")
+    parser.add_argument("--anchor-mode",
+                        default="contrastive",
+                        choices=["contrastive", "dominant", "mean"],
+                        help="How anchored init derives each component μ when bimodality "
+                             "is detected by BIC. 'contrastive' picks the cluster most "
+                             "distinct from other anchor samples; 'dominant' picks the "
+                             "larger cluster; 'mean' disables BIC and uses the simple "
+                             "sample mean (override).")
+    parser.add_argument("--anchor-debug", action="store_true",
+                        help="Print which branch (mean/dominant/contrastive) chose μ "
+                             "for each anchored component.")
     parser.add_argument("-K", "--components", type=int, default=3,
                         help="Number of mixture components (default: 3).")
     parser.add_argument("--latent-q", type=int, default=2,
                         help="CFUSN latent dim q (default: 2).")
     parser.add_argument("--num-fits", type=int, default=None,
                         help="Override fits-per-config (default: dynamic min(4^K, 100)).")
-    parser.add_argument("--include-kmeans-baseline", action="store_true",
-                        help="Also fit one (kmeans, β=0) baseline for reference.")
     parser.add_argument("--n-jobs", type=int, default=-1,
                         help="Outer parallel workers (-1 = one per config, capped by cores).")
     parser.add_argument("--save-pickle", type=str, default=None,
@@ -132,15 +151,17 @@ def main():
         if rows.any():
             sample_means[s] = np.nanmean(scores[rows], axis=0)
 
-    # Build (β, init) configs
-    configs = [(b, "anchored") for b in args.betas]
-    if args.include_kmeans_baseline:
-        configs.append((0.0, "kmeans"))
+    # Build (β, init) grid — full crossing of betas × init_strategies
+    configs = [(b, init) for init in args.init_strategies for b in args.betas]
 
     n_jobs = args.n_jobs if args.n_jobs > 0 else min(len(configs), os.cpu_count() or 4)
-    print(f"\nSweeping {len(configs)} configs with {n_jobs} parallel workers")
+    print(f"\nSweeping {len(configs)} configs (βs={args.betas}, inits={args.init_strategies}) "
+          f"with {n_jobs} parallel workers")
     print(f"  K={args.components}, latent_q={args.latent_q}, "
           f"unconstrained, no bootstrap (whole-dataset fit)")
+    if "anchored" in args.init_strategies:
+        print(f"  anchor centroid mode: {args.anchor_mode}"
+              + (" (debug logging on)" if args.anchor_debug else ""))
     if args.num_fits is not None:
         print(f"  num_fits override: {args.num_fits}")
     else:
@@ -152,6 +173,8 @@ def main():
         delayed(fit_for_config)(
             beta, init_strategy, ms,
             K=args.components, latent_q=args.latent_q, num_fits=args.num_fits,
+            anchor_centroid_mode=args.anchor_mode,
+            anchor_centroid_verbose=args.anchor_debug,
         )
         for (beta, init_strategy) in configs
     )

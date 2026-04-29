@@ -2,6 +2,7 @@ from .update_steps import em_iteration, get_sample_weights
 from .density_utils import get_likelihood, get_q, _ensure_matrix_delta
 from .initializations import (
     kmeans_init, methodOfMomentsInit, kmeans_init_mv, kmeans_init_mv_anchored,
+    kmeans_init_anchored,
 )
 from . import constraints
 
@@ -97,6 +98,14 @@ def single_fit(
                 elif mv:
                     initial_params, kmeans = kmeans_init_mv(
                         observations, n_clusters=N_components,
+                        constrained=constrained,
+                        init_constraint_adjustment=init_constraint_adjustment,
+                        **kwargs
+                    )
+                elif init_method == "anchored":
+                    initial_params, kmeans = kmeans_init_anchored(
+                        observations, sample_indicators,
+                        n_clusters=N_components,
                         constrained=constrained,
                         init_constraint_adjustment=init_constraint_adjustment,
                         **kwargs
@@ -271,12 +280,18 @@ def single_fit(
                 pbar.set_postfix({"likelihood": f"{likelihoods[-1]:.6f}"})
                 pbar.update(1)
 
-            if (
-                kwargs.get("early_stopping", True)
-                and it >= 1
-                and np.abs(likelihoods[-1] - likelihoods[-2]) / abs(likelihoods[-2]) < 1e-8
-            ):
-                break
+            if kwargs.get("early_stopping", True) and it >= 1:
+                # Suppress invalid-subtract warning when both LLs are -inf
+                # (NaN propagates harmlessly: NaN < 1e-8 → False, no break;
+                # the np.isnan(likelihoods).any() guard above will trip on
+                # the next iter and surface the real failure).
+                with np.errstate(invalid='ignore'):
+                    rel_change = (
+                        np.abs(likelihoods[-1] - likelihoods[-2])
+                        / abs(likelihoods[-2])
+                    )
+                if rel_change < 1e-8:
+                    break
 
         if not constrained and check_submerged_duration:
             violated = constraints.multicomponent_density_constraint_violated(

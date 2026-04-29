@@ -45,13 +45,28 @@ from predictor_mv_utils import (
 )
 
 
-def fit_for_config(beta, predictor, ds, K=3, num_fits=100):
-    """Run one univariate (predictor, β) config and return the best fit summary.
+def fit_for_config(beta, predictor, ds, init_strategy="default", K=3, num_fits=100,
+                   anchor_centroid_mode="contrastive", anchor_centroid_verbose=False):
+    """Run one univariate (predictor, β, init) config and return the best fit summary.
 
     Matches prepare_batch_jobs_single_predictor.py: K-component constrained
-    skew-normal mixture, whole dataset, num_fits inits, default init mix.
+    skew-normal mixture, whole dataset, num_fits inits.
+
+    init_strategy:
+      "default"            — production default (random kmeans / MoM mix)
+      "anchored"           — UV anchored init (kmeans_init_anchored)
+      "kmeans"             — forced kmeans
+      "method_of_moments"  — forced MoM
     """
     fitter = Fit(ds)
+    extra = {}
+    # Production default uses init_strategy="random"; passing it explicitly is
+    # a no-op vs not passing, but keeps the call self-documenting.
+    if init_strategy != "default":
+        extra["init_strategy"] = init_strategy
+    if init_strategy == "anchored":
+        extra["anchor_centroid_mode"] = anchor_centroid_mode
+        extra["anchor_centroid_verbose"] = anchor_centroid_verbose
     t0 = time.perf_counter()
     models, best_idx, best_ll = fitter.run(
         component_range=[K],
@@ -61,6 +76,7 @@ def fit_for_config(beta, predictor, ds, K=3, num_fits=100):
         num_fits=num_fits,
         core_limit=1,                   # avoid nested joblib parallelism
         verbose=False,
+        **extra,
     )
     elapsed = time.perf_counter() - t0
 
@@ -74,6 +90,8 @@ def fit_for_config(beta, predictor, ds, K=3, num_fits=100):
     return {
         "predictor": predictor,
         "beta": float(beta),
+        "init_strategy": init_strategy,
+        "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
         "best_ll": float(best_ll) if best_ll is not None else None,
         "best_idx": int(best_idx),
         "n_iters": int(len(best.get("likelihoods", []))),
@@ -95,7 +113,20 @@ def main():
                                 "single_gene_calibration_data",
                         help="Directory containing {gene}/{gene}_{predictor}.csv.gz.")
     parser.add_argument("--betas", nargs="+", type=float,
-                        default=[0.0, 0.25, 0.5, 0.75, 1.0])
+                        default=[0.0, 0.5, 1.0],
+                        help="β values to sweep (default: 0 0.5 1).")
+    parser.add_argument("--init-strategies", nargs="+",
+                        default=["default", "anchored"],
+                        choices=["default", "anchored", "kmeans", "method_of_moments"],
+                        help="Init strategies to compare. 'default' = production "
+                             "(random kmeans/MoM mix). Default sweep: default + anchored.")
+    parser.add_argument("--anchor-mode",
+                        default="contrastive",
+                        choices=["contrastive", "dominant", "mean"],
+                        help="How anchored init derives each component μ when bimodality "
+                             "is detected by BIC. 'mean' is the override that disables BIC.")
+    parser.add_argument("--anchor-debug", action="store_true",
+                        help="Print which branch (mean/dominant/contrastive) chose μ.")
     parser.add_argument("--predictors", nargs="+", default=list(PREDICTORS),
                         choices=list(PREDICTORS),
                         help="Predictors to fit (default: all of REVEL/MP2/AM).")
@@ -142,39 +173,51 @@ def main():
     if not scoresets:
         raise SystemExit("No predictor scoresets loaded.")
 
-    # Build configs: one per (β, predictor) — joblib parallelises across these
-    configs = [(b, p) for p in scoresets.keys() for b in args.betas]
+    # Build configs: full grid of (predictor × β × init)
+    configs = [
+        (b, p, init)
+        for p in scoresets.keys()
+        for init in args.init_strategies
+        for b in args.betas
+    ]
     n_jobs = args.n_jobs if args.n_jobs > 0 else min(len(configs), os.cpu_count() or 4)
     print(f"\nSweeping {len(configs)} configs "
-          f"({len(scoresets)} predictors × {len(args.betas)} βs) "
-          f"with {n_jobs} parallel workers")
+          f"({len(scoresets)} predictors × {len(args.betas)} βs × "
+          f"{len(args.init_strategies)} inits) with {n_jobs} parallel workers")
     print(f"  K={args.components}, constrained, no bootstrap, num_fits={args.num_fits}")
+    print(f"  init strategies: {args.init_strategies}")
+    if "anchored" in args.init_strategies:
+        print(f"  anchor centroid mode: {args.anchor_mode}"
+              + (" (debug logging on)" if args.anchor_debug else ""))
 
     t0 = time.perf_counter()
     results = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(fit_for_config)(
             beta, predictor, scoresets[predictor],
+            init_strategy=init,
             K=args.components, num_fits=args.num_fits,
+            anchor_centroid_mode=args.anchor_mode,
+            anchor_centroid_verbose=args.anchor_debug,
         )
-        for (beta, predictor) in configs
+        for (beta, predictor, init) in configs
     )
     elapsed = time.perf_counter() - t0
     print(f"\nTotal sweep wall time: {elapsed:.1f}s")
 
     # Tabulate
     print()
-    header = (f"{'predictor':<10}{'β':<8}{'best LL':<14}{'iters':<8}"
+    header = (f"{'predictor':<10}{'init':<20}{'β':<6}{'best LL':<14}{'iters':<8}"
               f"components (a, loc, scale) sorted by loc")
-    print("=" * max(len(header), 100))
+    print("=" * max(len(header), 110))
     print(header)
-    print("=" * max(len(header), 100))
+    print("=" * max(len(header), 110))
     for r in results:
         params_str = "   ".join(
             f"({p[0]:+.2f}, {p[1]:+.3f}, {p[2]:.3f})"
             for p in r["component_params_sorted"]
         )
         ll_str = f"{r['best_ll']:.4f}" if r["best_ll"] is not None else "NA"
-        print(f"{r['predictor']:<10}{r['beta']:<8}{ll_str:<14}"
+        print(f"{r['predictor']:<10}{r['init_strategy']:<20}{r['beta']:<6}{ll_str:<14}"
               f"{r['n_iters']:<8}{params_str}")
 
     if args.save_pickle:
