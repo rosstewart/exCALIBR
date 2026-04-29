@@ -122,6 +122,16 @@ def main():
     print(f"  Sample counts: {dict(zip(ms.sample_names, sample_counts))}")
     print(f"  Predictors: {ms.dataset_names}")
 
+    # Empirical per-sample mean per dim — used as reference lines on plots
+    # (each anchored component's μ should land near its anchor sample's mean).
+    scores = ms.scores
+    sa = ms.sample_assignments
+    sample_means = np.full((sa.shape[1], scores.shape[1]), np.nan)
+    for s in range(sa.shape[1]):
+        rows = sa[:, s].astype(bool)
+        if rows.any():
+            sample_means[s] = np.nanmean(scores[rows], axis=0)
+
     # Build (β, init) configs
     configs = [(b, "anchored") for b in args.betas]
     if args.include_kmeans_baseline:
@@ -172,6 +182,7 @@ def main():
                 "latent_q": args.latent_q,
                 "sample_names": list(ms.sample_names),
                 "sample_counts": sample_counts,
+                "sample_means": sample_means,         # (S, p), empirical per-sample mean
                 "predictors": list(ms.dataset_names),
                 "configs": configs,
                 "results": results,
