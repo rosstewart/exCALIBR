@@ -80,25 +80,54 @@ def fit_for_config(beta, predictor, ds, init_strategy="default", K=3, num_fits=1
     )
     elapsed = time.perf_counter() - t0
 
-    best = models[best_idx]
-    # Univariate component_params: list of (a, loc, scale) tuples
-    params_sorted = sorted(
-        best["component_params"],
-        key=lambda p: float(p[1]),       # by loc (mean parameter)
+    best = models[best_idx] if models else {}
+    cps = best.get("component_params", [])
+    # Detect the all-fits-failed case: tryToFit returns dict with
+    # component_params=[[], [], ...] when the EM/init raises, and
+    # _safe_ll gives every such fit -inf so best_idx points at one of them.
+    all_failed = (
+        not cps
+        or any(
+            (isinstance(p, (list, tuple)) and len(p) == 0)
+            for p in cps
+        )
+        or best_ll is None
+        or not np.isfinite(best_ll)
     )
+    if all_failed:
+        print(f"  [FAIL] {predictor} init={init_strategy} β={beta:g}: "
+              f"all {len(models)} fits failed", flush=True)
+        return {
+            "predictor": predictor,
+            "beta": float(beta),
+            "init_strategy": init_strategy,
+            "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
+            "best_ll": None,
+            "best_idx": int(best_idx) if best_idx is not None else -1,
+            "n_iters": 0,
+            "n_fits": int(len(models)),
+            "component_params_sorted": [],
+            "best_weights": None,
+            "elapsed_s": float(elapsed),
+            "failed": True,
+        }
+
+    # Univariate component_params: list of (a, loc, scale) tuples
+    params_sorted = sorted(cps, key=lambda p: float(p[1]))   # by loc
     weights = best["weights"]
     return {
         "predictor": predictor,
         "beta": float(beta),
         "init_strategy": init_strategy,
         "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
-        "best_ll": float(best_ll) if best_ll is not None else None,
+        "best_ll": float(best_ll),
         "best_idx": int(best_idx),
         "n_iters": int(len(best.get("likelihoods", []))),
         "n_fits": int(len(models)),
         "component_params_sorted": [list(p) for p in params_sorted],
         "best_weights": (weights.tolist() if hasattr(weights, "tolist") else weights),
         "elapsed_s": float(elapsed),
+        "failed": False,
     }
 
 
@@ -211,7 +240,13 @@ def main():
     print("=" * max(len(header), 110))
     print(header)
     print("=" * max(len(header), 110))
+    n_failed = 0
     for r in results:
+        if r.get("failed"):
+            n_failed += 1
+            print(f"{r['predictor']:<10}{r['init_strategy']:<20}{r['beta']:<6}"
+                  f"{'FAILED':<14}{'-':<8}all fits failed")
+            continue
         params_str = "   ".join(
             f"({p[0]:+.2f}, {p[1]:+.3f}, {p[2]:.3f})"
             for p in r["component_params_sorted"]
@@ -219,6 +254,8 @@ def main():
         ll_str = f"{r['best_ll']:.4f}" if r["best_ll"] is not None else "NA"
         print(f"{r['predictor']:<10}{r['init_strategy']:<20}{r['beta']:<6}{ll_str:<14}"
               f"{r['n_iters']:<8}{params_str}")
+    if n_failed:
+        print(f"\n  [WARN] {n_failed}/{len(results)} configs failed entirely")
 
     if args.save_pickle:
         save_path = Path(args.save_pickle)

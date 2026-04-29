@@ -310,6 +310,11 @@ def main():
     )
     kmeans_results = [r for r in results if r["init_strategy"] == "kmeans"]
     rows = anchored + kmeans_results
+    n_total = len(rows)
+    rows = [r for r in rows if not r.get("failed")]
+    n_skipped = n_total - len(rows)
+    if n_skipped:
+        print(f"  Skipping {n_skipped} failed config(s) from plot")
     if not rows:
         raise SystemExit("No results found in pickle.")
 

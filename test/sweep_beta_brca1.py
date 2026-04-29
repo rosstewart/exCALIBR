@@ -67,9 +67,36 @@ def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,
         **extra,
     )
     elapsed = time.perf_counter() - t0
-    best = models[best_idx]
+    best = models[best_idx] if models else {}
+    cps = best.get("component_params", [])
+    all_failed = (
+        not cps
+        or any(
+            (isinstance(p, (list, tuple)) and len(p) == 0)
+            for p in cps
+        )
+        or best_ll is None
+        or not np.isfinite(best_ll)
+    )
+    if all_failed:
+        print(f"  [FAIL] init={init_strategy} β={beta:g}: "
+              f"all {len(models)} fits failed", flush=True)
+        return {
+            "beta": float(beta),
+            "init_strategy": init_strategy,
+            "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
+            "best_ll": None,
+            "best_idx": int(best_idx) if best_idx is not None else -1,
+            "n_iters": 0,
+            "n_fits": int(len(models)),
+            "component_means_sorted": [],
+            "best_params": [],
+            "best_weights": None,
+            "elapsed_s": float(elapsed),
+            "failed": True,
+        }
     means_sorted = sorted(
-        [np.asarray(p[0]) for p in best["component_params"]],
+        [np.asarray(p[0]) for p in cps],
         key=lambda mu: float(mu[0]),
     )
     weights = best["weights"]
@@ -77,14 +104,15 @@ def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,
         "beta": float(beta),
         "init_strategy": init_strategy,
         "anchor_centroid_mode": anchor_centroid_mode if init_strategy == "anchored" else None,
-        "best_ll": float(best_ll) if best_ll is not None else None,
+        "best_ll": float(best_ll),
         "best_idx": int(best_idx),
         "n_iters": int(len(best.get("likelihoods", []))),
         "n_fits": int(len(models)),
         "component_means_sorted": [m.tolist() for m in means_sorted],
-        "best_params": best["component_params"],
+        "best_params": cps,
         "best_weights": (weights.tolist() if hasattr(weights, "tolist") else weights),
         "elapsed_s": float(elapsed),
+        "failed": False,
     }
 
 
@@ -187,13 +215,20 @@ def main():
     print("=" * max(len(header), 95))
     print(header)
     print("=" * max(len(header), 95))
+    n_failed = 0
     for r in results:
+        if r.get("failed"):
+            n_failed += 1
+            print(f"{r['init_strategy']:<10}{r['beta']:<8}{'FAILED':<14}{'-':<8}all fits failed")
+            continue
         means_str = "   ".join(
             "[" + ", ".join(f"{x:+.3f}" for x in m) + "]"
             for m in r["component_means_sorted"]
         )
         ll_str = f"{r['best_ll']:.4f}" if r["best_ll"] is not None else "NA"
         print(f"{r['init_strategy']:<10}{r['beta']:<8}{ll_str:<14}{r['n_iters']:<8}{means_str}")
+    if n_failed:
+        print(f"\n  [WARN] {n_failed}/{len(results)} configs failed entirely")
 
     if args.save_pickle:
         save_path = Path(args.save_pickle)

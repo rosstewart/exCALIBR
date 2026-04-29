@@ -679,14 +679,20 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
         )
         loc = float(np.atleast_1d(mu_arr)[0])
 
-        # Scale: empirical std of anchor obs, floored.
-        scale = max(float(np.std(Xc, ddof=1)), 1e-3) if len(Xc) > 1 else 1e-3
-
-        # Skewness sign from lambdaIndex enumeration (preserves the
-        # bootstrap-wide 2^K sign-pattern coverage). Magnitude from a
-        # bounded uniform — keeps init in a reasonable region without
-        # over-fitting on small anchors.
-        a_mag = float(np.random.uniform(0.05, 0.6))
+        # (α, scale) from data via skew-normal MoM on the anchor obs.
+        # Falls back to empirical std + a small uniform skewness when
+        # MoM fails (very small Xc, ~zero skewness, etc.).  We then
+        # override α's *sign* with lambdas[c] to preserve the
+        # bootstrap-wide 2^K sign-pattern coverage from lambdaIndex —
+        # the magnitude stays data-driven.
+        sn_params = sn_method_of_moments_init(Xc) if len(Xc) > 1 else []
+        if sn_params and len(sn_params) == 3:
+            alpha_data, _loc_unused, scale_data = sn_params
+            a_mag = max(abs(float(alpha_data)), 0.05)
+            scale = max(float(scale_data), 1e-3)
+        else:
+            a_mag = float(np.random.uniform(0.05, 0.4))
+            scale = max(float(np.std(Xc, ddof=1)), 1e-3) if len(Xc) > 1 else 1e-3
         alpha = float(lambdas[c]) * a_mag
 
         component_parameters.append((alpha, loc, scale))
@@ -703,6 +709,15 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
         except Exception:
             raise
 
+    # Equalise scales to the max — mirrors methodOfMomentsInit. The
+    # density constraint is much easier to satisfy when components
+    # share a scale (otherwise narrow P/LP scale + wide gnomAD scale
+    # produces overlapping densities that the constraint fixer rejects).
+    if component_parameters:
+        max_scale = max(p[2] for p in component_parameters)
+        component_parameters = [
+            (p[0], p[1], max_scale) for p in component_parameters
+        ]
     component_parameters = sorted(component_parameters, key=lambda p: p[1])
 
     if constrained:
