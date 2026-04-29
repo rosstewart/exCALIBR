@@ -35,8 +35,11 @@ _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parent))
 sys.path.insert(0, str(_THIS.parents[1]))
 
-from visualize_fit import _sn_logpdf, SAMPLE_COLORS
+from visualize_fit import _sn_logpdf
 from predictor_mv_utils import load_predictor_ms
+
+SAMPLE_COLORS = ['#CA7682', '#1D7AAB', '#A0A0A0', '#6BAA75']
+SAMPLE_ALPHAS = [0.6, 0.6, 0.3, 0.5]
 
 
 def _marginal_density(params, w_s, x_grid_2d, K):
@@ -48,11 +51,19 @@ def _marginal_density(params, w_s, x_grid_2d, K):
     return density, comp_densities
 
 
+def _draw_hist(ax, obs, color, alpha):
+    if len(obs):
+        ax.hist(obs, bins=50, density=True, alpha=alpha,
+                color=color, edgecolor="none")
+
+
 def _plot_one_predictor(dim, predictor_name, rows, scores, sa, sample_names,
                         sample_counts, gene, K, p, x_grid, n_grid,
                         dpi, out_path):
     S = len(sample_names)
-    n_cols = len(rows)
+    # Column 0 = raw data only; columns 1..n_fits = β configs
+    n_fit_cols = len(rows)
+    n_cols = 1 + n_fit_cols
     n_rows = S
 
     fig, axes = plt.subplots(
@@ -64,7 +75,37 @@ def _plot_one_predictor(dim, predictor_name, rows, scores, sa, sample_names,
 
     comp_colors = plt.cm.Set2(np.linspace(0, 1, max(K, 3)))
 
-    for col_idx, r in enumerate(rows):
+    # Pre-compute per-sample observations for this dim
+    obs_per_sample = []
+    for s in range(S):
+        obs = scores[sa[:, s].astype(bool), dim]
+        obs_per_sample.append(obs[~np.isnan(obs)])
+
+    # Column 0: raw data only
+    for row_idx in range(S):
+        ax = axes[row_idx, 0]
+        s = row_idx
+        color = SAMPLE_COLORS[s % len(SAMPLE_COLORS)]
+        alpha = SAMPLE_ALPHAS[s % len(SAMPLE_ALPHAS)]
+        _draw_hist(ax, obs_per_sample[s], color, alpha)
+        ax.grid(alpha=0.2, lw=0.4)
+        ax.tick_params(labelsize=7)
+        n_s = len(obs_per_sample[s])
+        ax.set_ylabel(
+            f"{sample_names[s]}\n(n={n_s})",
+            fontsize=8, fontweight="bold", color=color,
+        )
+        if row_idx == 0:
+            ax.set_title("data only", fontsize=8, fontweight="bold")
+        if row_idx == n_rows - 1:
+            ax.set_xlabel(predictor_name, fontsize=8)
+
+    # Columns 1+: β configs
+    x_2d = np.full((n_grid, p), np.nan)
+    x_2d[:, dim] = x_grid
+
+    for fit_idx, r in enumerate(rows):
+        col_idx = 1 + fit_idx
         beta = r["beta"]
         init = r["init_strategy"]
         params = [(np.asarray(mu, float), np.asarray(D, float), np.asarray(G, float))
@@ -75,19 +116,13 @@ def _plot_one_predictor(dim, predictor_name, rows, scores, sa, sample_names,
             f"kmeans\nβ={beta:g}" if init == "kmeans" else f"β = {beta:g}"
         )
 
-        x_2d = np.full((n_grid, p), np.nan)
-        x_2d[:, dim] = x_grid
-
         for row_idx in range(S):
             ax = axes[row_idx, col_idx]
             s = row_idx
             color = SAMPLE_COLORS[s % len(SAMPLE_COLORS)]
+            alpha = SAMPLE_ALPHAS[s % len(SAMPLE_ALPHAS)]
 
-            obs = scores[sa[:, s].astype(bool), dim]
-            obs = obs[~np.isnan(obs)]
-            if len(obs):
-                ax.hist(obs, bins=50, density=True, alpha=0.25,
-                        color=color, edgecolor="none")
+            _draw_hist(ax, obs_per_sample[s], color, alpha)
 
             if s < weights.shape[0]:
                 density, comp_dens = _marginal_density(params, weights[s], x_2d, K)
@@ -99,13 +134,6 @@ def _plot_one_predictor(dim, predictor_name, rows, scores, sa, sample_names,
 
             ax.grid(alpha=0.2, lw=0.4)
             ax.tick_params(labelsize=7)
-
-            if col_idx == 0:
-                n_s = int(len(obs)) if len(obs) else 0
-                ax.set_ylabel(
-                    f"{sample_names[s]}\n(n={n_s})",
-                    fontsize=8, fontweight="bold", color=color,
-                )
 
             if row_idx == n_rows - 1:
                 ax.set_xlabel(predictor_name, fontsize=8)
