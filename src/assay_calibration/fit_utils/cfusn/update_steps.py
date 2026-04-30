@@ -1066,7 +1066,12 @@ def em_iteration(observations, sample_indicators, current_component_params,
     if constrained and multicomponent_density_constraint_violated(
         current_component_params, xlims, multivariate=mv, mode=constraint_mode
     ):
-        raise ValueError("density constraint violated at start of em iteration")
+        import warnings
+        warnings.warn(
+            f"density constraint violated at start of em iteration "
+            f"{kwargs.get('iterNum', -1)} (constraint_mode={constraint_mode!r}); "
+            "continuing — per-component line search will attempt to restore it"
+        )
 
     S = sample_indicators.shape[1]
     K = len(current_component_params)
