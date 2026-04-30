@@ -126,7 +126,8 @@ def build_constraint_grids(param_sets, xlims, mode="line", n=1000):
 # Pairwise monotonicity check on precomputed log-pdfs
 # ──────────────────────────────────────────────────────────────────
 
-def _adjacent_pair_violated(log_pdfs, tolerance=0.0, mass_floor=-7.0):
+def _adjacent_pair_violated(log_pdfs, tolerance=0.0, mass_floor=-7.0,
+                            min_log_ratio_range=0.0):
     """Given a list of K log-pdf arrays evaluated on a shared grid,
     report whether any adjacent pair (i, i+1) has a non-monotone
     density ratio in the high-mass region.
@@ -136,12 +137,27 @@ def _adjacent_pair_violated(log_pdfs, tolerance=0.0, mass_floor=-7.0):
     ``not np.all(diffs < 0)`` condition).  ``mass_floor`` masks out
     grid points where either component has near-zero mass; without
     this, numerical noise in the tails creates spurious violations.
+
+    ``min_log_ratio_range`` (default 0 = off) skips the monotonicity
+    check between pairs whose log-density-ratio varies by less than
+    this amount across the high-mass region.  Such pairs represent
+    "effectively the same distribution" — their LR+ is approximately
+    constant and any non-monotonicity is structural noise from a near-
+    degenerate component ordering, not a real evidence-calibration
+    violation.  Used by marginal mode (which is otherwise too strict
+    when K > number of distinct sample classes — e.g. K=3 predictor
+    fits where B/LB and gnomAD anchor to overlapping score regions).
     """
     for i in range(len(log_pdfs) - 1):
         ix = (log_pdfs[i] > mass_floor) & (log_pdfs[i + 1] > mass_floor)
         if int(ix.sum()) < 2:
             continue
-        diffs = np.diff(log_pdfs[i][ix] - log_pdfs[i + 1][ix])
+        log_ratio = log_pdfs[i][ix] - log_pdfs[i + 1][ix]
+        if min_log_ratio_range > 0:
+            ratio_range = float(log_ratio.max() - log_ratio.min())
+            if ratio_range < min_log_ratio_range:
+                continue
+        diffs = np.diff(log_ratio)
         if (diffs > tolerance).any():
             return True
     return False
@@ -175,7 +191,7 @@ def density_constraint_violated(params_1, params_2, xlims: Tuple[float, float],
 
 def multicomponent_density_constraint_violated(
     param_sets, xlims, multivariate=False, D=None, tolerance=0,
-    mode="line",
+    mode="line", min_log_ratio_range=None,
 ):
     """Check density-ratio monotonicity for adjacent components.
 
@@ -189,11 +205,22 @@ def multicomponent_density_constraint_violated(
     ``mode='line'``    — 1-D probe through means.  Necessary but not
                           sufficient for full p-dim monotonicity.
     ``mode='marginal'`` — per-dim marginals via CFUSN marginal property.
-                          Stricter; recommended for predictor calibration.
+                          Stricter, but pairs with near-equal densities
+                          (``log_ratio_range < min_log_ratio_range``)
+                          are skipped so K > #distinct-classes fits
+                          (e.g. K=3 predictor where B/LB and gnomAD
+                          overlap) don't fail spuriously.
+
+    ``min_log_ratio_range`` defaults to 0.0 in line mode and 1.0 in
+    marginal mode (set ``min_log_ratio_range=0`` to disable the skip).
 
     Density evaluation auto-dispatches by Δ shape so CFUSN q>1 is
-    handled correctly (uses ``cfusn_logpdf_alternate``).
+    handled correctly.
     """
+    # Mode-specific default for the near-duplicate-pair skip.
+    if min_log_ratio_range is None:
+        min_log_ratio_range = 1.0 if mode == "marginal" else 0.0
+
     if not multivariate:
         # Univariate path — unchanged logic, kept for backward compat.
         if D is not None:
@@ -221,7 +248,10 @@ def multicomponent_density_constraint_violated(
                 # Density evaluation failed — treat as violated
                 # (the previous implementation did the same).
                 return True
-        if _adjacent_pair_violated(log_pdfs, tolerance=tolerance):
+        if _adjacent_pair_violated(
+            log_pdfs, tolerance=tolerance,
+            min_log_ratio_range=min_log_ratio_range,
+        ):
             return True
     return False
 

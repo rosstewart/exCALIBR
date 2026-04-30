@@ -888,6 +888,13 @@ def get_constrained_update_mv(
     constraint_mode = kwargs.get("constraint_mode", "line")
     max_iters = kwargs.get("constraint_bsearch_max_iters", 20)
     tol = kwargs.get("constraint_bsearch_tol", 1e-4)
+    # Match multicomponent_density_constraint_violated's default: skip
+    # near-duplicate adjacent pairs in marginal mode (1.0 nat ≈ 2.7×
+    # density ratio range — components below this look the same).
+    min_log_ratio_range = kwargs.get(
+        "constraint_min_log_ratio_range",
+        1.0 if constraint_mode == "marginal" else 0.0,
+    )
 
     # Build the candidate-at-alpha=1 param set; used both for the early-exit
     # check and as the basis for fixing the probe grid.
@@ -956,7 +963,9 @@ def get_constrained_update_mv(
                 log_pdfs.append(
                     var_lp if k == component_num else static_lps[grid_id][k]
                 )
-            if _adjacent_pair_violated(log_pdfs):
+            if _adjacent_pair_violated(
+                log_pdfs, min_log_ratio_range=min_log_ratio_range,
+            ):
                 return True
         return False
 
