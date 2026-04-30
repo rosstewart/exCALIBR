@@ -602,6 +602,39 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
             # If unanchored init fails, raise (caller will catch and retry)
             raise
 
+    # Equalise Γ across components — analog of UV methodOfMomentsInit's
+    # ``max_scale`` trick.  Different anchor samples produce different
+    # covariance shapes (e.g. P/LP cov from ~50 variants vs gnomAD cov from
+    # ~2000 variants).  With unequal scales, the log-density-ratio between
+    # any pair of components is quadratic in x — opens upward as x → ±∞ —
+    # which is fundamentally non-monotone, no matter how much
+    # ``fix_to_satisfy_density_constraint_mv`` shrinks Γ uniformly.  Equal
+    # scales make the log-ratio linear → monotone.  Δ is kept per-component
+    # (carries the per-anchor skew direction); we only rescale it if needed
+    # to keep Γ_common − Δ Δᵀ positive-definite.  Pass
+    # ``anchor_equalize_scale=False`` in kwargs to skip.
+    if kwargs.get("anchor_equalize_scale", True) and component_parameters:
+        Γs = [np.asarray(p[2], dtype=float) for p in component_parameters]
+        traces = [float(np.trace(G)) for G in Γs]
+        Γ_common = Γs[int(np.argmax(traces))].copy()
+        equalised = []
+        for mu, Delta, _Γ_old in component_parameters:
+            Δ = np.asarray(Delta, dtype=float)
+            DDT = np.outer(Δ, Δ) if Δ.ndim == 1 else Δ @ Δ.T
+            if np.linalg.eigvalsh(Γ_common - DDT).min() < 1e-8:
+                # Binary-search scale s so Γ_common − s²·ΔΔᵀ is PD.
+                lo, hi = 0.0, 1.0
+                for _ in range(30):
+                    mid = 0.5 * (lo + hi)
+                    test = Γ_common - mid * mid * DDT
+                    if np.linalg.eigvalsh(test).min() > 1e-8:
+                        lo = mid
+                    else:
+                        hi = mid
+                Δ = Δ * lo
+            equalised.append((mu, Δ, Γ_common.copy()))
+        component_parameters = equalised
+
     component_parameters.sort(key=lambda p: p[0][0])
 
     if constrained:
