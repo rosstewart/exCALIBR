@@ -49,7 +49,7 @@ Your CSV must contain these columns (or alternatively input a pre-formatted IGVF
 | Column | Description | Example |
 |--------|-------------|---------|
 | `score` | Variant effect score | 0.523 |
-| `sample` | Sample assignment index | 2 |
+| `sample` | Sample assignment index (can be multilabel) | "1,2" |
 | `Dataset` | Dataset name (optional) | "MyGene_MyLab_2025" |
 
 **Required sample indices (these indices cannot be changed):**
@@ -58,7 +58,7 @@ Your CSV must contain these columns (or alternatively input a pre-formatted IGVF
 - `2: gnomAD` or `population` - Population variants
 - `3: Synonymous` - Synonymous variants (optional)
 
-Note: Must have either Benign or Synonymous samples.
+Note: Must have either Benign or Synonymous samples. Variants can belong to multiple samples via separating each index with ",".
 
 ## Execution Modes
 
