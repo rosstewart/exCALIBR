@@ -21,7 +21,7 @@ logging.getLogger("adjustText").setLevel(logging.ERROR)
 import matplotlib.pyplot as plt
 import seaborn as sns
 from ..fit_utils.fit import (calculate_score_ranges,thresholds_from_prior)  # noqa: E402
-from ..fit_utils.two_sample import density_utils  # noqa: E402
+from ..fit_utils.cfusn import density_utils  # noqa: E402
 from ..data_utils.dataset import Scoreset  # noqa: E402
 from ..fit_utils.utils import serialize_dict  # noqa: E402
 import matplotlib.gridspec as gridspec
@@ -4695,7 +4695,7 @@ def import_dataset_configurations():
         "FKRP_Ma_2024": ("3c", "avg"),
     }
     
-    with open('/data/ross/assay_calibration/new_dataset_configs.json','rt') as f:
+    with open('/home/rcstewart/assay_calibration/src/igvf_configs/dataset_configs_jan_2026.json','rt') as f:
         new_dataset_configs = json.load(f)
 
     # del new_dataset_configs['TP53_Fayer_2021_meta']
@@ -4703,7 +4703,7 @@ def import_dataset_configurations():
     # del new_dataset_configs['SFPQ_unpublished']
     
     keep_old_list = set()
-    with open('/data/ross/assay_calibration/keep_old_datasets.txt','r') as f:
+    with open('/data/ross/assay_calibration/old/keep_old_datasets.txt','r') as f:
         for line in f:
             keep_old_list.add(line.strip())
 
