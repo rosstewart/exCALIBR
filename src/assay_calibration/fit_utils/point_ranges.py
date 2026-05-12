@@ -8,7 +8,7 @@ from typing import Dict, Tuple, List
 from joblib import Parallel, delayed
 import logging
 from .fit import (calculate_score_ranges,thresholds_from_prior)  # noqa: E402
-from .two_sample import density_utils  # noqa: E402
+from .cfusn import density_utils  # noqa: E402
 from ..data_utils.dataset import Scoreset  # noqa: E402
 from .utils import serialize_dict  # noqa: E402
 from collections import defaultdict

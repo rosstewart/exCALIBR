@@ -12,7 +12,7 @@ from joblib import Parallel, delayed
 import logging
 
 from ..fit_utils.fit import calculate_score_ranges, thresholds_from_prior
-from ..fit_utils.two_sample import density_utils
+from ..fit_utils.cfusn import density_utils
 from ..fit_utils.point_ranges import (
     enforce_monotonicity_point_ranges,
     prior_equation_2c,
