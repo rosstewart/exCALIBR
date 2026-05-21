@@ -25,9 +25,10 @@ from .evidence_thresholds import get_tavtigian_constant
 import logging
 import sys
 from joblib import Parallel, delayed
-from .cfusn.fit import single_fit
+from .cfusn.fit import single_fit, compute_sample_weights
 from .cfusn.density_utils import (
-    get_likelihood, msn_logpdf_alternate_missing, cfusn_logpdf_alternate_missing,
+    get_likelihood, get_sample_likelihood,
+    msn_logpdf_alternate_missing, cfusn_logpdf_alternate_missing,
     mixture_pdf, log_joint_densities, _ensure_matrix_delta, get_q,
 )
 from .utils import serialize_dict
@@ -171,6 +172,61 @@ def pattern_stratified_bootstrap(observations, sample_assignments, bootstrap_see
     train_out = np.concatenate(train_indices)
     eval_out = np.concatenate(eval_indices) if eval_indices else np.array([], dtype=int)
     return train_out, eval_out
+
+
+def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, mv, fit_kwargs):
+    """Validation log-likelihood with optional per-sample weighting.
+
+    When sample_balance_beta=0 and sample_proportions=None (defaults), returns the
+    standard per-observation average LL (existing behaviour, n-based).
+
+    When sample_balance_beta > 0 or sample_proportions is given, computes the
+    per-sample mean LL and combines them with the same weights used in the M-step,
+    so that the val score reflects the same objective the EM optimised.
+
+    Parameters
+    ----------
+    fit_kwargs : dict
+        Expects sample_balance_beta (float) and/or sample_proportions (array-like).
+    """
+    if not fit_kwargs.get("weighted_val_ll", False):
+        return get_likelihood(
+            val_observations, val_sample_assignments, params, weights, multivariate=mv
+        ) / len(val_sample_assignments)
+
+    beta = float(fit_kwargs.get("sample_balance_beta", 0.0))
+    proportions = fit_kwargs.get("sample_proportions", None)
+
+    if proportions is None and beta == 0.0:
+        return get_likelihood(
+            val_observations, val_sample_assignments, params, weights, multivariate=mv
+        ) / len(val_sample_assignments)
+
+    N_samples = val_sample_assignments.shape[1]
+    n_per_sample = val_sample_assignments.sum(axis=0).astype(float)
+
+    sample_lls = get_sample_likelihood(
+        val_observations, val_sample_assignments, params, weights, multivariate=mv
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        per_sample_mean_ll = np.where(n_per_sample > 0, sample_lls / n_per_sample, 0.0)
+
+    if proportions is not None:
+        w = np.asarray(proportions, dtype=float)
+        if len(w) != N_samples:
+            raise ValueError(
+                f"sample_proportions length {len(w)} != N_samples {N_samples}"
+            )
+    else:
+        n_ref = n_per_sample[n_per_sample > 0].min() if (n_per_sample > 0).any() else 1.0
+        w = np.where(n_per_sample > 0, (n_ref / np.maximum(n_per_sample, 1.0)) ** beta, 0.0)
+
+    w = np.where(n_per_sample > 0, w, 0.0)
+    w_sum = w.sum()
+    if w_sum == 0:
+        return -np.inf
+    w = w / w_sum
+    return float((w * per_sample_mean_ll).sum())
 
 
 class Fit:
@@ -370,9 +426,7 @@ class Fit:
             ):
                 return -np.inf
             try:
-                return get_likelihood(
-                    obs, sa, params, weights, multivariate=mv
-                ) / len(sa)
+                return _weighted_val_ll(obs, sa, params, weights, mv, kwargs)
             except Exception:
                 return -np.inf
 
@@ -738,13 +792,14 @@ class Fit:
 
             val_ll = None
             if job["val_observations"] is not None:
-                val_ll = get_likelihood(
+                val_ll = _weighted_val_ll(
                     job["val_observations"],
                     job["val_sample_assignments"],
                     result["component_params"],
                     result["weights"],
-                    multivariate=mv,
-                ) / len(job["val_sample_assignments"])
+                    mv,
+                    job.get("kwargs", {}),
+                )
 
             return {
                 "dataset_name": job.get("dataset_name"),

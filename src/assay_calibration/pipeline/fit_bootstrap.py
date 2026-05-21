@@ -224,12 +224,19 @@ class BootstrapRunner:
         # Generate fit jobs for each component count
         all_jobs = {}
         for n_components in self.config.components:
-            jobs = self.fitter.generate_fit_jobs(
+            fit_kwargs = dict(
                 component_range=[n_components],
                 bootstrap_seed=bootstrap_idx,
                 check_monotonic=True,
-                num_fits=self.config.num_fits_per_bootstrap
+                num_fits=self.config.num_fits_per_bootstrap,
             )
+            if self.config.sample_balance_beta != 0.0:
+                fit_kwargs["sample_balance_beta"] = self.config.sample_balance_beta
+            if self.config.sample_proportions is not None:
+                fit_kwargs["sample_proportions"] = self.config.sample_proportions
+            if self.config.weighted_val_ll:
+                fit_kwargs["weighted_val_ll"] = True
+            jobs = self.fitter.generate_fit_jobs(**fit_kwargs)
             
             # Extract shared data (train/val splits)
             if jobs:

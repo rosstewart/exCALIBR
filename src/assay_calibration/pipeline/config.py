@@ -36,6 +36,14 @@ class PipelineConfig:
     # BasicScoreset sample name override (order must match column ordering in data)
     sample_names: Optional[List[str]] = None
 
+    # Per-sample M-step reweighting (also applied to val_ll for fit selection)
+    # sample_proportions takes precedence over sample_balance_beta when both given.
+    # sample_proportions=[2,1,1,1]: sample 0 contributes twice as much as others.
+    # sample_balance_beta=1: all samples contribute equally regardless of size.
+    sample_proportions: Optional[List[float]] = None
+    sample_balance_beta: float = 0.0
+    weighted_val_ll: bool = False  # if True, val_ll uses the same sample weighting as the M-step
+
     # Debug mode: verbose logging of component params, weights, flip detection, point ranges
     debug: bool = False
 

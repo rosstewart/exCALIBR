@@ -210,7 +210,7 @@ def kmeans_init_mv(X, **kwargs):
         raise ValueError(f"Only {len(X_complete)}/{N} complete rows, need {min_needed}")
 
     last_error = None
-    for attempt in range(1000):
+    for attempt in range(100):
         try:
             kmeans = KMeans(
                 n_clusters=n_clusters,
@@ -305,7 +305,7 @@ def kmeans_init_mv(X, **kwargs):
             last_error = f"{type(e).__name__}: {e}"
             continue
 
-    raise ValueError(f"Failed init after 1000 attempts: {last_error}")
+    raise ValueError(f"Failed init after 100 attempts: {last_error}")
 
 
 def default_anchor_groups(K, S):
@@ -840,7 +840,7 @@ def fix_to_satisfy_density_constraint_mv(component_parameters, X, **kwargs):
     )
 
     trial = 0
-    while trial < 300:
+    while trial < 50:
         if not multicomponent_density_constraint_violated(
             component_parameters, xlims, multivariate=True, mode=constraint_mode,
         ):

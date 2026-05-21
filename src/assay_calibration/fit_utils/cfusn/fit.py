@@ -12,6 +12,48 @@ from tqdm.auto import tqdm
 import warnings
 
 
+def compute_sample_weights(sample_indicators, **kwargs):
+    """Per-observation M-step weights from sample_proportions or sample_balance_beta.
+
+    sample_proportions : array-like of length S
+        Explicit relative weight for each sample (e.g. [2,1,1,1] upweights
+        sample 0 twice as much as the others).  Takes precedence over
+        sample_balance_beta when both are supplied.  Values are normalised
+        internally so only their ratios matter.
+
+    sample_balance_beta : float (default 0)
+        Continuous balance parameter.  beta=0 → standard EM (no reweighting);
+        beta=1 → each sample contributes equally regardless of size.
+
+    Returns None when neither parameter requests any reweighting.
+    """
+    proportions = kwargs.get("sample_proportions", None)
+    beta = float(kwargs.get("sample_balance_beta", 0.0))
+    N_samples = sample_indicators.shape[1]
+    N_per_sample = sample_indicators.sum(axis=0).astype(float)
+
+    if proportions is not None:
+        proportions = np.asarray(proportions, dtype=float)
+        if len(proportions) != N_samples:
+            raise ValueError(
+                f"sample_proportions length {len(proportions)} != N_samples {N_samples}"
+            )
+        proportions = proportions / proportions.sum()
+        # per-obs weight p_s / N_s so the total M-step contribution of sample s ∝ p_s
+        per_sample_w = np.where(
+            N_per_sample > 0, proportions / np.maximum(N_per_sample, 1.0), 0.0
+        )
+    elif beta > 0 and N_samples > 1:
+        N_ref = N_per_sample[N_per_sample > 0].min() if (N_per_sample > 0).any() else 1.0
+        per_sample_w = np.where(
+            N_per_sample > 0, (N_ref / np.maximum(N_per_sample, 1.0)) ** beta, 0.0
+        )
+    else:
+        return None
+
+    return (sample_indicators.astype(float) * per_sample_w).sum(axis=1)
+
+
 def single_fit(
     observations, sample_indicators, N_components, constrained,
     init_method, init_constraint_adjustment, multivariate=False, **kwargs
@@ -38,20 +80,10 @@ def single_fit(
     N_samples = sample_indicators.shape[1]
 
     # ---- Per-observation sample-balance weights (M-step reweighting) ----
-    # When sample_balance_beta > 0, each observation's M-step contribution is
-    # multiplied by (N_ref / N_{s(n)})^beta where N_ref = min_s N_s. beta=0
-    # reproduces standard EM (no balancing); beta=1 makes each sample
-    # contribute equally to every component's parameter update.
-    beta = float(kwargs.get("sample_balance_beta", 0.0))
-    if beta > 0 and N_samples > 1:
-        N_per_sample = sample_indicators.sum(axis=0).astype(float)  # (S,)
-        N_ref = N_per_sample[N_per_sample > 0].min() if (N_per_sample > 0).any() else 1.0
-        per_sample_w = np.where(
-            N_per_sample > 0, (N_ref / np.maximum(N_per_sample, 1.0)) ** beta, 0.0
-        )  # (S,)
-        sample_weights_per_obs = (sample_indicators.astype(float) * per_sample_w).sum(axis=1)
-    else:
-        sample_weights_per_obs = None  # no balancing
+    # compute_sample_weights handles both sample_proportions (explicit per-sample
+    # target proportions) and sample_balance_beta (continuous balance exponent).
+    # Returns None → standard EM with no reweighting.
+    sample_weights_per_obs = compute_sample_weights(sample_indicators, **kwargs)
 
     # ---- Initialization ----
     if (

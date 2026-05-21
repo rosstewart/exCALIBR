@@ -69,7 +69,8 @@ CONFIG_LABELS = {
 
 def _bootstrap_job(fit_raw, scores, sa,
                    p_idx, b_idx, g_idx, s_idx, benign_method,
-                   partial_patterns, reestimate_marginal_weights):
+                   partial_patterns, reestimate_marginal_weights,
+                   extra_p_indices=None):
     """Process one bootstrap fit.  Standalone so joblib loky workers don't
     need to pickle the full MVCalibrationAnalysis object."""
     if fit_raw is None:
@@ -101,6 +102,15 @@ def _bootstrap_job(fit_raw, scores, sa,
     eff_b = b_idx if b_idx is not None and b_idx < n_w else None
     eff_g = g_idx if (g_idx is not None and g_idx < n_w and g_idx < n_sa) else None
     eff_s = s_idx if s_idx is not None and s_idx < n_w else None
+
+    # Validate extra_p_indices against weight rows
+    eff_extra_p = []
+    if extra_p_indices:
+        for ep in extra_p_indices:
+            if ep is not None and ep < n_w:
+                eff_extra_p.append(ep)
+
+    aux_lrs = {}   # {eff_idx: {'lr': array, 'prior': float}}
 
     if eff_p is None:
         return None, f"pathogenic index {p_idx} out of range for weights with {n_w} rows"
@@ -187,6 +197,62 @@ def _bootstrap_job(fit_raw, scores, sa,
     if not np.isfinite(prior) or prior <= 0 or prior >= 1:
         return None, f"invalid prior {prior}"
 
+    # ---- aux prior EM (one per auxiliary pathogenic sample) ----
+    # Each aux sample represents a different disease, so its prior must be
+    # estimated independently using that sample's mixing weights against gnomad.
+    aux_priors = {}
+    if eff_extra_p:
+        K_em = len(params)
+        for aux_eff_p in eff_extra_p:
+            if eff_g is None or eff_g >= sa.shape[1]:
+                aux_priors[aux_eff_p] = 0.5
+                continue
+            try:
+                pop_scores_a = scores[sa[:, eff_g].astype(bool)]
+                N_pop_a = pop_scores_a.shape[0]
+                w_p_a = weights[aux_eff_p]
+                log_fp_a = np.full(N_pop_a, np.nan)
+                log_fb_a = np.full(N_pop_a, np.nan)
+                pop_obs_a = ~np.isnan(pop_scores_a)
+                pop_groups_a = {}
+                for j in range(N_pop_a):
+                    key = frozenset(np.where(pop_obs_a[j])[0])
+                    if not key:
+                        continue
+                    pop_groups_a.setdefault(key, []).append(j)
+                for obs_key, ilist in pop_groups_a.items():
+                    jdx = np.array(ilist)
+                    b_sup = _sample_supports(eff_b, obs_key)
+                    s_sup = _sample_supports(eff_s, obs_key)
+                    w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                    if w_b is None:
+                        continue
+                    x_sub = pop_scores_a[jdx]
+                    log_fp_a[jdx] = logsumexp(
+                        [np.log(w_p_a[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                         for c in range(K_em)], axis=0)
+                    log_fb_a[jdx] = logsumexp(
+                        [np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                         for c in range(K_em)], axis=0)
+                valid_a = np.isfinite(log_fp_a) & np.isfinite(log_fb_a)
+                fp_a = np.exp(log_fp_a[valid_a])
+                fb_a = np.exp(log_fb_a[valid_a])
+                aux_prior = 0.5
+                for _ in range(10000):
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        post_a = 1 / (1 + (1 - aux_prior) / aux_prior * fb_a / fp_a)
+                    new_p = np.nanmean(post_a)
+                    if abs(new_p - aux_prior) < 1e-6:
+                        aux_prior = new_p
+                        break
+                    aux_prior = new_p
+                if np.isfinite(aux_prior) and 0 < aux_prior < 1:
+                    aux_priors[aux_eff_p] = aux_prior
+                else:
+                    aux_priors[aux_eff_p] = 0.5
+            except Exception:
+                aux_priors[aux_eff_p] = 0.5
+
     # ---- LR computation ----
     try:
         N, D = scores.shape
@@ -264,11 +330,36 @@ def _bootstrap_job(fit_raw, scores, sa,
                                  for c in range(K)], axis=0)
                 log_lr[idx] = lfp - lfb
             lr = log_lr
+
+        # ---- aux LR computation (same benign reference, different pathogenic weights) ----
+        for aux_eff_p in eff_extra_p:
+            aux_log_lr = np.full(N, np.nan)
+            w_p_aux = weights[aux_eff_p]
+            for obs_key, indices in pat_groups.items():
+                if not obs_key:
+                    continue
+                idx = np.array(indices)
+                b_sup = _sample_supports(eff_b, obs_key)
+                s_sup = _sample_supports(eff_s, obs_key)
+                w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                if w_b is None:
+                    continue
+                x_sub = scores[idx]
+                lfp = logsumexp([np.log(w_p_aux[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                aux_log_lr[idx] = lfp - lfb
+            aux_lrs[aux_eff_p] = {
+                'lr': aux_log_lr,
+                'prior': aux_priors.get(aux_eff_p, 0.5),
+            }
+
     except Exception as e:
         import traceback
         return None, f"LR computation: {e}\n{traceback.format_exc()}"
 
-    return (prior, lr), None
+    return (prior, lr, aux_lrs), None
 
 
 # ──────────────────────────────────────
@@ -367,6 +458,7 @@ class MVCalibrationAnalysis:
                  point_values=None,
                  pathogenic_idx=0, benign_idx=1,
                  gnomad_idx=2, synonymous_idx=3,
+                 auxiliary_pathogenic_indices=None,
                  benign_method='benign',
                  dataset_name=None, dataset_suffix='_mv'):
         """
@@ -409,6 +501,14 @@ class MVCalibrationAnalysis:
                 f"Neither benign (role {benign_idx}) nor synonymous (role {synonymous_idx}) "
                 f"has observations."
             )
+
+        # Auxiliary pathogenic samples — each gets its own point regions using
+        # the same benign reference as the primary pathogenic sample.
+        self.aux_p_entries = []  # list of (fixed_idx, eff_idx)
+        for fixed_idx in (auxiliary_pathogenic_indices or []):
+            eff = _eff_idx(f"aux pathogenic {fixed_idx}", fixed_idx)
+            if eff is not None:
+                self.aux_p_entries.append((fixed_idx, eff))
 
         print(f"Loading results from {results_path}...")
         with gzip.open(results_path, 'rt', encoding='utf-8') as f:
@@ -857,29 +957,42 @@ class MVCalibrationAnalysis:
             n_total = len(boot_items)
             scores = self.ms.scores
             sa = self.ms.sample_assignments
+            aux_eff_indices = [eff for _, eff in self.aux_p_entries]
+            eff_to_fixed = {eff: fixed for fixed, eff in self.aux_p_entries}
+
             print(f"  Processing {n_total} bootstraps (n_jobs={n_jobs})...")
+            if aux_eff_indices:
+                print(f"  Aux pathogenic samples (effective indices): {aux_eff_indices}")
             parallel_results = Parallel(n_jobs=n_jobs)(
                 delayed(_bootstrap_job)(
                     bd.get(config), scores, sa,
                     self.p_idx, self.b_idx, self.g_idx, self.s_idx,
                     self.benign_method, partial_patterns,
                     reestimate_marginal_weights,
+                    extra_p_indices=aux_eff_indices,
                 )
                 for _, bd in boot_items
             )
 
             priors = []
             lr_matrix = []
+            aux_lr_matrices = {fixed: [] for fixed, _ in self.aux_p_entries}
+            aux_prior_collections = {fixed: [] for fixed, _ in self.aux_p_entries}
             n_valid = 0
             for result, err in parallel_results:
                 if result is None:
                     if err:
                         warnings.warn(err)
                     continue
-                prior, lr = result
+                prior, lr, aux_lrs = result
                 priors.append(prior)
                 lr_matrix.append(lr)
                 n_valid += 1
+                for eff_idx, aux_data in aux_lrs.items():
+                    fixed_idx = eff_to_fixed.get(eff_idx)
+                    if fixed_idx is not None:
+                        aux_lr_matrices[fixed_idx].append(aux_data['lr'])
+                        aux_prior_collections[fixed_idx].append(aux_data['prior'])
 
             print(f"  Valid bootstraps: {n_valid}/{n_total}")
 
@@ -1085,6 +1198,67 @@ class MVCalibrationAnalysis:
                 self.results[config]['lr_median_raw'] = lr_median_orig
             if path_fraction is not None:
                 self.results[config]['path_fraction'] = path_fraction
+
+            # ── Auxiliary pathogenic results ──────────────────────────
+            aux_results = {}
+            for fixed_idx, eff_idx in self.aux_p_entries:
+                mats = aux_lr_matrices.get(fixed_idx, [])
+                if not mats:
+                    continue
+                aux_lr_mat = np.array(mats)
+                aux_lr_5th = np.nanpercentile(aux_lr_mat, path_percentile, axis=0)
+                aux_lr_95th = np.nanpercentile(aux_lr_mat, ben_percentile, axis=0)
+                aux_lr_median = np.nanmedian(aux_lr_mat, axis=0)
+
+                # Each aux sample has its own disease-specific prior and thresholds
+                aux_prior_arr = np.array(aux_prior_collections.get(fixed_idx, []))
+                aux_median_prior = float(np.nanmedian(aux_prior_arr)) if len(aux_prior_arr) else 0.5
+                aux_tau_p_log, aux_tau_b_log, aux_C_path, aux_C_ben = _thresholds(
+                    aux_median_prior, self.point_values)
+
+                if enforce_marginal_monotonicity:
+                    aux_lr_5th, aux_lr_95th, _ = self._enforce_marginal_monotonicity(
+                        aux_lr_5th, aux_lr_95th, aux_tau_p_log, aux_tau_b_log,
+                        liberal=liberal_marginal_monotonicity,
+                        directions=self._infer_score_directions())
+
+                aux_points = np.zeros(N, dtype=int)
+                for pv in self.point_values:
+                    aux_points[aux_lr_5th >= aux_tau_p_log[pv - 1]] = pv
+                for pv in self.point_values:
+                    aux_points[aux_lr_95th <= aux_tau_b_log[pv - 1]] = -pv
+
+                aux_path_mask = sa[:, eff_idx] if eff_idx < sa.shape[1] else np.zeros(N, bool)
+                aux_path_correct = ((aux_points[aux_path_mask] > 0).mean()
+                                    if aux_path_mask.any() else np.nan)
+                aux_path_wrong = ((aux_points[aux_path_mask] < 0).mean()
+                                  if aux_path_mask.any() else np.nan)
+                aux_neg_correct = ((aux_points[neg_mask] < 0).mean()
+                                   if neg_mask.any() else np.nan)
+                print(f"\n  ── Aux pathogenic sample {fixed_idx} ──")
+                print(f"  Prior: {aux_median_prior:.4f}  C_path: {aux_C_path:.2f}  C_ben: {aux_C_ben:.2f}")
+                print(f"  Path correct: {aux_path_correct*100:.1f}%  wrong: {aux_path_wrong*100:.1f}%")
+                print(f"  Ben+Syn correct: {aux_neg_correct*100:.1f}%")
+                print(f"  Point dist: {dict(sorted(Counter(aux_points).items()))}")
+
+                aux_results[fixed_idx] = {
+                    'lr_matrix': aux_lr_mat,
+                    'lr_median': aux_lr_median,
+                    'lr_5th': aux_lr_5th,
+                    'lr_95th': aux_lr_95th,
+                    'points': aux_points,
+                    'priors': aux_prior_arr,
+                    'median_prior': aux_median_prior,
+                    'C_path': aux_C_path,
+                    'C_ben': aux_C_ben,
+                    'tau_p_log': aux_tau_p_log,
+                    'tau_b_log': aux_tau_b_log,
+                    'path_correct': aux_path_correct,
+                    'path_wrong': aux_path_wrong,
+                    'neg_correct': aux_neg_correct,
+                    'eff_idx': eff_idx,
+                }
+            self.results[config]['aux_results'] = aux_results
 
     def summary_table(self):
         """Return a pandas DataFrame summarizing all configs."""
