@@ -2079,7 +2079,7 @@ def plot_scoreset_final_pillar_project_v2(dataset, scoreset_2018, scoreset, indv
 
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
-def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333)):
+def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_FITS=False):
     """
     Create a 2x2 grid of dataset plots for publication.
     Each panel shows all samples for one dataset stacked vertically.
@@ -2171,53 +2171,55 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             )
             
             max_hist_density = max([patch.get_height() for patch in ax.patches]) if ax.patches else 1.0
-            
-            # Plot fitted density
-            density_sample = sample_density(score_range, fits, sample_idx)
-            d = np.nansum(density_sample, axis=1)
-            d_perc = np.percentile(d, [5, 50, 95], axis=0)
-            
-            ax.plot(score_range, d_perc[1], color='black', alpha=0.5, linewidth=2)
-            ax.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
-            
+
+            if not HIDE_FITS:
+                # Plot fitted density
+                density_sample = sample_density(score_range, fits, sample_idx)
+                d = np.nansum(density_sample, axis=1)
+                d_perc = np.percentile(d, [5, 50, 95], axis=0)
+                
+                ax.plot(score_range, d_perc[1], color='black', alpha=0.5, linewidth=2)
+                ax.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
+                
             # Add threshold lines
             handles = []
-            for idx, point_val in enumerate(point_values_to_plot):
-                # Benign threshold
-                for pv, score_ranges in point_ranges.items():
-                    if pv == -point_val and score_ranges:
-                        for sr in score_ranges:
-                            threshold_score = sr[0] if not flipped else sr[1]
-                            ax.axvline(
-                                threshold_score, color='b',
-                                linestyle=linestyles[idx],
-                                linewidth=linewidths[idx], alpha=0.7
-                            )
+            if not HIDE_THRESHOLDS:
+                for idx, point_val in enumerate(point_values_to_plot):
+                    # Benign threshold
+                    for pv, score_ranges in point_ranges.items():
+                        if pv == -point_val and score_ranges:
+                            for sr in score_ranges:
+                                threshold_score = sr[0] if not flipped else sr[1]
+                                ax.axvline(
+                                    threshold_score, color='b',
+                                    linestyle=linestyles[idx],
+                                    linewidth=linewidths[idx], alpha=0.7
+                                )
+                                break
                             break
-                        break
-                
-                # Pathogenic threshold
-                for pv, score_ranges in point_ranges.items():
-                    if pv == point_val and score_ranges:
-                        for sr in score_ranges:
-                            threshold_score = sr[1] if not flipped else sr[0]
-                            ax.axvline(
-                                threshold_score, color='r',
-                                linestyle=linestyles[idx],
-                                linewidth=linewidths[idx], alpha=0.7
-                            )
+                    
+                    # Pathogenic threshold
+                    for pv, score_ranges in point_ranges.items():
+                        if pv == point_val and score_ranges:
+                            for sr in score_ranges:
+                                threshold_score = sr[1] if not flipped else sr[0]
+                                ax.axvline(
+                                    threshold_score, color='r',
+                                    linestyle=linestyles[idx],
+                                    linewidth=linewidths[idx], alpha=0.7
+                                )
+                                break
                             break
-                        break
-                
-                # Create handle for legend
-                if len(point_ranges.get(point_val, [])) != 0 or len(point_ranges.get(-point_val, [])) != 0:
-                    h = mlines.Line2D(
-                        [], [], color='gray',
-                        linestyle=linestyles[idx],
-                        linewidth=linewidths[idx],
-                        label=f"±{point_val}"
-                    )
-                    handles.append(h)
+                    
+                    # Create handle for legend
+                    if len(point_ranges.get(point_val, [])) != 0 or len(point_ranges.get(-point_val, [])) != 0:
+                        h = mlines.Line2D(
+                            [], [], color='gray',
+                            linestyle=linestyles[idx],
+                            linewidth=linewidths[idx],
+                            label=f"±{point_val}"
+                        )
+                        handles.append(h)
             
             # Title on first sample only - MATCHING YANG PLOT FORMAT
             if sample_idx == 0:
@@ -2251,6 +2253,7 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                 ax.set_ylabel("Density", fontsize=12)
             else:
                 ax.set_ylabel("")
+            ax.set_xlim([score_range[0], score_range[-1]])
             
             n_count = sample_mask.sum()
             
@@ -2287,30 +2290,31 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             )
 
             ax.add_artist(hist_legend)
-            
-            # Add point ranges legend on the right (or "No evidence" text)
-            if handles:
-                # Create points legend on the right
-                ax.legend(
-                    handles,
-                    [h.get_label() for h in handles],
-                    loc='upper right',
-                    ncol=2 if len(handles) > 3 else 1,
-                    fontsize=min_font_size-1,
-                    framealpha=0.5,
-                    handlelength=2,
-                    columnspacing=1.0
-                )
-            else:
-                # No evidence thresholds - display "No evidence" text
-                ax.text(0.985, 0.945, 'No evidence',
-                       transform=ax.transAxes,
-                       fontsize=min_font_size,
-                       ha='right', va='top',
-                       bbox=dict(boxstyle='square,pad=0.4', 
-                                facecolor='white', 
-                                edgecolor='lightgray',
-                                alpha=0.5))
+
+            if not HIDE_THRESHOLDS:
+                # Add point ranges legend on the right (or "No evidence" text)
+                if handles:
+                    # Create points legend on the right
+                    ax.legend(
+                        handles,
+                        [h.get_label() for h in handles],
+                        loc='upper right',
+                        ncol=2 if len(handles) > 3 else 1,
+                        fontsize=min_font_size-1,
+                        framealpha=0.5,
+                        handlelength=2,
+                        columnspacing=1.0
+                    )
+                else:
+                    # No evidence thresholds - display "No evidence" text
+                    ax.text(0.985, 0.945, 'No evidence',
+                           transform=ax.transAxes,
+                           fontsize=min_font_size,
+                           ha='right', va='top',
+                           bbox=dict(boxstyle='square,pad=0.4', 
+                                    facecolor='white', 
+                                    edgecolor='lightgray',
+                                    alpha=0.5))
             
             ax.grid(True, alpha=0.3, axis='both', linewidth=0.5)
             ax.set_axisbelow(True)

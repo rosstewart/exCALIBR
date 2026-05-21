@@ -130,6 +130,9 @@ def single_fit(
                     times_submerged=[],
                 )
 
+        if mv and latent_q > 1:
+            initial_params = _ensure_cfusn_params(initial_params, latent_q)
+
         W = get_sample_weights(
             observations, sample_indicators, initial_params, W, multivariate=mv
         )

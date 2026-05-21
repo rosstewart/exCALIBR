@@ -306,8 +306,8 @@ def _draw_dataset_panel(
         fit_lw            = 1.5
         title_fs          = 9
 
-    x_min = 0.0
-    x_max = 1.0
+    x_min = score_range[0]
+    x_max = score_range[-1]
     bin_width = (x_max - x_min) / bin_div
 
     population_scores = _get_sample_scores(scoreset, sample_num=2)
@@ -345,12 +345,13 @@ def _draw_dataset_panel(
 
         max_h = max((p.get_height() for p in ax.patches), default=1.0)
 
-        # Fitted total density (bootstrap median + 5/95 band)
-        density_sample = sample_density(score_range, fits, sample_idx)
-        d_total = np.nansum(density_sample, axis=1)
-        d_perc  = np.percentile(d_total, [5, 50, 95], axis=0)
-        ax.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
-        ax.plot(score_range, d_perc[1], color='black', alpha=0.65, linewidth=fit_lw)
+        if sample_idx < len(fits[0]['fit']['weights']):
+            # Fitted total density (bootstrap median + 5/95 band)
+            density_sample = sample_density(score_range, fits, sample_idx)
+            d_total = np.nansum(density_sample, axis=1)
+            d_perc  = np.percentile(d_total, [5, 50, 95], axis=0)
+            ax.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
+            ax.plot(score_range, d_perc[1], color='black', alpha=0.65, linewidth=fit_lw)
 
         ax.set_xlim(x_min, x_max)
         if not is_full:
@@ -432,7 +433,7 @@ def _draw_dataset_panel(
     if is_full:
         ax_combined.set_ylabel('Density', fontsize=fontsize_subtitle)
         ax_combined.tick_params(axis='both', labelsize=fontsize_tick)
-        ax_combined.set_title('Experimental score distributions', loc='left',
+        ax_combined.set_title(f'{title if title is not None else "Experimental"} score distributions', loc='left',
                               pad=3, fontsize=title_fs)
     else:
         ax_combined.set_ylabel('')
@@ -464,21 +465,22 @@ def _draw_dataset_panel(
         point_ranges_yile, x_min, x_max, flipped) \
         if point_ranges_yile is not None else []
 
-    _plot_calibration_bar(
-        ax_yile, intervals_yile, population_scores, x_min, x_max,
-        fontsize_count=fontsize_count,
-    )
-
-    ax_yile.set_ylabel('Yile', fontsize=side_label_fs, rotation=0,
-                       ha='right', va='center', labelpad=side_label_pad)
-
-    if show_xlabel:
-        ax_yile.set_xlabel('Predictor Score',
-                           fontsize=fontsize_subtitle if is_full else 8)
-        ax_yile.tick_params(axis='x', labelsize=fontsize_tick)
-    else:
-        ax_yile.set_xlabel('')
-        ax_yile.tick_params(axis='x', bottom=False, labelbottom=False)
+    if ax_yile is not None:
+        _plot_calibration_bar(
+            ax_yile, intervals_yile, population_scores, x_min, x_max,
+            fontsize_count=fontsize_count,
+        )
+    
+        ax_yile.set_ylabel('Yile', fontsize=side_label_fs, rotation=0,
+                           ha='right', va='center', labelpad=side_label_pad)
+    
+        if show_xlabel:
+            ax_yile.set_xlabel('Predictor Score',
+                               fontsize=fontsize_subtitle if is_full else 8)
+            ax_yile.tick_params(axis='x', labelsize=fontsize_tick)
+        else:
+            ax_yile.set_xlabel('')
+            ax_yile.tick_params(axis='x', bottom=False, labelbottom=False)
 
     # ── Row 4 : color legend (union of point values used by either bar) ─────
     pvs_present = sorted(
@@ -566,17 +568,28 @@ def plot_calibration_predictor(
     n_actual = sum(1 for c in scoreset_for_fit.sample_counts if c > 0)
 
     fig = plt.figure(figsize=(12, 12))
-    gs = gridspec.GridSpec(
-        5, n_actual,
-        height_ratios=[2, 2, 0.6, 0.6, 0.3],
-        hspace=0.35, wspace=0.15,
-    )
+    if point_ranges_yile is not None:
+        gs = gridspec.GridSpec(
+            5, n_actual,
+            height_ratios=[2, 2, 0.6, 0.6, 0.3],
+            hspace=0.35, wspace=0.15,
+        )
+    else:
+        gs = gridspec.GridSpec(
+            4, n_actual,
+            height_ratios=[2, 2, 0.6, 0.3],
+            hspace=0.35, wspace=0.15,
+        )
 
     axes_fits   = [plt.subplot(gs[0, i]) for i in range(n_actual)]
     ax_combined = plt.subplot(gs[1, :])
     ax_excalibr = plt.subplot(gs[2, :])
-    ax_yile     = plt.subplot(gs[3, :])
-    ax_legend   = plt.subplot(gs[4, :])
+    if point_ranges_yile is not None:
+        ax_yile     = plt.subplot(gs[3, :])
+        ax_legend   = plt.subplot(gs[4, :])
+    else:
+        ax_yile = None
+        ax_legend = plt.subplot(gs[3, :])
 
     _draw_dataset_panel(
         axes_fits=axes_fits,
@@ -722,6 +735,77 @@ def plot_multi_calibration_predictor(
 
     return [fig for _, fig in sorted(results, key=lambda x: x[0])]
 
+
+def plot_calibration_abstract(
+    *,
+    dataset,
+    scoreset,
+    fits,
+    calibration_results,
+    point_ranges_yile=None,
+    score_range_n=2000,
+):
+    """
+    Convenience wrapper around plot_calibration_predictor that derives
+    all required arguments from a calibration_results dict and the
+    bootstrap fits store.
+
+    Parameters
+    ----------
+    dataset : str
+        Dataset key (e.g. "gof_benta"); must be present in `fits`.
+    scoreset : BasicScoreset
+        Scoreset used for histograms and population counts.
+    fits : dict
+        Full bootstrap fits store: fits[dataset][bootstrap_seed][n_c].
+    calibration_results : dict
+        Calibration JSON for this dataset, containing at minimum:
+          'n_c', 'point_ranges', 'scoreset_flipped', 'prior'.
+    point_ranges_yile : dict or None
+        Optional Yile thresholds; passed through unchanged.
+    score_range_n : int
+        Number of points in the dense evaluation grid (default 500).
+    """
+    # ── Resolve n_c ────────────────────────────────────────────────────────
+    n_c = calibration_results["n_c"]
+
+    # ── Collect one fit entry per bootstrap seed ────────────────────────────
+    # fits[dataset][seed][n_c] — gather every seed that has this n_c
+    dataset_fits = fits.get(dataset, {})
+    fit_list = []
+    for seed, seed_fits in dataset_fits.items():
+        if n_c in seed_fits:
+            fit_list.append(seed_fits[n_c])
+    if not fit_list:
+        raise ValueError(
+            f"No fits found for dataset={dataset!r}, n_c={n_c!r}. "
+            f"Available n_c keys in first seed: "
+            f"{list(next(iter(dataset_fits.values()), {}).keys())}"
+        )
+
+    # ── Derive score range from all non-empty samples ──────────────────────
+    # Use the full score array (sample_assignments filters handled inside)
+    all_scores = scoreset.scores
+    s_min = float(np.nanmin(all_scores))
+    s_max = float(np.nanmax(all_scores))
+    score_range = np.linspace(s_min, s_max, score_range_n)
+
+    # ── Unpack calibration results ──────────────────────────────────────────
+    point_ranges_excalibr = calibration_results["point_ranges"]
+    flipped               = bool(calibration_results.get("scoreset_flipped", False))
+    prior                 = calibration_results.get("prior", None)
+
+    # ── Delegate to the full plotting function ──────────────────────────────
+    return plot_calibration_predictor(
+        dataset=dataset,
+        scoreset=scoreset,
+        fits=fit_list,
+        score_range=score_range,
+        point_ranges_excalibr=point_ranges_excalibr,
+        point_ranges_yile=point_ranges_yile,
+        flipped=flipped,
+        prior=prior,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience: build a panel dict from the user's reference data layout

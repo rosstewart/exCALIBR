@@ -982,6 +982,31 @@ def get_constrained_update_mv(
         if hi - lo < tol:
             break
 
+    # The binary search used a probe grid frozen at alpha=1.  The outer
+    # verification rebuilds the grid from the actual alpha=lo params (which
+    # may point in a different direction in line mode) and can detect
+    # violations the frozen-grid search missed.  Do a final proper check
+    # here so the outer code doesn't have to revert.
+    def _proper_violated_at(a):
+        p = _interp_at(a)
+        test = [
+            (updated_component_params[ki] if ki < component_num
+             else (p if ki == component_num
+                   else current_component_params[ki]))
+            for ki in range(K)
+        ]
+        return multicomponent_density_constraint_violated(
+            test, xlims, multivariate=True, mode=constraint_mode,
+            min_log_ratio_range=min_log_ratio_range,
+        )
+
+    for _ in range(10):
+        if not _proper_violated_at(lo):
+            break
+        lo *= 0.5
+    else:
+        return current_component_params[component_num]
+
     return _interp_at(lo)
 
 

@@ -1537,6 +1537,134 @@ class BasicMultiScoreset:
 
         self._build()
 
+    @staticmethod
+    def _parse_sample_assignments(sa_vals):
+        """Parse 1-D sample_assignments into a 2-D boolean array.
+
+        Accepts the same formats as BasicScoreset.validate_sample_assignments:
+          - object/string dtype  → split each value on ',' and one-hot encode
+          - numeric dtype        → treat each value as a sample id, one-hot encode
+          - already 2-D array   → returned as-is (cast to bool)
+        """
+        sa_vals = np.asarray(sa_vals)
+        if sa_vals.ndim == 2:
+            return sa_vals.astype(bool)
+        if sa_vals.dtype.kind in ('U', 'O'):
+            all_keys = sorted({k for v in sa_vals for k in str(v).split(',')})
+            key_to_idx = {k: i for i, k in enumerate(all_keys)}
+            result = np.zeros((len(sa_vals), len(all_keys)), dtype=bool)
+            for row, v in enumerate(sa_vals):
+                for k in str(v).split(','):
+                    result[row, key_to_idx[k]] = True
+            return result
+        # numeric — treat each value as a sample identifier
+        unique_samples = sorted(set(sa_vals))
+        result = np.zeros((len(sa_vals), len(unique_samples)), dtype=bool)
+        for col_i, sid in enumerate(unique_samples):
+            result[:, col_i] = sa_vals == sid
+        return result
+
+    @classmethod
+    def from_dataframe(cls, dataframe, score_cols=None, id_col=None,
+                       sample_assignments_col='sample_assignments',
+                       dataset_names=None, **kwargs):
+        """Create a BasicMultiScoreset directly from a DataFrame.
+
+        Parameters
+        ----------
+        dataframe : pd.DataFrame
+            Must contain score columns and a sample_assignments column.
+        score_cols : list of str, optional
+            Columns to use as score dimensions.  If None, all numeric columns
+            except id_col and sample_assignments_col are used.
+        id_col : str, optional
+            Column to use as variant identifier.  Defaults to the DataFrame index.
+        sample_assignments_col : str
+            Column containing sample assignments (comma-separated strings, integer
+            sample ids, or a pre-built boolean/int one-hot column is also accepted
+            if the column holds array-like objects — but see _parse_sample_assignments
+            for supported 1-D formats).
+        dataset_names : list of str, optional
+            Names for each score dimension.  Defaults to the column names in
+            score_cols.
+        **kwargs
+            sample_names : list of str, optional
+                Names for each sample class.  Defaults to the class-level defaults
+                (P/LP, B/LB, population, Synonymous); any extra samples beyond the
+                defaults are auto-named 'sample_{i}'.
+        """
+        df = dataframe.copy()
+
+        exclude = {sample_assignments_col}
+        if id_col is not None:
+            exclude.add(id_col)
+
+        if score_cols is None:
+            score_cols = [
+                c for c in df.columns
+                if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
+            ]
+
+        d = len(score_cols)
+        if d == 0:
+            raise ValueError("No score columns found or specified.")
+
+        all_ids = df[id_col].tolist() if id_col is not None else list(df.index)
+        N = len(df)
+
+        scores_matrix = df[score_cols].to_numpy(dtype=float)
+
+        sample_assignments = cls._parse_sample_assignments(
+            df[sample_assignments_col].values
+        )
+        n_samples_total = sample_assignments.shape[1]
+
+        if dataset_names is None:
+            dataset_names = list(score_cols)
+        elif len(dataset_names) != d:
+            raise ValueError(
+                f"dataset_names length {len(dataset_names)} does not match "
+                f"number of score columns {d}"
+            )
+
+        default_names = [
+            "Pathogenic/Likely Pathogenic", "Benign/Likely Benign",
+            "population", "Synonymous",
+        ]
+        sample_names = list(kwargs.get("sample_names", default_names[:n_samples_total]))
+        if len(sample_names) < n_samples_total:
+            sample_names += [
+                f"sample_{i}" for i in range(len(sample_names), n_samples_total)
+            ]
+
+        missing_mask = np.isnan(scores_matrix)
+        keep_mask = ~np.all(missing_mask, axis=1)
+
+        obj = cls.__new__(cls)
+        obj.scoresets = []
+        obj.d = d
+        obj._init_kwargs = dict(kwargs)
+        obj.dataset_names = dataset_names
+        obj._n_samples_total = n_samples_total
+        obj._sample_names = sample_names
+
+        obj._all_ids = all_ids
+        obj._variants_kept = [all_ids[i] for i in range(N) if keep_mask[i]]
+        obj._scores_matrix = scores_matrix
+        obj._missing_mask = missing_mask
+        obj._keep_mask = keep_mask
+        obj._scores = scores_matrix[keep_mask]
+        obj._missing = missing_mask[keep_mask]
+        obj._sample_assignments = sample_assignments[keep_mask]
+        obj.n_variants = obj._scores.shape[0]
+        obj._xlims = tuple(
+            (np.nanmin(obj._scores[:, dim]), np.nanmax(obj._scores[:, dim]))
+            for dim in range(d)
+        )
+        obj.sample_counts = obj._sample_assignments.sum(axis=0)
+
+        return obj
+
     def _build(self):
         # Union of IDs preserving first-seen order
         seen: dict = {}

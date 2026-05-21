@@ -61,28 +61,64 @@ class BootstrapRunner:
         self.fitter = Fit(self.dataset)
     
     def _run_parallel(self) -> Tuple[Dict, Dict]:
-        """Run bootstrap fits in parallel using joblib"""
+        """Run bootstrap fits in parallel using joblib, flattened across bootstraps × fits."""
         print(f"\nRunning {self.config.n_bootstraps} bootstraps in parallel...")
         print(f"  Jobs: {self.config.n_jobs if self.config.n_jobs > 0 else 'all CPUs'}")
         print(f"  Components: {self.config.components}")
-        
+
         # Generate all bootstrap jobs
         all_jobs = []
         for bootstrap_idx in range(self.config.n_bootstraps):
-            bootstrap_job = self._generate_bootstrap_job(bootstrap_idx)
-            all_jobs.append(bootstrap_job)
-        
+            all_jobs.append(self._generate_bootstrap_job(bootstrap_idx))
+
         # Extract dataset splits for OOB (before execution, zero overhead)
         dataset_splits = self._extract_splits(all_jobs)
-        
-        # Execute in parallel
-        results = Parallel(n_jobs=self.config.n_jobs, verbose=10)(
-            delayed(self._execute_bootstrap_job)(job) 
-            for job in all_jobs
+
+        # Flatten to one task per individual fit across all bootstraps × components × fits
+        flat_tasks = [
+            (bootstrap_job['bootstrap_seed'], component_key, minimal_job, job_data['shared_data'])
+            for bootstrap_job in all_jobs
+            for component_key, job_data in bootstrap_job['component_jobs'].items()
+            for minimal_job in job_data['jobs']
+        ]
+
+        # Execute all individual fits in parallel
+        flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=10)(
+            delayed(BootstrapRunner._execute_single_fit)(
+                minimal_job, shared_data, self.config.dataset_name
+            )
+            for _, _, minimal_job, shared_data in flat_tasks
         )
-        
-        # Aggregate results
-        return self._aggregate_results(results), dataset_splits
+
+        # Aggregate: keep best fit by val_ll per (bootstrap_seed, component_key)
+        best_fits: Dict = {}
+        for (bootstrap_seed, component_key, _, _), result in zip(flat_tasks, flat_results):
+            if result is None:
+                continue
+            key = (bootstrap_seed, component_key)
+            if key not in best_fits or result['val_ll'] > best_fits[key]['val_ll']:
+                best_fits[key] = result
+
+        # Reconstruct the same {seed: {component_key: best_result}} structure
+        aggregated = {}
+        for bootstrap_idx in range(self.config.n_bootstraps):
+            entry = {}
+            for n_c in self.config.components:
+                component_key = f"{n_c}c"
+                entry[component_key] = best_fits.get((bootstrap_idx, component_key))
+            aggregated[bootstrap_idx] = entry
+
+        return aggregated, dataset_splits
+
+    @staticmethod
+    def _execute_single_fit(minimal_job: Dict, shared_data: Dict, dataset_name: str) -> Optional[Dict]:
+        """Execute one fit job; returns None on failure."""
+        try:
+            full_job = {**minimal_job, **shared_data, 'dataset_name': dataset_name}
+            return Fit.execute_fit_job(full_job)
+        except Exception as e:
+            print(f"  ✗ Fit failed: {e}")
+            return None
     
     def _run_single(self) -> Tuple[Dict, Dict]:
         """Run bootstrap fits single-threaded (for debugging)"""

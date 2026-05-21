@@ -233,7 +233,7 @@ class Fit:
             )
 
         # Propagate latent_q for CFUSN
-        latent_q = kwargs.get("latent_q", 1)
+        latent_q = kwargs.get("latent_q", 2)
 
         bootstrap_seed = kwargs.get("bootstrap_seed", None)
         onehot_rng = np.random.RandomState(bootstrap_seed)

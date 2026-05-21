@@ -4,12 +4,6 @@ from pathlib import Path
 import numpy as np
 from scipy import stats
 import importlib
-import src.assay_calibration.fit_utils.two_sample.fit
-from src.assay_calibration.fit_utils.fit import Fit
-importlib.reload(src.assay_calibration.fit_utils.two_sample.fit)
-importlib.reload(src.assay_calibration.fit_utils.fit)
-from src.assay_calibration.fit_utils.two_sample.fit import single_fit
-from src.assay_calibration.fit_utils.two_sample import (density_utils,constraints, optimize)
 import scipy.stats as sps
 import matplotlib
 matplotlib.set_loglevel("warning")
@@ -23,6 +17,7 @@ sys.path.append(str(Path(os.getcwd()).parent))
 from src.assay_calibration.data_utils.dataset import (
     BasicScoreset,
 )
+from src.assay_calibration.fit_utils.fit import Fit
 import json
 import glob
 import pickle
@@ -42,10 +37,24 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, score_col, 
     save_dir = f'{output_dir}/{dataset_name}'
     os.makedirs(save_dir, exist_ok=True)
 
+
+    # Find the maximum assignment index present
+    max_idx = (
+        df["sample_assignments"]
+        .dropna()
+        .str.split(",")
+        .explode()
+        .astype(int)
+        .max()
+    )
+    
+    # Create all expected columns from 0..max_idx
+    all_cols = [str(i) for i in range(max_idx + 1)]
+    
     onehot = (
         df["sample_assignments"]
         .str.get_dummies(sep=",")
-        .reindex(columns=["0", "1", "2"], fill_value=0)
+        .reindex(columns=all_cols, fill_value=0)
         .astype(bool)
         .to_numpy()
     )
@@ -57,6 +66,7 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, score_col, 
         return
 
     n_samples = len([s for s in ds.samples])
+    print(f"{dataset}: {n_samples} samples detected")
     if n_samples < 2:
         print(f"{dataset} skipping: insufficient samples")
         return
@@ -74,7 +84,7 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, score_col, 
             check_monotonic=True,
             num_fits=NUM_FITS
         )
-        
+        in 
         jobs_3c = fitter.generate_fit_jobs(
             component_range=[3],
             bootstrap_seed=bootstrap_iter,
@@ -171,9 +181,21 @@ def requires_2018(df, dataset):
 
     # return gene in genes_2018
 
-def generate_single_predictor_datasets():
-    from collections import defaultdict
+from collections import defaultdict
+import glob
 
+def generate_single_predictor_datasets(data_dir=None):
+    predictor_datasets = defaultdict(dict)
+
+    if data_dir is not None:
+        for out_path in glob.glob(f"{data_dir}/*.csv*"):
+            # cols score and sample_assignemnts
+            predictor_datasets[out_path.split('/')[-1].split('.')[0]] = pd.read_csv(out_path)
+        
+        print(predictor_datasets)
+    
+        return predictor_datasets
+    
     wd = '/data/ross/assay_calibration'
     data_dir = f"{wd}/predictor_scores/single_gene_calibration_data"
 
@@ -181,7 +203,6 @@ def generate_single_predictor_datasets():
     predictors = ("REVEL", "MP2", "AM")
 
     
-    predictor_datasets = defaultdict(dict)
     for gene in sg_calibration_genes:
         for predictor in predictors:
             out_path = f"{data_dir}/{gene}/{gene}_{predictor}.csv.gz"
@@ -190,9 +211,11 @@ def generate_single_predictor_datasets():
             predictor_datasets[predictor][gene] = pd.read_csv(out_path, compression="gzip")
 
     return predictor_datasets
+
+
     
 
-def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30):
+def generate_job_manifest(output_dir, data_dir=None, target_array_size=1000, n_jobs=30):
     """
     Generate job manifest optimized for MAX_ARRAY_SIZE limit.
     
@@ -211,7 +234,7 @@ def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30):
     # df = pd.read_csv("/data/ross/assay_calibration/scoresets_12_01_25/final_pillar_data_with_clinvar_18_25_gnomad_wREVEL_wAM_wspliceAI_wMutpred2_wtrainvar_expanded_111225.csv")
     # df = pd.read_csv("/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz", sep='\t')
     # datasets = df.Dataset.unique()
-    predictor_datasets = generate_single_predictor_datasets()
+    predictor_datasets = generate_single_predictor_datasets(data_dir=data_dir)
     
     
     # print(f"Generating consolidated jobs from {len(dataset_files)} datasets...")
@@ -221,19 +244,32 @@ def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30):
     
     # Process all datasets in parallel
     print("\nLoading datasets and generating jobs...")
-    
-    all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(process_dataset)(
-            dataset,                 # The actual data object
-            f"{pred}_{gene}",        # The combined name
-            output_dir, 
-            N_BOOTSTRAPS, 
-            NUM_FITS, 
-            None
-        ) 
-        for pred, gene_map in predictor_datasets.items()     # Outer loop: Predictor level
-        for gene, dataset in gene_map.items()                # Inner loop: Gene level
-    )
+
+    if data_dir is None:
+        all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(process_dataset)(
+                dataset,                 # The actual data object
+                f"{pred}_{gene}",        # The combined name
+                output_dir, 
+                N_BOOTSTRAPS, 
+                NUM_FITS, 
+                None
+            ) 
+            for pred, gene_map in predictor_datasets.items()     # Outer loop: Predictor level
+            for gene, dataset in gene_map.items()                # Inner loop: Gene level
+        )
+    else:
+        all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(process_dataset)(
+                dataset,                 # The actual data object
+                dataset_name,        # The combined name
+                output_dir, 
+                N_BOOTSTRAPS, 
+                NUM_FITS, 
+                None
+            ) 
+            for dataset_name, dataset in predictor_datasets.items()
+        )
         
     # Flatten
     print("\nFlattening and organizing jobs...")
@@ -526,6 +562,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Setup HPC job array for bootstrap fits')
     parser.add_argument('output_dir', type=str,
                        help='Output directory')
+    parser.add_argument('--data-dir', type=str, default=None,
+                       help='Directory containing dataset .csv files (default: None; generates predictor jobs)')
     parser.add_argument('--target-array-size', type=int, default=1000,
                        help='Target number of array tasks (default: 1000, cluster MAX_ARRAY_SIZE)')
     parser.add_argument('--n-jobs', type=int, default=30,
@@ -539,6 +577,7 @@ if __name__ == "__main__":
     # Generate all jobs and scripts
     total_jobs, num_arrays = generate_job_manifest(
         args.output_dir,
+        data_dir=args.data_dir,
         target_array_size=args.target_array_size,
         n_jobs=args.n_jobs
     )

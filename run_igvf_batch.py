@@ -353,10 +353,16 @@ def main():
             print(f"{'='*80}")
             run_single_dataset(name, df, boot_results, n_c, benign, ovr, args, splits)
     else:
-        # Parallel dataset processing
+        # Parallel dataset processing — scale inner jobs to avoid CPU oversubscription
+        import multiprocessing
+        from argparse import Namespace
+        parallel_args = Namespace(**vars(args))
+        if args.n_jobs_inner == -1:
+            n_cpus = multiprocessing.cpu_count()
+            parallel_args.n_jobs_inner = max(1, n_cpus // abs(args.n_jobs))
         Parallel(n_jobs=args.n_jobs, verbose=10)(
             delayed(run_single_dataset)(
-                name, df, boot_results, n_c, benign, ovr, args, splits
+                name, df, boot_results, n_c, benign, ovr, parallel_args, splits
             )
             for name, boot_results, n_c, benign, ovr, splits in datasets_to_process
         )
