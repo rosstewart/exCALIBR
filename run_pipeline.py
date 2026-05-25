@@ -20,6 +20,7 @@ from src.assay_calibration.pipeline.visualize import (
 )
 from src.assay_calibration.pipeline.variant_evidence import compute_variant_table
 from src.assay_calibration.pipeline.utils import setup_logging, save_results, load_dataset_from_df
+from src.assay_calibration.pipeline.progress import ProgressReporter
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -141,6 +142,12 @@ Examples:
     parser.add_argument("--clinvar-release", choices=["2025", "2018"], default="2025", help="ClinVar release year")
     parser.add_argument("--min-clinvar-star", type=int, default=1,
                        help="Minimum ClinVar review stars (default: 1)")
+    
+    # Progress reporting (for web backend)
+    parser.add_argument("--progress-file", default=None,
+                        help="Path to write JSON progress updates (used by web backend). "
+                            "Has no effect on pipeline output when omitted.")
+
 
     args = parser.parse_args()
 
@@ -186,6 +193,7 @@ Examples:
         sample_names=args.sample_names,
         debug=args.debug,
         viz_only=args.viz_only,
+        progress_file=args.progress_file,
     )
 
     # Run pipeline
@@ -196,6 +204,7 @@ def run_calibration_pipeline(config: PipelineConfig):
 
     # Setup
     logger = setup_logging(config.output_dir, config.dataset_name)
+    reporter = ProgressReporter(config.progress_file)
     logger.info("="*80)
     logger.info("ASSAY CALIBRATION PIPELINE")
     logger.info("="*80)
@@ -248,11 +257,19 @@ def run_calibration_pipeline(config: PipelineConfig):
         logger.info("STEP 1: Bootstrap Fitting")
         logger.info("="*80)
 
-        runner = BootstrapRunner(config)
+        runner = BootstrapRunner(config, reporter=reporter)
         bootstrap_results, dataset_splits = runner.run()
         fits_are_fresh = True
 
         logger.info(f"\nCompleted {len(bootstrap_results)} bootstrap iterations")
+
+        # Count valid fits across all bootstraps and components
+        valid_fits = sum(
+            1 for seed_results in bootstrap_results.values()
+            for v in seed_results.values() if v is not None
+        )
+        total_fits = len(bootstrap_results) * len(config.components)
+
 
     # Step 2: Model selection (if fitting multiple components)
     # Always process ALL fitted components; model selection annotates the
@@ -289,6 +306,11 @@ def run_calibration_pipeline(config: PipelineConfig):
     else:
         logger.info(f"\nUsing fitted components: {list(selected_components.keys())}")
 
+    reporter.stage("model_selection",
+        selected_model=f"{selected_k}c" if selected_k else None,
+        components_fitted=list(selected_components.keys()),
+    )
+
     # Step 3a: Generate visualizations and export
     logger.info("\n" + "="*80)
     logger.info("STEP 3: Visualization and Export")
@@ -299,7 +321,7 @@ def run_calibration_pipeline(config: PipelineConfig):
         config=config,
         selected_components=selected_components,
         logger=logger
-    )
+    )       
 
     if getattr(config, "viz_only", False):
         logger.info("\n--viz-only: skipping variant tables and calibration save")
@@ -326,6 +348,23 @@ def run_calibration_pipeline(config: PipelineConfig):
         variant_df.to_csv(table_path, index=False)
         logger.info(f"  Saved variant table: {table_path} ({len(variant_df)} variants)")
 
+        reporter.stage("visualization",
+           component=component_key,
+           prior=calibration.get("prior"),
+           scoreset_flipped=calibration.get("scoreset_flipped"),
+           valid_fits=valid_fits,
+           total_fits=total_fits,
+       )
+        
+    reporter.stage("variant_table",
+        variants_assigned=sum(len(pd.read_csv(
+            Path(config.output_dir) / f"{config.dataset_name}_{k}_variants.csv"
+        )) for k in results),
+    )
+
+    # Simpler alternative (avoids re-reading CSVs):
+    reporter.stage("variant_table")
+
     # Step 4: Save results
     logger.info("\n" + "="*80)
     logger.info("STEP 4: Saving Results")
@@ -337,6 +376,11 @@ def run_calibration_pipeline(config: PipelineConfig):
         config=config,
         logger=logger,
         selected_k=selected_k,
+    )
+
+    reporter.complete(
+        selected_model=f"{selected_k}c" if selected_k else None,
+        components=list(results.keys()),
     )
 
     logger.info("\n" + "="*80)

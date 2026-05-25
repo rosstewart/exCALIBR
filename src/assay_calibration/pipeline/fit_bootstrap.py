@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from joblib import Parallel, delayed
 import subprocess
+from .progress import ProgressReporter
 
 from ..fit_utils.fit import Fit
 
@@ -19,8 +20,9 @@ from .utils import load_dataset_from_df
 class BootstrapRunner:
     """Handles bootstrap fitting with different execution modes"""
     
-    def __init__(self, config: PipelineConfig):
+    def __init__(self, config: PipelineConfig, reporter: "ProgressReporter | None" = None):
         self.config = config
+        self.reporter = reporter
         self.dataset = None
         self.fitter = None
         
@@ -47,18 +49,32 @@ class BootstrapRunner:
     def _load_dataset(self):
         """Load dataset from CSV"""
         df = pd.read_csv(self.config.dataset_csv)
-        
         self.dataset = load_dataset_from_df(df, self.config)
         
         n_samples = len([s for s in self.dataset.samples])
+        n_variants = len(self.dataset.scores)
         print(f"Loaded dataset: {self.config.dataset_name}")
         print(f"  Samples: {n_samples}")
-        print(f"  Variants: {len(self.dataset.scores)}")
+        print(f"  Variants: {n_variants}")
         
         if n_samples < 3:
             raise ValueError(f"Insufficient samples: {n_samples} < 3")
         
         self.fitter = Fit(self.dataset)
+
+        # Report dataset info — n_fits_total computed here so reporter can show an accurate total from the start.
+        n_fits_total = (
+            self.config.n_bootstraps
+            * len(self.config.components)
+            * self.config.num_fits_per_bootstrap
+        )
+        if self.reporter is not None:
+            self.reporter.start(
+                n_bootstraps=self.config.n_bootstraps,
+                n_fits_total=n_fits_total,
+                n_variants=n_variants,
+                n_samples=n_samples,
+            )
     
     def _run_parallel(self) -> Tuple[Dict, Dict]:
         """Run bootstrap fits in parallel using joblib, flattened across bootstraps × fits."""
@@ -82,13 +98,20 @@ class BootstrapRunner:
             for minimal_job in job_data['jobs']
         ]
 
-        # Execute all individual fits in parallel
-        flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=10)(
+        # Build the joblib generator
+        # NOTE: verbose=10 is changed to verbose=0 since progress is now handled by reporter.track() instead of joblib's built-in printing.
+        job_gen = Parallel(n_jobs=self.config.n_jobs, verbose=0, return_as="generator")(
             delayed(BootstrapRunner._execute_single_fit)(
                 minimal_job, shared_data, self.config.dataset_name
             )
             for _, _, minimal_job, shared_data in flat_tasks
         )
+
+        # Stream results — reporter.track() updates progress after each fit
+        if self.reporter is not None:
+            flat_results = list(self.reporter.track(job_gen, total=len(flat_tasks)))
+        else:
+            flat_results = list(job_gen)
 
         # Aggregate: keep best fit by val_ll per (bootstrap_seed, component_key)
         best_fits: Dict = {}
