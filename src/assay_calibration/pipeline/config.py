@@ -82,6 +82,12 @@ class PipelineConfig:
     clinvar_release: str = "2025"
     min_clinvar_star: int = 1
 
+    # Progress reporting (optional — used by web backend)
+    # If set, the pipeline writes structured JSON progress updates to this path.
+    # Has no effect on pipeline behaviour or output when None (the default).
+    progress_file: Optional[str] = None
+
+
     def __post_init__(self):
         if self.components is None:
             self.components = [2, 3]
