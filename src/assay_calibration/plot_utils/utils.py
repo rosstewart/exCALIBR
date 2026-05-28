@@ -2079,7 +2079,7 @@ def plot_scoreset_final_pillar_project_v2(dataset, scoreset_2018, scoreset, indv
 
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
-def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_FITS=False):
+def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_MIXTURE_FITS=False, HIDE_COMPONENT_FITS=True, HIDE_COMPONENT_VARIANCE=True, FIRST_ONLY=False, SHOW_PRIOR=True):
     """
     Create a 2x2 grid of dataset plots for publication.
     Each panel shows all samples for one dataset stacked vertically.
@@ -2123,6 +2123,8 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
     outer_grid = GridSpec(2, 2, figure=fig, hspace=0.14, wspace=0.10)
     
     for panel_idx, (dataset, letter) in enumerate(zip(dataset_names, panel_letters)):
+        if FIRST_ONLY and panel_idx > 0:
+            continue
         
         # Load data for this dataset
         try:
@@ -2172,14 +2174,26 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             
             max_hist_density = max([patch.get_height() for patch in ax.patches]) if ax.patches else 1.0
 
-            if not HIDE_FITS:
-                # Plot fitted density
+            if not HIDE_MIXTURE_FITS or not HIDE_COMPONENT_FITS or not HIDE_COMPONENT_VARIANCE:
                 density_sample = sample_density(score_range, fits, sample_idx)
+            
+            if not HIDE_MIXTURE_FITS:
+                # Plot fitted density
                 d = np.nansum(density_sample, axis=1)
                 d_perc = np.percentile(d, [5, 50, 95], axis=0)
                 
                 ax.plot(score_range, d_perc[1], color='black', alpha=0.5, linewidth=2)
                 ax.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
+
+            if not HIDE_COMPONENT_FITS or not HIDE_COMPONENT_VARIANCE:
+                comp_colors = ["#873A47", "#0E465F", "gray"]
+                for compNum in range(density_sample.shape[1]):
+                    compDensity = density_sample[:,compNum,:]
+                    d_perc = np.nanpercentile(compDensity,[5,50,95],axis=0)
+                    if not HIDE_COMPONENT_FITS:
+                        ax.plot(score_range, d_perc[1], linestyle='--', color=comp_colors[compNum], alpha=sample_alphas[compNum], linewidth=2)
+                    if not HIDE_COMPONENT_VARIANCE:
+                        ax.fill_between(score_range, d_perc[0], d_perc[2], color=comp_colors[compNum], alpha=sample_alphas[compNum]/2)
                 
             # Add threshold lines
             handles = []
@@ -2222,7 +2236,7 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                         handles.append(h)
             
             # Title on first sample only - MATCHING YANG PLOT FORMAT
-            if sample_idx == 0:
+            if sample_idx == 0 and not FIRST_ONLY:
                 gene_name = dataset.split('_')[0]
                 author_name = dataset.split('_')[1]
                 
@@ -2273,7 +2287,7 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             
             short_name = short_labels.get(sample_name, sample_name)
             
-            if sample_name == "gnomAD":
+            if sample_name == "gnomAD" and SHOW_PRIOR:
                 hist_label = f'{short_name}\n(n={n_count:,d}, prior={indv_summary["prior"]:.3f})'
             else:
                 hist_label = f'{short_name}\n(n={n_count:,d})'
@@ -2321,9 +2335,220 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             ax.tick_params(labelsize=8)
     
     plt.tight_layout()
-    
+
     return fig
 
+
+def plot_four_datasets_gmm_scores(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list,
+                                   figsize=(16, 13.33333), mode='gnomad_gmm'):
+    """
+    Like plot_four_datasets_publication but shows only the first dataset with
+    histograms and a two-component mixture overlay.  Skew-normal fits and
+    thresholds are hidden.
+
+    mode='gnomad_gmm'  (default)
+        Fit a 2-component GMM to the gnomAD sample.  For every other sample
+        the component means/variances are held fixed and only the mixing
+        proportions are re-estimated via EM.
+
+    mode='plp_blb'
+        Fit a 2-component GMM to the *pooled* P/LP + B/LB scores.  For every
+        sample the mixing proportions are re-estimated via EM with those fixed
+        components.
+
+    mode='plp_blb_indep'
+        Fit one Gaussian independently to the P/LP sample (component 0, dark
+        red) and one to the B/LB sample (component 1, dark blue) using their
+        sample means and standard deviations.  For every sample the mixing
+        proportions are re-estimated via EM with those fixed components.
+    """
+    from sklearn.mixture import GaussianMixture
+    from scipy.stats import norm as sp_norm
+
+    if len(dataset_names) != 4:
+        raise ValueError("Must provide exactly 4 dataset names")
+    if mode not in ('gnomad_gmm', 'plp_blb', 'plp_blb_indep'):
+        raise ValueError("mode must be 'gnomad_gmm', 'plp_blb', or 'plp_blb_indep'")
+
+    sample_colors = ['#CA7682', '#1D7AAB', '#A0A0A0', '#6BAA75']
+    sample_alphas = [0.7, 0.7, 0.7, 0.7]
+    comp_colors = ["#873A47", "#0E465F"]  # component 0 = pathogenic-like, 1 = benign-like
+
+    panel_letters = ['A', 'B', 'C', 'D']
+
+    fig = plt.figure(figsize=figsize)
+    outer_grid = GridSpec(2, 2, figure=fig, hspace=0.14, wspace=0.10)
+
+    def _update_weights(scores, means, stds, n_iter=200):
+        """EM with fixed component parameters; returns mixing proportions."""
+        n_comp = len(means)
+        w = np.ones(n_comp) / n_comp
+        s = scores.flatten()
+        for _ in range(n_iter):
+            resp = np.column_stack([w[k] * sp_norm.pdf(s, means[k], stds[k]) for k in range(n_comp)])
+            row_sums = resp.sum(axis=1, keepdims=True)
+            row_sums = np.where(row_sums == 0, 1e-300, row_sums)
+            resp /= row_sums
+            w = resp.mean(axis=0)
+            w = np.maximum(w, 1e-10)
+            w /= w.sum()
+        return w
+
+    def _col_idx_for_sample_num(scoreset, target_num):
+        """Return the sample_assignments column index for a given sample_num."""
+        col = 0
+        for i in range(len(scoreset.sample_counts)):
+            if scoreset.sample_counts[i] == 0:
+                continue
+            if i == target_num:
+                return col
+            col += 1
+        return None
+
+    for panel_idx, (dataset, letter) in enumerate(zip(dataset_names, panel_letters)):
+        if panel_idx > 0:
+            continue
+
+        try:
+            scoreset, indv_summary, fits, score_range, config, n_c, flipped, n_samples = load_dataset_for_plot(
+                dataset, dataset_configs, dataset_relax_configs, keep_old_list
+            )
+        except Exception as e:
+            print(f"Error loading {dataset}: {e}")
+            continue
+
+        # --- derive component parameters depending on mode ---
+        gmm_means = gmm_stds = None
+
+        if mode == 'gnomad_gmm':
+            gnomad_col_idx = None
+            col_idx = 0
+            for i in range(len(scoreset.sample_counts)):
+                if scoreset.sample_counts[i] == 0:
+                    continue
+                name = scoreset.sample_names[i].lower()
+                if "population" in name or "gnomad" in name:
+                    gnomad_col_idx = col_idx
+                    break
+                col_idx += 1
+
+            if gnomad_col_idx is None:
+                print(f"Could not find gnomAD sample for {dataset}; skipping GMM")
+            else:
+                gnomad_scores = scoreset.scores[scoreset.sample_assignments[:, gnomad_col_idx]].reshape(-1, 1)
+                gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42, n_init=10)
+                gmm.fit(gnomad_scores)
+                gmm_means = gmm.means_.flatten()
+                gmm_stds = np.sqrt(gmm.covariances_[:, 0, 0])
+
+        elif mode == 'plp_blb':
+            plp_col = _col_idx_for_sample_num(scoreset, 0)
+            blb_col = _col_idx_for_sample_num(scoreset, 3)
+            if plp_col is None or blb_col is None:
+                print(f"Could not find P/LP or B/LB sample for {dataset}; skipping")
+            else:
+                plp_scores = scoreset.scores[scoreset.sample_assignments[:, plp_col]]
+                blb_scores = scoreset.scores[scoreset.sample_assignments[:, blb_col]]
+                combined = np.concatenate([plp_scores, blb_scores]).reshape(-1, 1)
+                gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42, n_init=10)
+                gmm.fit(combined)
+                gmm_means = gmm.means_.flatten()
+                gmm_stds  = np.sqrt(gmm.covariances_[:, 0, 0])
+
+        elif mode == 'plp_blb_indep':
+            plp_col = _col_idx_for_sample_num(scoreset, 0)
+            blb_col = _col_idx_for_sample_num(scoreset, 3)
+            if plp_col is None or blb_col is None:
+                print(f"Could not find P/LP or B/LB sample for {dataset}; skipping")
+            else:
+                plp_scores = scoreset.scores[scoreset.sample_assignments[:, plp_col]]
+                blb_scores = scoreset.scores[scoreset.sample_assignments[:, blb_col]]
+                gmm_means = np.array([plp_scores.mean(), blb_scores.mean()])
+                gmm_stds  = np.array([plp_scores.std(),  blb_scores.std()])
+
+        panel_row = panel_idx // 2
+        panel_col = panel_idx % 2
+
+        inner_grid = GridSpecFromSubplotSpec(
+            n_samples, 1,
+            subplot_spec=outer_grid[panel_row, panel_col],
+            hspace=0.08
+        )
+
+        x_plot = np.array(score_range)
+
+        num_skipped = 0
+        for sample_num in range(len(scoreset.sample_counts)):
+            if scoreset.sample_counts[sample_num] == 0:
+                num_skipped += 1
+                continue
+
+            sample_idx = sample_num - num_skipped
+            ax = fig.add_subplot(inner_grid[sample_idx, 0])
+
+            sample_mask = scoreset.sample_assignments[:, sample_idx]
+            sample_name = scoreset.sample_names[sample_num]
+            if sample_name == "population":
+                sample_name = "gnomAD"
+
+            sns.histplot(
+                scoreset.scores[sample_mask],
+                stat='density', ax=ax,
+                alpha=sample_alphas[sample_num],
+                color=sample_colors[sample_num]
+            )
+
+            # overlay mixture with sample-specific mixing proportions
+            if gmm_means is not None:
+                sample_scores = scoreset.scores[sample_mask]
+                w = _update_weights(sample_scores, gmm_means, gmm_stds)
+
+                mixture = np.zeros(len(x_plot))
+                for k in range(2):
+                    comp = w[k] * sp_norm.pdf(x_plot, gmm_means[k], gmm_stds[k])
+                    mixture += comp
+                    ax.plot(x_plot, comp, linestyle='--', color=comp_colors[k], alpha=sample_alphas[k], linewidth=2)
+                # ax.plot(x_plot, mixture, color='black', alpha=0.5, linewidth=2)
+
+            # title on first sample only
+            if sample_idx == 0:
+                gene_name = dataset.split('_')[0]
+                author_name = dataset.split('_')[1]
+                ax.set_title(rf"$\mathbfit{{{gene_name}}}$ – {author_name}",
+                             fontsize=14, fontweight='bold', pad=8)
+
+            is_last_sample = (sample_num == len(scoreset.sample_counts) - 1 or
+                              (sample_num == len(scoreset.sample_counts) - 2 and
+                               scoreset.sample_counts[-1] == 0))
+
+            if is_last_sample:
+                ax.set_xlabel("Assay score", fontsize=12)
+            else:
+                ax.set_xticks([])
+                ax.set_xlabel("")
+
+            ax.set_ylabel("Density", fontsize=12)
+            ax.set_xlim([score_range[0], score_range[-1]])
+
+            n_count = sample_mask.sum()
+            hist_patch = Patch(facecolor=sample_colors[sample_num], alpha=0.7, edgecolor='none')
+            short_labels = {
+                "Pathogenic/Likely Pathogenic": "P/LP",
+                "Benign/Likely Benign": "B/LB",
+                "gnomAD": "gnomAD",
+                "Synonymous": "Synonymous",
+            }
+            short_name = short_labels.get(sample_name, sample_name)
+            hist_label = f'{short_name}\n(n={n_count:,d})'
+
+            ax.legend([hist_patch], [hist_label], loc='upper left', fontsize=10, framealpha=0.8)
+
+            ax.grid(True, alpha=0.3, axis='both', linewidth=0.5)
+            ax.set_axisbelow(True)
+            ax.tick_params(labelsize=8)
+
+    plt.tight_layout()
+    return fig
 
 
 def load_dataset_for_plot(dataset, dataset_configs, dataset_relax_configs, keep_old_list):

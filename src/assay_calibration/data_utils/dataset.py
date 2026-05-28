@@ -348,7 +348,7 @@ class Scoreset:
 
         Optional Arg:
         - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-        - clinvar_release : str in {'2025','2018'} (default '2025') : Clinvar release to use
+        - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
         """
         self._init_kwargs = dict(kwargs)
         self._init_dataframe(dataframe, **kwargs)
@@ -475,7 +475,7 @@ class Scoreset:
 
         Optional Arg:
             - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-            - clinvar_release : str in {'2025','2018'} (default '2025') : Clinvar release to use
+            - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
         Returns
         -------
         None
@@ -513,7 +513,7 @@ class Scoreset:
         self.filter_invalid()
         self.splicing_filter(**kwargs)
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
-        clinvar_release = kwargs.get("clinvar_release",'2025')
+        clinvar_release = kwargs.get("clinvar_release",'2026')
         n_jobs = kwargs.get("n_jobs", 1)
         rows = self.dataframe.to_dict('records')
         if n_jobs == 1:
@@ -555,15 +555,20 @@ class Scoreset:
         self.detects_splice = (
             self.dataframe.loc[:, "splice_measure"].unique()[0] == "Yes"  # type: ignore
         )
+        # if assay does not detect effects of splicing, remove likely splicing aberrations
         if not self.detects_splice:
+            # Remove VEP (mapped/unmapped) consequences
             self.dataframe = self.dataframe[
-                self.dataframe.simplified_consequence.str.lower() != "splice region"
+                ~self.dataframe.simplified_consequence.str.lower().isin([
+                    "splice region",
+                    "splice_site_variant",
+                    "splice_acceptor_variant",
+                    "splice_donor_variant",
+                ])
             ]
-            self.dataframe = self.dataframe[
-                self.dataframe.simplified_consequence.str.lower() != "splice_site_variant"
-            ]
-            spliceai_cols = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
             
+            # Remove SpliceAI scores
+            spliceai_cols = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
             mask = self.dataframe[spliceai_cols].lt(0.2) | self.dataframe[spliceai_cols].isna()
             self.dataframe = self.dataframe[mask.all(axis=1)]
 
@@ -808,7 +813,8 @@ class Scoreset:
         """
         variants_by_id = {}
         for variant in self.variants:
-            variants_by_id.setdefault(variant.ID, []).append(variant)
+            key = getattr(variant, "mavedb_variant_urn", None) or variant.ID
+            variants_by_id.setdefault(key, []).append(variant)
         return variants_by_id
 
     @property
@@ -948,7 +954,7 @@ class Variant:
             "Likely pathogenic",
             "Pathogenic/Likely pathogenic",
         }
-        self.is_vus = self.sufficient_quality_2025 and self.clinvar_sig_2025 in { # VUS ALWAYS 2025 SINCE NOT CONTROL
+        self.is_vus = self.sufficient_quality_2026 and self.clinvar_sig_2026 in { # VUS ALWAYS 2026 SINCE NOT CONTROL
             "Uncertain significance",
         }
 
@@ -1015,19 +1021,19 @@ class Variant:
         }
         if self.min_clinvar_star == 0:
             self.sufficient_quality = True
-            self.sufficient_quality_2025 = True
+            self.sufficient_quality_2026 = True
         elif self.min_clinvar_star == 1:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses
         elif self.min_clinvar_star == 2:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status)
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status)
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status)
         elif self.min_clinvar_star == 3:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
         elif self.min_clinvar_star == 4:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
         else:
             raise ValueError(f"Invalid min_clinvar_star value {self.min_clinvar_star}")
 
@@ -1155,7 +1161,11 @@ def csv_to_vcf(input_filepath, output_filepath):
         # Write VCF rows
         for _, row in tqdm(df.iterrows(), total=len(df)):
             vcf_file.write(
-                f"{row['Chrom']}\t{int(row.hg38_start)}\t{row['ID']}\t{row['ref_allele']}\t{row['alt_allele']}\t.\t.\t.\n"
+                f"{row['Chrom']}\t"
+                f"{int(row.hg38_start)}\t"
+                f"{row.get('mavedb_variant_urn', row['ID'])}\t"
+                f"{row['ref_allele']}\t"
+                f"{row['alt_allele']}\t.\t.\t.\n"
             )
 
 

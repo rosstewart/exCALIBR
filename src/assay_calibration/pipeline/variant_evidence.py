@@ -110,6 +110,69 @@ def _build_standard_table(scoreset, calibration: Dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame:
+    """Continuous (Method B) per-variant table.
+
+    Interpolates LR+ from the calibration's median bootstrap LR+ curve,
+    computes posterior at the calibration's prior, and assigns a label
+    ('P'/'LP'/'VUS'/'LB'/'B') via direct posterior comparison.
+    """
+    import sys, os
+    _SRC = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if _SRC not in sys.path:
+        sys.path.insert(0, _SRC)
+    from assay_calibration.fit_utils.bayesian_thresholds import (
+        bayes_posterior_from_lr, continuous_classify,
+    )
+
+    score_range = np.asarray(calibration["score_range"], dtype=float)
+    log_lr = np.asarray(calibration["log_lr_plus"], dtype=float)
+    # Aggregate bootstrap LR+ curves to a single median curve (use median to
+    # be robust; this matches the spirit of the median-prior path).
+    if log_lr.ndim == 2:
+        log_lr_curve = np.nanmedian(log_lr, axis=0)
+    else:
+        log_lr_curve = log_lr
+
+    prior = float(calibration["prior"])
+    ids = _get_variant_ids(scoreset)
+
+    # Interpolate LR+ at each variant's score
+    def _interp_log_lr(s):
+        if s is None or np.isnan(s):
+            return np.nan
+        return float(np.interp(s, score_range, log_lr_curve,
+                               left=np.nan, right=np.nan))
+
+    rows = []
+    for idx in range(len(scoreset.scores)):
+        score = float(scoreset.scores[idx])
+        log_lr_i = _interp_log_lr(score)
+        if np.isnan(log_lr_i):
+            lr_i = np.nan; post_i = np.nan; label = "Unknown"
+        else:
+            lr_i = float(np.exp(log_lr_i))
+            post_i = float(bayes_posterior_from_lr(lr_i, prior))
+            label = str(continuous_classify(lr_i, prior))
+
+        sample = "Unknown"
+        for s_idx in range(len(scoreset.sample_names)):
+            if scoreset._sample_assignments[idx, s_idx]:
+                sample = scoreset.sample_names[s_idx]
+                break
+
+        rows.append({
+            "variant_id": ids[idx] if idx < len(ids) else f"variant_{idx}",
+            "score": score,
+            "sample": sample,
+            "lr_plus": lr_i,
+            "posterior": post_i,
+            "classification": label,
+        })
+
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # OOB helpers
 # ---------------------------------------------------------------------------
@@ -207,6 +270,7 @@ def _process_variant_oob(
     flipped: bool,
     liberal: bool,
     min_samples: int = 1,
+    acmg_mapping_method: str = "tavtigian",
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
@@ -259,7 +323,7 @@ def _process_variant_oob(
         pr_p, pr_b, C = calculate_score_ranges(
             np.nanpercentile(vlr, 5, axis=0),
             np.nanpercentile(vlr, 95, axis=0),
-            prior, vsr, point_values,
+            prior, vsr, point_values, acmg_mapping_method=acmg_mapping_method,
         )
         pr = {**pr_p, **pr_b}
 
@@ -316,12 +380,14 @@ def _compute_oob_evidence(
     liberal = config.liberal_monotonicity
     n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
 
+    oob_acmg_mapping_method = getattr(config, "acmg_mapping_method", "tavtigian")
     raw = Parallel(n_jobs=min(len(oob_map), n_cores), verbose=5)(
         delayed(_process_variant_oob)(
             vidx, oob_idx, scoreset.scores[vidx],
             priors, log_fp, log_fb, score_range,
             config.point_values, flipped, liberal,
-            config.oob_min_samples
+            config.oob_min_samples,
+            oob_acmg_mapping_method,
         )
         for vidx, oob_idx in oob_map.items()
     )
@@ -385,11 +451,21 @@ def compute_variant_table(
         (logger.info if logger else print)(msg)
 
     # --- standard assignment (always) ---
-    df = _build_standard_table(scoreset, calibration)
-    log(f"  Standard evidence assigned to {len(df)} variants")
+    acmg_mapping_method = calibration.get(
+        "acmg_mapping_method",
+        getattr(config, "acmg_mapping_method", "tavtigian"),
+    )
+    if acmg_mapping_method == "continuous":
+        df = _build_continuous_table(scoreset, calibration, config)
+    else:
+        df = _build_standard_table(scoreset, calibration)
+    log(f"  Standard evidence assigned to {len(df)} variants "
+        f"(acmg_mapping_method={acmg_mapping_method})")
 
     # --- OOB assignment (optional) ---
-    if config.compute_oob:
+    if config.compute_oob and acmg_mapping_method == "continuous":
+        log("  Note: OOB evidence not supported for continuous acmg_mapping_method; skipping")
+    elif config.compute_oob:
         if dataset_splits is None:
             log("  WARNING: OOB requested but no dataset_splits provided; skipping")
         elif "valid_bootstrap_seeds" not in calibration:

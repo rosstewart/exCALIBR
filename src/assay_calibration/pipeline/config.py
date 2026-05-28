@@ -78,6 +78,20 @@ class PipelineConfig:
     point_values: List[int] = None
     score_range_points: int = 2000  # Number of interpolation points for score range
 
+    # ACMG-mapping method: how LR+ thresholds are derived from the prior.
+    #   "tavtigian"  — legacy C*-based integer-point system (default).
+    #   "piecewise"  — prior-adaptive piecewise α; integer points preserved
+    #                  with exact posterior at the four ACMG knots.
+    #   "continuous" — posterior-based classification (B/LB/VUS/LP/P) directly
+    #                  from LR+; no integer points.
+    # "all" is handled at the orchestration layer (run_pipeline / run_igvf_batch)
+    # by running the calibration step once per ACMG-mapping method.
+    #   "strict_additive" — prior-dependent LSQ-optimal α(p); strictly additive
+    #                      (1 VS = 2 St = 4 M = 8 Su in log-LR at each prior);
+    #                      exact posteriors at shifting classification boundaries.
+    acmg_mapping_method: Literal["tavtigian", "piecewise", "continuous",
+                                 "strict_additive"] = "tavtigian"
+
     # ClinVar parameters
     clinvar_release: str = "2025"
     min_clinvar_star: int = 1

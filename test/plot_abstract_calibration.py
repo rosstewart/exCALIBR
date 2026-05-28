@@ -74,6 +74,19 @@ LINESTYLES = [
     (0, (3, 5, 1, 5)), (0, (5, 5)), (0, (3, 1, 1, 1)), 'solid',
 ]
 
+# Categorical (continuous-method) evidence labels and their display properties.
+# Ordered strong-to-weak so the legend reads P → LP | LB → B.
+CATEGORICAL_KEYS = frozenset({'P', 'LP', 'LB', 'B'})
+CATEGORICAL_ORDER = {'P': 8, 'LP': 4, 'LB': -4, 'B': -8}   # numeric proxy for sorting
+CATEGORICAL_COLOR = {
+    'P':  STRENGTH_COLOR[8],
+    'LP': STRENGTH_COLOR[4],
+    'LB': STRENGTH_COLOR[-4],
+    'B':  STRENGTH_COLOR[-8],
+    0:    STRENGTH_COLOR[0],
+}
+CATEGORICAL_LABEL = {'P': 'P', 'LP': 'LP', 'LB': 'LB', 'B': 'B', 0: 'VUS'}
+
 SAMPLE_NAME_SHORTENER_FULL = {
     "Pathogenic/Likely Pathogenic": "ClinVar P/LP",
     "Benign/Likely Benign":         "ClinVar B/LB",
@@ -103,30 +116,38 @@ def _clip_finite(value, lo, hi):
     return value
 
 
+def _is_categorical(point_ranges) -> bool:
+    """Return True if point_ranges uses categorical keys (P, LP, LB, B)."""
+    return bool(point_ranges and any(k in CATEGORICAL_KEYS for k in point_ranges))
+
+
 def _normalize_point_ranges(point_ranges):
     """
     Accept either flat ({pv: [start, end]}) or nested ({pv: [[start, end]]})
-    representations, with str or int keys, and return a clean
-    {int_pv: [start, end] | []} dict.
+    representations and return a clean {pv: [start, end] | []} dict.
+
+    Keys may be:
+      - integers / digit-strings  → converted to int  (numeric mode)
+      - 'P', 'LP', 'LB', 'B'     → kept as str       (categorical mode)
     """
     if point_ranges is None:
         return None
     out = {}
     for k, v in point_ranges.items():
-        try:
-            pv = int(k)
-        except (TypeError, ValueError):
-            continue
+        # Determine key type
+        if str(k) in CATEGORICAL_KEYS:
+            pv = str(k)
+        else:
+            try:
+                pv = int(k)
+            except (TypeError, ValueError):
+                continue
         if v is None or len(v) == 0:
             out[pv] = []
             continue
-        # Nested form?
+        # Nested form: [[start, end], ...]
         if isinstance(v[0], (list, tuple)):
-            if len(v) == 0:
-                out[pv] = []
-            else:
-                # Take first range; warn if more than one (matches old behavior)
-                out[pv] = list(v[0])
+            out[pv] = list(v[0]) if v else []
         else:
             out[pv] = list(v)
     return out
@@ -140,11 +161,17 @@ def build_calibration_intervals(point_ranges, x_min, x_max, flipped):
     range is filled with indeterminate (point=0) intervals.
 
     `point_ranges` is the FLAT format {pv: [start, end]} or {pv: []}.
+    Keys may be int (numeric mode) or str (categorical mode: P/LP/LB/B).
     Infinities and out-of-range bounds are clipped to [x_min, x_max].
     """
+    is_cat = _is_categorical(point_ranges)
+
+    def _sort_key(pv):
+        return CATEGORICAL_ORDER.get(pv, 0) if is_cat else pv
+
     nonzero = []
     if point_ranges:
-        for pv in sorted(p for p in point_ranges if p != 0):
+        for pv in sorted((p for p in point_ranges if p != 0), key=_sort_key):
             rng = point_ranges[pv]
             if not rng or len(rng) != 2:
                 continue
@@ -185,20 +212,20 @@ def build_calibration_intervals(point_ranges, x_min, x_max, flipped):
 def _build_thresholds(point_ranges, flipped,
                       point_values=POINT_VALUES_TO_PLOT, linestyles=LINESTYLES):
     """Return [(pv, score, color, ls, lw), …] for axvline overlays on fits panels."""
-    out = []
     if not point_ranges:
-        return out
+        return []
+    if _is_categorical(point_ranges):
+        return _build_categorical_thresholds(point_ranges, flipped)
+    out = []
     for idx, pv in enumerate(point_values):
         ls = linestyles[idx]
-        # Benign side: threshold = score at which -pv evidence first applies
-        # (upper bound of -pv when not flipped, lower bound when flipped).
+        # Benign side: upper bound of -pv when not flipped (where LB/B evidence starts).
         rng = point_ranges.get(-pv)
         if rng and len(rng) == 2:
             tscore = rng[1] if not flipped else rng[0]
             if math.isfinite(tscore):
                 out.append((-pv, tscore, '#2166AC', ls, 1.0))
-        # Pathogenic side: threshold = score at which +pv evidence first applies
-        # (lower bound of +pv when not flipped, upper bound when flipped).
+        # Pathogenic side: lower bound of +pv when not flipped (where LP/P evidence starts).
         rng = point_ranges.get(pv)
         if rng and len(rng) == 2:
             tscore = rng[0] if not flipped else rng[1]
@@ -207,18 +234,44 @@ def _build_thresholds(point_ranges, flipped,
     return out
 
 
+def _build_categorical_thresholds(point_ranges, flipped):
+    """Threshold lines for categorical (continuous-method) evidence."""
+    out = []
+    # Pathogenic side: inner boundary = upper bound of LP / lower bound of P
+    for pv, ls in [('LP', 'dashed'), ('P', 'dotted')]:
+        rng = point_ranges.get(pv)
+        if rng and len(rng) == 2:
+            tscore = rng[1] if not flipped else rng[0]
+            if math.isfinite(tscore):
+                out.append((pv, tscore, '#B2182B', ls, 1.0))
+    # Benign side: inner boundary = lower bound of LB / lower bound of B
+    for pv, ls in [('LB', 'dashed'), ('B', 'dotted')]:
+        rng = point_ranges.get(pv)
+        if rng and len(rng) == 2:
+            tscore = rng[0] if not flipped else rng[1]
+            if math.isfinite(tscore):
+                out.append((pv, tscore, '#2166AC', ls, 1.0))
+    return out
+
+
 def _plot_calibration_bar(ax, intervals, scores_for_count, x_min, x_max,
-                          *, fontsize_count, min_label_frac=0.06):
+                          *, fontsize_count, min_label_frac=0.06, color_map=None):
     """Render one evidence-strength colored bar with per-bin counts.
 
     When no intervals are provided, the entire bar is treated as indeterminate.
+    `color_map` defaults to STRENGTH_COLOR; pass CATEGORICAL_COLOR for
+    continuous-method evidence.
     """
+    if color_map is None:
+        color_map = STRENGTH_COLOR
     if not intervals:
         intervals = [(0, x_min, x_max)]
     for pv, start, end in intervals:
-        ax.axvspan(start, end, color=STRENGTH_COLOR[pv], alpha=1.0)
+        ax.axvspan(start, end, color=color_map.get(pv, STRENGTH_COLOR[0]), alpha=1.0)
         count = int(((scores_for_count >= start) & (scores_for_count < end)).sum())
         if (end - start) > (x_max - x_min) * min_label_frac:
+            if pv in CATEGORICAL_ORDER:
+                pv = CATEGORICAL_ORDER[pv]
             text_color = 'white' if abs(pv) >= 7 else 'black'
             ax.text((start + end) / 2, 0.5, f'{count:,}',
                     ha='center', va='center',
@@ -311,6 +364,9 @@ def _draw_dataset_panel(
     bin_width = (x_max - x_min) / bin_div
 
     population_scores = _get_sample_scores(scoreset, sample_num=2)
+    is_cat = _is_categorical(point_ranges_excalibr)
+    excalibr_color_map = CATEGORICAL_COLOR if is_cat else STRENGTH_COLOR
+    excalibr_label_map = CATEGORICAL_LABEL if is_cat else POINT_LABEL
     excalibr_thresholds = _build_thresholds(point_ranges_excalibr, flipped)
 
     # ── Row 1 : per-sample ExCALIBR fits ────────────────────────────────────
@@ -366,9 +422,10 @@ def _draw_dataset_panel(
             ax.tick_params(axis='both', bottom=False, left=False,
                            labelbottom=False, labelleft=False)
 
-        # Threshold overlays (ExCALIBR only, restricted to the round levels)
+        # Threshold overlays (ExCALIBR only)
         for pv, tscore, tcol, tls, _ in excalibr_thresholds:
-            if abs(pv) in (1, 2, 4, 8):
+            show = True if is_cat else abs(pv) in (1, 2, 4, 8)
+            if show:
                 ax.axvline(tscore, color=tcol, linestyle=tls,
                            linewidth=threshold_lw, alpha=0.7)
 
@@ -451,7 +508,7 @@ def _draw_dataset_panel(
         point_ranges_excalibr, x_min, x_max, flipped)
     _plot_calibration_bar(
         ax_excalibr, intervals_exc, population_scores, x_min, x_max,
-        fontsize_count=fontsize_count,
+        fontsize_count=fontsize_count, color_map=excalibr_color_map,
     )
     # if is_full:
     #     ax_excalibr.set_title('Gene-specific calibration', loc='left',
@@ -469,6 +526,7 @@ def _draw_dataset_panel(
         _plot_calibration_bar(
             ax_yile, intervals_yile, population_scores, x_min, x_max,
             fontsize_count=fontsize_count,
+            color_map=CATEGORICAL_COLOR if _is_categorical(point_ranges_yile) else STRENGTH_COLOR,
         )
     
         ax_yile.set_ylabel('Yile', fontsize=side_label_fs, rotation=0,
@@ -483,16 +541,25 @@ def _draw_dataset_panel(
             ax_yile.tick_params(axis='x', bottom=False, labelbottom=False)
 
     # ── Row 4 : color legend (union of point values used by either bar) ─────
-    pvs_present = sorted(
-        {pv for pv, _, _ in intervals_exc} | {pv for pv, _, _ in intervals_yile}
-    )
-    if flipped:
-        legend_order = sorted(pvs_present)
+    all_pvs = {pv for pv, _, _ in intervals_exc} | {pv for pv, _, _ in intervals_yile}
+    if is_cat:
+        # Sort by categorical strength: P > LP > 0 > LB > B (reverse for legend readability)
+        legend_order = sorted(
+            all_pvs,
+            key=lambda p: CATEGORICAL_ORDER.get(p, 0),
+            reverse=not flipped,
+        )
+        color_map_leg = excalibr_color_map
+        label_map_leg = excalibr_label_map
     else:
-        legend_order = sorted(pvs_present, reverse=True)
+        pvs_present = sorted(all_pvs)
+        legend_order = sorted(pvs_present) if flipped else sorted(pvs_present, reverse=True)
+        color_map_leg = STRENGTH_COLOR
+        label_map_leg = POINT_LABEL
 
     legend_handles = [
-        Patch(facecolor=STRENGTH_COLOR[pv], label=POINT_LABEL[pv], edgecolor='none')
+        Patch(facecolor=color_map_leg.get(pv, STRENGTH_COLOR[0]),
+              label=label_map_leg.get(pv, str(pv)), edgecolor='none')
         for pv in legend_order
     ]
 

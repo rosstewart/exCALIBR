@@ -48,7 +48,8 @@ class BootstrapRunner:
     
     def _load_dataset(self):
         """Load dataset from CSV"""
-        df = pd.read_csv(self.config.dataset_csv)
+        sep = "\t" if self.config.dataset_csv.endswith((".tsv", ".tsv.gz")) else ","
+        df = pd.read_csv(self.config.dataset_csv, sep=sep)
         self.dataset = load_dataset_from_df(df, self.config)
         
         n_samples = len([s for s in self.dataset.samples])

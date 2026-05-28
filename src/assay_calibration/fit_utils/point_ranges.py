@@ -294,7 +294,8 @@ def get_fit_prior(fit, scoreset, benign_method, pathogenic_idx=0, benign_idx=1, 
     
     return prior_estimate
 
-def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, point_values):
+def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, point_values,
+                                acmg_mapping_method="tavtigian"):
     fit_xmin, fit_xmax = fit['fit']['xlims']
     mask = (score_range >= fit_xmin) & (score_range <= fit_xmax)# & ((fp > -7.0) | (fb > -7.0)) # add min density check
 
@@ -311,12 +312,21 @@ def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, poi
     lrP = log_fp_local[mask] - log_fb_local[mask]
     s = score_range[mask]
 
-    
-    ranges_p, ranges_b, C = calculate_score_ranges(
-        lrP, lrP, fit_priors[fitIdx], s, point_values
-    )
-    C = int(C)
-    
+    if acmg_mapping_method == "continuous":
+        from .fit import calculate_classification_ranges
+        ranges_p, ranges_b, thresholds = calculate_classification_ranges(
+            lrP, lrP, fit_priors[fitIdx], s
+        )
+        # For continuous, "C" slot carries the LR+ threshold dict (not an int).
+        C = thresholds
+    else:
+        ranges_p, ranges_b, C = calculate_score_ranges(
+            lrP, lrP, fit_priors[fitIdx], s, point_values,
+            acmg_mapping_method=acmg_mapping_method,
+        )
+        if C is not None:
+            C = int(C)  # tavtigian path returns int; piecewise returns None
+
     if prior_invalid(fit_priors[fitIdx]):
         log_fp_local = np.full_like(fp, np.nan, dtype=float)
         log_fb_local = np.full_like(fb, np.nan, dtype=float)

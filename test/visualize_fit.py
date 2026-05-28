@@ -19,6 +19,7 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal as mvn, norm
 from scipy.ndimage import uniform_filter1d
 from joblib import Parallel, delayed
+from src.assay_calibration.fit_utils.cfusn.density_utils import get_q
 
 
 # ──────────────────────────────────────
@@ -28,6 +29,8 @@ SAMPLE_COLORS = ['#CA7682', '#1D7AAB', '#A0A0A0', '#6BAA75']
 SAMPLE_NAMES_DEFAULT = ['Pathogenic/Likely Pathogenic', 'Benign/Likely Benign',
                         'population', 'Synonymous']
 SAMPLE_MARKERS = ['o', 's', '^', 'D']
+# Thin borders for row-0 scatter: dark enough to read against the evidence colormap
+_SAMPLE_EDGE_COLORS = ['#8B0000', '#00008B', '#303030', '#1A5E2A']  # dark red/blue/gray/green
 
 POINT_CMAP_COLORS = [
     (0.0, '#08306b'), (0.3, '#4292c6'), (0.45, '#c6dbef'),
@@ -191,18 +194,40 @@ def _cfusn_logpdf(x, mu, Delta, Gamma):
 # Bootstrap density computations
 # ──────────────────────────────────────
 
+def _reconstitute_fit_dict(fit_raw):
+    """Standalone reconstitution — no analysis object needed (safe to pickle)."""
+    inner = fit_raw.get('fit', fit_raw)
+    if inner is None:
+        return None
+    cp = inner.get('component_params', [])
+    if not cp or any(len(p) == 0 for p in cp):
+        return None
+    params = []
+    for p in cp:
+        mu    = np.array(p[0], dtype=float)
+        Delta = np.array(p[1], dtype=float)
+        Gamma = np.array(p[2], dtype=float)
+        if Delta.ndim == 2 and Delta.shape[1] == 1:
+            Delta = Delta.ravel()
+        params.append((mu, Delta, Gamma))
+    weights = np.array(inner['weights'], dtype=float)
+    return {'component_params': params, 'weights': weights,
+            'xlims': inner.get('xlims'),
+            'latent_q': inner.get('latent_q', get_q(params))}
+
+
 def _collect_valid_fits(analysis, config):
-    """Collect all valid reconstituted fits for a config."""
-    all_fits = []
-    for boot_key, boot_data in analysis.raw_boots.items():
-        fit_raw = boot_data.get(config)
-        if fit_raw is None:
-            continue
-        inner = fit_raw.get('fit', fit_raw)
-        fit = analysis._reconstitute_params(inner)
-        if fit is not None:
-            all_fits.append(fit)
-    return all_fits
+    """Collect all valid reconstituted fits for a config (parallel, loky)."""
+    candidates = [
+        boot_data[config]
+        for boot_data in analysis.raw_boots.values()
+        if config in boot_data and boot_data[config] is not None
+    ]
+    results = Parallel(n_jobs=-1)(
+        delayed(_reconstitute_fit_dict)(fit_raw)
+        for fit_raw in candidates
+    )
+    return [r for r in results if r is not None]
 
 
 def _eval_all_marginals(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S):
@@ -218,11 +243,7 @@ def _eval_all_marginals(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S):
 
 
 def _eval_fit_on_grid(fit, grid_pts, p_idx, b_idx, s_idx, benign_method):
-    """Evaluate LR+ for one bootstrap fit on a pre-built grid of points.
-
-    Module-level so joblib loky workers can pickle it by name.
-    Returns (lr_flat,) — 1-D array of length n_grid_pts.
-    """
+    """Evaluate LR+ for one bootstrap fit on a pre-built grid of points."""
     params = fit['component_params']
     weights = fit['weights']
     K = len(params)
@@ -245,6 +266,92 @@ def _eval_fit_on_grid(fit, grid_pts, p_idx, b_idx, s_idx, benign_method):
         axis=0,
     )
     return log_fp - log_fb
+
+
+def _eval_fit_on_grid_batch_p(fit, grid_pts, p_indices, b_idx, s_idx, benign_method):
+    """Evaluate LR+ on a grid for multiple pathogenic indices in one shot.
+
+    Component log-densities (_sn_logpdf) are computed ONCE and shared across
+    all p_indices, avoiding redundant density evaluations.
+
+    Returns list of len(p_indices) flat lr arrays.
+    """
+    params = fit['component_params']
+    weights = fit['weights']
+    K = len(params)
+    n_w = len(weights)
+
+    # Component densities computed once, shared across all p_indices
+    comp_log = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+
+    s_valid = s_idx is not None and s_idx < n_w
+    if s_valid and benign_method == 'synonymous':
+        w_b = weights[s_idx]
+    elif s_valid and benign_method == 'avg':
+        w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+    else:
+        w_b = weights[b_idx]
+    log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+
+    out = []
+    for p_idx in p_indices:
+        if p_idx >= n_w:
+            out.append(np.full(len(grid_pts), np.nan))
+            continue
+        w_p = weights[p_idx]
+        log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        out.append(log_fp - log_fb)
+    return out
+
+
+def _eval_all_marginals_batch_p(fit, x_2d_list, p_indices, b_idx, s_idx, benign_method, S):
+    """Evaluate marginals for multiple pathogenic indices in one shot.
+
+    Component log-densities computed ONCE per dimension and shared across all
+    p_indices.  sample_logs / comp_logs are also identical across p_indices.
+
+    Returns list of len(p_indices), each a list of D results
+    (lr_1d, sample_logs, comp_logs_per_sample).
+    """
+    params = fit['component_params']
+    weights = fit['weights']
+    K = len(params)
+    n_w = len(weights)
+
+    s_valid = s_idx is not None and s_idx < n_w
+    if s_valid and benign_method == 'synonymous':
+        w_b = weights[s_idx]
+    elif s_valid and benign_method == 'avg':
+        w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+    else:
+        w_b = weights[b_idx]
+
+    w_ps = [weights[p_idx] if p_idx < n_w else None for p_idx in p_indices]
+    results_per_p = [[] for _ in p_indices]
+
+    for x_2d in x_2d_list:
+        comp_log = [_sn_logpdf(x_2d, *params[c]) for c in range(K)]
+
+        sample_logs, comp_logs_per_sample = [], []
+        for s in range(S):
+            if s >= n_w:
+                sample_logs.append(None); comp_logs_per_sample.append(None)
+                continue
+            w_s = weights[s]
+            log_d = logsumexp([np.log(w_s[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+            sample_logs.append(log_d)
+            comp_logs_per_sample.append([np.log(w_s[c] + 1e-300) + comp_log[c] for c in range(K)])
+
+        log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+
+        for pi, w_p in enumerate(w_ps):
+            if w_p is None:
+                results_per_p[pi].append((np.full(len(x_2d), np.nan), sample_logs, comp_logs_per_sample))
+                continue
+            log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+            results_per_p[pi].append((log_fp - log_fb, sample_logs, comp_logs_per_sample))
+
+    return results_per_p
 
 
 def _eval_fit_sample_densities(fit, grid_pts, n_samples):
@@ -354,7 +461,7 @@ def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g,
     s_idx = getattr(analysis, 's_idx', None)
     benign_method = analysis.benign_method
 
-    lr_all = Parallel(n_jobs=-1, prefer='processes')(
+    lr_all = Parallel(n_jobs=-1)(
         delayed(_eval_fit_on_grid)(fit, grid_pts, p_idx, b_idx, s_idx, benign_method)
         for fit in all_fits
     )
@@ -453,7 +560,7 @@ def _compute_bootstrap_marginal_lr(analysis, config, dim, x_grid):
         return None, None, None, 0
 
     # Parallel evaluation across bootstraps
-    results = Parallel(n_jobs=-1, prefer='processes')(
+    results = Parallel(n_jobs=-1)(
         delayed(_eval_marginal_fit)(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S)
         for fit in valid_fits
     )
@@ -545,7 +652,7 @@ def _compute_all_marginals(analysis, config, x_grids, p_idx_override=None):
         return [None] * D
 
     # One parallel call: each worker processes all D marginals for one bootstrap
-    all_results = Parallel(n_jobs=-1, prefer='processes')(
+    all_results = Parallel(n_jobs=-1)(
         delayed(_eval_all_marginals)(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S)
         for fit in valid_fits
     )
@@ -605,12 +712,138 @@ def _compute_all_marginals(analysis, config, x_grids, p_idx_override=None):
     return marginal_data
 
 
+def _aggregate_marginal_dim(dim_results, x_grid, path_pctile, ben_pctile, S):
+    """Aggregate per-bootstrap marginal results for one dim into a marginal_data dict."""
+    lr_list = [r[0] for r in dim_results]
+    sample_logs    = {s: [r[1][s] for r in dim_results if r[1][s] is not None] for s in range(S)}
+    component_logs = {s: {} for s in range(S)}
+    for r in dim_results:
+        for s in range(S):
+            if r[2][s] is None:
+                continue
+            for c, clog in enumerate(r[2][s]):
+                component_logs[s].setdefault(c, []).append(clog)
+
+    lr_arr = np.array(lr_list)
+    lr_percentiles = {
+        'p5':  np.nanpercentile(lr_arr, path_pctile, axis=0),
+        'p50': np.nanpercentile(lr_arr, 50,          axis=0),
+        'p95': np.nanpercentile(lr_arr, ben_pctile,  axis=0),
+    }
+    sample_marginals = {}
+    for s in range(S):
+        logs = sample_logs[s]
+        if not logs:
+            sample_marginals[s] = None
+            continue
+        arr = np.array(logs)
+        mean_log = logsumexp(arr, axis=0) - np.log(arr.shape[0])
+        sample_marginals[s] = {'mean': np.exp(mean_log), 'std': np.std(np.exp(arr), axis=0)}
+
+    component_marginals = {}
+    for s in range(S):
+        if not component_logs[s]:
+            component_marginals[s] = None
+            continue
+        component_marginals[s] = []
+        for c in range(len(component_logs[s])):
+            arr = np.array(component_logs[s][c])
+            mean_log = logsumexp(arr, axis=0) - np.log(arr.shape[0])
+            component_marginals[s].append({'mean': np.exp(mean_log)})
+
+    return {'x': x_grid, 'lr': lr_percentiles,
+            'sample': sample_marginals, 'components': component_marginals,
+            'n': len(dim_results)}
+
+
+def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
+                                    b_idx, s_idx, benign_method, S,
+                                    path_pctile, ben_pctile):
+    """Compute marginals for all p_indices in one parallel sweep.
+
+    Component densities are computed ONCE per (bootstrap, dimension) and shared
+    across all p_indices.  Replaces N sequential calls to _compute_all_marginals.
+
+    Returns list of len(p_indices), each a list of D marginal_data dicts.
+    """
+    D = len(x_grids)
+    total_dims = len(x_grids)   # will be overridden below from first fit
+    if all_fits:
+        total_dims = all_fits[0]['component_params'][0][0].shape[0]
+
+    x_2d_list = []
+    for dim, x_grid in enumerate(x_grids):
+        x_2d = np.full((len(x_grid), total_dims), np.nan)
+        x_2d[:, dim] = x_grid
+        x_2d_list.append(x_2d)
+
+    n_used = len(all_fits)
+    if n_used == 0:
+        return [[None] * D for _ in p_indices]
+
+    all_results = Parallel(n_jobs=-1)(
+        delayed(_eval_all_marginals_batch_p)(
+            fit, x_2d_list, p_indices, b_idx, s_idx, benign_method, S)
+        for fit in all_fits
+    )
+    # all_results[boot][pi][dim] = (lr_1d, sample_logs, comp_logs)
+
+    return [
+        [
+            _aggregate_marginal_dim(
+                [all_results[b][pi][dim] for b in range(n_used)],
+                x_grids[dim], path_pctile, ben_pctile, S,
+            )
+            for dim in range(D)
+        ]
+        for pi in range(len(p_indices))
+    ]
+
+
+def _compute_lr_grids_for_all_p(all_fits, x1g, x2g, total_dims,
+                                  b_idx, s_idx, benign_method, p_configs):
+    """Compute LR+ grids for multiple pathogenic indices in one parallel sweep.
+
+    p_configs : list of dicts, each with:
+        p_idx, tau_p_log, tau_b_log, path_pctile, ben_pctile, point_values
+
+    Returns list of (grid_points, lr_conservative) tuples, one per p_config.
+    """
+    X1, X2 = np.meshgrid(x1g, x2g, indexing='ij')
+    grid_pts = np.full((X1.size, total_dims), np.nan)
+    grid_pts[:, 0] = X1.ravel()
+    grid_pts[:, 1] = X2.ravel()
+    n_grid    = len(grid_pts)
+    grid_shape = (len(x1g), len(x2g))
+    p_indices  = [pc['p_idx'] for pc in p_configs]
+
+    lr_all = Parallel(n_jobs=-1)(
+        delayed(_eval_fit_on_grid_batch_p)(fit, grid_pts, p_indices, b_idx, s_idx, benign_method)
+        for fit in all_fits
+    )
+    # lr_all[boot][pi] = flat lr array
+
+    results = []
+    for pi, pc in enumerate(p_configs):
+        lr_arr = np.array([lr_all[b][pi] for b in range(len(all_fits))])
+        lr_p5  = np.nanpercentile(lr_arr, pc['path_pctile'], axis=0)
+        lr_p95 = np.nanpercentile(lr_arr, pc['ben_pctile'],  axis=0)
+        gp = np.zeros(n_grid, dtype=int)
+        for pv in pc['point_values']:
+            gp[lr_p5  >= pc['tau_p_log'][pv - 1]] = pv
+        for pv in pc['point_values']:
+            gp[lr_p95 <= pc['tau_b_log'][pv - 1]] = -pv
+        lr_con = np.where(lr_p5 > 0, lr_p5, np.where(lr_p95 < 0, lr_p95, 0.0))
+        results.append((gp.reshape(grid_shape), lr_con.reshape(grid_shape)))
+    return results
+
+
 # ──────────────────────────────────────
 # Main plot function
 # ──────────────────────────────────────
 
 def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
-                        contour_levels=6):
+                        contour_levels=6, first_row_only=False):
     """
     Multivariate calibration visualization. Layout adapts to dimensionality.
 
@@ -655,26 +888,39 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
     print(f"  Collecting bootstrap fits...")
     all_fits     = _collect_valid_fits(analysis, config)
     n_boots_used = len(all_fits)
-    print(f"  Computing {D} marginal LR+ curves ({n_boots_used} boots, {model_label})...")
-    marginal_list = _compute_all_marginals(analysis, config, x_grids)
-    marginal_data = {d: marginal_list[d] for d in range(D)}
 
     # Auxiliary pathogenic marginals
     aux_p_entries = getattr(analysis, 'aux_p_entries', [])
-    aux_marginal_data = {}   # {fixed_idx: {dim: md}}
-    for fixed_idx, eff_idx in aux_p_entries:
-        _sn_aux = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
-                   else f'Sample {fixed_idx}')
-        print(f"  Computing aux marginals for {_sn_aux} (idx={fixed_idx})...")
-        aux_list = _compute_all_marginals(analysis, config, x_grids,
-                                          p_idx_override=eff_idx)
-        aux_marginal_data[fixed_idx] = {d: aux_list[d] for d in range(D)}
+
+    # Marginals — skip entirely when only the top row is needed
+    all_p_indices = [analysis.p_idx] + [eff for _, eff in aux_p_entries]
+    r_cfg = analysis.results[config]
+    path_pctile = r_cfg.get('path_percentile', 5)
+    ben_pctile  = 100 - path_pctile
+    if first_row_only:
+        marginal_data   = {d: None for d in range(D)}
+        aux_marginal_data = {fixed_idx: {d: None for d in range(D)}
+                             for fixed_idx, _ in aux_p_entries}
+    else:
+        print(f"  Computing marginals for {len(all_p_indices)} pathogenic index(es) "
+              f"× {D} dims ({n_boots_used} boots)...")
+        all_marginals = _compute_all_marginals_batch_p(
+            all_fits, x_grids, all_p_indices,
+            analysis.b_idx, getattr(analysis, 's_idx', None),
+            analysis.benign_method,
+            ms.sample_assignments.shape[1],
+            path_pctile, ben_pctile,
+        )
+        marginal_data = {d: all_marginals[0][d] for d in range(D)}
+        aux_marginal_data = {}
+        for ai, (fixed_idx, _) in enumerate(aux_p_entries):
+            aux_marginal_data[fixed_idx] = {d: all_marginals[ai + 1][d] for d in range(D)}
 
     gene = getattr(ms, 'scoreset_name', '')
     suptitle = (
-        f'{gene} — {config} ({model_label})\n'
+        f'{gene} — {config}\n'
         f'{n_boots_used} bootstraps, prior={median_prior:.4f}, '
-        f'C_p={C_path:.1f}, C_b={C_ben:.1f}, missing={missing_frac*100:.1f}%'
+        f'missing={missing_frac*100:.1f}%'
     )
 
     info = {'marginal_data': marginal_data, 'n_boots_used': n_boots_used, 'latent_q': latent_q}
@@ -688,6 +934,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             model_label, n_boots_used, pad, n_grid, contour_levels,
             figsize, suptitle,
             aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data,
+            first_row_only=first_row_only,
         )
     else:
         fig, info = _plot_mv_hd(
@@ -849,7 +1096,8 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                 path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound, missing_frac,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
-                aux_p_entries=None, aux_marginal_data=None):
+                aux_p_entries=None, aux_marginal_data=None,
+                first_row_only=False):
     """Layout for D=2: 2D grid, density contours, marginals."""
     aux_p_entries = aux_p_entries or []
     aux_marginal_data = aux_marginal_data or {}
@@ -861,45 +1109,83 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
     x2_range = (x2g[0], x2g[-1])
     complete = ~np.isnan(scores).any(axis=1)
 
-    print(f"  Computing conservative LR+ grid ({n_grid}×{n_grid})...")
-    grid_points, lr_conservative = _compute_conservative_lr_grid(
-        analysis, config, all_fits, x1g, x2g)
+    # Build p_configs for primary + all aux in one batch
+    r_cfg      = analysis.results[config]
+    _aux_res   = r_cfg.get('aux_results', {})
+    _p_configs = [{
+        'p_idx':       analysis.p_idx,
+        'tau_p_log':   r_cfg['tau_p_log'],
+        'tau_b_log':   r_cfg['tau_b_log'],
+        'path_pctile': r_cfg.get('path_percentile', 5),
+        'ben_pctile':  r_cfg.get('ben_percentile', 95),
+        'point_values': analysis.point_values,
+    }]
+    for _, eff_idx in aux_p_entries:
+        _ar = _aux_res.get(eff_idx, {})   # keyed by eff_idx in aux_results
+        # aux_results is keyed by fixed_idx; find it
+        _ar = next((v for k, v in _aux_res.items() if v.get('eff_idx') == eff_idx), {})
+        _p_configs.append({
+            'p_idx':       eff_idx,
+            'tau_p_log':   _ar.get('tau_p_log', r_cfg['tau_p_log']),
+            'tau_b_log':   _ar.get('tau_b_log', r_cfg['tau_b_log']),
+            'path_pctile': r_cfg.get('path_percentile', 5),
+            'ben_pctile':  r_cfg.get('ben_percentile', 95),
+            'point_values': analysis.point_values,
+        })
+    print(f"  Computing LR+ grid ({n_grid}×{n_grid}) for {len(_p_configs)} "
+          f"pathogenic index(es)...")
+    _all_grids = _compute_lr_grids_for_all_p(
+        all_fits, x1g, x2g, scores.shape[1],
+        analysis.b_idx, getattr(analysis, 's_idx', None),
+        analysis.benign_method, _p_configs,
+    )
+    grid_points, lr_conservative = _all_grids[0]
 
-    # Row 0: primary grid + aux grids + scatter
-    # Rows 1-3: density contours and marginals (use max(S,n_aux+2) cols)
-    n_cols = max(S + 1, n_aux + 2)
-    scatter_col = n_aux + 1  # scatter panel always immediately after aux grids
+    # Row 0: primary grid + aux grids (no separate legend column — legend goes below)
+    n_grid_cols = 1 + n_aux
+    n_cols = n_grid_cols if first_row_only else max(S, n_grid_cols)
 
     # Each of D=2 dimensions gets 1 primary row + n_aux aux-LR rows
     n_marg_rows = D * (1 + n_aux)
-    height_ratios = [1.2, 1.2] + [0.8] + [0.5] * n_aux + [0.8] + [0.5] * n_aux
-    n_total_rows = 2 + n_marg_rows
+    if first_row_only:
+        height_ratios = [1.2]
+        n_total_rows = 1
+    else:
+        height_ratios = [1.2, 1.2] + [0.8] + [0.5] * n_aux + [0.8] + [0.5] * n_aux
+        n_total_rows = 2 + n_marg_rows
 
     if figsize is None:
-        figsize = (4.5 * n_cols, 4.0 + 4.0 * D + 2.0 * D * n_aux)
+        if first_row_only:
+            figsize = (5.5 * n_grid_cols, 6.5)   # extra vertical room for bottom legend
+        else:
+            figsize = (5.5 * n_cols, 5.0 + 4.0 * D + 2.0 * D * n_aux)
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(n_total_rows, n_cols, figure=fig,
                            height_ratios=height_ratios,
-                           hspace=0.45, wspace=0.35)
+                           hspace=0.45, wspace=0.25)
 
     # Row 0 col 0: primary 2D point grid
     ax = fig.add_subplot(gs[0, 0])
-    im = ax.pcolormesh(x1g, x2g, grid_points.T, cmap=POINT_CMAP,
-                       norm=pt_norm, shading='auto', alpha=0.7)
-    plt.colorbar(im, ax=ax, label='Evidence Points', shrink=0.8)
-    ax.contour(x1g, x2g, lr_conservative.T, levels=[0], colors='black', linewidths=1)
-    for s_idx in range(S):
+    # Points rendered first (behind evidence colormap)
+    for s_idx in range(min(S, 4) - 1, -1, -1):   # descending: 3→0 so P/LP on top
         mask = sa[:, s_idx] & complete
         if not mask.any(): continue
         ax.scatter(scores[mask, 0], scores[mask, 1],
-                   c=points[mask], cmap=POINT_CMAP, norm=pt_norm, s=10, alpha=0.6,
-                   edgecolors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], linewidths=0.3,
+                   color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                   s=14, alpha=0.7,
+                   edgecolors=_SAMPLE_EDGE_COLORS[s_idx % len(_SAMPLE_EDGE_COLORS)],
+                   linewidths=0.5, zorder=1,
                    marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
+    # Evidence colormap on top (semi-transparent so points show through)
+    im = ax.pcolormesh(x1g, x2g, grid_points.T, cmap=POINT_CMAP,
+                       norm=pt_norm, shading='auto', alpha=0.72, zorder=2)
+    plt.colorbar(im, ax=ax, label='Evidence Points', shrink=0.8)
+    ax.contour(x1g, x2g, lr_conservative.T, levels=[0], colors='black', linewidths=1, zorder=3)
     ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
     ax.set_xlim(x1_range); ax.set_ylim(x2_range)
-    ax.set_title(f'Point Regions ({model_label})\nprior={median_prior:.4f}, '
-                 f'C_p={C_path:.1f}, C_b={C_ben:.1f}', fontsize=9, fontweight='bold')
-    ax.grid(lw=0.2, alpha=0.3)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_title(f'Point Regions\nprior={median_prior:.4f}', fontsize=9, fontweight='bold')
+    ax.grid(lw=0.2, alpha=0.3, zorder=0)
 
     # Row 0 cols 1..n_aux: aux 2D point grids
     for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
@@ -907,109 +1193,126 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
         aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
                     else f'Sample {fixed_idx}')
-        print(f"  Computing aux LR+ grid for {aux_name} (idx={fixed_idx})...")
-        aux_gp, aux_lr_con = _compute_conservative_lr_grid(
-            analysis, config, all_fits, x1g, x2g, p_idx_override=eff_idx)
-        im2 = ax.pcolormesh(x1g, x2g, aux_gp.T, cmap=POINT_CMAP,
-                            norm=pt_norm, shading='auto', alpha=0.7)
-        plt.colorbar(im2, ax=ax, label='Evidence Points', shrink=0.8)
-        ax.contour(x1g, x2g, aux_lr_con.T, levels=[0], colors='black', linewidths=1)
-        # Scatter using aux points from results if available
-        aux_r = analysis.results[config].get('aux_results', {}).get(fixed_idx, {})
-        aux_pts = aux_r.get('points', points)
-        for s_idx in range(S):
+        aux_gp, aux_lr_con = _all_grids[1 + ai]
+        # Points first, evidence on top
+        for s_idx in range(min(S, 4) - 1, -1, -1):   # descending: 3→0
             mask = sa[:, s_idx] & complete
             if not mask.any(): continue
             ax.scatter(scores[mask, 0], scores[mask, 1],
-                       c=aux_pts[mask], cmap=POINT_CMAP, norm=pt_norm, s=10, alpha=0.6,
-                       edgecolors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], linewidths=0.3,
+                       color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                       s=14, alpha=0.7,
+                       edgecolors=_SAMPLE_EDGE_COLORS[s_idx % len(_SAMPLE_EDGE_COLORS)],
+                       linewidths=0.5, zorder=1,
                        marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
+        im2 = ax.pcolormesh(x1g, x2g, aux_gp.T, cmap=POINT_CMAP,
+                            norm=pt_norm, shading='auto', alpha=0.72, zorder=2)
+        plt.colorbar(im2, ax=ax, label='Evidence Points', shrink=0.8)
+        ax.contour(x1g, x2g, aux_lr_con.T, levels=[0], colors='black', linewidths=1, zorder=3)
         ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
         ax.set_xlim(x1_range); ax.set_ylim(x2_range)
+        ax.set_aspect('equal', adjustable='box')
         _ar = analysis.results.get(config, {}).get('aux_results', {}).get(fixed_idx, {})
         _ap = _ar.get('median_prior', float('nan'))
-        _ac = _ar.get('C_path', float('nan'))
-        ax.set_title(f'Aux: {aux_name}\nprior={_ap:.4f}, C_p={_ac:.1f} ({model_label})',
+        ax.set_title(f'Aux: {aux_name}\nprior={_ap:.4f}',
                      fontsize=9, fontweight='bold', color=aux_color)
         ax.grid(lw=0.2, alpha=0.3)
 
-    # Row 0 col scatter_col: scatter by sample
-    ax = fig.add_subplot(gs[0, scatter_col])
-    for s_idx in range(S):
-        mask = sa[:, s_idx] & complete
-        if not mask.any(): continue
-        ax.scatter(scores[mask, 0], scores[mask, 1],
-                   c=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], s=8, alpha=0.4,
-                   edgecolors='none', marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)],
-                   label=f"{sample_names[s_idx]} ({mask.sum()})")
-    ax.legend(fontsize=5, framealpha=0.6, loc='upper right')
-    ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
-    ax.set_xlim(x1_range); ax.set_ylim(x2_range)
-    ax.set_title('Observations by Sample', fontsize=9, fontweight='bold')
-    ax.grid(lw=0.2, alpha=0.3)
-    for c_idx in range(scatter_col + 1, n_cols):
+    # Fill any unused row-0 columns (density rows may need more cols)
+    for c_idx in range(n_grid_cols, n_cols):
         fig.add_subplot(gs[0, c_idx]).axis('off')
 
-    # Row 1: per-sample 2D density contours
-    if all_fits:
-        for s_idx in range(min(S, n_cols)):
-            ax = fig.add_subplot(gs[1, s_idx])
-            d = _compute_sample_density_grid(all_fits, s_idx, x1g, x2g)
-            if d is not None:
-                d_mean, d_std = d['mean'], d['std']
-                levels = np.linspace(d_mean.max() * 0.01, d_mean.max() * 0.95, contour_levels)
-                cmap_name = 'Greens' if s_idx >= 2 else ('Reds' if s_idx == 0 else 'Blues')
-                if levels[-1] > levels[0]:
-                    ax.contourf(x1g, x2g, d_mean.T, levels=levels, cmap=cmap_name, alpha=0.4)
-                    ax.contour(x1g, x2g, d_mean.T, levels=levels,
-                               colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
-                               linewidths=0.5, alpha=0.6)
-                outer = levels[1] if len(levels) > 1 else levels[0]
-                for bound, ls in [(np.maximum(d_mean - d_std, 0), ':'), (d_mean + d_std, ':')]:
-                    ax.contour(x1g, x2g, bound.T, levels=[outer],
-                               colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
-                               linewidths=0.3, linestyles=ls, alpha=0.3)
-            mask = sa[:, s_idx] & complete
-            if mask.any():
-                ax.scatter(scores[mask, 0], scores[mask, 1],
-                           c=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], s=4, alpha=0.3,
-                           edgecolors='none')
-            _plot_component_means(ax, all_fits, s_idx)
-            ax.set_xlim(x1_range); ax.set_ylim(x2_range)
-            ax.set_xlabel(dataset_names[0], fontsize=7); ax.set_ylabel(dataset_names[1], fontsize=7)
-            n_s = sa[:, s_idx].sum()
-            ax.set_title(f'{sample_names[s_idx]} (n={n_s})', fontsize=8, fontweight='bold',
-                         color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)])
-            ax.grid(lw=0.2, alpha=0.2)
-    for c_idx in range(S, n_cols):
-        fig.add_subplot(gs[1, c_idx]).axis('off')
+    # ── Bottom legends (below all panels) ──────────────────────────────────
+    # Sample handles — match actual scatter style
+    sample_handles = [
+        Line2D([0], [0], marker=SAMPLE_MARKERS[s_idx],
+               color=_SAMPLE_EDGE_COLORS[s_idx % len(_SAMPLE_EDGE_COLORS)],
+               markerfacecolor=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+               markersize=9, linewidth=0, markeredgewidth=0.8,
+               label=f"{sample_names[s_idx]} (n={int(sa[:, s_idx].sum())})")
+        for s_idx in range(min(S, 4))
+    ]
 
-    # Rows 2+: marginals — one primary row + n_aux aux rows per dimension
-    _aux_results = analysis.results.get(config, {}).get('aux_results', {})
-    for dim in range(D):
-        base_row = 2 + dim * (1 + n_aux)
-        md = marginal_data[dim]
-        if md is None:
-            for r_ in range(1 + n_aux):
-                for c in range(n_cols):
-                    fig.add_subplot(gs[base_row + r_, c]).axis('off')
-            continue
-        _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
-                           dataset_names, sample_names, tau_p_log, tau_b_log,
-                           ylim_bound, path_pctile, ben_pctile, analysis)
-        for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
-            aux_md_dim = (aux_marginal_data.get(fixed_idx) or {}).get(dim)
-            aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
-                        else f'Sample {fixed_idx}')
-            aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
-            aux_r = _aux_results.get(fixed_idx, {})
-            aux_tau_p = aux_r.get('tau_p_log', tau_p_log)
-            aux_tau_b = aux_r.get('tau_b_log', tau_b_log)
-            _draw_aux_lr_row(fig, gs, base_row + 1 + ai, dim,
-                             aux_md_dim, aux_name, aux_color,
-                             eff_idx, aux_tau_p, aux_tau_b,
-                             ylim_bound, path_pctile, ben_pctile,
-                             dataset_names, analysis, n_cols)
+    # Evidence handles — only levels actually present across any panel, including 0
+    all_grid_arrays = [grid_points] + [_all_grids[1 + ai][0] for ai in range(n_aux)]
+    present_evs = sorted({int(v) for gp in all_grid_arrays
+                           for v in np.unique(gp) if -8 <= v <= 8})
+    ev_handles = [
+        Patch(facecolor=POINT_CMAP(pt_norm(pv)), edgecolor='gray', linewidth=0.3,
+              label=f"{'+' if pv > 0 else ''}{pv}")
+        for pv in present_evs
+    ]
+
+    leg_ev = fig.legend(handles=ev_handles, loc='lower center',
+                        bbox_to_anchor=(0.5, 0.0), fontsize=7.5,
+                        frameon=True, title='Evidence points', title_fontsize=8,
+                        ncol=len(present_evs))
+    leg_sample = fig.legend(handles=sample_handles, loc='lower center',
+                             bbox_to_anchor=(0.5, 0.10), fontsize=7.5,
+                             frameon=True, title='Samples', title_fontsize=8,
+                             ncol=len(sample_handles))
+    fig.subplots_adjust(bottom=0.25)
+
+    if not first_row_only:
+        # Row 1: per-sample 2D density contours
+        if all_fits:
+            for s_idx in range(min(S, n_cols)):
+                ax = fig.add_subplot(gs[1, s_idx])
+                d = _compute_sample_density_grid(all_fits, s_idx, x1g, x2g)
+                if d is not None:
+                    d_mean, d_std = d['mean'], d['std']
+                    levels = np.linspace(d_mean.max() * 0.01, d_mean.max() * 0.95, contour_levels)
+                    cmap_name = 'Greens' if s_idx >= 2 else ('Reds' if s_idx == 0 else 'Blues')
+                    if levels[-1] > levels[0]:
+                        ax.contourf(x1g, x2g, d_mean.T, levels=levels, cmap=cmap_name, alpha=0.4)
+                        ax.contour(x1g, x2g, d_mean.T, levels=levels,
+                                   colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                                   linewidths=0.5, alpha=0.6)
+                    outer = levels[1] if len(levels) > 1 else levels[0]
+                    for bound, ls in [(np.maximum(d_mean - d_std, 0), ':'), (d_mean + d_std, ':')]:
+                        ax.contour(x1g, x2g, bound.T, levels=[outer],
+                                   colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                                   linewidths=0.3, linestyles=ls, alpha=0.3)
+                mask = sa[:, s_idx] & complete
+                if mask.any():
+                    ax.scatter(scores[mask, 0], scores[mask, 1],
+                               c=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], s=4, alpha=0.3,
+                               edgecolors='none')
+                _plot_component_means(ax, all_fits, s_idx)
+                ax.set_xlim(x1_range); ax.set_ylim(x2_range)
+                ax.set_xlabel(dataset_names[0], fontsize=7); ax.set_ylabel(dataset_names[1], fontsize=7)
+                n_s = sa[:, s_idx].sum()
+                ax.set_title(f'{sample_names[s_idx]} (n={n_s})', fontsize=8, fontweight='bold',
+                             color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)])
+                ax.grid(lw=0.2, alpha=0.2)
+        for c_idx in range(S, n_cols):
+            fig.add_subplot(gs[1, c_idx]).axis('off')
+
+        # Rows 2+: marginals — one primary row + n_aux aux rows per dimension
+        _aux_results = analysis.results.get(config, {}).get('aux_results', {})
+        for dim in range(D):
+            base_row = 2 + dim * (1 + n_aux)
+            md = marginal_data[dim]
+            if md is None:
+                for r_ in range(1 + n_aux):
+                    for c in range(n_cols):
+                        fig.add_subplot(gs[base_row + r_, c]).axis('off')
+                continue
+            _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
+                               dataset_names, sample_names, tau_p_log, tau_b_log,
+                               ylim_bound, path_pctile, ben_pctile, analysis)
+            for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
+                aux_md_dim = (aux_marginal_data.get(fixed_idx) or {}).get(dim)
+                aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
+                            else f'Sample {fixed_idx}')
+                aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
+                aux_r = _aux_results.get(fixed_idx, {})
+                aux_tau_p = aux_r.get('tau_p_log', tau_p_log)
+                aux_tau_b = aux_r.get('tau_b_log', tau_b_log)
+                _draw_aux_lr_row(fig, gs, base_row + 1 + ai, dim,
+                                 aux_md_dim, aux_name, aux_color,
+                                 eff_idx, aux_tau_p, aux_tau_b,
+                                 ylim_bound, path_pctile, ben_pctile,
+                                 dataset_names, analysis, n_cols)
 
     fig.suptitle(suptitle, fontsize=11, fontweight='bold', y=1.02)
     info = {

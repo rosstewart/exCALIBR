@@ -47,14 +47,23 @@ def load_precomputed_fits(fits_path: str, dataset_name: str) -> Dict:
     with gzip.open(fits_path, 'rt', encoding='utf-8') as f:
         all_results = json.load(f)
 
-    if dataset_name not in all_results:
-        available = list(all_results.keys())[:10]
-        raise KeyError(
-            f"Dataset '{dataset_name}' not found in precomputed fits. "
-            f"Available: {available}{'...' if len(all_results) > 10 else ''}"
-        )
+    # Two supported formats:
+    #   (a) {dataset_name: {seed: {"2c": ..., "3c": ...}}}
+    #   (b) flat {seed: {"2c": ..., "3c": ...}}  (as written by save_results)
+    if dataset_name in all_results:
+        return all_results[dataset_name]
 
-    return all_results[dataset_name]
+    # Detect flat format: top-level keys look like bootstrap seeds (digit strings)
+    # and their values look like component dicts.
+    keys = list(all_results.keys())
+    if keys and all(str(k).lstrip('-').isdigit() for k in keys):
+        return all_results
+
+    available = keys[:10]
+    raise KeyError(
+        f"Dataset '{dataset_name}' not found in precomputed fits. "
+        f"Available: {available}{'...' if len(keys) > 10 else ''}"
+    )
 
 
 def generate_visualizations(
@@ -80,7 +89,8 @@ def generate_visualizations(
 
     # Load dataset if not provided
     if scoreset is None:
-        df = pd.read_csv(config.dataset_csv)
+        sep = "\t" if config.dataset_csv.endswith((".tsv", ".tsv.gz")) else ","
+        df = pd.read_csv(config.dataset_csv, sep=sep)
         scoreset = load_dataset_from_df(df, config)
     results = {}
 
@@ -328,9 +338,11 @@ def process_component_fits(
                         for r in results_fpfb])
     
     # Get bootstrap score ranges
+    acmg_mapping_method = getattr(config, "acmg_mapping_method", "tavtigian")
     results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
         delayed(get_bootstrap_score_ranges)(
-            fitIdx, fit, fp, fb, score_range, fit_priors, config.point_values
+            fitIdx, fit, fp, fb, score_range, fit_priors, config.point_values,
+            acmg_mapping_method=acmg_mapping_method,
         )
         for fitIdx, (fit, fp, fb) in enumerate(zip(fits, _log_fp, _log_fb))
     )
@@ -355,8 +367,12 @@ def process_component_fits(
         logger.info(f"    log_lr_plus[0] range: [{np.nanmin(log_lr_plus[0]):.4f}, {np.nanmax(log_lr_plus[0]):.4f}]")
         logger.info(f"    Prior: {prior:.6f}, fit_priors range: [{np.nanmin(fit_priors):.6f}, {np.nanmax(fit_priors):.6f}]")
 
-    # Compute C range
-    C = np.array([np.nanpercentile(Cs, 5), np.nanpercentile(Cs, 95)])
+    # Compute C range (piecewise mapping returns C=None — skip those)
+    Cs_valid = [c for c in Cs if isinstance(c, (int, float)) and not (isinstance(c, float) and np.isnan(c))]
+    if Cs_valid:
+        C = np.array([np.nanpercentile(Cs_valid, 5), np.nanpercentile(Cs_valid, 95)])
+    else:
+        C = np.array([np.nan, np.nan])
     
     # Detect if scoreset is flipped - USE MEAN SCORES INSTEAD OF WEIGHTS
     scoreset_flipped = False
@@ -409,18 +425,33 @@ def process_component_fits(
     
     if config.use_median_prior:
         # Use median prior for unified thresholds
-        logger.info("  Using median prior for unified thresholds")
-        point_ranges_pathogenic, point_ranges_benign, C = calculate_score_ranges(
-            np.nanpercentile(log_lr_plus[:, range_subset], 5, axis=0),
-            np.nanpercentile(log_lr_plus[:, range_subset], 95, axis=0),
-            prior,
-            score_range[range_subset],
-            config.point_values,
-        )
-        point_ranges = {**point_ranges_pathogenic, **point_ranges_benign}
-        if prior <= 0 or prior >= 1:
-            for point in point_ranges:
-                point_ranges[point] = []
+        logger.info(f"  Using median prior for unified thresholds (method={acmg_mapping_method})")
+        if acmg_mapping_method == "continuous":
+            from ..fit_utils.fit import calculate_classification_ranges
+            cls_p, cls_b, lr_thresholds = calculate_classification_ranges(
+                np.nanpercentile(log_lr_plus[:, range_subset], 5, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], 95, axis=0),
+                prior,
+                score_range[range_subset],
+            )
+            point_ranges = {**cls_p, **cls_b}
+            if prior <= 0 or prior >= 1:
+                for k in point_ranges:
+                    point_ranges[k] = []
+            C = lr_thresholds  # dict of LR+ thresholds, not an integer C*
+        else:
+            point_ranges_pathogenic, point_ranges_benign, C = calculate_score_ranges(
+                np.nanpercentile(log_lr_plus[:, range_subset], 5, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], 95, axis=0),
+                prior,
+                score_range[range_subset],
+                config.point_values,
+                acmg_mapping_method=acmg_mapping_method,
+            )
+            point_ranges = {**point_ranges_pathogenic, **point_ranges_benign}
+            if prior <= 0 or prior >= 1:
+                for point in point_ranges:
+                    point_ranges[point] = []
     else:
         # Use 5th percentile conservative thresholds
         logger.info("  Using 5th percentile conservative thresholds")
@@ -480,54 +511,81 @@ def process_component_fits(
     # Check for insufficient bootstrap coverage
     percent_no_evidence = {point: 0.0 for point in config.point_values + list(-1 * np.array(config.point_values))}
 
-    if config.debug:
-        logger.info("  [DEBUG] Point ranges BEFORE enforce_monotonicity:")
-        for k in sorted(point_ranges.keys(), key=lambda x: -x):
-            logger.info(f"    {k:+d}: {point_ranges[k]}")
+    # Monotonicity enforcement and extend-to-xlims are integer-point-specific.
+    # Continuous uses string-keyed ranges but still needs the outermost P and B
+    # ranges extended to ±inf so scores beyond the observed range are classified.
+    if acmg_mapping_method == "continuous":
+        # Extend outermost pathogenic range (P, or LP if P is empty) to ±inf.
+        for label in ("P", "LP"):
+            ranges = point_ranges.get(label)
+            if ranges:
+                if not scoreset_flipped:
+                    ranges[0][0] = -np.inf   # low score = pathogenic
+                else:
+                    ranges[-1][-1] = np.inf  # high score = pathogenic
+                break
+        # Extend outermost benign range (B, or LB if B is empty) to ±inf.
+        for label in ("B", "LB"):
+            ranges = point_ranges.get(label)
+            if ranges:
+                if not scoreset_flipped:
+                    ranges[-1][-1] = np.inf  # high score = benign
+                else:
+                    ranges[0][0] = -np.inf   # low score = benign
+                break
+        if config.debug:
+            logger.info("  [DEBUG] Continuous classification ranges:")
+            for k, v in point_ranges.items():
+                logger.info(f"    {k}: {v}")
+    else:
+        if config.debug:
+            logger.info("  [DEBUG] Point ranges BEFORE enforce_monotonicity:")
+            for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-    # Enforce monotonicity (first pass)
-    enforce_monotonicity_point_ranges(
-        point_ranges,
-        config.point_values,
-        score_range[range_subset],
-        scoreset_flipped=scoreset_flipped,
-        liberal=config.liberal_monotonicity
-    )
+        # Enforce monotonicity (first pass)
+        enforce_monotonicity_point_ranges(
+            point_ranges,
+            config.point_values,
+            score_range[range_subset],
+            scoreset_flipped=scoreset_flipped,
+            liberal=config.liberal_monotonicity
+        )
 
-    if config.debug:
-        logger.info("  [DEBUG] Point ranges AFTER first enforce_monotonicity:")
-        for k in sorted(point_ranges.keys(), key=lambda x: -x):
-            logger.info(f"    {k:+d}: {point_ranges[k]}")
+        if config.debug:
+            logger.info("  [DEBUG] Point ranges AFTER first enforce_monotonicity:")
+            for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-    # Extend to limits
-    extend_points_to_xlims(
-        point_ranges,
-        config.point_values,
-        score_range[range_subset],
-        scoreset_flipped,
-        inf=True
-    )
+        # Extend to limits
+        extend_points_to_xlims(
+            point_ranges,
+            config.point_values,
+            score_range[range_subset],
+            scoreset_flipped,
+            inf=True
+        )
 
-    if config.debug:
-        logger.info("  [DEBUG] Point ranges AFTER extend_points_to_xlims:")
-        for k in sorted(point_ranges.keys(), key=lambda x: -x):
-            logger.info(f"    {k:+d}: {point_ranges[k]}")
+        if config.debug:
+            logger.info("  [DEBUG] Point ranges AFTER extend_points_to_xlims:")
+            for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-    # Enforce monotonicity again after extending (matches assign_points.py)
-    enforce_monotonicity_point_ranges(
-        point_ranges,
-        config.point_values,
-        score_range[range_subset],
-        scoreset_flipped=scoreset_flipped,
-        liberal=config.liberal_monotonicity
-    )
+        # Enforce monotonicity again after extending (matches assign_points.py)
+        enforce_monotonicity_point_ranges(
+            point_ranges,
+            config.point_values,
+            score_range[range_subset],
+            scoreset_flipped=scoreset_flipped,
+            liberal=config.liberal_monotonicity
+        )
 
-    if config.debug:
-        logger.info("  [DEBUG] Point ranges AFTER second enforce_monotonicity (final):")
-        for k in sorted(point_ranges.keys(), key=lambda x: -x):
-            logger.info(f"    {k:+d}: {point_ranges[k]}")
+        if config.debug:
+            logger.info("  [DEBUG] Point ranges AFTER second enforce_monotonicity (final):")
+            for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-    logger.info(f"  Final point ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
+    logger.info(f"  Final ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
     
     # Serialize and return
     return serialize_dict({
@@ -543,4 +601,5 @@ def process_component_fits(
         'C': C,
         'scoreset_flipped': scoreset_flipped,
         'n_valid_fits': len(fits),
+        'acmg_mapping_method': acmg_mapping_method,
     })

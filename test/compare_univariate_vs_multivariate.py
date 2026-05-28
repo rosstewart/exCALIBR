@@ -810,3 +810,248 @@ def plot_lr_curves(ms, mv_result, config_name="", figsize=None,
 
     return fig
 
+
+# ──────────────────────────────────────
+# CSV-based calibration loading & comparison
+# ──────────────────────────────────────
+
+def _parse_calibration_row(row):
+    """Parse one row of a calibration CSV into {evidence_points: (lower, upper)}."""
+    ranges = {}
+    for col in row.index:
+        if not col.startswith('range_'):
+            continue
+        val = row[col]
+        if pd.isna(val) or str(val).strip() == '':
+            continue
+        pts = int(col[len('range_'):])   # 'range_-8' → -8, 'range_1' → 1
+        parts = str(val).strip().split()
+        if len(parts) != 2:
+            continue
+        lower = float(parts[0])   # float() accepts 'Infinity', '-Infinity'
+        upper = float(parts[1])
+        ranges[pts] = (lower, upper)
+    return ranges
+
+
+def _classify_score_single(score, ranges):
+    """Return evidence points for *score* using parsed calibration ranges.
+
+    Boundaries are lower-inclusive, upper-exclusive: [lower, upper).
+    Returns 0 (uncertain) when no range matches; NaN when the score is NaN.
+    """
+    if np.isnan(score):
+        return np.nan
+    for pts, (lower, upper) in ranges.items():
+        if lower <= score < upper:
+            return pts
+    return 0
+
+
+def load_and_classify_from_csv(ms, csv_path, dim_mapping):
+    """Classify variants in *ms* using calibration ranges stored in a CSV.
+
+    Parameters
+    ----------
+    ms : MultiScoreset / BasicMultiScoreset
+    csv_path : str
+        CSV with columns: dataset, range_{-8..8}, prior, ...
+        The ``dataset`` column is used as the index.
+    dim_mapping : dict
+        Maps each dataset name to a score-dimension index in ``ms.scores``.
+        Example::
+
+            {'gof_benta': 1, 'gof_clinvar': 1,
+             'lof_cadins': 0, 'lof_clinvar': 0}
+
+    Returns
+    -------
+    dict of {dataset_name: np.ndarray[float], shape (n_variants,)}
+        Values are integer evidence points (or NaN for missing scores).
+    """
+    cal_df = pd.read_csv(csv_path, index_col='dataset')
+    scores = ms.scores  # (n_variants, n_dims)
+
+    out = {}
+    for dataset, dim in dim_mapping.items():
+        if dataset not in cal_df.index:
+            raise ValueError(f"Dataset '{dataset}' not found in {csv_path}")
+        ranges = _parse_calibration_row(cal_df.loc[dataset])
+        dim_scores = scores[:, dim]
+        out[dataset] = np.array(
+            [_classify_score_single(s, ranges) for s in dim_scores], dtype=float
+        )
+    return out
+
+
+def combine_uv_calibrations(pts1, pts2, keep_pathogenic_if_discordant=False):
+    """Combine two evidence arrays: max concordant evidence, with configurable
+    handling of discordant pairs (one > 0, other < 0).
+
+    Rules (per variant):
+    - Both NaN → NaN
+    - One NaN → use the other (missing dimension, can't contradict)
+    - Both non-negative → max (strongest pathogenic evidence wins)
+    - Both non-positive → min (strongest benign evidence wins)
+    - One is 0 → use the other
+    - Discordant (one > 0, other < 0):
+        keep_pathogenic_if_discordant=False (default) → 0 (no evidence)
+        keep_pathogenic_if_discordant=True → take the positive value
+    """
+    p1 = np.asarray(pts1, dtype=float)
+    p2 = np.asarray(pts2, dtype=float)
+    n1, n2 = np.isnan(p1), np.isnan(p2)
+    s1 = np.where(n1, 0.0, p1)
+    s2 = np.where(n2, 0.0, p2)
+
+    discordant = ((s1 > 0) & (s2 < 0)) | ((s1 < 0) & (s2 > 0))
+
+    concordant = np.where(
+        s1 == 0, s2,
+        np.where(s2 == 0, s1,
+            np.where(s1 > 0, np.maximum(s1, s2), np.minimum(s1, s2))
+        )
+    )
+
+    if keep_pathogenic_if_discordant:
+        discordant_resolve = np.where(s1 > 0, s1, s2)   # whichever is positive
+        out = np.where(discordant, discordant_resolve, concordant)
+    else:
+        out = np.where(discordant, 0.0, concordant)
+
+    out = np.where(n1 & n2, np.nan, out)
+    return out
+
+
+def compare_all_calibrations(ms, csv_path, dim_mapping, mv_points_dict,
+                              eval_sample_idxs=(0, 1),
+                              method_eval_indices=None):
+    """Compare accuracy, coverage, and AUC for UV (CSV) and MV calibrations.
+
+    Parameters
+    ----------
+    ms : MultiScoreset
+    csv_path : str
+        Calibration CSV consumed by :func:`load_and_classify_from_csv`.
+    dim_mapping : dict
+        Dataset-name → score-dimension index for each UV calibration to load.
+    mv_points_dict : dict
+        Additional named point arrays to include (e.g. MV results).
+    eval_sample_idxs : tuple (pos_idx, neg_idx)
+        Default positive/negative sample indices in ``ms._sample_assignments``.
+    method_eval_indices : dict or None
+        Per-method overrides of (pos_idx, neg_idx).  Any method not listed
+        falls back to ``eval_sample_idxs``.  Example::
+
+            {
+                'gof_benta': (4, 1),   # BENTA vs B/LB
+                'mv_benta':  (4, 1),
+                'lof_cadins': (5, 1),  # CADINS vs B/LB
+                'mv_cadins':  (5, 1),
+            }
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per method with columns: method, n_pos, n_neg, N, TP, TN, FP,
+        FN, uncertain, accuracy, coverage, sensitivity, specificity, MCC, AUC.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    sa = ms._sample_assignments
+    method_eval_indices = method_eval_indices or {}
+
+    uv_points = load_and_classify_from_csv(ms, csv_path, dim_mapping)
+    all_points = {**uv_points, **mv_points_dict}
+
+    rows = []
+    for name, pts in all_points.items():
+        pos_idx, neg_idx = method_eval_indices.get(name, eval_sample_idxs)
+        is_pos = sa[:, pos_idx].astype(bool)
+        is_neg = sa[:, neg_idx].astype(bool)
+        eval_mask = is_pos | is_neg
+        labels = is_pos[eval_mask]
+
+        pts_eval = np.asarray(pts, dtype=float)[eval_mask]
+        m = compute_metrics(labels, pts_eval, name)
+
+        # AUC: use discrete points as ranking score; NaN scores excluded
+        finite_mask = np.isfinite(pts_eval)
+        try:
+            auc = roc_auc_score(labels[finite_mask], pts_eval[finite_mask])
+        except ValueError:
+            auc = np.nan
+
+        rows.append({
+            'method':      name,
+            'pos_idx':     pos_idx,
+            'neg_idx':     neg_idx,
+            'n_pos':       int(is_pos[eval_mask].sum()),
+            'n_neg':       int(is_neg[eval_mask].sum()),
+            'N':           m.get('N', 0),
+            'TP':          m.get('TP', np.nan),
+            'TN':          m.get('TN', np.nan),
+            'FP':          m.get('FP', np.nan),
+            'FN':          m.get('FN', np.nan),
+            'uncertain':   m.get('uncertain', np.nan),
+            'accuracy':    m.get('accuracy', np.nan),
+            'coverage':    m.get('coverage', np.nan),
+            'sensitivity': m.get('sensitivity', np.nan),
+            'specificity': m.get('specificity', np.nan),
+            'MCC':         m.get('MCC', np.nan),
+            'AUC':         auc,
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_calibration_comparison(metrics_df, group_labels=None, title=""):
+    """Plot accuracy vs coverage per method, one subplot per positive-sample group.
+
+    Parameters
+    ----------
+    metrics_df : pd.DataFrame
+        Output of :func:`compare_all_calibrations`.  Must have columns
+        ``pos_idx``, ``coverage``, ``accuracy``, ``AUC``, ``method``.
+    group_labels : dict or None
+        Maps pos_idx → subplot title string.
+        Defaults to ``{0: 'P/LP vs B/LB', 4: 'BENTA vs B/LB', 5: 'CADINS vs B/LB'}``.
+    title : str
+        Figure suptitle.
+    """
+    if group_labels is None:
+        group_labels = {0: 'P/LP vs B/LB', 4: 'BENTA vs B/LB', 5: 'CADINS vs B/LB'}
+
+    groups = sorted(metrics_df['pos_idx'].unique(),
+                    key=lambda x: list(group_labels).index(x) if x in group_labels else x)
+    n = len(groups)
+    fig, axes = plt.subplots(1, n, figsize=(6 * n, 5), squeeze=False)
+
+    for ax, grp in zip(axes[0], groups):
+        sub = metrics_df[(metrics_df['pos_idx'] == grp) & (metrics_df['coverage'] > 0)]
+
+        ax.scatter(sub['coverage'], sub['accuracy'], s=70, zorder=3,
+                   c=sub['AUC'], cmap='RdYlGn', vmin=0.5, vmax=1.0,
+                   edgecolors='gray', linewidths=0.5)
+
+        for _, row in sub.iterrows():
+            label = f"{row['method']}\n(AUC={row['AUC']:.2f}, n+={row['n_pos']}, n-={row['n_neg']})"
+            ax.annotate(label, (row['coverage'], row['accuracy']),
+                        textcoords='offset points', xytext=(5, 3), fontsize=7,
+                        linespacing=1.4)
+
+        ax.set_xlabel('Coverage', fontsize=10)
+        ax.set_ylabel('Accuracy', fontsize=10)
+        ax.set_title(group_labels.get(grp, f'pos_idx={grp}'), fontsize=11, fontweight='bold')
+        # ax.set_xlim(-0.05, 1.05)
+        # ax.set_ylim(-0.05, 1.05)
+        ax.grid(lw=0.3, alpha=0.4)
+
+    sm = plt.cm.ScalarMappable(cmap='RdYlGn', norm=plt.Normalize(0.5, 1.0))
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes[0], label='AUC', shrink=0.7, pad=0.02)
+
+    if title:
+        fig.suptitle(title, fontsize=13, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    return fig
+

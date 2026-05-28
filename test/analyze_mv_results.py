@@ -531,10 +531,6 @@ class MVCalibrationAnalysis:
 
         # Detect latent_q from the first valid fit
         self._latent_q = self._detect_latent_q()
-        if self._latent_q > 1:
-            print(f"  Detected CFUSN model with latent_q={self._latent_q}")
-        else:
-            print(f"  Detected restricted MSN model (q=1)")
 
         self.results = {}
 
@@ -1439,11 +1435,21 @@ class MVCalibrationAnalysis:
                      fontsize=13, fontweight='bold', y=1.01)
         return fig
 
-    def plot_config_detail(self, config, figsize=None, n_grid=120, contour_levels=6):
-        """Detailed visualization using bootstrap-averaged densities."""
+    def plot_config_detail(self, config, figsize=None, n_grid=120, contour_levels=6,
+                           first_row_only=False):
+        """Detailed visualization using bootstrap-averaged densities.
+
+        Parameters
+        ----------
+        first_row_only : bool
+            If True, render only the top row (2D point-region grids + legend)
+            and skip the density-contour and marginal rows.  Much faster when
+            you only need a quick look at the evidence map.
+        """
         from visualize_fit import plot_mv_calibration
         return plot_mv_calibration(self, config, figsize=figsize,
-                                   n_grid=n_grid, contour_levels=contour_levels)
+                                   n_grid=n_grid, contour_levels=contour_levels,
+                                   first_row_only=first_row_only)
 
 
     # ──────────────────────────────────────────────────────────────

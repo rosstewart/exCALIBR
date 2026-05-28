@@ -143,6 +143,20 @@ Examples:
     parser.add_argument("--min-clinvar-star", type=int, default=1,
                        help="Minimum ClinVar review stars (default: 1)")
     
+    # ACMG-mapping method
+    parser.add_argument("--acmg-mapping-method",
+                       choices=["tavtigian", "piecewise", "continuous",
+                                "strict_additive", "all"],
+                       default="tavtigian",
+                       help="ACMG-mapping method (default: tavtigian). "
+                            "'piecewise' = prior-adaptive integer-point system with exact "
+                            "ACMG boundary posteriors; 'continuous' = posterior-based "
+                            "classification with no integer points; 'strict_additive' = "
+                            "strictly additive integer-point system with prior-dependent "
+                            "LSQ-optimal alpha, prior-aware LR+ thresholds, and exact "
+                            "posteriors at shifting classification boundaries; "
+                            "'all' = run all four and write per-method output files.")
+
     # Progress reporting (for web backend)
     parser.add_argument("--progress-file", default=None,
                         help="Path to write JSON progress updates (used by web backend). "
@@ -194,13 +208,68 @@ Examples:
         debug=args.debug,
         viz_only=args.viz_only,
         progress_file=args.progress_file,
+        acmg_mapping_method=(args.acmg_mapping_method
+                              if args.acmg_mapping_method != "all" else "tavtigian"),
     )
 
-    # Run pipeline
-    run_calibration_pipeline(config)
+    # Resolve ACMG-mapping methods to run
+    acmg_mapping_methods = (["tavtigian", "piecewise", "continuous", "strict_additive"]
+                             if args.acmg_mapping_method == "all"
+                             else [args.acmg_mapping_method])
 
-def run_calibration_pipeline(config: PipelineConfig):
-    """Main pipeline execution"""
+    # Run pipeline once per ACMG-mapping method.  For 'all', share Step 1/2
+    # across methods by computing fits once and re-running Step 3+ per method.
+    if len(acmg_mapping_methods) == 1:
+        config.acmg_mapping_method = acmg_mapping_methods[0]
+        run_calibration_pipeline(config)
+    else:
+        run_calibration_pipeline_multi(config, acmg_mapping_methods)
+
+def run_calibration_pipeline_multi(config: PipelineConfig, acmg_mapping_methods):
+    """Run the calibration pipeline once per ACMG-mapping method, sharing fits.
+
+    The first method computes (or loads) bootstrap fits and saves them to
+    disk; subsequent methods reload those fits from the saved path so we
+    don't refit.  Outputs are distinguished by a "_<acmg_mapping_method>"
+    suffix on the dataset name, e.g. ``MYGENE_tavtigian_3c_calibration.json``.
+    """
+    original_name = config.dataset_name
+    original_precomputed = config.precomputed_fits
+    saved_fits_path = None
+
+    for i, acmg_mapping_method in enumerate(acmg_mapping_methods):
+        config.acmg_mapping_method = acmg_mapping_method
+        config.dataset_name = f"{original_name}_{acmg_mapping_method}"
+
+        if i == 0:
+            # Pass original_name so precomputed fits are looked up without the
+            # acmg-method suffix (fits are identical across methods).
+            run_calibration_pipeline(config, fits_name=original_name)
+            # Subsequent methods reuse the saved fits regardless of how Step 1 ran.
+            cand = os.path.join(
+                config.output_dir,
+                f"{config.dataset_name}_bootstrap_fits.json.gz",
+            )
+            if os.path.exists(cand):
+                saved_fits_path = cand
+        else:
+            if saved_fits_path is not None:
+                config.precomputed_fits = saved_fits_path
+            run_calibration_pipeline(config, fits_name=original_name)
+
+    # restore for any caller that holds the config
+    config.dataset_name = original_name
+    config.precomputed_fits = original_precomputed
+
+
+def run_calibration_pipeline(config: PipelineConfig, fits_name: Optional[str] = None):
+    """Main pipeline execution.
+
+    fits_name: override the dataset name used to look up precomputed fits.
+    Useful when running --acmg-mapping-method all, where config.dataset_name
+    is suffixed (e.g. 'gof_benta_tavtigian') but fits are stored under the
+    original name ('gof_benta').
+    """
 
     # Setup
     logger = setup_logging(config.output_dir, config.dataset_name)
@@ -231,7 +300,7 @@ def run_calibration_pipeline(config: PipelineConfig):
         logger.info("="*80)
 
         bootstrap_results = load_precomputed_fits(
-            config.precomputed_fits, config.dataset_name
+            config.precomputed_fits, fits_name or config.dataset_name
         )
         logger.info(f"\nLoaded {len(bootstrap_results)} bootstrap iterations")
 
@@ -263,12 +332,12 @@ def run_calibration_pipeline(config: PipelineConfig):
 
         logger.info(f"\nCompleted {len(bootstrap_results)} bootstrap iterations")
 
-        # Count valid fits across all bootstraps and components
-        valid_fits = sum(
-            1 for seed_results in bootstrap_results.values()
-            for v in seed_results.values() if v is not None
-        )
-        total_fits = len(bootstrap_results) * len(config.components)
+    # Count valid fits across all bootstraps and components (both paths)
+    valid_fits = sum(
+        1 for seed_results in bootstrap_results.values()
+        for v in seed_results.values() if v is not None
+    )
+    total_fits = len(bootstrap_results) * len(config.components)
 
 
     # Step 2: Model selection (if fitting multiple components)
@@ -333,7 +402,8 @@ def run_calibration_pipeline(config: PipelineConfig):
     logger.info("STEP 3b: Per-Variant Evidence Table")
     logger.info("="*80)
 
-    df_vt = pd.read_csv(config.dataset_csv)
+    sep = "\t" if config.dataset_csv.endswith((".tsv", ".tsv.gz")) else ","
+    df_vt = pd.read_csv(config.dataset_csv, sep=sep)
     scoreset_vt = load_dataset_from_df(df_vt, config)
 
     for component_key, calibration in results.items():

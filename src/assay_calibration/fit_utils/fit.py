@@ -540,7 +540,8 @@ class Fit:
         fB = self.joint_densities(x, controls_idx)
         return np.log(fP) - np.log(fB)
 
-    def get_score_thresholds(self, prior, point_values, **kwargs):
+    def get_score_thresholds(self, prior, point_values,
+                              acmg_mapping_method="tavtigian", **kwargs):
         if prior <= 0 or prior >= 1:
             raise ValueError(f"Prior must be in (0,1), got {prior:.4f}")
         point_values = np.array(point_values)
@@ -556,16 +557,36 @@ class Fit:
             score_ranges_p, score_ranges_b, C = calculate_score_ranges(
                 log_lr_sum[order], log_lr_sum[order],
                 prior, uscores_1d,
-                point_values
+                point_values, acmg_mapping_method=acmg_mapping_method,
             )
             return score_ranges_p, score_ranges_b
         else:
             uscores = np.linspace(scores.min(), scores.max(), 1000)
             log_LR = self.get_log_lrPlus(uscores)
             score_ranges_p, score_ranges_b, C = calculate_score_ranges(
-                log_LR, log_LR, prior, uscores, point_values
+                log_LR, log_LR, prior, uscores, point_values,
+                acmg_mapping_method=acmg_mapping_method,
             )
             return score_ranges_p, score_ranges_b
+
+    def get_continuous_classification(self, scores, prior, targets=None):
+        """Method B (continuous LR+): per-score posterior + ACMG label.
+
+        Bypasses integer points entirely.  Returns a dict with arrays
+        'lr_plus', 'posterior', 'label' aligned to *scores*.
+        """
+        from .bayesian_thresholds import (
+            bayes_posterior_from_lr, continuous_classify,
+        )
+        if prior <= 0 or prior >= 1:
+            raise ValueError(f"Prior must be in (0,1), got {prior:.4f}")
+        log_lr = self.get_log_lrPlus(np.asarray(scores))
+        if log_lr.ndim > 1:
+            log_lr = log_lr.sum(axis=0)
+        lr = np.exp(log_lr)
+        post = bayes_posterior_from_lr(lr, prior)
+        labels = continuous_classify(lr, prior, targets=targets)
+        return {"lr_plus": lr, "posterior": post, "label": labels}
 
     def to_dict(self, **kwargs):
         model_params = serialize_dict(self.fit_result)
@@ -828,12 +849,50 @@ def prior_from_weights(weights, population_idx=2, controls_idx=1, pathogenic_idx
     return prior if 0 < prior < 1 else np.nan
 
 
-def thresholds_from_prior(prior, point_values, **kwargs):
-    C = get_tavtigian_constant(prior, **kwargs)
-    pv = np.array(point_values)
-    lrP = C ** (pv / len(pv))
-    lrB = 1 / lrP
-    return lrP, lrB, C
+def thresholds_from_prior(prior, point_values,
+                           acmg_mapping_method="tavtigian", **kwargs):
+    """LR+ tier thresholds at *prior* for the given integer point codes.
+
+    acmg_mapping_method : str
+        "tavtigian" (default): legacy C*-based thresholds via
+            get_tavtigian_constant.  lrP = C^(pv/len(pv)).
+        "piecewise": prior-adaptive Bayesian thresholds with exact posteriors
+            at the four ACMG boundary points (T = 10, 6, -1, -7).  See
+            assay_calibration.fit_utils.bayesian_thresholds.
+
+    Returns
+    -------
+    lrP, lrB, C
+        lrP[i], lrB[i] are LR+ thresholds for pathogenic/benign evidence at
+        point_values[i].  C is the Tavtigian constant for
+        acmg_mapping_method='tavtigian' and None for 'piecewise'.
+    """
+    if acmg_mapping_method == "tavtigian":
+        C = get_tavtigian_constant(prior, **kwargs)
+        pv = np.array(point_values)
+        lrP = C ** (pv / len(pv))
+        lrB = 1 / lrP
+        return lrP, lrB, C
+    elif acmg_mapping_method == "piecewise":
+        from .bayesian_thresholds import piecewise_tier_thresholds
+        return piecewise_tier_thresholds(prior, point_values)
+    elif acmg_mapping_method == "strict_additive":
+        try:
+            from tavtigian_sims.additivity import recanonical_tier_thresholds
+        except ImportError:
+            import sys, os as _os
+            _root = _os.path.normpath(
+                _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                              "..", "..", "..", ".."))
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
+            from tavtigian_sims.additivity import recanonical_tier_thresholds
+        return recanonical_tier_thresholds(prior, point_values)
+    else:
+        raise ValueError(
+            f"Unknown acmg_mapping_method {acmg_mapping_method!r}; "
+            f"expected 'tavtigian', 'piecewise', or 'strict_additive'"
+        )
 
 
 def assign_p(lr, tau, points):
@@ -871,13 +930,90 @@ def get_point_ranges(scores, lrPlus, tau, point_values, pathogenicOrBenign):
     return point_ranges
 
 
-def calculate_score_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores, point_values, **kwargs):
-    lrP, lrB, C = thresholds_from_prior(prior, point_values, **kwargs)
+def calculate_score_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores, point_values,
+                            acmg_mapping_method="tavtigian", **kwargs):
+    lrP, lrB, C = thresholds_from_prior(
+        prior, point_values, acmg_mapping_method=acmg_mapping_method, **kwargs
+    )
     tauP = np.log(lrP)
     tauB = np.log(lrB)
     pathogenic_ranges = get_point_ranges(scores, log_lrPlusLow, tauP, point_values, "pathogenic")
     benign_ranges = get_point_ranges(scores, log_lrPlusHigh, tauB, point_values, "benign")
     return pathogenic_ranges, benign_ranges, C
+
+
+def calculate_classification_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores):
+    """Continuous-method (Method B) analogue of calculate_score_ranges.
+
+    Returns score intervals keyed by classification label rather than by
+    integer points.  Boundaries are exact: a score falls in label "P" iff
+    the posterior from its LR+ is >= 0.99 at the given prior, etc.
+
+    Returns
+    -------
+    pathogenic_ranges : {"P": [[lo,hi], ...], "LP": [...]}
+    benign_ranges     : {"B": [[lo,hi], ...], "LB": [...]}
+    thresholds        : dict label -> LR+ threshold (continuous)
+    """
+    from .bayesian_thresholds import continuous_lr_thresholds
+    thresholds = continuous_lr_thresholds(prior)
+
+    def _ranges(log_lr_arr, labels_in_order, lr_thresholds, scores):
+        # labels_in_order: ascending in LR+ stringency, e.g. ["LP", "P"] for path
+        # lr_thresholds[label] gives the LR+ at which posterior reaches that label.
+        tau = np.log(np.array([lr_thresholds[l] for l in labels_in_order]))
+        out = {l: [] for l in labels_in_order}
+
+        def _assign(lr):
+            for i in range(len(tau) - 1, -1, -1):
+                if lr >= tau[i]:
+                    return labels_in_order[i]
+            return None
+
+        range_open = np.nan
+        range_label = None
+        for si, li in zip(scores, log_lr_arr):
+            lab = _assign(li)
+            if lab != range_label:
+                if range_label is not None:
+                    out[range_label].append(sorted([float(range_open), float(si)]))
+                range_open = si
+                range_label = lab
+        if range_label is not None:
+            out[range_label].append(sorted([float(range_open), float(scores[-1])]))
+        return out
+
+    def _ranges_benign(log_lr_arr, labels_in_order, lr_thresholds, scores):
+        # labels_in_order: ascending in LR+ stringency *for benign* (B more
+        # stringent than LB), so we compare against -log(lr) flipped.
+        tau = np.log(np.array([lr_thresholds[l] for l in labels_in_order]))
+        # For benign, lr below threshold means evidence is "at least this benign".
+        out = {l: [] for l in labels_in_order}
+
+        def _assign(lr):
+            for i in range(len(tau) - 1, -1, -1):
+                if lr <= tau[i]:
+                    return labels_in_order[i]
+            return None
+
+        range_open = np.nan
+        range_label = None
+        for si, li in zip(scores, log_lr_arr):
+            lab = _assign(li)
+            if lab != range_label:
+                if range_label is not None:
+                    out[range_label].append(sorted([float(range_open), float(si)]))
+                range_open = si
+                range_label = lab
+        if range_label is not None:
+            out[range_label].append(sorted([float(range_open), float(scores[-1])]))
+        return out
+
+    # Pathogenic side: P is more stringent than LP (higher LR+)
+    pathogenic_ranges = _ranges(log_lrPlusLow, ["LP", "P"], thresholds, scores)
+    # Benign side: B is more stringent than LB (lower LR+)
+    benign_ranges = _ranges_benign(log_lrPlusHigh, ["LB", "B"], thresholds, scores)
+    return pathogenic_ranges, benign_ranges, thresholds
 
 
 def makeOneHot(sample_assignments, rng=None):

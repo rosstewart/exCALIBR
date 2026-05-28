@@ -4,12 +4,12 @@ from pathlib import Path
 import numpy as np
 from scipy import stats
 import importlib
-import src.assay_calibration.fit_utils.two_sample.fit
+import src.assay_calibration.fit_utils.cfusn.fit
 from src.assay_calibration.fit_utils.fit import Fit
-importlib.reload(src.assay_calibration.fit_utils.two_sample.fit)
+importlib.reload(src.assay_calibration.fit_utils.cfusn.fit)
 importlib.reload(src.assay_calibration.fit_utils.fit)
-from src.assay_calibration.fit_utils.two_sample.fit import single_fit
-from src.assay_calibration.fit_utils.two_sample import (density_utils,constraints, optimize)
+from src.assay_calibration.fit_utils.cfusn.fit import single_fit
+from src.assay_calibration.fit_utils.cfusn import (density_utils,constraints, optimize)
 import scipy.stats as sps
 import matplotlib
 matplotlib.set_loglevel("warning")
@@ -33,14 +33,18 @@ import pandas as pd
 # STEP 1: Generate consolidated job manifest
 # ============================================================================
 
-def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2025"):
+def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2026", selected_components=None):
     """Process a single dataset and return consolidated jobs (one per bootstrap)."""
-    if clinvar_release == "2025":
+    if clinvar_release == "2026":
         dataset_name = dataset
     else:
         dataset_name = f"{dataset}_clinvar_{clinvar_release}"
     save_dir = f'{output_dir}/{dataset_name}'
     os.makedirs(save_dir, exist_ok=True)
+
+    if selected_components is None:
+        selected_components = [2, 3]
+    print(f"{dataset_name}: components={selected_components}")
 
     try:
         ds = Scoreset(df[df["Dataset"] == dataset],
@@ -54,27 +58,30 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_rel
     if n_samples < 2:
         print(f"{dataset} skipping: insufficient samples")
         return
-    
+
     fitter = Fit(ds)
-    
+
     all_jobs = []
-    
-    # Create one job per bootstrap iteration (containing both 2c and 3c fits)
+
+    # Create one job per bootstrap iteration
     for bootstrap_iter in range(N_BOOTSTRAPS):
-        # Generate jobs for both component ranges
-        jobs_2c = fitter.generate_fit_jobs(
-            component_range=[2],
-            bootstrap_seed=bootstrap_iter,
-            check_monotonic=True,
-            num_fits=NUM_FITS
-        )
-        
-        jobs_3c = fitter.generate_fit_jobs(
-            component_range=[3],
-            bootstrap_seed=bootstrap_iter,
-            check_monotonic=True,
-            num_fits=NUM_FITS
-        )
+        jobs_2c = []
+        if 2 in selected_components:
+            jobs_2c = fitter.generate_fit_jobs(
+                component_range=[2],
+                bootstrap_seed=bootstrap_iter,
+                check_monotonic=True,
+                num_fits=NUM_FITS
+            )
+
+        jobs_3c = []
+        if 3 in selected_components:
+            jobs_3c = fitter.generate_fit_jobs(
+                component_range=[3],
+                bootstrap_seed=bootstrap_iter,
+                check_monotonic=True,
+                num_fits=NUM_FITS
+            )
 
         jobs_4c = None
         # if 'VHL_Buckley_2024' in dataset_name:
@@ -85,13 +92,14 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_rel
         #         num_fits=NUM_FITS
         #     )
         
-        # Extract shared data from first job (all jobs in a bootstrap share train/val splits)
-        if jobs_2c:
+        # Extract shared data from first available job (all jobs in a bootstrap share train/val splits)
+        reference_jobs = jobs_2c or jobs_3c
+        if reference_jobs:
             shared_data = {
-                'train_observations': jobs_2c[0]['train_observations'],
-                'train_sample_assignments': jobs_2c[0]['train_sample_assignments'],
-                'val_observations': jobs_2c[0]['val_observations'],
-                'val_sample_assignments': jobs_2c[0]['val_sample_assignments'],
+                'train_observations': reference_jobs[0]['train_observations'],
+                'train_sample_assignments': reference_jobs[0]['train_sample_assignments'],
+                'val_observations': reference_jobs[0]['val_observations'],
+                'val_sample_assignments': reference_jobs[0]['val_sample_assignments'],
             }
         else:
             shared_data = None
@@ -165,35 +173,74 @@ def requires_2018(df, dataset):
     return gene in genes_2018
     
 
-def generate_job_manifest(target_array_size=1000, n_jobs=30, run_downsample_discordance=False):
+def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30, run_downsample_discordance=False,
+                          config_file=None):
     """
     Generate job manifest optimized for MAX_ARRAY_SIZE limit.
-    
+
     Args:
+        output_dir: Directory where jobs and results are written
         target_array_size: Target number of array tasks (default: 1000, your cluster limit)
         n_jobs: Number of parallel workers for job generation
+        config_file: Path to dataset config JSON (default: src/igvf_configs/dataset_configs_jan_2026.json)
     """
-    
-    output_dir = "/data/ross/assay_calibration/explorer_jobs_multivariate"
+    if config_file is None:
+        config_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                   "src", "igvf_configs", "dataset_configs_jan_2026.json")
+
+    with open(config_file) as f:
+        dataset_config = json.load(f)
+
+    # Build new->old name mapping (strip _clinvar_2018 suffix before lookup)
+    name_map_df = pd.read_csv("/data/ross/assay_calibration/dataframe/new_dataset_names.csv")
+    new_to_old = dict(zip(name_map_df["New_names"], name_map_df["Old_names"]))
+
+    def components_for(dataset_name):
+        entry = dataset_config.get(dataset_name)
+        if entry is None:
+            # Strip _clinvar_2018 suffix for the name-mapping lookup, but keep
+            # dataset_name itself unchanged (only used to find the config entry)
+            base = dataset_name.removesuffix("_clinvar_2018")
+            old_name = new_to_old.get(base)
+            if old_name is not None:
+                # Re-attach the suffix if it was present
+                lookup = old_name + ("_clinvar_2018" if dataset_name.endswith("_clinvar_2018") else "")
+                entry = dataset_config.get(lookup)
+        if entry is None:
+            return [2, 3]  # default: both
+        nc_str = entry[0]  # "2c" or "3c"
+        return [int(nc_str[0])]
+
     jobs_dir = f"{output_dir}/jobs"
     os.makedirs(jobs_dir, exist_ok=True)
-    
+
     N_BOOTSTRAPS = 1000
     NUM_FITS = 100  # fits per bootstrap per component
-    
+
     df = pd.read_csv("/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz", sep='\t')
     datasets = df.Dataset.unique()
-    
-    # print(f"Generating consolidated jobs from {len(dataset_files)} datasets...")
+
     print(f"Target array size: {target_array_size}")
     print(f"Parallel workers: {n_jobs if n_jobs > 0 else 'all CPUs'}")
-    
+    print(f"Config file: {config_file}")
+
+    # Print component selection summary
+    for dataset in sorted(datasets):
+        clinvar_release = "2018" if requires_2018(df, dataset) else "2026"
+        dataset_name = dataset if clinvar_release == "2026" else f"{dataset}_clinvar_{clinvar_release}"
+        comps = components_for(dataset_name)
+        print(f"  {dataset_name}: {comps}c")
+
     # Process all datasets in parallel
     print("\nLoading datasets and generating jobs...")
     all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(process_dataset)(
-            df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2025" if not requires_2018(df,dataset) else "2018"
-        ) for dataset in datasets #requires_2018(df, dataset)
+            df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
+            clinvar_release="2026" if not requires_2018(df, dataset) else "2018",
+            selected_components=components_for(
+                dataset if not requires_2018(df, dataset) else f"{dataset}_clinvar_2018"
+            )
+        ) for dataset in datasets
     )
     
     # Flatten
@@ -205,7 +252,7 @@ def generate_job_manifest(target_array_size=1000, n_jobs=30, run_downsample_disc
     
     total_jobs = len(all_jobs)
     print(f"Total consolidated jobs: {total_jobs:,}")
-    print(f"  (Each job runs {NUM_FITS} fits for 2c + {NUM_FITS} fits for 3c = {NUM_FITS*2} fits)")
+    print(f"  (Each job runs up to {NUM_FITS} fits per selected component)")
     
     # Calculate optimal jobs per array task
     jobs_per_array = max(1, total_jobs // target_array_size)
@@ -483,33 +530,37 @@ for dataset, stats in sorted(by_dataset.items()):
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Setup HPC job array for bootstrap fits')
+    parser.add_argument('--output-dir', type=str, required=True,
+                       help='Directory where jobs and results are written')
+    parser.add_argument('--config-file', type=str, default=None,
+                       help='Path to dataset config JSON (default: src/igvf_configs/dataset_configs_jan_2026.json)')
     parser.add_argument('--target-array-size', type=int, default=1000,
                        help='Target number of array tasks (default: 1000, cluster MAX_ARRAY_SIZE)')
-    parser.add_argument('--n-jobs', type=int, default=30,
-                       help='Number of parallel workers for job generation (default: 30)')
     parser.add_argument('--n-jobs', type=int, default=30,
                        help='Number of parallel workers for job generation (default: 30)')
     parser.add_argument('--run_downsample_discordance', action='store_true',
                    help='Generate jobs for downsampling and discordance analyses (default: False)')
     args = parser.parse_args()
-    
-    output_dir = "/data/ross/assay_calibration/explorer_jobs_multivariate"
-    
+
+    output_dir = args.output_dir
+
     print("="*80)
     print("HPC Job Array Setup - Consolidated Bootstrap Fits")
     print("="*80)
-    
+
     # Generate all jobs and scripts
     total_jobs, num_arrays = generate_job_manifest(
+        output_dir=output_dir,
         target_array_size=args.target_array_size,
         n_jobs=args.n_jobs,
-        run_downsample_discordance=args.run_downsample_discordance
+        run_downsample_discordance=args.run_downsample_discordance,
+        config_file=args.config_file,
     )
     # create_worker_script(output_dir)
     # create_status_checker(output_dir)
-    
+
     print("\n" + "="*80)
     print("Setup complete!")
     print("="*80)

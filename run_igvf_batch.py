@@ -79,6 +79,8 @@ def run_single_dataset(
     overrides: Dict,
     args,
     dataset_splits: Optional[Dict] = None,
+    acmg_mapping_method: str = "tavtigian",
+    output_name_suffix: str = "",
 ) -> Optional[Dict]:
     """Run calibration for a single dataset within the batch.
 
@@ -106,10 +108,13 @@ def run_single_dataset(
     else:
         component_list = [int(n_c.replace("c", ""))]
 
+    # Effective dataset name (used in output filenames) carries the method suffix
+    effective_name = dataset_name + output_name_suffix
+
     # Build per-dataset config
     config = PipelineConfig(
         dataset_csv=args.dataset,
-        dataset_name=dataset_name,
+        dataset_name=effective_name,
         output_dir=os.path.join(args.output_dir, dataset_name),
         components=component_list,
         use_median_prior=True,
@@ -127,6 +132,7 @@ def run_single_dataset(
         point_values=[1, 2, 3, 4, 5, 6, 7, 8],
         sample_names=args.sample_names if hasattr(args, "sample_names") else None,
         debug=args.debug if hasattr(args, "debug") else False,
+        acmg_mapping_method=acmg_mapping_method,
     )
 
     output_dir = Path(config.output_dir)
@@ -263,6 +269,14 @@ def main():
     parser.add_argument("--viz-only", action="store_true",
                        help="Regenerate visualizations only — skip variant tables and calibration JSON save "
                             "(useful for rerunning after fixing a plot bug)")
+    parser.add_argument("--acmg-mapping-method",
+                       choices=["tavtigian", "piecewise", "continuous",
+                                "strict_additive", "all"],
+                       default="tavtigian",
+                       help="ACMG-mapping method (default: tavtigian). "
+                            "'strict_additive' = strictly additive integer-point system "
+                            "with prior-dependent LSQ-optimal alpha; 'all' runs all four "
+                            "methods and writes per-method output files for comparison.")
 
     args = parser.parse_args()
 
@@ -343,15 +357,28 @@ def main():
             n_c, benign_method, overrides, dataset_splits,
         ))
 
-    print(f"\nProcessing {len(datasets_to_process)} datasets...")
+    acmg_mapping_methods = (["tavtigian", "piecewise", "continuous", "strict_additive"]
+                             if args.acmg_mapping_method == "all"
+                             else [args.acmg_mapping_method])
+    suffix = (lambda m: "" if (len(acmg_mapping_methods) == 1 and m == "tavtigian")
+              else f"_{m}")
+
+    print(f"\nProcessing {len(datasets_to_process)} datasets × "
+          f"{len(acmg_mapping_methods)} ACMG-mapping method(s)...")
 
     if args.n_jobs == 1:
         # Sequential processing
-        for i, (name, boot_results, n_c, benign, ovr, splits) in enumerate(datasets_to_process):
-            print(f"\n{'='*80}")
-            print(f"[{i+1}/{len(datasets_to_process)}] {name} ({n_c}, {benign})")
-            print(f"{'='*80}")
-            run_single_dataset(name, df, boot_results, n_c, benign, ovr, args, splits)
+        idx = 0
+        for name, boot_results, n_c, benign, ovr, splits in datasets_to_process:
+            idx += 1
+            for acmg_mapping_method in acmg_mapping_methods:
+                print(f"\n{'='*80}")
+                print(f"[{idx}/{len(datasets_to_process)}] {name} "
+                      f"({n_c}, {benign}, acmg_mapping_method={acmg_mapping_method})")
+                print(f"{'='*80}")
+                run_single_dataset(name, df, boot_results, n_c, benign, ovr, args, splits,
+                                   acmg_mapping_method=acmg_mapping_method,
+                                   output_name_suffix=suffix(acmg_mapping_method))
     else:
         # Parallel dataset processing — scale inner jobs to avoid CPU oversubscription
         import multiprocessing
@@ -362,9 +389,12 @@ def main():
             parallel_args.n_jobs_inner = max(1, n_cpus // abs(args.n_jobs))
         Parallel(n_jobs=args.n_jobs, verbose=10)(
             delayed(run_single_dataset)(
-                name, df, boot_results, n_c, benign, ovr, parallel_args, splits
+                name, df, boot_results, n_c, benign, ovr, parallel_args, splits,
+                acmg_mapping_method=acmg_mapping_method,
+                output_name_suffix=suffix(acmg_mapping_method),
             )
             for name, boot_results, n_c, benign, ovr, splits in datasets_to_process
+            for acmg_mapping_method in acmg_mapping_methods
         )
 
     print(f"\n{'='*80}")

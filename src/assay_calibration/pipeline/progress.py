@@ -113,7 +113,7 @@ class ProgressReporter:
             "remaining":   None,
             "updated_at":  self._now(),
         })
-        self._state["results"].update(kwargs)
+        self._state.setdefault("results", {}).update(kwargs)
         self._write()
 
     def complete(self, **kwargs) -> None:
@@ -127,7 +127,7 @@ class ProgressReporter:
             "remaining":   None,
             "updated_at":  self._now(),
         })
-        self._state["results"].update(kwargs)
+        self._state.setdefault("results", {}).update(kwargs)
         self._write()
 
     def track(self, iterable: Iterator[T], total: int) -> Iterator[T]:
