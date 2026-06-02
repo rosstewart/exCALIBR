@@ -1022,13 +1022,23 @@ def makeOneHot(sample_assignments, rng=None):
     assert np.all(sample_assignments.any(axis=0))
     sample_assignments = np.array(sample_assignments)
     onehot = np.zeros_like(sample_assignments)
-    while not np.all(np.any(onehot, axis=0)):
+    max_attempts = 10_000
+    for _ in range(max_attempts):
         for i in range(sample_assignments.shape[0]):
             true_indices = np.where(sample_assignments[i])[0]
             if len(true_indices) > 0:
                 selected = rng.choice(true_indices)
                 onehot[i] = False
                 onehot[i, selected] = True
+        if np.all(np.any(onehot, axis=0)):
+            break
+    else:
+        uncovered = np.where(~np.any(onehot, axis=0))[0].tolist()
+        raise ValueError(
+            f"makeOneHot: could not cover sample(s) {uncovered} after {max_attempts} attempts. "
+            f"These samples have only shared variants and there are not enough shared variants "
+            f"to guarantee coverage. Each sample should have at least one exclusive variant."
+        )
     assert np.all(np.any(onehot, axis=0))
     assert np.all(onehot.sum(axis=1) <= 1)
     return onehot

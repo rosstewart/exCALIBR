@@ -277,6 +277,22 @@ class BasicScoreset:
                 f"sample_assignments must be a 1D list of sample ids or 2D array of one-hot vectors, got {ndim} dimensions"
             )
 
+        # Warn if any sample has no exclusive variants — makeOneHot coverage will be
+        # infeasible for that sample, causing an error during bootstrap fitting.
+        sa = np.array(self._sample_assignments)
+        if sa.ndim == 2 and sa.shape[1] > 1:
+            shared_mask = sa.sum(axis=1) > 1
+            for s in range(sa.shape[1]):
+                n_exclusive = (sa[:, s] & ~shared_mask).sum()
+                if sa[:, s].any() and n_exclusive == 0:
+                    import warnings
+                    warnings.warn(
+                        f"Sample index {s} has no exclusive variants "
+                        f"(all {int(sa[:, s].sum())} variant(s) are shared with other samples). "
+                        f"Bootstrap one-hot assignment may be infeasible for this sample.",
+                        stacklevel=3,
+                    )
+
     @property
     def sample_assignments(self):
         return self._sample_assignments[:, self.sample_counts > 0]
