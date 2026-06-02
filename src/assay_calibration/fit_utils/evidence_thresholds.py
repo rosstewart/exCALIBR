@@ -1,7 +1,8 @@
 import numpy as np
+from typing import Union
 
 
-def get_tavtigian_constant(prior: float, *args, **kwargs) -> float | int:
+def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
     original = kwargs.get("original", False)
     strict = kwargs.get("strict", False)
     C_max = kwargs.get("C_max", 100000)

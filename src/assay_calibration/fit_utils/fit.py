@@ -194,7 +194,7 @@ def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, 
             val_observations, val_sample_assignments, params, weights, multivariate=mv
         ) / len(val_sample_assignments)
 
-    beta = float(fit_kwargs.get("sample_balance_beta", 0.0))
+    beta = float(fit_kwargs.get("sample_balance_beta", 1.0 if mv else 0.0))
     proportions = fit_kwargs.get("sample_proportions", None)
 
     if proportions is None and beta == 0.0:

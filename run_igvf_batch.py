@@ -32,6 +32,8 @@ warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
 from src.assay_calibration.pipeline.config import PipelineConfig
+
+GENES_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}
 from src.assay_calibration.pipeline.visualize import (
     generate_visualizations,
     load_precomputed_fits,
@@ -81,6 +83,7 @@ def run_single_dataset(
     dataset_splits: Optional[Dict] = None,
     acmg_mapping_method: str = "tavtigian",
     output_name_suffix: str = "",
+    clinvar_mode: str = "default",
 ) -> Optional[Dict]:
     """Run calibration for a single dataset within the batch.
 
@@ -90,16 +93,25 @@ def run_single_dataset(
         Component key, e.g. ``"2c"`` or ``"3c"``.  The special value
         ``"all"`` processes both 2c and 3c (with model selection saved
         but all components output).
+    clinvar_mode : str
+        ``"2018"``     – forced ClinVar 2018 (genes_2018 auto-detected or explicit)
+        ``"default"``  – use dataset name / ``--clinvar-release`` arg as before
     """
 
-    dataset_df = df[df["Dataset"] == dataset_name.replace("_clinvar_2018", "")]
+    csv_name = dataset_name.replace("_clinvar_2018", "")
+    dataset_df = df[df["Dataset"] == csv_name].copy()
     if len(dataset_df) == 0:
         print(f"  SKIP {dataset_name}: no rows in dataset CSV")
         return None
+    # load_dataset_from_df re-filters by config.dataset_name, so relabel to match
+    dataset_df["Dataset"] = dataset_name
 
     # Determine ClinVar release
-    clinvar_release = "2018" if "clinvar_2018" in dataset_name else "2025"
-    if "not_clinvar_2018" in dataset_name:
+    if clinvar_mode == "2018":
+        clinvar_release = "2018"
+    elif "clinvar_2018" in dataset_name and "not_clinvar_2018" not in dataset_name:
+        clinvar_release = "2018"
+    else:
         clinvar_release = "2025"
 
     # Build component list
@@ -138,6 +150,8 @@ def run_single_dataset(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(str(output_dir), dataset_name)
+
+    print(f"  clinvar={clinvar_release}  mode={clinvar_mode}  acmg={acmg_mapping_method}")
 
     try:
         # Load scoreset
@@ -257,6 +271,16 @@ def main():
                        choices=["all_variants", "all_nsSNV", "all_missense_nsSNV",
                                 "gnomAD", "gnomAD_nsSNV", "gnomAD_missense_nsSNV"])
 
+    # Skip already-completed datasets
+    parser.add_argument("--skip-existing", action="store_true",
+                       help="Skip datasets whose calibration JSON output already exists "
+                            "(useful for resuming a failed run)")
+
+    # ClinVar 2018 gene override
+    parser.add_argument("--no-clinvar-2018", action="store_true",
+                       help="Disable automatic ClinVar 2018 mode for BRCA1/MSH2/PTEN/TP53 datasets; "
+                            "use default dataset names and ClinVar release instead")
+
     # Model selection override
     parser.add_argument("--auto-select-model", action="store_true",
                        help="Use bootstrap paired test to auto-select n_c instead of config")
@@ -327,11 +351,36 @@ def main():
     # Process datasets
     os.makedirs(args.output_dir, exist_ok=True)
 
+    def _gene_of(dataset_name: str) -> str:
+        """Extract gene name (first underscore-delimited token, strip _clinvar_2018)."""
+        base = dataset_name.replace("_clinvar_2018", "")
+        return base.split("_")[0]
+
     datasets_to_process = []
     for dataset_name, config_entry in dataset_configs.items():
-        if dataset_name not in all_bootstrap_results:
-            print(f"  SKIP {dataset_name}: not in precomputed fits")
-            continue
+        # Determine ClinVar mode
+        if not getattr(args, "no_clinvar_2018", False) and _gene_of(dataset_name) in GENES_2018:
+            # When auto-2018 is active, the _clinvar_2018 config entries are redundant:
+            # the base name entry already runs with clinvar_2018. Skip duplicates.
+            if dataset_name.endswith("_clinvar_2018"):
+                continue
+            clinvar_mode = "2018"
+            # Rename so output dir/files carry the _clinvar_2018 suffix
+            effective_dataset_name = f"{dataset_name}_clinvar_2018"
+            bootstrap_key = effective_dataset_name
+        else:
+            clinvar_mode = "default"
+            effective_dataset_name = dataset_name
+            bootstrap_key = dataset_name
+
+        if bootstrap_key not in all_bootstrap_results:
+            # Fall back to the plain name before skipping
+            if dataset_name in all_bootstrap_results:
+                bootstrap_key = dataset_name
+            else:
+                print(f"  SKIP {dataset_name}: not in precomputed fits "
+                      f"(tried '{bootstrap_key}')")
+                continue
 
         n_c, benign_method, overrides = parse_dataset_config(config_entry)
 
@@ -340,21 +389,36 @@ def main():
         if args.auto_select_model and n_c != "all":
             try:
                 test_result = bootstrap_paired_test(
-                    all_bootstrap_results[dataset_name], verbose=False
+                    all_bootstrap_results[bootstrap_key], verbose=False
                 )
                 n_c = f"{test_result['conservative_k']}c"
             except Exception:
                 pass  # fallback to config
 
+        # Skip if outputs already exist
+        if args.skip_existing:
+            components_to_check = ["2c", "3c"] if n_c == "all" else [n_c]
+            existing = [
+                c for c in components_to_check
+                if os.path.exists(os.path.join(
+                    args.output_dir, effective_dataset_name,
+                    f"{effective_dataset_name}_{c}_calibration.json"
+                ))
+            ]
+            if set(existing) == set(components_to_check):
+                print(f"  SKIP {effective_dataset_name}: output already exists ({', '.join(existing)})")
+                continue
+
         # Get splits for this dataset
         dataset_splits = None
-        if all_splits and dataset_name in all_splits:
-            dataset_splits = all_splits[dataset_name]
+        if all_splits and effective_dataset_name in all_splits:
+            dataset_splits = all_splits[effective_dataset_name]
 
         datasets_to_process.append((
-            dataset_name,
-            all_bootstrap_results[dataset_name],
+            effective_dataset_name,
+            all_bootstrap_results[bootstrap_key],
             n_c, benign_method, overrides, dataset_splits,
+            clinvar_mode,
         ))
 
     acmg_mapping_methods = (["tavtigian", "piecewise", "continuous", "strict_additive"]
@@ -369,7 +433,7 @@ def main():
     if args.n_jobs == 1:
         # Sequential processing
         idx = 0
-        for name, boot_results, n_c, benign, ovr, splits in datasets_to_process:
+        for name, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process:
             idx += 1
             for acmg_mapping_method in acmg_mapping_methods:
                 print(f"\n{'='*80}")
@@ -378,7 +442,8 @@ def main():
                 print(f"{'='*80}")
                 run_single_dataset(name, df, boot_results, n_c, benign, ovr, args, splits,
                                    acmg_mapping_method=acmg_mapping_method,
-                                   output_name_suffix=suffix(acmg_mapping_method))
+                                   output_name_suffix=suffix(acmg_mapping_method),
+                                   clinvar_mode=cv_mode)
     else:
         # Parallel dataset processing — scale inner jobs to avoid CPU oversubscription
         import multiprocessing
@@ -392,8 +457,9 @@ def main():
                 name, df, boot_results, n_c, benign, ovr, parallel_args, splits,
                 acmg_mapping_method=acmg_mapping_method,
                 output_name_suffix=suffix(acmg_mapping_method),
+                clinvar_mode=cv_mode,
             )
-            for name, boot_results, n_c, benign, ovr, splits in datasets_to_process
+            for name, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process
             for acmg_mapping_method in acmg_mapping_methods
         )
 

@@ -190,18 +190,29 @@ def prior_equation_2c(w_p, w_b, w_g):
 def prior_invalid(prior):
     return prior <= 0 or prior >= 1
 
-def get_fit_prior(fit, scoreset, benign_method, pathogenic_idx=0, benign_idx=1, gnomad_idx=2, synonymous_idx=3, **kwargs):
+def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, benign_idx=1, gnomad_idx=2, synonymous_idx=3,
+                  sample_assignments=None, **kwargs):
     if benign_idx is None:
         benign_idx = synonymous_idx
     if synonymous_idx is None:
         synonymous_idx = benign_idx
-    
+
     if benign_method == 'synonymous':
         benign_idx = synonymous_idx
-    
+
     params = fit['fit']['component_params']
     weights = fit['fit']['weights']
-    population = scoreset.scores[scoreset.sample_assignments[:,gnomad_idx]]
+
+    # Accept either a Scoreset object or pre-extracted (scores, sample_assignments) arrays.
+    # Passing raw numpy arrays avoids pickling the full Scoreset for every parallel task.
+    if sample_assignments is not None:
+        scores = scoreset_or_scores
+        sa = sample_assignments
+    else:
+        scores = scoreset_or_scores.scores
+        sa = scoreset_or_scores.sample_assignments
+
+    population = scores[sa[:, gnomad_idx]]
     # print(f"population: {len(population)} samples")
     
     pop_density = density_utils.joint_densities(

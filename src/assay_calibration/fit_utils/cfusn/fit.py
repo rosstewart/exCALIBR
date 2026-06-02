@@ -5,6 +5,7 @@ from .initializations import (
     kmeans_init_anchored,
 )
 from . import constraints
+from . import separation
 
 import numpy as np
 import logging
@@ -64,7 +65,18 @@ def single_fit(
     MIN_SCALE = 1e-100
     mv = multivariate
     latent_q = kwargs.get("latent_q", 2)
-    constraint_mode = kwargs.get("constraint_mode", "line")
+    constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
+
+    # Fail fast on deprecated 'line'/'marginal' modes (multivariate only); the
+    # univariate density-ratio constraint is retained and ignores the mode.
+    separation.validate_constraint_mode(constraint_mode, mv)
+    # Multivariate constrained fits induce non-overlap via the separation
+    # features (Bhattacharyya repulsion by default; optionally responsibility
+    # tempering) rather than a feasibility projection; this deliberately trades
+    # likelihood for separation, so the EM-monotonicity machinery (backtracking,
+    # final density check) is relaxed below.
+    separation_active = bool(constrained and mv)
+    sep_min_iters = separation.separation_min_iters(**kwargs)
 
     if kwargs.get("submerge_steps") is not None:
         raise NotImplementedError("submerge_steps is deprecated")
@@ -219,7 +231,7 @@ def single_fit(
         times_submerged = []
         if not constrained and check_submerged_duration:
             is_underwater = constraints.multicomponent_density_constraint_violated(
-                updated_component_params, xlims, multivariate=mv, mode=constraint_mode,
+                updated_component_params, xlims, multivariate=mv, mode="line",
             )
             if is_underwater:
                 underwater_time += 1
@@ -269,7 +281,12 @@ def single_fit(
 
             likelihoods = np.append(likelihoods, ll)
 
-            if it > 0 and likelihoods[-1] < likelihoods[-2]:
+            # Separation (tempering + repulsion) deliberately trades likelihood
+            # for non-overlap, so the penalised objective is not EM-monotone in
+            # the raw LL. Skip backtracking for separation fits and accept the
+            # decrease; convergence is governed by the LL plateau after the
+            # annealing schedule completes (see sep_min_iters guard below).
+            if it > 0 and likelihoods[-1] < likelihoods[-2] and not separation_active:
                 decrease = likelihoods[-2] - likelihoods[-1]
                 # Trigger backtracking only on a decrease that exceeds floating-
                 # point noise on the LL. The original 1e-13 absolute threshold
@@ -317,7 +334,11 @@ def single_fit(
                 pbar.set_postfix({"likelihood": f"{likelihoods[-1]:.6f}"})
                 pbar.update(1)
 
-            if kwargs.get("early_stopping", True) and it >= 1:
+            # Don't converge before the tempering schedule has finished annealing
+            # — early LL plateaus during warmup would stop the fit before
+            # separation pressure is applied.
+            allow_early_stop = not (separation_active and it < sep_min_iters)
+            if kwargs.get("early_stopping", True) and it >= 1 and allow_early_stop:
                 # Suppress invalid-subtract warning when both LLs are -inf
                 # (NaN propagates harmlessly: NaN < 1e-8 → False, no break;
                 # the np.isnan(likelihoods).any() guard above will trip on
@@ -332,7 +353,7 @@ def single_fit(
 
         if not constrained and check_submerged_duration:
             violated = constraints.multicomponent_density_constraint_violated(
-                updated_component_params, xlims, multivariate=mv, mode=constraint_mode,
+                updated_component_params, xlims, multivariate=mv, mode="line",
             )
             if is_underwater and not violated:
                 times_submerged.append(underwater_time)
@@ -342,9 +363,12 @@ def single_fit(
         ))
         if verbose:
             pbar.close()
-        if constrained and constraints.multicomponent_density_constraint_violated(
-            updated_component_params, xlims, multivariate=mv, mode=constraint_mode,
-        ):
+        # The final density-ratio check applies only to the retained univariate
+        # constraint; multivariate separation does not use a density constraint.
+        if constrained and not separation_active and \
+                constraints.multicomponent_density_constraint_violated(
+                    updated_component_params, xlims, multivariate=mv,
+                ):
             raise ValueError("Final parameters violate density constraint")
 
     except (ValueError, ZeroDivisionError) as e:

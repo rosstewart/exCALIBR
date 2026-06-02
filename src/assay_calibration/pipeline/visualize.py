@@ -260,15 +260,19 @@ def process_component_fits(
     else:
         # Compute priors - PASS ALL INDICES
         if not config.use_2c_equation or n_c != 2:
-            # Use EM estimation
+            # Pre-extract arrays so loky memory-maps them rather than pickling
+            # the full Scoreset object once per task.
+            scores_arr = np.asarray(scoreset.scores)
+            sa_arr = np.asarray(scoreset.sample_assignments)
             n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
             fit_priors = np.array(Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
                 delayed(get_fit_prior)(
-                    fit, scoreset, config.benign_method,
+                    fit, scores_arr, config.benign_method,
                     pathogenic_idx=pathogenic_idx,
                     benign_idx=benign_idx,
                     gnomad_idx=gnomad_idx,
-                    synonymous_idx=synonymous_idx
+                    synonymous_idx=synonymous_idx,
+                    sample_assignments=sa_arr,
                 )
                 for fit in fits
             ))

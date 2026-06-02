@@ -668,7 +668,7 @@ def plot_scores_only(dataset, scoreset):
             if ax_fit.patches else 1.0
         )
 
-        label = scoreset.sample_names[sample_num].replace('population', 'gnomAD')
+        label = scoreset.sample_names[sample_num]#.replace('population', 'gnomAD')
         ax_fit.set_title(f"{label}\n(n={n:,d})")
         ax_fit.set_xlabel("Score")
         ax_fit.set_ylabel("Density")
