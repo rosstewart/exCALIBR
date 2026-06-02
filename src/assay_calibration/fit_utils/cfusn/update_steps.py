@@ -21,6 +21,7 @@ References:
 """
 
 from . import density_utils
+from . import separation
 from .constraints import (
     multicomponent_density_constraint_violated,
     build_constraint_grids,
@@ -1062,6 +1063,19 @@ def verify_binary_search_result(
 # EM iteration — unified (supports q=1 and q>1)
 # ══════════════════════════════════════════════
 
+def resolve_separation_config(constrained, multivariate, constraint_mode):
+    """Separation feature config for a fit, or None when not applicable.
+
+    Returns ``None`` for unconstrained fits and for univariate constrained
+    fits (which keep the 1-D density-ratio constraint). For multivariate
+    constrained fits returns ``{"tempering", "repulsion", "mode"}`` and raises
+    on the deprecated 'line'/'marginal' modes.
+    """
+    if not (constrained and multivariate):
+        return None
+    return separation.resolve_constraint_mode(constraint_mode)
+
+
 def em_iteration(observations, sample_indicators, current_component_params,
                  current_weights, constrained, xlims, multivariate=False,
                  cached_log_pdfs=None, return_log_pdfs=False, **kwargs):
@@ -1087,14 +1101,21 @@ def em_iteration(observations, sample_indicators, current_component_params,
         forward as ``cached_log_pdfs`` for the next iteration.
     """
     mv = multivariate
-    constraint_mode = kwargs.get("constraint_mode", "line")
-    if constrained and multicomponent_density_constraint_violated(
-        current_component_params, xlims, multivariate=mv, mode=constraint_mode
+    constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
+
+    # Multivariate constrained fits use the separation features (responsibility
+    # tempering + Bhattacharyya repulsion); the deprecated 'line'/'marginal'
+    # density-ratio modes raise here. Univariate constrained fits retain the
+    # working 1-D density-ratio constraint (binary search), unaffected by mode.
+    sep_cfg = resolve_separation_config(constrained, mv, constraint_mode)
+
+    if constrained and not mv and multicomponent_density_constraint_violated(
+        current_component_params, xlims, multivariate=False
     ):
         import warnings
         warnings.warn(
             f"density constraint violated at start of em iteration "
-            f"{kwargs.get('iterNum', -1)} (constraint_mode={constraint_mode!r}); "
+            f"{kwargs.get('iterNum', -1)}; "
             "continuing — per-component line search will attempt to restore it"
         )
 
@@ -1108,23 +1129,44 @@ def em_iteration(observations, sample_indicators, current_component_params,
         multivariate=mv, cached_log_pdfs=cached_log_pdfs,
     )
 
+    # (1) Responsibility tempering — sharpen before the M-step.
+    if sep_cfg is not None and sep_cfg["tempering"]:
+        beta = separation.tempering_beta(kwargs.get("iterNum", 0), **kwargs)
+        responsibilities = separation.apply_responsibility_tempering(
+            responsibilities, beta
+        )
+
+    # The legacy per-component density line-search runs only for the retained
+    # univariate constraint; MV separation disables it (sep_cfg is not None).
+    mstep_constrained = constrained and sep_cfg is None
+    # Stabilisers (covariance ridge + low-mass freeze) guard against the
+    # degeneracy that responsibility sharpening exacerbates.
+    kwargs["_stabilize_separation"] = sep_cfg is not None
+
     if not mv:
         updated_params = _em_update_univariate(
             observations, responsibilities, current_component_params,
-            constrained, xlims, K, **kwargs
+            mstep_constrained, xlims, K, **kwargs
         )
     else:
         q = density_utils.get_q(current_component_params)
         if q > 1:
             updated_params = _em_update_cfusn(
                 observations, responsibilities, current_component_params,
-                constrained, xlims, K, q=q, **kwargs
+                mstep_constrained, xlims, K, q=q, **kwargs
             )
         else:
             updated_params = _em_update_multivariate(
                 observations, responsibilities, current_component_params,
-                constrained, xlims, K, **kwargs
+                mstep_constrained, xlims, K, **kwargs
             )
+
+    # (2) Bhattacharyya repulsion — push overlapping components apart in joint
+    # space after the closed-form M-step.
+    if sep_cfg is not None and sep_cfg["repulsion"]:
+        updated_params = separation.bhattacharyya_repulsion_step(
+            updated_params, xlims, multivariate=mv, **kwargs
+        )
 
     sw = kwargs.get("sample_weights", None)
     if return_log_pdfs:
@@ -1195,10 +1237,19 @@ def _em_update_multivariate(
     component_params in alternate form: (mu, Delta_vec, Gamma_mat).
     """
     sample_weights = kwargs.get("sample_weights", None)
+    stabilize = kwargs.get("_stabilize_separation", False)
+    min_mass = separation.min_component_mass(**kwargs) if stabilize else 0.0
     updated = [None] * K
     for c in range(K):
         z = responsibilities[c]
         mu_old, Delta_old, Gamma_old = current_component_params[c]
+
+        # Low-mass freeze (see _em_update_cfusn).
+        if stabilize:
+            z_mass = float((z if sample_weights is None else z * sample_weights).sum())
+            if z_mass < min_mass:
+                updated[c] = (mu_old, Delta_old, Gamma_old)
+                continue
 
         mu_cand = get_location_update_mv(observations, z, mu_old, Delta_old, Gamma_old,
                                          sample_weights=sample_weights)
@@ -1209,9 +1260,19 @@ def _em_update_multivariate(
             sample_weights=sample_weights,
         )
 
+        if stabilize:
+            Gamma_cand = separation.regularize_gamma(Gamma_cand, xlims, **kwargs)
+
         eigvals = np.linalg.eigvalsh(Gamma_cand)
         if eigvals.min() < 1e-8:
             Gamma_cand += (1e-8 - eigvals.min()) * np.eye(Gamma_cand.shape[0])
+
+        # Sanity guard against Δ blowups (see _em_update_cfusn).
+        if stabilize and not separation.params_sane(
+            mu_cand, Delta_cand, Gamma_cand, xlims, **kwargs
+        ):
+            updated[c] = (mu_old, Delta_old, Gamma_old)
+            continue
 
         if constrained:
             try:
@@ -1264,12 +1325,23 @@ def _em_update_cfusn(
     """
     n_mc = kwargs.get("n_mc_truncated", 500)
     sample_weights = kwargs.get("sample_weights", None)
+    stabilize = kwargs.get("_stabilize_separation", False)
+    min_mass = separation.min_component_mass(**kwargs) if stabilize else 0.0
     updated = [None] * K
 
     for c in range(K):
         z = responsibilities[c]  # (N,)
         mu_old, Delta_old, Gamma_old = current_component_params[c]
         Delta_old = density_utils._ensure_matrix_delta(Delta_old)
+
+        # Low-mass freeze: a component that has lost (almost) all of its
+        # responsibility mass has an ill-defined mean — keep it put rather than
+        # letting the M-step send it to a degenerate spike outside the data.
+        if stabilize:
+            z_mass = float((z if sample_weights is None else z * sample_weights).sum())
+            if z_mass < min_mass:
+                updated[c] = (mu_old, Delta_old, Gamma_old)
+                continue
 
         rng = np.random.RandomState(kwargs.get("iterNum", 0) * K + c)
 
@@ -1288,10 +1360,24 @@ def _em_update_cfusn(
         Gamma_cand = get_Gamma_update_cfusn(mu_cand, Delta_cand, observations, z, eta, Psi,
                                             sample_weights=sample_weights)
 
+        # Covariance ridge: floor the scale so a sharpened component can't
+        # collapse to a near-degenerate spike.
+        if stabilize:
+            Gamma_cand = separation.regularize_gamma(Gamma_cand, xlims, **kwargs)
+
         # Enforce positive-definiteness of Gamma
         eigvals = np.linalg.eigvalsh(Gamma_cand)
         if eigvals.min() < 1e-8:
             Gamma_cand += (1e-8 - eigvals.min()) * np.eye(Gamma_cand.shape[0])
+
+        # Sanity guard: a degenerate per-component moment matrix can drive the
+        # Δ solve to extreme values (centroid flung to ~1e9). Reject such a
+        # candidate and keep the previous params for this component.
+        if stabilize and not separation.params_sane(
+            mu_cand, Delta_cand, Gamma_cand, xlims, **kwargs
+        ):
+            updated[c] = (mu_old, Delta_old, Gamma_old)
+            continue
 
         # Constraint enforcement via line search
         if constrained:

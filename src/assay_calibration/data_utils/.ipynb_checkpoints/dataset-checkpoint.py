@@ -7,6 +7,8 @@ import logging
 from io import StringIO
 from tqdm import tqdm
 import json
+from joblib import Parallel, delayed  # noqa: F401
+from typing import Union
 
 logging.basicConfig()
 logging.root.setLevel(logging.NOTSET)
@@ -14,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class PillarProjectDataframe:
-    def __init__(self, data_path: Path | str):
+    def __init__(self, data_path: Union[Path, str]):
         self.data_path = Path(data_path)
         self.init_data()
 
@@ -214,14 +216,29 @@ def standardize_auth_label(
 
 
 class BasicScoreset:
-    def __init__(self, scores: np.ndarray, sample_assignments: np.ndarray,**kwargs):
-        self.scores = scores
-        self._sample_assignments = sample_assignments
+    def __init__(self, scores, sample_assignments, ids=None, **kwargs):
+        self.scores = np.asarray(scores)
+        self._sample_assignments = np.asarray(sample_assignments)
+        if ids is not None:
+            ids = np.asarray(list(ids))
+            if len(ids) != len(self.scores):
+                raise ValueError(
+                    f"ids length {len(ids)} does not match scores length "
+                    f"{len(self.scores)}"
+                )
+        self._ids = ids
         self.validate_inputs()
         self.validate_sample_assignments()
         self.sample_counts = self._sample_assignments.sum(axis=0)
         self.scoreset_name = kwargs.get("scoreset_name", "BasicScoreset")
-        self.sample_names = kwargs.get("sample_names",["Pathogenic/Likely Pathogenic","Benign/Likely Benign","gnomAD","Synonymous"])[:self.n_samples]
+        _default_names_4 = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD", "Synonymous"]
+        _default_names_3 = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD"]
+        if "sample_names" in kwargs:
+            self.sample_names = kwargs["sample_names"]
+        elif self.n_samples == 3:
+            self.sample_names = _default_names_3
+        else:
+            self.sample_names = _default_names_4[:self.n_samples]
 
     def validate_inputs(self):
         n_observations = self.scores.shape[0]
@@ -233,16 +250,29 @@ class BasicScoreset:
     def validate_sample_assignments(self):
         ndim = self._sample_assignments.ndim
         if ndim == 1:
-            print(
-                "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."
-            )
-            sample_ids = np.array(self._sample_assignments)
-            unique_samples = list(set(sample_ids))
-            self._sample_assignments = np.zeros(
-                (len(sample_ids), len(unique_samples)), dtype=bool
-            )
-            for sampleNum, sample_id in enumerate(unique_samples):
-                self._sample_assignments[:, sampleNum] = sample_ids == sample_id
+            sample_vals = np.array(self._sample_assignments)
+            if sample_vals.dtype.kind in ('U', 'O'):
+                # print(
+                #     "Assuming sample_assignments is list of comma-separated strings"
+                # )
+                # Always split on comma — single values like "2" split fine into ["2"]
+                all_keys = sorted({k for v in sample_vals for k in str(v).split(',')})
+                key_to_idx = {k: i for i, k in enumerate(all_keys)}
+                result = np.zeros((len(sample_vals), len(all_keys)), dtype=bool)
+                for row, v in enumerate(sample_vals):
+                    for k in str(v).split(','):
+                        result[row, key_to_idx[k]] = True
+                self._sample_assignments = result
+            else:
+                # print(
+                #     "Assuming sample_assignments is a list of sample identifiers, converting to 2D array."
+                # )
+                unique_samples = sorted(set(sample_vals))
+                self._sample_assignments = np.zeros(
+                    (len(sample_vals), len(unique_samples)), dtype=bool
+                )
+                for sampleNum, sample_id in enumerate(unique_samples):
+                    self._sample_assignments[:, sampleNum] = sample_vals == sample_id
         elif ndim != 2:
             raise ValueError(
                 f"sample_assignments must be a 1D list of sample ids or 2D array of one-hot vectors, got {ndim} dimensions"
@@ -255,6 +285,10 @@ class BasicScoreset:
     @property
     def n_samples(self):
         return self._sample_assignments.shape[1]
+
+    @property
+    def ids(self):
+        return self._ids
 
     @property
     def samples(self):
@@ -276,7 +310,7 @@ class BasicScoreset:
     #             yield sample_scores, f"Sample {sample_index + 1}"
 
     @classmethod
-    def from_csv(cls, csv_path: Path | str, **kwargs):
+    def from_csv(cls, csv_path: Union[Path, str], **kwargs):
         """
         Create a BasicScoreset from a CSV file.
 
@@ -315,12 +349,12 @@ class Scoreset:
 
         Optional Arg:
         - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-        - clinvar_release : str in {'2025','2018'} (default '2025') : Clinvar release to use
+        - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
         """
         self._init_kwargs = dict(kwargs)
         self._init_dataframe(dataframe, **kwargs)
 
-    def to_json(self, output_path: Path | str):
+    def to_json(self, output_path: Union[Path, str]):
         """
         Save the scoreset to a JSON file.
 
@@ -337,6 +371,33 @@ class Scoreset:
         if not output_path.parent.exists():
             output_path.parent.mkdir(parents=True, exist_ok=True)
         self.dataframe.to_json(output_path, orient="records", lines=True)
+
+    def to_csv(self, output_path: Union[Path, str]):
+        """
+        Save the scoreset to a simple output CSV.
+
+        Parameters
+        ----------
+        output_path : Path|str
+            The path to save the CSV file to
+
+        Returns
+        -------
+        None
+        """
+        output_path = Path(output_path)
+        if not output_path.parent.exists():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        rows, cols = np.where(self.sample_assignments)
+        sample_assignments_str = [
+            ",".join(map(str, cols[rows == i])) 
+            for i in range(self.sample_assignments.shape[0])
+        ]
+
+        output_df = pd.DataFrame({"score": self.scores, "sample": sample_assignments_str})
+        
+        output_df.to_csv(output_path, index=False)
 
     @classmethod
     def from_dataframe(cls, dataframe: pd.DataFrame, **kwargs):
@@ -356,7 +417,7 @@ class Scoreset:
         return cls(dataframe, **kwargs)
 
     @classmethod
-    def from_json(cls, json_path: Path | str, **kwargs):
+    def from_json(cls, json_path: Union[Path, str], **kwargs):
         """
         Create a Scoreset from a JSON or JSONL file.
     
@@ -415,7 +476,7 @@ class Scoreset:
 
         Optional Arg:
             - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-            - clinvar_release : str in {'2025','2018'} (default '2025') : Clinvar release to use
+            - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
         Returns
         -------
         None
@@ -426,31 +487,59 @@ class Scoreset:
             raise ValueError("dataframe must contain only one dataset")
         if not len(dataframe):
             raise ValueError("dataframe must contain at least one row")
-        # drop rows with NaN in auth_reported_score
+                
+        self.score_col = kwargs.get("score_col", "auth_reported_score")
+        
+        score_col = self.score_col
+        
+        # ensure numeric conversion
         dataframe = dataframe.assign(
-            auth_reported_score=pd.to_numeric(
-                dataframe.auth_reported_score, errors="coerce"
-            )
+            **{
+                score_col: pd.to_numeric(dataframe[score_col], errors="coerce")
+            }
         )
-        dataframe = dataframe.dropna(subset=["auth_reported_score"])
+        
+        # drop NaNs in chosen score column
+        dataframe = dataframe.dropna(subset=[score_col])
+        
+        # (this does nothing by default)
         dataframe = Scoreset.remove_outliers(dataframe, **kwargs)
+        
         if not len(dataframe):
             raise ValueError(
-                "dataframe must contain at least one row with a non-NaN auth_reported_score"
+                f"dataframe must contain at least one row with a non-NaN {score_col}"
             )
         self.dataframe = dataframe
         self.filter_nonsense = kwargs.get("filter_nonsense",False)
         self.filter_invalid()
         self.splicing_filter(**kwargs)
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
-        clinvar_release = kwargs.get("clinvar_release",'2025')
-        self.variants = [Variant(row,min_clinvar_star,clinvar_release) for _, row in self.dataframe.iterrows()]
+        clinvar_release = kwargs.get("clinvar_release",'2026')
+        n_jobs = kwargs.get("n_jobs", 1)
+        rows = self.dataframe.to_dict('records')
+        if n_jobs == 1:
+            self.variants = [
+                Variant(row, min_clinvar_star, clinvar_release, score_col)
+                for row in rows
+            ]
+        else:
+            self.variants = Parallel(n_jobs=n_jobs, prefer='threads')(
+                delayed(Variant)(row, min_clinvar_star, clinvar_release, score_col)
+                for row in rows
+            )
         self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
-        self.score_avg = kwargs.get("score_avg",False)
+        self.score_avg = kwargs.get("score_avg",True)
+
+        # for discordance and downsampling analyses
+        self.discordance_pct = kwargs.get("discordance_pct",0.0)
+        self.downsample_n_variants = kwargs.get("downsample_n_variants",None)
+        self.downsample_seed = kwargs.get("downsample_seed",None)
+        
         self._init_matrices(**kwargs)
 
     def filter_invalid(self):
-        self.dataframe = self.dataframe[self.dataframe.Flag != "*"]
+        if "Flag" in self.dataframe.columns:
+            self.dataframe = self.dataframe[self.dataframe["Flag"].ne("*")]
 
         if self.filter_nonsense:
             # print('filtering nonsense variants within 50 aa of termini...')
@@ -468,19 +557,22 @@ class Scoreset:
         self.detects_splice = (
             self.dataframe.loc[:, "splice_measure"].unique()[0] == "Yes"  # type: ignore
         )
+        # if assay does not detect effects of splicing, remove likely splicing aberrations
         if not self.detects_splice:
+            # Remove VEP (mapped/unmapped) consequences
             self.dataframe = self.dataframe[
-                self.dataframe.simplified_consequence.str.lower() != "splice region"
+                ~self.dataframe.simplified_consequence.str.lower().isin([
+                    "splice region",
+                    "splice_site_variant",
+                    "splice_acceptor_variant",
+                    "splice_donor_variant",
+                ])
             ]
-            self.dataframe = self.dataframe[
-                self.dataframe.simplified_consequence.str.lower() != "splice_site_variant"
-            ]
-            self.dataframe = self.dataframe[
-                (self.dataframe["spliceAI_DS_AG"] < 0.2) &
-                (self.dataframe["spliceAI_DS_AL"] < 0.2) &
-                (self.dataframe["spliceAI_DS_DG"] < 0.2) &
-                (self.dataframe["spliceAI_DS_DL"] < 0.2)
-            ]
+            
+            # Remove SpliceAI scores
+            spliceai_cols = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
+            mask = self.dataframe[spliceai_cols].lt(0.2) | self.dataframe[spliceai_cols].isna()
+            self.dataframe = self.dataframe[mask.all(axis=1)]
 
     @staticmethod
     def remove_outliers(dataframe, **kwargs):
@@ -502,11 +594,12 @@ class Scoreset:
         pd.DataFrame
             The dataframe with outliers removed (1.5 IQR Rule)
         """
+        score_col = kwargs.get("score_col", "auth_reported_score")
         quantile_min = kwargs.get("quantile_min", 0.0)
         quantile_max = kwargs.get("quantile_max", 1.0)
-        lowerbound = dataframe.auth_reported_score.quantile(quantile_min)
-        upperbound = dataframe.auth_reported_score.quantile(quantile_max)
-        scores = dataframe.auth_reported_score
+        lowerbound = dataframe[score_col].quantile(quantile_min)
+        upperbound = dataframe[score_col].quantile(quantile_max)
+        scores = dataframe[score_col]
         include = (scores >= lowerbound) & (scores <= upperbound)
         return dataframe[include]
 
@@ -525,7 +618,6 @@ class Scoreset:
         
         """
         self.has_synomyous = any([variant.is_synonymous for variant in self.variants])
-        # if self.has_synomyous:
         self.NSamples = 4
         self.sample_names = [
             "Pathogenic/Likely Pathogenic",
@@ -533,13 +625,6 @@ class Scoreset:
             "population",
             "Synonymous",
         ]
-        # else:
-        #     self.NSamples = 3
-        #     self.sample_names = [
-        #         "Pathogenic/Likely Pathogenic",
-        #         "Benign/Likely Benign",
-        #         "population",
-        #     ]
         variants_by_id = self.get_variants_by_id()
         self.n_variants = len(variants_by_id)
         self._sample_assignments = np.zeros(
@@ -555,43 +640,75 @@ class Scoreset:
         self._ids = []
         self.parse_population_type(**kwargs)
         group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
+        is_pop = self.is_population_member  # avoid repeated self-lookup in tight loop
         for idx, (_id, variants) in enumerate(variants_by_id.items()):
 
-                
             self._ids.append(_id)
 
+            v0 = variants[0]
             if self.score_avg:
-                variants[0].auth_reported_score = np.mean([v.auth_reported_score for v in variants])
-            
-            self._scores[idx] = variants[0].auth_reported_score
-            self._auth_labels[idx] = variants[0].auth_label
-            if variants[0].is_snv:
-                self._snv_scores.append(variants[0].auth_reported_score)
-            self._all_scores.append(variants[0].auth_reported_score)
-            
-            if any([variant.is_vus for variant in variants]):
-                self._vus_scores.append(variants[0].auth_reported_score)
-            
+                v0.assay_score = np.mean([v.assay_score for v in variants])
+
+            score0 = v0.assay_score
+            self._scores[idx] = score0
+            self._auth_labels[idx] = v0.auth_label
+            if v0.is_snv:
+                self._snv_scores.append(score0)
+            self._all_scores.append(score0)
+
+            if any(v.is_vus for v in variants):
+                self._vus_scores.append(score0)
+
             try:
-                self._aa_subs[idx] = variants[0].aa_ref + str(int(variants[0].aa_pos)) + variants[0].aa_alt
+                self._aa_subs[idx] = v0.aa_ref + str(int(v0.aa_pos)) + v0.aa_alt
             except (ValueError, TypeError):
                 self._aa_subs[idx] = None
 
-            
-            try:
-                self._variant_codes.append([getattr(variants[0], group) for group in group_cols])
-            except (ValueError, TypeError):
-                self._variant_codes.append(None)
-            
-            if any([variant.is_synonymous for variant in variants]):
+            # Store ALL unique nucleotide-level group_col tuples for this
+            # variant group (not just v0).  Protein-level assays
+            # group many nucleotide substitutions under a single protein-level
+            # ID; saving all of them allows MultiScoreset to match this entry
+            # against any of the underlying nucleotide variants in other assays.
+            seen_codes: set = set()
+            codes = []
+            for v in variants:
+                chrom = getattr(v, 'Chrom', None)
+                pos = getattr(v, 'hg38_start', None)
+                ref = getattr(v, 'ref_allele', None)
+                alt = getattr(v, 'alt_allele', None)
+                use_genomic = all(
+                    x is not None and not (isinstance(x, float) and pd.isna(x))
+                    for x in (chrom, pos, ref, alt)
+                )
+                if use_genomic:
+                    try:
+                        code = tuple(getattr(v, g) for g in group_cols)
+                        if code not in seen_codes:
+                            seen_codes.add(code)
+                            codes.append(code)
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    hgvs_c = getattr(v, 'hgvs_c', None)
+                    if isinstance(hgvs_c, str):
+                        for hgvs in hgvs_c.split('|'):
+                            hgvs = hgvs.strip()
+                            if hgvs:
+                                code_key = (hgvs,)
+                                if code_key not in seen_codes:
+                                    seen_codes.add(code_key)
+                                    codes.append(code_key)
+            self._variant_codes.append(codes if codes else None)
+
+            if any(v.is_synonymous for v in variants):
                 self._sample_assignments[idx, 3] = True
                 if self.synonymous_exclusive:
                     continue
-            if any([self.is_population_member(variant) for variant in variants]):
+            if any(is_pop(v) for v in variants):
                 self._sample_assignments[idx, 2] = True
-            if any([variant.is_pathogenic for variant in variants]):
+            if any(v.is_pathogenic for v in variants):
                 self._sample_assignments[idx, 0] = True
-            if any([variant.is_benign for variant in variants]):
+            if any(v.is_benign for v in variants):
                 self._sample_assignments[idx, 1] = True
         
         keep_mask = self._sample_assignments.any(axis=1)
@@ -599,11 +716,82 @@ class Scoreset:
         self._scores = self.scores[keep_mask]
         self._sample_assignments = self._sample_assignments[keep_mask]
         self._auth_labels = self._auth_labels[keep_mask]
+        self._aa_subs = self._aa_subs[keep_mask]
+
+        
+        if self.discordance_pct != 0:
+            self._sample_assignments = self.add_label_noise(self._sample_assignments, self.discordance_pct)
+        
+        if self.downsample_n_variants is not None:
+            keep_mask_downsample = self.downsample_controls(self._sample_assignments, self.downsample_n_variants, self.downsample_seed)
+            self._keep_mask_downsample = keep_mask_downsample
+            self._scores = self._scores[keep_mask_downsample]
+            self._sample_assignments = self._sample_assignments[keep_mask_downsample]
+            self._auth_labels = self._auth_labels[keep_mask_downsample]
+            self._aa_subs = self._aa_subs[keep_mask_downsample]
+
         self.n_variants = len(self._scores)
         self.sample_counts = self._sample_assignments.sum(axis=0)
         self._snv_scores = np.array(self._snv_scores)
         self._vus_scores = np.array(self._vus_scores)
         self._all_scores = np.array(self._all_scores)
+
+    
+
+    def add_label_noise(self, sample_assignments, discordance_pct):
+        """
+        Introduces label noise by overwriting a discordance_pct fraction of pathogenic
+        (col 0) rows with randomly sampled benign rows, and vice versa. Each class is
+        treated independently, so 1% discordance means exactly 1% of P and 1% of B
+        are affected. Sampling is done from the original assignments to avoid
+        order-dependency. Seed is deterministic based on discordance_pct.
+        """
+        assert 0 <= discordance_pct <= 0.5, (
+            f"discordance_pct must be between 0 and 0.5 inclusive, got {discordance_pct}"
+        )
+        rng = np.random.default_rng(seed=int(discordance_pct * 1e6))
+        assignments = sample_assignments.copy()
+    
+        path_idx = np.where(assignments[:, 0])[0]
+        ben_idx  = np.where(assignments[:, 1])[0]
+    
+        n_path_flip = int(discordance_pct * len(path_idx))
+        n_ben_flip  = int(discordance_pct * len(ben_idx))
+    
+        # Overwrite P->B: selected pathogenic rows get a randomly sampled benign row
+        flip_path = rng.choice(path_idx, size=n_path_flip, replace=False)
+        src_ben   = rng.choice(ben_idx,  size=n_path_flip, replace=True)
+        assignments[flip_path] = sample_assignments[src_ben]
+    
+        # Overwrite B->P: selected benign rows get a randomly sampled pathogenic row
+        flip_ben  = rng.choice(ben_idx,  size=n_ben_flip,  replace=False)
+        src_path  = rng.choice(path_idx, size=n_ben_flip,  replace=True)
+        assignments[flip_ben] = sample_assignments[src_path]
+    
+        return assignments
+
+
+    def downsample_controls(self, sample_assignments, downsample_n_variants, downsample_seed):
+        """
+        Downsample pathogenic (col 0) and benign (col 1) variants each to at most
+        downsample_n_variants, keeping all non-control rows intact.
+        Returns a boolean keep mask over the input arrays.
+        Seed is deterministic based on downsample_seed.
+        """
+        assert downsample_seed is not None, f"downsample_seed must be set to enforce multiple reproducible runs"
+        
+        rng = np.random.default_rng(seed=int(downsample_seed))
+        keep = np.ones(len(sample_assignments), dtype=bool)
+    
+        for col in (0, 1):          # 0 = pathogenic, 1 = benign
+            idx = np.where(sample_assignments[:, col])[0]
+            if len(idx) > downsample_n_variants:
+                drop = rng.choice(idx, size=len(idx) - downsample_n_variants, replace=False)
+                keep[drop] = False
+    
+        return keep
+    
+    
 
     def parse_population_type(self,**kwargs):
         population_type = kwargs.get("population_type",'gnomAD')
@@ -621,17 +809,17 @@ class Scoreset:
         if self.population_type == "all_variants":
             return True
         if self.population_type == "all_nsSNV":
-            return variant.is_nsSNV
+            return variant.is_snv#is_nsSNV
         if self.population_type == "all_missense_nsSNV":
-            return variant.simplified_consequence == "missense_variant" and variant.is_nsSNV
+            return variant.is_missense and variant.is_snv
         if self.population_type == "gnomAD":
             return variant.is_gnomAD
         if self.population_type == "gnomAD_nsSNV":
-            return variant.is_gnomAD and variant.is_nsSNV
+            return variant.is_gnomAD and variant.is_snv
         if self.population_type == "gnomAD_missense_nsSNV":
             return variant.is_gnomAD and \
-                variant.is_nsSNV and \
-                variant.simplified_consequence == "missense_variant"
+                variant.is_snv and \
+                variant.is_missense
         return False
         
 
@@ -645,10 +833,9 @@ class Scoreset:
             A dictionary where keys are unique Variant.ID values and values are lists of Variant objects with that ID
         """
         variants_by_id = {}
-        for variant_id in set(variant.ID for variant in self.variants):
-            variants_by_id[variant_id] = [
-                variant for variant in self.variants if variant.ID == variant_id
-            ]
+        for variant in self.variants:
+            key = getattr(variant, "mavedb_variant_urn", None) or variant.ID
+            variants_by_id.setdefault(key, []).append(variant)
         return variants_by_id
 
     @property
@@ -708,7 +895,7 @@ class Scoreset:
         return self._keep_mask
 
     def __repr__(self):
-        out = f"{self.scoreset_name}: {len(self)} total variants\n"
+        out = f"{self.scoreset_name}: {len(self.scores)} total variants\n"
         for sample_scores, sample_name in self.samples:
             out += f"\t{sample_name}: {len(sample_scores)} variants\n"
 
@@ -730,27 +917,28 @@ class Scoreset:
 
 
 class Variant:
-    def __init__(self, variant_info: pd.Series, min_clinvar_star: int, clinvar_release: str):
+    def __init__(self, variant_info, min_clinvar_star: int, clinvar_release: str, score_col: str):
         self.min_clinvar_star = min_clinvar_star
         self.clinvar_release = clinvar_release
-        self.row = variant_info
-        self._init_variant_info(variant_info)
+        self.score_col = score_col
+        # Accept both pd.Series and plain dict (dict is faster from to_dict('records'))
+        self.row = variant_info if isinstance(variant_info, dict) else dict(variant_info)
+        self._init_variant_info(self.row, score_col)
 
-    def _init_variant_info(self, variant_info: pd.Series):
+    def _init_variant_info(self, variant_info, score_col: str):
         self.ID = None
         self.simplified_consequence = None
         self.clinvar_star = None
         self.gnomad_MAF = None
-        self.auth_reported_score = None
+        self.assay_score = variant_info[score_col]
         self.transcript_ref = ""
         self.transcript_alt = ""
         self.aa_ref = np.nan
         self.aa_alt = ""
         self.hgvs_p = ""
-        for k, v in variant_info.items():
-            setattr(self, str(k), v)
-        self.clinvar_sig = getattr(variant_info,f"clinvar_sig_{self.clinvar_release}")
-        self.clinvar_star = getattr(variant_info,f"clinvar_star_{self.clinvar_release}")
+        self.__dict__.update({str(k): v for k, v in variant_info.items()})
+        self.clinvar_sig = variant_info[f"clinvar_sig_{self.clinvar_release}"]
+        self.clinvar_star = variant_info[f"clinvar_star_{self.clinvar_release}"]
         self.parse_gnomAD_MAF()
         self.parse_clinvar_sig()
         self.parse_consequences()
@@ -765,10 +953,10 @@ class Variant:
                          (self.aa_ref != self.aa_alt))
 
     def parse_consequences(self):
-        self.is_synonymous = (self.simplified_consequence == "Synonymous") or (
+        self.is_synonymous = (self.simplified_consequence.lower() == "synonymous") or (
             self.simplified_consequence == "synonymous_variant"
         )
-        self.is_missense = self.simplified_consequence == 'missense_variant'
+        self.is_missense = (self.simplified_consequence == 'missense_variant') or (self.simplified_consequence.lower() == 'missense')
         self.is_snv = len(str(self.ref_allele)) == 1 and len(str(self.alt_allele)) == 1 and str(self.ref_allele) != str(self.alt_allele)
 
     def parse_clinvar_sig(self):
@@ -787,7 +975,7 @@ class Variant:
             "Likely pathogenic",
             "Pathogenic/Likely pathogenic",
         }
-        self.is_vus = self.sufficient_quality_2025 and self.clinvar_sig_2025 in { # VUS ALWAYS 2025 SINCE NOT CONTROL
+        self.is_vus = self.sufficient_quality_2026 and self.clinvar_sig_2026 in { # VUS ALWAYS 2026 SINCE NOT CONTROL
             "Uncertain significance",
         }
 
@@ -854,19 +1042,19 @@ class Variant:
         }
         if self.min_clinvar_star == 0:
             self.sufficient_quality = True
-            self.sufficient_quality_2025 = True
+            self.sufficient_quality_2026 = True
         elif self.min_clinvar_star == 1:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses
         elif self.min_clinvar_star == 2:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status)
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status)
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status)
         elif self.min_clinvar_star == 3:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
         elif self.min_clinvar_star == 4:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
-            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
+            self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
         else:
             raise ValueError(f"Invalid min_clinvar_star value {self.min_clinvar_star}")
 
@@ -878,7 +1066,7 @@ class Variant:
 
     @property
     def score(self):
-        return self.auth_reported_score
+        return self.assay_score
 
     @staticmethod
     def is_nan(value):
@@ -917,6 +1105,10 @@ def summarize_datasets(dataframe_path, **kwargs):
             missense_only=kwargs.get("missense_only", False),
             synonymous_exclusive=kwargs.get("synonymous_exclusive", False),
             score_avg=kwargs.get("score_avg", False),
+            score_col=kwargs.get("score_col", "auth_reported_score"),
+            discordance_pct = kwargs.get("discordance_pct",0.0),
+            downsample_n_variants = kwargs.get("downsample_n_variants",None),
+            downsample_seed = kwargs.get("downsample_seed",None),
             filter_nonsense=kwargs.get("filter_nonsense", False)
         )
         f.write(f"{dataset_name}\n")
@@ -990,10 +1182,36 @@ def csv_to_vcf(input_filepath, output_filepath):
         # Write VCF rows
         for _, row in tqdm(df.iterrows(), total=len(df)):
             vcf_file.write(
-                f"{row['Chrom']}\t{int(row.hg38_start)}\t{row['ID']}\t{row['ref_allele']}\t{row['alt_allele']}\t.\t.\t.\n"
+                f"{row['Chrom']}\t"
+                f"{int(row.hg38_start)}\t"
+                f"{row.get('mavedb_variant_urn', row['ID'])}\t"
+                f"{row['ref_allele']}\t"
+                f"{row['alt_allele']}\t.\t.\t.\n"
             )
 
 
+
+
+class _UnionFind:
+    """Path-compressed union-find for hashable elements."""
+    def __init__(self):
+        self._parent: dict = {}
+
+    def add(self, x):
+        if x not in self._parent:
+            self._parent[x] = x
+
+    def find(self, x):
+        self.add(x)
+        while self._parent[x] != x:
+            self._parent[x] = self._parent[self._parent[x]]  # path halving
+            x = self._parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[rb] = ra
 
 
 class MultiScoreset:
@@ -1069,8 +1287,9 @@ class MultiScoreset:
                 f"{getattr(scoreset, 'scoreset_name', '?')}"
             )
 
-        # Convert to hashable tuples — return a plain Python list,
-        # NOT a numpy object array (which breaks set hashing).
+        # Return a frozenset of group_col tuples per variant.
+        # New format: code is a list of tuples [(gene,chrom,pos,ref,alt), ...]
+        # Old format (backward compat): code is a flat list [gene,chrom,pos,ref,alt]
         keys = []
         for code in kept_codes:
             if code is None:
@@ -1078,7 +1297,12 @@ class MultiScoreset:
                     f"None variant code in {getattr(scoreset, 'scoreset_name', '?')}; "
                     f"ensure group columns {self.group_cols} are present."
                 )
-            keys.append(tuple(code))
+            if code and isinstance(code[0], tuple):
+                # New format: list of tuples
+                keys.append(frozenset(code))
+            else:
+                # Old format: flat list of values → single tuple
+                keys.append(frozenset([tuple(code)]))
 
         return keys
 
@@ -1087,27 +1311,20 @@ class MultiScoreset:
     # ──────────────────────────────────────
 
     def _build(self):
-        variant_set = set()
-        variant_keys = []
+        variant_keys = []   # per assay: list[frozenset[tuple]]
         scores_list = []
         samples_list = []
 
         for s in self.scoresets:
-            keys = self._get_variant_keys(s)
-            scores = s.scores  # (n_kept,) — already filtered
+            keys = self._get_variant_keys(s)   # list[frozenset[tuple]]
+            scores = s.scores
 
-            # Use _sample_assignments (always 4 columns), NOT the
-            # .sample_assignments property which drops empty columns.
-            # _sample_assignments is already filtered by keep_mask
-            # inside Scoreset._init_matrices.
             if hasattr(s, '_sample_assignments'):
                 samples = s._sample_assignments
-                # Pad to 4 columns if fewer (shouldn't happen for Scoreset, but safety)
                 if samples.shape[1] < 4:
                     pad = np.zeros((samples.shape[0], 4 - samples.shape[1]), dtype=bool)
                     samples = np.hstack([samples, pad])
             else:
-                # Fallback for BasicScoreset or similar
                 sa = s.sample_assignments
                 if sa.shape[1] < 4:
                     pad = np.zeros((sa.shape[0], 4 - sa.shape[1]), dtype=bool)
@@ -1124,50 +1341,80 @@ class MultiScoreset:
             variant_keys.append(keys)
             scores_list.append(scores)
             samples_list.append(samples)
-            variant_set.update(keys)
 
-        # Build union of all variants — sort by string repr to handle mixed types
-        all_variants = sorted(variant_set, key=lambda t: tuple(str(x) for x in t))
-        n_variants = len(all_variants)
-        variant_to_idx = {v: i for i, v in enumerate(all_variants)}
+        # ── Union-find: merge variants that share any group_col tuple ──────────
+        # Each individual group_col tuple (gene,chrom,pos,ref,alt) is a node.
+        # Within a single assay's variant entry, all tuples in its frozenset
+        # represent the same biological entity → union them.
+        # Across assays, if any tuple appears in both entries → same variant.
+        uf = _UnionFind()
 
-        # Allocate matrices
+        # First pass: register every atom and union within each frozenset
+        for assay_keys in variant_keys:
+            for fset in assay_keys:
+                atoms = list(fset)
+                for a in atoms:
+                    uf.add(a)
+                for i in range(1, len(atoms)):
+                    uf.union(atoms[0], atoms[i])
+
+        # Collect canonical roots and assign a sequential variant index
+        # Use a representative atom per biological variant as the canonical key
+        root_to_idx: dict = {}
+        canonical: list = []   # one representative atom per merged cluster
+
+        def _get_or_create(fset):
+            root = uf.find(next(iter(fset)))
+            if root not in root_to_idx:
+                root_to_idx[root] = len(canonical)
+                canonical.append(root)
+            return root_to_idx[root]
+
+        n_variants = 0
+        assay_row_idx = []   # per assay: list of global variant indices
+        for assay_keys in variant_keys:
+            row_indices = []
+            for fset in assay_keys:
+                idx = _get_or_create(fset)
+                row_indices.append(idx)
+            assay_row_idx.append(row_indices)
+            n_variants = max(n_variants, max(row_indices) + 1 if row_indices else 0)
+
+        # ── Allocate and fill matrices ─────────────────────────────────────────
         scores_matrix = np.full((n_variants, self.d), np.nan)
         sample_assignments = np.zeros((n_variants, 4), dtype=bool)
 
-        # Fill from each assay
         for assay_i in range(self.d):
-            keys = variant_keys[assay_i]
+            row_indices = assay_row_idx[assay_i]
             scores = scores_list[assay_i]
             samples = samples_list[assay_i]
-            for k in range(len(keys)):
-                v = keys[k]
-                idx = variant_to_idx[v]
+            for k, idx in enumerate(row_indices):
                 scores_matrix[idx, assay_i] = scores[k]
-                # Merge sample assignments via OR across assays.
-                # A variant is pathogenic/benign/etc if ANY assay flags it.
                 sample_assignments[idx] |= samples[k]
 
-        # Filter: keep variants with at least one non-NaN score
+        # ── Keep only variants with at least one observed score ────────────────
         missing_mask = np.isnan(scores_matrix)
         keep_mask = ~np.all(missing_mask, axis=1)
+
+        # Build _variants_kept: one representative group_col tuple per variant
+        # (the canonical atom chosen by union-find).  Stored as a tuple matching
+        # group_cols so downstream code (e.g. align_variants) can unpack it.
+        all_canonical = canonical   # list of group_col tuples, one per variant
+        self._variants_kept = [all_canonical[i] for i in range(n_variants) if keep_mask[i]]
 
         self._scores_matrix = scores_matrix
         self._missing_mask = missing_mask
         self._keep_mask = keep_mask
         self._scores = scores_matrix[keep_mask]
         self._missing = missing_mask[keep_mask]
-        self.variants = all_variants  # list of tuples
-        self._variants_kept = [all_variants[i] for i in range(n_variants) if keep_mask[i]]
+        self.variants = all_canonical
         self._sample_assignments = sample_assignments[keep_mask]
         self.n_variants = self._scores.shape[0]
 
-        # Per-dimension xlims (ignoring NaN)
         self._xlims = tuple(
             (np.nanmin(self._scores[:, dim]), np.nanmax(self._scores[:, dim]))
             for dim in range(self.d)
         )
-
         self.sample_counts = self._sample_assignments.sum(axis=0)
 
     # ──────────────────────────────────────
@@ -1268,6 +1515,329 @@ class MultiScoreset:
 
     def __len__(self):
         return self.n_variants
+
+
+class BasicMultiScoreset:
+    """Combine D BasicScoresets into a single (N, D) score matrix using
+    explicit per-variant IDs to align across assays.
+
+    Each input BasicScoreset must have its ``ids`` attribute populated.
+    Variants are aligned by ID (typically a protein-variant string). The
+    union of IDs across all inputs is taken; for each ID, missing
+    dimensions are filled with NaN. Sample assignments are merged (OR).
+
+    Exposes the same interface as MultiScoreset so it is a drop-in for
+    Fit() and the analysis scripts.
+    """
+
+    def __init__(self, scoresets, dataset_names=None, **kwargs):
+        if len(scoresets) == 0:
+            raise ValueError("scoresets cannot be empty")
+        for i, s in enumerate(scoresets):
+            if getattr(s, "_ids", None) is None:
+                raise ValueError(
+                    f"BasicScoreset {i} ({getattr(s, 'scoreset_name', '?')}) "
+                    f"has no ids; pass ids= when constructing each "
+                    f"BasicScoreset before combining."
+                )
+
+        self.scoresets = scoresets
+        self.d = len(scoresets)
+        self._init_kwargs = dict(kwargs)
+
+        if dataset_names is None:
+            dataset_names = [
+                getattr(s, "scoreset_name", f"assay_{i}")
+                for i, s in enumerate(scoresets)
+            ]
+        if len(dataset_names) != self.d:
+            raise ValueError("dataset_names must match number of scoresets")
+        self.dataset_names = dataset_names
+
+        s_total = max(s._sample_assignments.shape[1] for s in scoresets)
+        self._n_samples_total = s_total
+
+        default = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign",
+                   "population", "Synonymous"]
+        names = kwargs.get("sample_names", default[:s_total])
+        if len(names) < s_total:
+            names = list(names) + [
+                f"sample_{i}" for i in range(len(names), s_total)
+            ]
+        self._sample_names = names
+
+        self._build()
+
+    @staticmethod
+    def _parse_sample_assignments(sa_vals):
+        """Parse 1-D sample_assignments into a 2-D boolean array.
+
+        Accepts the same formats as BasicScoreset.validate_sample_assignments:
+          - object/string dtype  → split each value on ',' and one-hot encode
+          - numeric dtype        → treat each value as a sample id, one-hot encode
+          - already 2-D array   → returned as-is (cast to bool)
+        """
+        sa_vals = np.asarray(sa_vals)
+        if sa_vals.ndim == 2:
+            return sa_vals.astype(bool)
+        if sa_vals.dtype.kind in ('U', 'O'):
+            all_keys = sorted({k for v in sa_vals for k in str(v).split(',')})
+            key_to_idx = {k: i for i, k in enumerate(all_keys)}
+            result = np.zeros((len(sa_vals), len(all_keys)), dtype=bool)
+            for row, v in enumerate(sa_vals):
+                for k in str(v).split(','):
+                    result[row, key_to_idx[k]] = True
+            return result
+        # numeric — treat each value as a sample identifier
+        unique_samples = sorted(set(sa_vals))
+        result = np.zeros((len(sa_vals), len(unique_samples)), dtype=bool)
+        for col_i, sid in enumerate(unique_samples):
+            result[:, col_i] = sa_vals == sid
+        return result
+
+    @classmethod
+    def from_dataframe(cls, dataframe, score_cols=None, id_col=None,
+                       sample_assignments_col='sample_assignments',
+                       dataset_names=None, **kwargs):
+        """Create a BasicMultiScoreset directly from a DataFrame.
+
+        Parameters
+        ----------
+        dataframe : pd.DataFrame
+            Must contain score columns and a sample_assignments column.
+        score_cols : list of str, optional
+            Columns to use as score dimensions.  If None, all numeric columns
+            except id_col and sample_assignments_col are used.
+        id_col : str, optional
+            Column to use as variant identifier.  Defaults to the DataFrame index.
+        sample_assignments_col : str
+            Column containing sample assignments (comma-separated strings, integer
+            sample ids, or a pre-built boolean/int one-hot column is also accepted
+            if the column holds array-like objects — but see _parse_sample_assignments
+            for supported 1-D formats).
+        dataset_names : list of str, optional
+            Names for each score dimension.  Defaults to the column names in
+            score_cols.
+        **kwargs
+            sample_names : list of str, optional
+                Names for each sample class.  Defaults to the class-level defaults
+                (P/LP, B/LB, population, Synonymous); any extra samples beyond the
+                defaults are auto-named 'sample_{i}'.
+        """
+        df = dataframe.copy()
+
+        exclude = {sample_assignments_col}
+        if id_col is not None:
+            exclude.add(id_col)
+
+        if score_cols is None:
+            score_cols = [
+                c for c in df.columns
+                if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
+            ]
+
+        d = len(score_cols)
+        if d == 0:
+            raise ValueError("No score columns found or specified.")
+
+        all_ids = df[id_col].tolist() if id_col is not None else list(df.index)
+        N = len(df)
+
+        scores_matrix = df[score_cols].to_numpy(dtype=float)
+
+        sample_assignments = cls._parse_sample_assignments(
+            df[sample_assignments_col].values
+        )
+        n_samples_total = sample_assignments.shape[1]
+
+        if dataset_names is None:
+            dataset_names = list(score_cols)
+        elif len(dataset_names) != d:
+            raise ValueError(
+                f"dataset_names length {len(dataset_names)} does not match "
+                f"number of score columns {d}"
+            )
+
+        default_names = [
+            "Pathogenic/Likely Pathogenic", "Benign/Likely Benign",
+            "population", "Synonymous",
+        ]
+        sample_names = list(kwargs.get("sample_names", default_names[:n_samples_total]))
+        if len(sample_names) < n_samples_total:
+            sample_names += [
+                f"sample_{i}" for i in range(len(sample_names), n_samples_total)
+            ]
+
+        missing_mask = np.isnan(scores_matrix)
+        keep_mask = ~np.all(missing_mask, axis=1)
+
+        obj = cls.__new__(cls)
+        obj.scoresets = []
+        obj.d = d
+        obj._init_kwargs = dict(kwargs)
+        obj.dataset_names = dataset_names
+        obj._n_samples_total = n_samples_total
+        obj._sample_names = sample_names
+
+        obj._all_ids = all_ids
+        obj._variants_kept = [all_ids[i] for i in range(N) if keep_mask[i]]
+        obj._scores_matrix = scores_matrix
+        obj._missing_mask = missing_mask
+        obj._keep_mask = keep_mask
+        obj._scores = scores_matrix[keep_mask]
+        obj._missing = missing_mask[keep_mask]
+        obj._sample_assignments = sample_assignments[keep_mask]
+        obj.n_variants = obj._scores.shape[0]
+        obj._xlims = tuple(
+            (np.nanmin(obj._scores[:, dim]), np.nanmax(obj._scores[:, dim]))
+            for dim in range(d)
+        )
+        obj.sample_counts = obj._sample_assignments.sum(axis=0)
+
+        return obj
+
+    def _build(self):
+        # Union of IDs preserving first-seen order
+        seen: dict = {}
+        for s in self.scoresets:
+            for vid in s._ids:
+                if vid not in seen:
+                    seen[vid] = len(seen)
+        all_ids = list(seen.keys())
+        N = len(all_ids)
+
+        scores_matrix = np.full((N, self.d), np.nan)
+        sample_assignments = np.zeros((N, self._n_samples_total), dtype=bool)
+
+        for assay_i, s in enumerate(self.scoresets):
+            ids = s._ids
+            scores = np.asarray(s.scores)
+            samples = np.asarray(s._sample_assignments)
+            S_s = samples.shape[1]
+            for k, vid in enumerate(ids):
+                idx = seen[vid]
+                scores_matrix[idx, assay_i] = scores[k]
+                sample_assignments[idx, :S_s] |= samples[k]
+
+        missing_mask = np.isnan(scores_matrix)
+        keep_mask = ~np.all(missing_mask, axis=1)
+
+        self._all_ids = all_ids
+        self._variants_kept = [all_ids[i] for i in range(N) if keep_mask[i]]
+        self._scores_matrix = scores_matrix
+        self._missing_mask = missing_mask
+        self._keep_mask = keep_mask
+        self._scores = scores_matrix[keep_mask]
+        self._missing = missing_mask[keep_mask]
+        self._sample_assignments = sample_assignments[keep_mask]
+        self.n_variants = self._scores.shape[0]
+
+        self._xlims = tuple(
+            (np.nanmin(self._scores[:, dim]), np.nanmax(self._scores[:, dim]))
+            for dim in range(self.d)
+        )
+        self.sample_counts = self._sample_assignments.sum(axis=0)
+
+    # ── Scoreset/MultiScoreset-compatible API ────────────────────────
+
+    @property
+    def scores(self):
+        return self._scores
+
+    @property
+    def full_scores(self):
+        return self._scores_matrix
+
+    @property
+    def missing(self):
+        return self._missing
+
+    @property
+    def keep_mask(self):
+        return self._keep_mask
+
+    @property
+    def kept_variants(self):
+        return self._variants_kept
+
+    @property
+    def sample_assignments(self):
+        return self._sample_assignments[:, self.sample_counts > 0]
+
+    @property
+    def n_samples(self):
+        return int((self.sample_counts > 0).sum())
+
+    @property
+    def scoreset_name(self):
+        return " + ".join(self.dataset_names)
+
+    @property
+    def sample_names(self):
+        return [
+            self._sample_names[i]
+            for i in range(min(len(self._sample_names), len(self.sample_counts)))
+            if self.sample_counts[i] > 0
+        ]
+
+    @property
+    def xlims(self):
+        return self._xlims
+
+    @property
+    def n_assays(self):
+        return self.d
+
+    @property
+    def is_multivariate(self):
+        return True
+
+    @property
+    def samples(self):
+        for si in range(min(len(self._sample_names),
+                            self._sample_assignments.shape[1])):
+            if self.sample_counts[si] > 0:
+                mask = self._sample_assignments[:, si]
+                yield self._scores[mask], self._sample_names[si]
+
+    @property
+    def pathogenic_mask(self):
+        return self._sample_assignments[:, 0]
+
+    @property
+    def benign_mask(self):
+        if self._sample_assignments.shape[1] > 1:
+            return self._sample_assignments[:, 1]
+        return np.zeros(self.n_variants, dtype=bool)
+
+    @property
+    def population_mask(self):
+        if self._sample_assignments.shape[1] > 2:
+            return self._sample_assignments[:, 2]
+        return np.zeros(self.n_variants, dtype=bool)
+
+    @property
+    def synonymous_mask(self):
+        if self._sample_assignments.shape[1] > 3:
+            return self._sample_assignments[:, 3]
+        return np.zeros(self.n_variants, dtype=bool)
+
+    def __repr__(self):
+        out = f"BasicMultiScoreset: {self.scoreset_name}\n"
+        out += f"  {self.n_variants} variants, {self.d} assays\n"
+        for dim in range(self.d):
+            n_obs = (~np.isnan(self._scores[:, dim])).sum()
+            out += (f"  Dim {dim} ({self.dataset_names[dim]}): "
+                    f"{n_obs}/{self.n_variants} observed\n")
+        miss_pct = self._missing.mean() * 100
+        out += f"  Overall: {miss_pct:.1f}% missing entries\n"
+        for scores, name in self.samples:
+            out += f"  {name}: {len(scores)} variants\n"
+        return out
+
+    def __len__(self):
+        return self.n_variants
+
 
 if __name__ == "__main__":
     Fire()

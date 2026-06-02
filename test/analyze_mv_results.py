@@ -1436,7 +1436,7 @@ class MVCalibrationAnalysis:
         return fig
 
     def plot_config_detail(self, config, figsize=None, n_grid=120, contour_levels=6,
-                           first_row_only=False):
+                           first_row_only=False, max_lr_pairs=10):
         """Detailed visualization using bootstrap-averaged densities.
 
         Parameters
@@ -1445,11 +1445,16 @@ class MVCalibrationAnalysis:
             If True, render only the top row (2D point-region grids + legend)
             and skip the density-contour and marginal rows.  Much faster when
             you only need a quick look at the evidence map.
+        max_lr_pairs : int
+            Maximum number of dimension-pair LR+ grids to show in row 0 of the
+            D>2 layout.  Defaults to 10.  All C(D,2) pairs are shown in order
+            of (dim_i, dim_j), not just pairs anchored to dim 0.
         """
         from visualize_fit import plot_mv_calibration
         return plot_mv_calibration(self, config, figsize=figsize,
                                    n_grid=n_grid, contour_levels=contour_levels,
-                                   first_row_only=first_row_only)
+                                   first_row_only=first_row_only,
+                                   max_lr_pairs=max_lr_pairs)
 
 
     # ──────────────────────────────────────────────────────────────

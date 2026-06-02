@@ -13,6 +13,7 @@ from .constraints import (
     density_constraint_violated,
     multicomponent_density_constraint_violated,
 )
+from . import separation
 import numpy as np
 from sklearn.cluster import KMeans
 import scipy.stats as sps
@@ -825,14 +826,19 @@ def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None):
 
 
 def fix_to_satisfy_density_constraint_mv(component_parameters, X, **kwargs):
-    """Shrink scale matrices until constraint is satisfied.
+    """Shrink scale matrices until the (legacy) density constraint is satisfied.
 
-    Works for both q=1 (Delta is vector) and q>1 (Delta is matrix), and
-    honours ``constraint_mode`` ('line' or 'marginal').
+    Only applies to the deprecated 'line'/'marginal' density-ratio modes. The
+    current separation features (tempering + repulsion) induce non-overlap
+    during EM, not at initialization, so this is a no-op for them — shrinking
+    the init scales would only hurt the starting basin.
     """
+    constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
+    if not separation.is_legacy_mode(constraint_mode):
+        return component_parameters
+
     n_components = len(component_parameters)
     K_dim = component_parameters[0][0].shape[0]
-    constraint_mode = kwargs.get("constraint_mode", "line")
 
     xlims = tuple(
         (float(np.nanmin(X[:, d])), float(np.nanmax(X[:, d])))

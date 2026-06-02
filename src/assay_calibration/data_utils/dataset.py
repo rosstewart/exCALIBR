@@ -8,6 +8,7 @@ from io import StringIO
 from tqdm import tqdm
 import json
 from joblib import Parallel, delayed  # noqa: F401
+from typing import Union
 
 logging.basicConfig()
 logging.root.setLevel(logging.NOTSET)
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class PillarProjectDataframe:
-    def __init__(self, data_path: Path | str):
+    def __init__(self, data_path: Union[Path, str]):
         self.data_path = Path(data_path)
         self.init_data()
 
@@ -297,6 +298,8 @@ class BasicScoreset:
                     self._sample_assignments[:, sample_index]
                 ], self.sample_names[sample_index]
 
+    def plot(self):
+        return _plot_scoreset_scores(self)
 
     # @property
     # def samples(self):
@@ -309,7 +312,7 @@ class BasicScoreset:
     #             yield sample_scores, f"Sample {sample_index + 1}"
 
     @classmethod
-    def from_csv(cls, csv_path: Path | str, **kwargs):
+    def from_csv(cls, csv_path: Union[Path, str], **kwargs):
         """
         Create a BasicScoreset from a CSV file.
 
@@ -353,7 +356,7 @@ class Scoreset:
         self._init_kwargs = dict(kwargs)
         self._init_dataframe(dataframe, **kwargs)
 
-    def to_json(self, output_path: Path | str):
+    def to_json(self, output_path: Union[Path, str]):
         """
         Save the scoreset to a JSON file.
 
@@ -371,7 +374,7 @@ class Scoreset:
             output_path.parent.mkdir(parents=True, exist_ok=True)
         self.dataframe.to_json(output_path, orient="records", lines=True)
 
-    def to_csv(self, output_path: Path | str):
+    def to_csv(self, output_path: Union[Path, str]):
         """
         Save the scoreset to a simple output CSV.
 
@@ -416,7 +419,7 @@ class Scoreset:
         return cls(dataframe, **kwargs)
 
     @classmethod
-    def from_json(cls, json_path: Path | str, **kwargs):
+    def from_json(cls, json_path: Union[Path, str], **kwargs):
         """
         Create a Scoreset from a JSON or JSONL file.
     
@@ -537,7 +540,8 @@ class Scoreset:
         self._init_matrices(**kwargs)
 
     def filter_invalid(self):
-        self.dataframe = self.dataframe[self.dataframe.Flag != "*"]
+        if "Flag" in self.dataframe.columns:
+            self.dataframe = self.dataframe[self.dataframe["Flag"].ne("*")]
 
         if self.filter_nonsense:
             # print('filtering nonsense variants within 50 aa of termini...')
@@ -639,6 +643,32 @@ class Scoreset:
         self.parse_population_type(**kwargs)
         group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
         is_pop = self.is_population_member  # avoid repeated self-lookup in tight loop
+
+        # Determine variant-matching strategy once for the whole scoreset.
+        # Use .all() so a strategy is only chosen when it covers every variant.
+        _genomic_cols = ['Chrom', 'hg38_start', 'ref_allele', 'alt_allele']
+        _has_genomic = all(
+            c in self.dataframe.columns and self.dataframe[c].notna().all()
+            for c in _genomic_cols
+        )
+        _has_hgvs_c = (
+            'hgvs_c' in self.dataframe.columns and
+            self.dataframe['hgvs_c'].notna().all()
+        )
+        _has_hgvs_p = (
+            'hgvs_p' in self.dataframe.columns and
+            self.dataframe['hgvs_p'].notna().all()
+        )
+        if _has_genomic:
+            _code_strategy = 'genomic'
+        elif _has_hgvs_c:
+            _code_strategy = 'hgvs_c'
+        elif _has_hgvs_p:
+            _code_strategy = 'hgvs_p'
+        else:
+            _code_strategy = 'id'
+        self._code_strategy = _code_strategy
+
         for idx, (_id, variants) in enumerate(variants_by_id.items()):
 
             self._ids.append(_id)
@@ -670,13 +700,41 @@ class Scoreset:
             seen_codes: set = set()
             codes = []
             for v in variants:
-                try:
-                    code = tuple(getattr(v, g) for g in group_cols)
-                    if code not in seen_codes:
-                        seen_codes.add(code)
-                        codes.append(code)
-                except (ValueError, TypeError):
-                    pass
+                if _code_strategy == 'genomic':
+                    try:
+                        code = tuple(getattr(v, g) for g in group_cols)
+                        if code not in seen_codes:
+                            seen_codes.add(code)
+                            codes.append(code)
+                    except (ValueError, TypeError):
+                        pass
+                elif _code_strategy == 'hgvs_c':
+                    hgvs_c = getattr(v, 'hgvs_c', None)
+                    if isinstance(hgvs_c, str):
+                        for hgvs in hgvs_c.split('|'):
+                            hgvs = hgvs.strip()
+                            if hgvs:
+                                code_key = (hgvs,)
+                                if code_key not in seen_codes:
+                                    seen_codes.add(code_key)
+                                    codes.append(code_key)
+                elif _code_strategy == 'hgvs_p':
+                    hgvs_p = getattr(v, 'hgvs_p', None)
+                    if isinstance(hgvs_p, str):
+                        for hgvs in hgvs_p.split('|'):
+                            hgvs = hgvs.strip()
+                            if hgvs:
+                                code_key = (hgvs,)
+                                if code_key not in seen_codes:
+                                    seen_codes.add(code_key)
+                                    codes.append(code_key)
+                else:
+                    fallback = getattr(v, 'mavedb_variant_urn', None) or getattr(v, 'ID', None)
+                    if fallback is not None:
+                        code_key = (fallback,)
+                        if code_key not in seen_codes:
+                            seen_codes.add(code_key)
+                            codes.append(code_key)
             self._variant_codes.append(codes if codes else None)
 
             if any(v.is_synonymous for v in variants):
@@ -788,17 +846,17 @@ class Scoreset:
         if self.population_type == "all_variants":
             return True
         if self.population_type == "all_nsSNV":
-            return variant.is_nsSNV
+            return variant.is_snv#is_nsSNV
         if self.population_type == "all_missense_nsSNV":
-            return variant.simplified_consequence == "missense_variant" and variant.is_nsSNV
+            return variant.is_missense and variant.is_snv
         if self.population_type == "gnomAD":
             return variant.is_gnomAD
         if self.population_type == "gnomAD_nsSNV":
-            return variant.is_gnomAD and variant.is_nsSNV
+            return variant.is_gnomAD and variant.is_snv
         if self.population_type == "gnomAD_missense_nsSNV":
             return variant.is_gnomAD and \
-                variant.is_nsSNV and \
-                variant.simplified_consequence == "missense_variant"
+                variant.is_snv and \
+                variant.is_missense
         return False
         
 
@@ -873,6 +931,9 @@ class Scoreset:
     def keep_mask(self):
         return self._keep_mask
 
+    def plot(self):
+        return _plot_scoreset_scores(self)
+
     def __repr__(self):
         out = f"{self.scoreset_name}: {len(self.scores)} total variants\n"
         for sample_scores, sample_name in self.samples:
@@ -932,10 +993,10 @@ class Variant:
                          (self.aa_ref != self.aa_alt))
 
     def parse_consequences(self):
-        self.is_synonymous = (self.simplified_consequence == "Synonymous") or (
+        self.is_synonymous = (self.simplified_consequence.lower() == "synonymous") or (
             self.simplified_consequence == "synonymous_variant"
         )
-        self.is_missense = self.simplified_consequence == 'missense_variant'
+        self.is_missense = (self.simplified_consequence == 'missense_variant') or (self.simplified_consequence.lower() == 'missense')
         self.is_snv = len(str(self.ref_allele)) == 1 and len(str(self.alt_allele)) == 1 and str(self.ref_allele) != str(self.alt_allele)
 
     def parse_clinvar_sig(self):
@@ -1171,6 +1232,108 @@ def csv_to_vcf(input_filepath, output_filepath):
 
 
 
+def _plot_scoreset_scores(scoreset):
+    """Histogram of scores per sample for a univariate Scoreset or BasicScoreset."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    scores = scoreset.scores
+    score_range = [float(np.nanmin(scores)), float(np.nanmax(scores))]
+    n_active = int((scoreset.sample_counts > 0).sum())
+
+    fig, axes = plt.subplots(
+        1, n_active, figsize=(7 * n_active, 6),
+        squeeze=False, gridspec_kw={'hspace': 0.3, 'wspace': 0.3}
+    )
+    COLORS = {0: '#CA7682', 1: '#1D7AAB', 2: '#A0A0A0', 3: '#6BAA75'}
+    ALPHAS  = {0: 0.6,      1: 0.6,      2: 0.3,      3: 0.5}
+
+    col = 0
+    for sample_num in range(len(scoreset.sample_counts)):
+        if scoreset.sample_counts[sample_num] == 0:
+            continue
+        ax = axes[0, col]
+        mask = scoreset.sample_assignments[:, col].astype(bool)
+        sample_scores = scores[mask]
+        n = int(mask.sum())
+        n_bins = int(np.clip(np.sqrt(n), 5, 30))
+        sns.histplot(
+            sample_scores, bins=n_bins, binrange=score_range,
+            stat='density', ax=ax,
+            alpha=ALPHAS.get(sample_num, 0.5),
+            color=COLORS.get(sample_num, '#888888'),
+        )
+        max_density = max((p.get_height() for p in ax.patches), default=1.0)
+        ax.set_title(f"{scoreset.sample_names[sample_num]}\n(n={n:,d})")
+        ax.set_xlabel("Score")
+        ax.set_ylabel("Density")
+        ax.set_ylim([0, max_density * 1.1])
+        ax.grid(linewidth=0.5, alpha=0.3)
+        col += 1
+
+    fig.suptitle(scoreset.scoreset_name, fontsize=18, fontweight="heavy", y=1.02)
+    return fig
+
+
+def _plot_multiscoreset_scores(scoreset, dim_pairs=None, max_pairs=10):
+    """2-D scatter of score dimensions per sample for a MultiScoreset or BasicMultiScoreset."""
+    import matplotlib.pyplot as plt
+    from itertools import combinations
+
+    all_pairs = list(combinations(range(scoreset.d), 2))
+    if dim_pairs is None:
+        dim_pairs = all_pairs[:max_pairs]
+
+    n_pairs = len(dim_pairs)
+    sa = scoreset.sample_assignments   # (N, n_active), empty columns dropped
+    names = scoreset.sample_names      # n_active names aligned with sa columns
+    n_active = len(names)
+
+    if n_pairs == 0 or n_active == 0:
+        raise ValueError("No dimension pairs or active samples to plot.")
+
+    COLORS = ['#CA7682', '#1D7AAB', '#A0A0A0', '#6BAA75']
+    ALPHAS  = [0.4, 0.4, 0.2, 0.35]
+
+    fig, axes = plt.subplots(
+        n_pairs, n_active,
+        figsize=(5 * n_active, 4 * n_pairs),
+        squeeze=False,
+        gridspec_kw={'hspace': 0.4, 'wspace': 0.3}
+    )
+
+    for row, (di, dj) in enumerate(dim_pairs):
+        # Compute axis limits from all scores for this pair (across all samples)
+        xi_all = scoreset._scores[:, di]
+        xj_all = scoreset._scores[:, dj]
+        valid_all = ~(np.isnan(xi_all) | np.isnan(xj_all))
+        xlim = (float(np.nanmin(xi_all[valid_all])), float(np.nanmax(xi_all[valid_all])))
+        ylim = (float(np.nanmin(xj_all[valid_all])), float(np.nanmax(xj_all[valid_all])))
+
+        for col, name in enumerate(names):
+            ax = axes[row, col]
+            mask = sa[:, col].astype(bool)
+            xi = scoreset._scores[mask, di]
+            xj = scoreset._scores[mask, dj]
+            valid = ~(np.isnan(xi) | np.isnan(xj))
+            ax.scatter(
+                xi[valid], xj[valid],
+                alpha=ALPHAS[col % len(ALPHAS)],
+                color=COLORS[col % len(COLORS)],
+                s=8, linewidths=0,
+            )
+            n = int(valid.sum())
+            ax.set_title(f"{name}\n(n={n:,d})" if row == 0 else f"n={n:,d}")
+            ax.set_xlabel(scoreset.dataset_names[di])
+            ax.set_ylabel(scoreset.dataset_names[dj])
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.grid(linewidth=0.5, alpha=0.3)
+
+    fig.suptitle(scoreset.scoreset_name, fontsize=16, fontweight='bold', y=1.01)
+    return fig
+
+
 class _UnionFind:
     """Path-compressed union-find for hashable elements."""
     def __init__(self):
@@ -1294,7 +1457,29 @@ class MultiScoreset:
         scores_list = []
         samples_list = []
 
+        _strategy_messages = {
+            'hgvs_c': (
+                "Genomic position columns are absent or all-null. "
+                "Using pipe-separated hgvs_c values as variant identifiers."
+            ),
+            'hgvs_p': (
+                "Genomic position columns and hgvs_c are absent or all-null. "
+                "Using hgvs_p values as variant identifiers."
+            ),
+            'id': (
+                "Genomic position columns, hgvs_c, and hgvs_p are all absent or null. "
+                "Falling back to mavedb_variant_urn / ID as variant identifiers. "
+                "Cross-scoreset matching will only work if IDs are consistent across assays."
+            ),
+        }
+
         for s in self.scoresets:
+            strategy = getattr(s, '_code_strategy', 'genomic')
+            if strategy != 'genomic':
+                print(
+                    f"[{getattr(s, 'scoreset_name', '?')}] "
+                    f"{_strategy_messages[strategy]}"
+                )
             keys = self._get_variant_keys(s)   # list[frozenset[tuple]]
             scores = s.scores
 
@@ -1479,6 +1664,9 @@ class MultiScoreset:
     @property
     def synonymous_mask(self):
         return self._sample_assignments[:, 3]
+
+    def plot(self, dim_pairs=None, max_pairs=10):
+        return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs)
 
     def __repr__(self):
         out = f"MultiScoreset: {self.scoreset_name}\n"
@@ -1800,6 +1988,9 @@ class BasicMultiScoreset:
         if self._sample_assignments.shape[1] > 3:
             return self._sample_assignments[:, 3]
         return np.zeros(self.n_variants, dtype=bool)
+
+    def plot(self, dim_pairs=None, max_pairs=10):
+        return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs)
 
     def __repr__(self):
         out = f"BasicMultiScoreset: {self.scoreset_name}\n"

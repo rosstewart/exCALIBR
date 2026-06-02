@@ -843,7 +843,7 @@ def _compute_lr_grids_for_all_p(all_fits, x1g, x2g, total_dims,
 # ──────────────────────────────────────
 
 def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
-                        contour_levels=6, first_row_only=False):
+                        contour_levels=6, first_row_only=False, max_lr_pairs=10):
     """
     Multivariate calibration visualization. Layout adapts to dimensionality.
 
@@ -945,6 +945,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             model_label, n_boots_used, pad, n_grid, contour_levels,
             figsize, suptitle,
             aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data,
+            max_lr_pairs=max_lr_pairs,
         )
 
     return fig, info
@@ -1329,19 +1330,21 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                 path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
-                aux_p_entries=None, aux_marginal_data=None):
+                aux_p_entries=None, aux_marginal_data=None, max_lr_pairs=10):
     """Layout for D>2.
 
-    Row 0: pairwise LR+ grids — dim 0 vs dim 1, dim 0 vs dim 2, …; followed by
-           aux pairwise grids for each aux sample (dim 0 vs dim 1 only).
+    Row 0: pairwise LR+ grids — all C(D,2) combinations up to max_lr_pairs,
+           followed by aux pairwise grids for each aux sample (dim 0 vs dim 1 only).
     Rows 1..D: per-dimension marginals — [S sample density panels] + [marginal LR+].
     """
+    from itertools import combinations as _combinations
     aux_p_entries = aux_p_entries or []
     aux_marginal_data = aux_marginal_data or {}
     n_aux = len(aux_p_entries)
     _aux_results = analysis.results.get(config, {}).get('aux_results', {})
 
-    n_pairs = D - 1
+    all_dim_pairs = list(_combinations(range(D), 2))[:max_lr_pairs]
+    n_pairs = len(all_dim_pairs)
     n_cols  = max(max(S, 2) + 1, n_pairs + n_aux)
     # Each dimension: 1 primary row + n_aux aux-LR rows
     n_rows  = 1 + D * (1 + n_aux)
@@ -1359,16 +1362,16 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
     # ═══════════════════════════════════════
     # Row 0: primary pairwise grids then aux grids (dim 0 vs dim 1 for each aux)
     # ═══════════════════════════════════════
-    for k, dim_j in enumerate(range(1, D)):
-        xig = x_grids[0]
+    for k, (dim_i, dim_j) in enumerate(all_dim_pairs):
+        xig = x_grids[dim_i]
         xjg = x_grids[dim_j]
         xi_range = (xig[0], xig[-1])
         xj_range = (xjg[0], xjg[-1])
 
-        print(f"  Computing LR+ grid: dim 0 vs dim {dim_j}...")
+        print(f"  Computing LR+ grid: dim {dim_i} vs dim {dim_j}...")
         grid_points, lr_conservative = _compute_conservative_lr_grid(
             analysis, config, all_fits, xig, xjg,
-            dim_i=0, dim_j=dim_j, total_dims=D,
+            dim_i=dim_i, dim_j=dim_j, total_dims=D,
         )
 
         ax = fig.add_subplot(gs[0, k])
@@ -1382,17 +1385,17 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
             mask = sa[:, s_idx] & complete
             if not mask.any():
                 continue
-            ax.scatter(scores[mask, 0], scores[mask, dim_j],
+            ax.scatter(scores[mask, dim_i], scores[mask, dim_j],
                        c=points[mask], cmap=POINT_CMAP, norm=pt_norm,
                        s=8, alpha=0.5,
                        edgecolors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
                        linewidths=0.3,
                        marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
 
-        ax.set_xlabel(dataset_names[0], fontsize=7)
+        ax.set_xlabel(dataset_names[dim_i], fontsize=7)
         ax.set_ylabel(dataset_names[dim_j], fontsize=7)
         ax.set_xlim(xi_range); ax.set_ylim(xj_range)
-        ax.set_title(f'{dataset_names[0]} vs {dataset_names[dim_j]}',
+        ax.set_title(f'{dataset_names[dim_i]} vs {dataset_names[dim_j]}',
                      fontsize=8, fontweight='bold')
         ax.grid(lw=0.2, alpha=0.3)
 
