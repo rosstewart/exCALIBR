@@ -210,6 +210,21 @@ def kmeans_init_mv(X, **kwargs):
     if len(X_complete) < min_needed:
         raise ValueError(f"Only {len(X_complete)}/{N} complete rows, need {min_needed}")
 
+    # Fallback covariance computed once — used when a cluster is too small
+    # to estimate its own covariance reliably.
+    global_cov = np.zeros((K_dim, K_dim))
+    for d1 in range(K_dim):
+        for d2 in range(d1, K_dim):
+            both = ~np.isnan(X_complete[:, d1]) & ~np.isnan(X_complete[:, d2])
+            if both.sum() >= 2:
+                global_cov[d1, d2] = np.cov(X_complete[both, d1],
+                                             X_complete[both, d2])[0, 1]
+            global_cov[d2, d1] = global_cov[d1, d2]
+    global_cov += 1e-6 * np.eye(K_dim)
+    _ev = np.linalg.eigvalsh(global_cov)
+    if _ev.min() < 1e-8:
+        global_cov += (1e-8 - _ev.min()) * np.eye(K_dim)
+
     last_error = None
     for attempt in range(100):
         try:
@@ -234,30 +249,31 @@ def kmeans_init_mv(X, **kwargs):
                     ])
 
             component_parameters = []
-            ok = True
             for c in range(n_clusters):
                 Xc = X[labels == c]
-                if len(Xc) < max(10, K_dim + 2):
-                    ok = False
-                    last_error = f"Cluster {c}: {len(Xc)} pts"
-                    break
+                small_cluster = len(Xc) < max(10, K_dim + 2)
 
-                mu = np.nanmean(Xc, axis=0)
+                mu = np.nanmean(Xc, axis=0) if len(Xc) > 0 else np.nanmean(X, axis=0)
 
-                # Compute covariance handling NaN
-                cov = np.zeros((K_dim, K_dim))
-                for d1 in range(K_dim):
-                    for d2 in range(d1, K_dim):
-                        both = ~np.isnan(Xc[:, d1]) & ~np.isnan(Xc[:, d2])
-                        if both.sum() < 2:
-                            cov[d1, d2] = 1e-2
-                        else:
-                            cov[d1, d2] = np.cov(Xc[both, d1], Xc[both, d2])[0, 1]
-                        cov[d2, d1] = cov[d1, d2]
-                cov += 1e-6 * np.eye(K_dim)
-                eigvals = np.linalg.eigvalsh(cov)
-                if eigvals.min() < 1e-8:
-                    cov += (1e-8 - eigvals.min()) * np.eye(K_dim)
+                if small_cluster:
+                    # Too few points for a reliable per-cluster covariance —
+                    # use global covariance scaled down so components don't overlap.
+                    cov = global_cov / n_clusters
+                else:
+                    # Compute covariance handling NaN
+                    cov = np.zeros((K_dim, K_dim))
+                    for d1 in range(K_dim):
+                        for d2 in range(d1, K_dim):
+                            both = ~np.isnan(Xc[:, d1]) & ~np.isnan(Xc[:, d2])
+                            if both.sum() < 2:
+                                cov[d1, d2] = 1e-2
+                            else:
+                                cov[d1, d2] = np.cov(Xc[both, d1], Xc[both, d2])[0, 1]
+                            cov[d2, d1] = cov[d1, d2]
+                    cov += 1e-6 * np.eye(K_dim)
+                    eigvals = np.linalg.eigvalsh(cov)
+                    if eigvals.min() < 1e-8:
+                        cov += (1e-8 - eigvals.min()) * np.eye(K_dim)
 
                 if latent_q == 1:
                     # Restricted MSN: Delta is (p,) vector
@@ -274,9 +290,12 @@ def kmeans_init_mv(X, **kwargs):
                         ((cluster_pattern_idx >> j) & 1) * 2 - 1
                         for j in range(latent_q)
                     ])
-                    # CFUSN: Delta is (p, q) matrix
+                    # CFUSN: Delta is (p, q) matrix.
+                    # Pass Xc=None for small clusters so _init_delta_matrix uses
+                    # the enumerated sign pattern rather than unreliable skewness.
                     Delta = _init_delta_matrix(cov, K_dim, latent_q,
-                                               Xc=Xc, cluster_sign_pattern=cluster_sign_pattern)
+                                               Xc=None if small_cluster else Xc,
+                                               cluster_sign_pattern=cluster_sign_pattern)
                     Gamma = cov - Delta @ Delta.T
                     Gamma = 0.5 * (Gamma + Gamma.T)
                     eigvals_G = np.linalg.eigvalsh(Gamma)
@@ -284,9 +303,6 @@ def kmeans_init_mv(X, **kwargs):
                         Gamma += (1e-8 - eigvals_G.min()) * np.eye(K_dim)
 
                 component_parameters.append((mu, Delta, Gamma))
-
-            if not ok:
-                continue
 
             component_parameters.sort(key=lambda p: p[0][0])
 

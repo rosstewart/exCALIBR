@@ -165,7 +165,8 @@ def single_fit(
             except ValueError as e:
                 if kwargs.get("raise_on_error", False):
                     raise
-                print(f"[INIT FAILED] {e}")
+                if kwargs.get("verbose_init", True):
+                    print(f"[INIT FAILED] {e}")
                 return dict(
                     component_params=[[] for _ in range(N_components)],
                     weights=W,

@@ -262,47 +262,53 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
     #     if kl_divergence < 0.1:
     #         return default_prior
     
-    # EM initialization
-    converged = False
-    em_steps = 0
-    max_em_steps = kwargs.get("max_em_steps", 10000)
-    tolerance = kwargs.get("tolerance", 1e-6)
-    prev_prior = prior_estimate
-    
-    while not converged and em_steps < max_em_steps:
-        em_steps += 1
-        
-        with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
-            if mode == 'standard':
+    if mode == 'standard':
+        # Standard EM
+        converged = False
+        em_steps = 0
+        max_em_steps = kwargs.get("max_em_steps", 10000)
+        tolerance = kwargs.get("tolerance", 1e-6)
+        while not converged and em_steps < max_em_steps:
+            em_steps += 1
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
                 posteriors = 1 / (
-                    1 + (1 - prior_estimate) / prior_estimate 
+                    1 + (1 - prior_estimate) / prior_estimate
                     * benign_density / pathogenic_density
                 )
-            elif mode == 'positive_unlabeled':
-                posteriors = prior_estimate * pathogenic_density / pop_density
-                posteriors = np.clip(posteriors, 0, 1)
-            elif mode == 'negative_unlabeled':
-                posteriors = prior_estimate * benign_density / pop_density
-                posteriors = np.clip(posteriors, 0, 1)
-        
-        
-        new_prior = np.nanmean(posteriors)
+            new_prior = np.nanmean(posteriors)
+            if abs(new_prior - prior_estimate) < tolerance:
+                converged = True
+            prior_estimate = new_prior
+            if prior_estimate < 0 or prior_estimate > 1:
+                break
+    else:
+        # Mean-matching estimator:
+        #   NU: α = 1 - E_{gnomAD}[fb] / E_{benign}[fb]
+        #   PU: α = E_{gnomAD}[fp] / E_{path}[fp]
+        # Requires only that pathogenic (benign) variants have low benign (path) density.
+        # More robust than Blanchard-Recht: does not assume fpop/fbenign ≥ 1-α pointwise,
+        # which breaks when fitted model weights don't satisfy the mixture decomposition.
+        if mode == 'negative_unlabeled':
+            labeled = scores[sa[:, benign_idx]]
+            labeled_density = density_utils.joint_densities(
+                labeled, params, weights[benign_idx] if benign_method != 'avg'
+                else (np.array(weights[benign_idx]) + np.array(weights[synonymous_idx])) / 2
+            ).sum(axis=0)
+            mean_pop = float(np.nanmean(benign_density))
+            mean_lab = float(np.nanmean(labeled_density))
+            prior_estimate = float(np.clip(1.0 - mean_pop / mean_lab, 0.001, 0.999)) if mean_lab > 0 else 0.1
+        else:  # positive_unlabeled
+            labeled = scores[sa[:, pathogenic_idx]]
+            labeled_density = density_utils.joint_densities(
+                labeled, params, weights[pathogenic_idx]
+            ).sum(axis=0)
+            mean_pop = float(np.nanmean(pathogenic_density))
+            mean_lab = float(np.nanmean(labeled_density))
+            prior_estimate = float(np.clip(mean_pop / mean_lab, 0.001, 0.999)) if mean_lab > 0 else 0.1
 
-        prev_prior = prior_estimate
-        if abs(new_prior - prev_prior) < tolerance:
-            converged = True
-        
-        prior_estimate = new_prior
-        
-        if prior_estimate < 0 or prior_estimate > 1:
-            break
-    
-    if mode == 'negative_unlabeled':
-        prior_estimate = 1.0 - prior_estimate
-    
     if prior_estimate <= 0.001 or prior_estimate >= 0.999:
         return np.nan
-    
+
     return prior_estimate
 
 def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, point_values,

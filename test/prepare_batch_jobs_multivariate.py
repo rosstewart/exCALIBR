@@ -139,17 +139,16 @@ def print_gene_groups(gene_groups):
 # STEP 1: Build MultiScoreset and generate jobs for one gene
 # ============================================================================
 
-def build_multi_scoreset(df, gene, datasets, clinvar_release="2025", **kwargs):
+def build_multi_scoreset(df, gene, datasets, clinvar_release="2026", population_type=None, **kwargs):
     scoresets = []
     dataset_names = []
 
     for ds_name in datasets:
         try:
-            ds = Scoreset(
-                df[df["Dataset"] == ds_name],
-                clinvar_release=clinvar_release,
-                min_clinvar_star=1,
-            )
+            scoreset_kwargs = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
+            if population_type is not None:
+                scoreset_kwargs["population_type"] = population_type
+            ds = Scoreset(df[df["Dataset"] == ds_name], **scoreset_kwargs)
             n_samples = sum(1 for _ in ds.samples)
             if n_samples < 2:
                 print(f"  {ds_name}: skipping (only {n_samples} sample(s))")
@@ -174,9 +173,9 @@ def build_multi_scoreset(df, gene, datasets, clinvar_release="2025", **kwargs):
 
 
 def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
-                       clinvar_release="2025", component_range=None,
+                       clinvar_release="2026", component_range=None,
                        constraint_modes=None, latent_q=2,
-                       init_strategy="kmeans", sample_balance_beta=0.0):
+                       init_strategy="kmeans", population_type=None):
     """
     Process a single gene group: build MultiScoreset and generate consolidated jobs.
 
@@ -189,7 +188,7 @@ def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
     if constraint_modes is None:
         constraint_modes = ['con', 'unc']
 
-    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2025' else ''}"
+    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
     save_dir = f"{output_dir}/{gene_label}"
     os.makedirs(save_dir, exist_ok=True)
 
@@ -197,7 +196,7 @@ def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
     print(f"Gene: {gene} ({len(datasets)} assays)")
     print(f"{'='*60}")
 
-    ms, valid_datasets = build_multi_scoreset(df, gene, datasets, clinvar_release)
+    ms, valid_datasets = build_multi_scoreset(df, gene, datasets, clinvar_release, population_type=population_type)
     if ms is None:
         return None
 
@@ -229,7 +228,6 @@ def process_gene_group(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
                     fit_kwargs = {
                         "latent_q": latent_q,
                         "init_strategy": init_strategy,
-                        "sample_balance_beta": sample_balance_beta,
                     }
                     if NUM_FITS is not None:
                         fit_kwargs["num_fits"] = NUM_FITS
@@ -311,7 +309,8 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
                               max_dimensions=np.inf, manual_groups=None,
                               genes=None, component_range=None,
                               constraint_modes=None, output_dir=None,
-                              init_strategy="kmeans", sample_balance_beta=0.0):
+                              init_strategy="kmeans",
+                              dataframe_path=None, population_type=None):
     """
     Generate job manifest for multivariate calibration.
 
@@ -340,10 +339,10 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
         constraint_modes = ['con', 'unc']
 
     # Load data
-    df = pd.read_csv(
-        "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz",
-        sep="\t",
-    )
+    if dataframe_path is None:
+        dataframe_path = "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
+    sep = "\t" if dataframe_path.endswith(".tsv.gz") or dataframe_path.endswith(".tsv") else ","
+    df = pd.read_csv(dataframe_path, sep=sep)
 
     # Discover multi-assay genes
     gene_groups = discover_gene_groups(df, max_dimensions=max_dimensions,
@@ -380,7 +379,6 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
     else:
         print(f"  Fits per config: {NUM_FITS} (override)")
     print(f"  Init strategy: {init_strategy}")
-    print(f"  Sample-balance β: {sample_balance_beta}")
 
     genes_2018 = ["BRCA1", "MSH2", "PTEN", "TP53"]
     
@@ -389,12 +387,12 @@ def generate_mv_job_manifest(target_array_size=1000, n_jobs=30,
     all_jobs_by_gene = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(process_gene_group)(
             df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
-            clinvar_release="2025" if gene not in genes_2018 else "2018",
+            clinvar_release="2026" if gene not in genes_2018 else "2018",
             component_range=component_range,
             constraint_modes=constraint_modes,
             latent_q=LATENT_Q,
             init_strategy=init_strategy,
-            sample_balance_beta=sample_balance_beta,
+            population_type=population_type,
         )
         for gene, datasets in gene_groups.items()
     )
@@ -652,6 +650,15 @@ Examples:
         help="Override output directory (default: auto-generated from arguments)"
     )
     parser.add_argument(
+        "--population-type", type=str, default=None,
+        help="Population type passed to Scoreset (e.g. 'all_missense_nsSNV'). Omit to use Scoreset default."
+    )
+    parser.add_argument(
+        "--dataframe", type=str, default=None,
+        help="Path to input dataframe (default: integrated_variant_effect_dataset.tsv.gz). "
+             "CSV (.csv/.csv.gz) or TSV (.tsv/.tsv.gz) are auto-detected by extension."
+    )
+    parser.add_argument(
         "--init-strategy", type=str, default="kmeans",
         choices=["kmeans", "anchored"],
         help="Initialization strategy. 'kmeans' (default) uses joint k-means; "
@@ -659,12 +666,7 @@ Examples:
              "Anchored is recommended for predictor-style imbalanced data; "
              "for functional assays the default kmeans is usually fine."
     )
-    parser.add_argument(
-        "--sample-balance-beta", type=float, default=0.0,
-        help="Sample-balanced M-step strength β ∈ [0,1]. 0=off (default; status quo), "
-             "1=each sample contributes equally to component params. Increase for "
-             "imbalanced sample sizes (e.g. predictor data)."
-    )
+
     args = parser.parse_args()
 
     # Resolve constraint modes
@@ -703,10 +705,9 @@ Examples:
     print(f"  Output:      {output_dir}")
     print()
 
-    df = pd.read_csv(
-        "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz",
-        sep="\t",
-    )
+    df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
+    df_sep = "\t" if df_path.endswith(".tsv.gz") or df_path.endswith(".tsv") else ","
+    df = pd.read_csv(df_path, sep=df_sep)
 
     gene_groups = discover_gene_groups(df, max_dimensions=max_dim)
 
@@ -736,7 +737,8 @@ Examples:
         constraint_modes=constraint_modes,
         output_dir=output_dir,
         init_strategy=args.init_strategy,
-        sample_balance_beta=args.sample_balance_beta,
+        dataframe_path=args.dataframe,
+        population_type=args.population_type,
     )
 
     print(f"\n{'=' * 80}")

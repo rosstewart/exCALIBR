@@ -230,45 +230,79 @@ def _collect_valid_fits(analysis, config):
     return [r for r in results if r is not None]
 
 
-def _eval_all_marginals(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S):
+def _eval_all_marginals(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S,
+                        g_idx=None, prior=None):
     """Evaluate marginal LR+ and sample densities for one bootstrap across all dimensions.
 
     x_2d_list : list of D arrays, each (n_grid, total_dims) with one column set.
     Returns   : list of D results, each the output of _eval_marginal_fit.
     """
     return [
-        _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S)
+        _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S,
+                           g_idx=g_idx, prior=prior)
         for x_2d in x_2d_list
     ]
 
 
-def _eval_fit_on_grid(fit, grid_pts, p_idx, b_idx, s_idx, benign_method):
+def _eval_fit_on_grid(fit, grid_pts, p_idx, b_idx, s_idx, benign_method,
+                      g_idx=None, prior=None):
     """Evaluate LR+ for one bootstrap fit on a pre-built grid of points."""
     params = fit['component_params']
     weights = fit['weights']
     K = len(params)
+    n_w = len(weights)
 
-    w_p = weights[p_idx]
-    s_valid = s_idx is not None and s_idx < len(weights)
-    if s_valid and benign_method == 'synonymous':
-        w_b = weights[s_idx]
-    elif s_valid and benign_method == 'avg':
-        w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+    nu_mode = p_idx is None and (b_idx is not None or s_idx is not None) and g_idx is not None
+    pu_mode = p_idx is not None and b_idx is None and s_idx is None and g_idx is not None
+
+    comp_log = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+
+    s_valid = s_idx is not None and s_idx < n_w
+    b_valid = b_idx is not None and b_idx < n_w
+
+    def _benign_log():
+        if s_valid and benign_method == 'synonymous':
+            w_b = weights[s_idx]
+        elif s_valid and b_valid and benign_method == 'avg':
+            w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+        elif b_valid:
+            w_b = weights[b_idx]
+        elif s_valid:
+            w_b = weights[s_idx]
+        else:
+            return None
+        return logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+
+    if nu_mode:
+        log_fb = _benign_log()
+        if log_fb is None:
+            return np.zeros(len(grid_pts))
+        log_fpop = logsumexp([np.log(weights[g_idx][c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        _p = prior if prior is not None else 0.1
+        fp = np.maximum((np.exp(log_fpop) - (1 - _p) * np.exp(log_fb)) / _p,
+                        np.exp(log_fpop) * 1e-10)
+        return np.log(fp) - log_fb
+    elif pu_mode:
+        w_p = weights[p_idx]
+        log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        log_fpop = logsumexp([np.log(weights[g_idx][c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        _p = prior if prior is not None else 0.1
+        fb = np.maximum((np.exp(log_fpop) - _p * np.exp(log_fp)) / (1 - _p),
+                        np.exp(log_fpop) * 1e-10)
+        return log_fp - np.log(fb)
     else:
-        w_b = weights[b_idx]
-
-    log_fp = logsumexp(
-        [np.log(w_p[c] + 1e-300) + _sn_logpdf(grid_pts, *params[c]) for c in range(K)],
-        axis=0,
-    )
-    log_fb = logsumexp(
-        [np.log(w_b[c] + 1e-300) + _sn_logpdf(grid_pts, *params[c]) for c in range(K)],
-        axis=0,
-    )
-    return log_fp - log_fb
+        if p_idx is None or p_idx >= n_w:
+            return np.zeros(len(grid_pts))
+        w_p = weights[p_idx]
+        log_fb = _benign_log()
+        if log_fb is None:
+            return np.zeros(len(grid_pts))
+        log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        return log_fp - log_fb
 
 
-def _eval_fit_on_grid_batch_p(fit, grid_pts, p_indices, b_idx, s_idx, benign_method):
+def _eval_fit_on_grid_batch_p(fit, grid_pts, p_indices, b_idx, s_idx, benign_method,
+                               g_idx=None, prior=None):
     """Evaluate LR+ on a grid for multiple pathogenic indices in one shot.
 
     Component log-densities (_sn_logpdf) are computed ONCE and shared across
@@ -281,30 +315,53 @@ def _eval_fit_on_grid_batch_p(fit, grid_pts, p_indices, b_idx, s_idx, benign_met
     K = len(params)
     n_w = len(weights)
 
-    # Component densities computed once, shared across all p_indices
     comp_log = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
 
     s_valid = s_idx is not None and s_idx < n_w
+    b_valid = b_idx is not None and b_idx < n_w
+
     if s_valid and benign_method == 'synonymous':
         w_b = weights[s_idx]
-    elif s_valid and benign_method == 'avg':
+    elif s_valid and b_valid and benign_method == 'avg':
         w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
-    else:
+    elif b_valid:
         w_b = weights[b_idx]
-    log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+    elif s_valid:
+        w_b = weights[s_idx]
+    else:
+        w_b = None
+
+    log_fb = (logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+              if w_b is not None else None)
+    log_fpop = (logsumexp([np.log(weights[g_idx][c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+                if g_idx is not None and g_idx < n_w else None)
+    _p = prior if prior is not None else 0.1
 
     out = []
     for p_idx in p_indices:
-        if p_idx >= n_w:
+        nu = p_idx is None and log_fb is not None and log_fpop is not None
+        pu = p_idx is not None and w_b is None and log_fpop is not None and (p_idx < n_w)
+        if nu:
+            fp = np.maximum((np.exp(log_fpop) - (1 - _p) * np.exp(log_fb)) / _p,
+                            np.exp(log_fpop) * 1e-10)
+            out.append(np.log(fp) - log_fb)
+        elif pu:
+            w_p = weights[p_idx]
+            log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+            fb = np.maximum((np.exp(log_fpop) - _p * np.exp(log_fp)) / (1 - _p),
+                            np.exp(log_fpop) * 1e-10)
+            out.append(log_fp - np.log(fb))
+        elif p_idx is None or p_idx >= n_w or log_fb is None:
             out.append(np.full(len(grid_pts), np.nan))
-            continue
-        w_p = weights[p_idx]
-        log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
-        out.append(log_fp - log_fb)
+        else:
+            w_p = weights[p_idx]
+            log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+            out.append(log_fp - log_fb)
     return out
 
 
-def _eval_all_marginals_batch_p(fit, x_2d_list, p_indices, b_idx, s_idx, benign_method, S):
+def _eval_all_marginals_batch_p(fit, x_2d_list, p_indices, b_idx, s_idx, benign_method, S,
+                                g_idx=None, prior=None):
     """Evaluate marginals for multiple pathogenic indices in one shot.
 
     Component log-densities computed ONCE per dimension and shared across all
@@ -319,14 +376,21 @@ def _eval_all_marginals_batch_p(fit, x_2d_list, p_indices, b_idx, s_idx, benign_
     n_w = len(weights)
 
     s_valid = s_idx is not None and s_idx < n_w
+    b_valid = b_idx is not None and b_idx < n_w
+
+    # Benign weights for standard/NU modes
     if s_valid and benign_method == 'synonymous':
         w_b = weights[s_idx]
-    elif s_valid and benign_method == 'avg':
+    elif s_valid and b_valid and benign_method == 'avg':
         w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
-    else:
+    elif b_valid:
         w_b = weights[b_idx]
+    elif s_valid:
+        w_b = weights[s_idx]
+    else:
+        w_b = None  # PU mode: no benign available
 
-    w_ps = [weights[p_idx] if p_idx < n_w else None for p_idx in p_indices]
+    w_ps = [weights[p_idx] if (p_idx is not None and p_idx < n_w) else None for p_idx in p_indices]
     results_per_p = [[] for _ in p_indices]
 
     for x_2d in x_2d_list:
@@ -342,14 +406,30 @@ def _eval_all_marginals_batch_p(fit, x_2d_list, p_indices, b_idx, s_idx, benign_
             sample_logs.append(log_d)
             comp_logs_per_sample.append([np.log(w_s[c] + 1e-300) + comp_log[c] for c in range(K)])
 
-        log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        log_fb = (logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+                  if w_b is not None else None)
+        log_fpop = (logsumexp([np.log(weights[g_idx][c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+                    if g_idx is not None and g_idx < n_w else None)
+        _p = prior if prior is not None else 0.1
 
         for pi, w_p in enumerate(w_ps):
-            if w_p is None:
+            p_idx_i = p_indices[pi]
+            nu = p_idx_i is None and log_fb is not None and log_fpop is not None
+            pu = p_idx_i is not None and w_p is not None and w_b is None and log_fpop is not None
+            if nu:
+                fp = np.maximum((np.exp(log_fpop) - (1 - _p) * np.exp(log_fb)) / _p,
+                                np.exp(log_fpop) * 1e-10)
+                results_per_p[pi].append((np.log(fp) - log_fb, sample_logs, comp_logs_per_sample))
+            elif pu:
+                log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+                fb = np.maximum((np.exp(log_fpop) - _p * np.exp(log_fp)) / (1 - _p),
+                                np.exp(log_fpop) * 1e-10)
+                results_per_p[pi].append((log_fp - np.log(fb), sample_logs, comp_logs_per_sample))
+            elif w_p is None or log_fb is None:
                 results_per_p[pi].append((np.full(len(x_2d), np.nan), sample_logs, comp_logs_per_sample))
-                continue
-            log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
-            results_per_p[pi].append((log_fp - log_fb, sample_logs, comp_logs_per_sample))
+            else:
+                log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+                results_per_p[pi].append((log_fp - log_fb, sample_logs, comp_logs_per_sample))
 
     return results_per_p
 
@@ -373,7 +453,8 @@ def _eval_fit_sample_densities(fit, grid_pts, n_samples):
     return result
 
 
-def _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S):
+def _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S,
+                       g_idx=None, prior=None):
     """Evaluate LR+ and per-sample densities for one bootstrap on a 1-D marginal grid.
 
     Module-level so joblib loky workers can pickle it by name.
@@ -403,18 +484,52 @@ def _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S):
         sample_logs.append(log_d)
         comp_logs_per_sample.append([np.log(w_s[c] + 1e-300) + comp_log[c] for c in range(K)])
 
-    w_p = weights[p_idx]
-    s_valid = s_idx is not None and s_idx < len(weights)
-    if s_valid and benign_method == 'synonymous':
-        w_b = weights[s_idx]
-    elif s_valid and benign_method == 'avg':
-        w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
-    else:
-        w_b = weights[b_idx]
+    nu_mode = p_idx is None and (b_idx is not None or s_idx is not None) and g_idx is not None
+    pu_mode = p_idx is not None and b_idx is None and s_idx is None and g_idx is not None
 
-    log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
-    log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
-    lr_1d = log_fp - log_fb
+    s_valid = s_idx is not None and s_idx < n_w
+    if nu_mode:
+        if s_valid and benign_method == 'synonymous':
+            w_b = weights[s_idx]
+        elif s_valid and b_idx is not None and b_idx < n_w and benign_method == 'avg':
+            w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+        elif b_idx is not None and b_idx < n_w:
+            w_b = weights[b_idx]
+        else:
+            w_b = weights[s_idx]
+        log_fb   = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        log_fpop = logsumexp([np.log(weights[g_idx][c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        _p = prior if prior is not None else 0.1
+        fp = np.maximum((np.exp(log_fpop) - (1 - _p) * np.exp(log_fb)) / _p,
+                        np.exp(log_fpop) * 1e-10)
+        lr_1d = np.log(fp) - log_fb
+    elif pu_mode:
+        w_p      = weights[p_idx]
+        log_fp   = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        log_fpop = logsumexp([np.log(weights[g_idx][c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+        _p = prior if prior is not None else 0.1
+        fb = np.maximum((np.exp(log_fpop) - _p * np.exp(log_fp)) / (1 - _p),
+                        np.exp(log_fpop) * 1e-10)
+        lr_1d = log_fp - np.log(fb)
+    else:
+        if p_idx is None or p_idx >= n_w:
+            lr_1d = np.zeros(x_2d.shape[0])
+        else:
+            w_p = weights[p_idx]
+            if s_valid and benign_method == 'synonymous':
+                w_b = weights[s_idx]
+            elif s_valid and b_idx is not None and b_idx < n_w and benign_method == 'avg':
+                w_b = (np.array(weights[b_idx]) + np.array(weights[s_idx])) / 2
+            elif b_idx is not None and b_idx < n_w:
+                w_b = weights[b_idx]
+            elif s_valid:
+                w_b = weights[s_idx]
+            else:
+                lr_1d = np.zeros(x_2d.shape[0])
+                return lr_1d, sample_logs, comp_logs_per_sample
+            log_fp = logsumexp([np.log(w_p[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+            log_fb = logsumexp([np.log(w_b[c] + 1e-300) + comp_log[c] for c in range(K)], axis=0)
+            lr_1d = log_fp - log_fb
 
     return lr_1d, sample_logs, comp_logs_per_sample
 
@@ -459,10 +574,13 @@ def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g,
     p_idx = p_idx_override if p_idx_override is not None else analysis.p_idx
     b_idx = analysis.b_idx
     s_idx = getattr(analysis, 's_idx', None)
+    g_idx = getattr(analysis, 'g_idx', None)
+    prior = r.get('median_prior', None)
     benign_method = analysis.benign_method
 
     lr_all = Parallel(n_jobs=-1)(
-        delayed(_eval_fit_on_grid)(fit, grid_pts, p_idx, b_idx, s_idx, benign_method)
+        delayed(_eval_fit_on_grid)(fit, grid_pts, p_idx, b_idx, s_idx, benign_method,
+                                   g_idx=g_idx, prior=prior)
         for fit in all_fits
     )
     lr_arr = np.array(lr_all)
@@ -635,6 +753,8 @@ def _compute_all_marginals(analysis, config, x_grids, p_idx_override=None):
     p_idx = p_idx_override if p_idx_override is not None else analysis.p_idx
     b_idx = analysis.b_idx
     s_idx = getattr(analysis, 's_idx', None)
+    g_idx = getattr(analysis, 'g_idx', None)
+    prior = analysis.results[config].get('median_prior', None)
     benign_method = analysis.benign_method
 
     valid_fits = []
@@ -653,7 +773,8 @@ def _compute_all_marginals(analysis, config, x_grids, p_idx_override=None):
 
     # One parallel call: each worker processes all D marginals for one bootstrap
     all_results = Parallel(n_jobs=-1)(
-        delayed(_eval_all_marginals)(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S)
+        delayed(_eval_all_marginals)(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S,
+                                     g_idx=g_idx, prior=prior)
         for fit in valid_fits
     )
     # all_results[b][d] = (lr_1d, sample_logs, comp_logs_per_sample)
@@ -758,7 +879,8 @@ def _aggregate_marginal_dim(dim_results, x_grid, path_pctile, ben_pctile, S):
 
 def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
                                     b_idx, s_idx, benign_method, S,
-                                    path_pctile, ben_pctile):
+                                    path_pctile, ben_pctile,
+                                    g_idx=None, prior=None):
     """Compute marginals for all p_indices in one parallel sweep.
 
     Component densities are computed ONCE per (bootstrap, dimension) and shared
@@ -783,7 +905,8 @@ def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
 
     all_results = Parallel(n_jobs=-1)(
         delayed(_eval_all_marginals_batch_p)(
-            fit, x_2d_list, p_indices, b_idx, s_idx, benign_method, S)
+            fit, x_2d_list, p_indices, b_idx, s_idx, benign_method, S,
+            g_idx=g_idx, prior=prior)
         for fit in all_fits
     )
     # all_results[boot][pi][dim] = (lr_1d, sample_logs, comp_logs)
@@ -801,7 +924,8 @@ def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
 
 
 def _compute_lr_grids_for_all_p(all_fits, x1g, x2g, total_dims,
-                                  b_idx, s_idx, benign_method, p_configs):
+                                  b_idx, s_idx, benign_method, p_configs,
+                                  g_idx=None, prior=None):
     """Compute LR+ grids for multiple pathogenic indices in one parallel sweep.
 
     p_configs : list of dicts, each with:
@@ -818,7 +942,8 @@ def _compute_lr_grids_for_all_p(all_fits, x1g, x2g, total_dims,
     p_indices  = [pc['p_idx'] for pc in p_configs]
 
     lr_all = Parallel(n_jobs=-1)(
-        delayed(_eval_fit_on_grid_batch_p)(fit, grid_pts, p_indices, b_idx, s_idx, benign_method)
+        delayed(_eval_fit_on_grid_batch_p)(fit, grid_pts, p_indices, b_idx, s_idx, benign_method,
+                                           g_idx=g_idx, prior=prior)
         for fit in all_fits
     )
     # lr_all[boot][pi] = flat lr array
@@ -910,11 +1035,30 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             analysis.benign_method,
             ms.sample_assignments.shape[1],
             path_pctile, ben_pctile,
+            g_idx=getattr(analysis, 'g_idx', None),
+            prior=r.get('median_prior', None),
         )
         marginal_data = {d: all_marginals[0][d] for d in range(D)}
         aux_marginal_data = {}
         for ai, (fixed_idx, _) in enumerate(aux_p_entries):
             aux_marginal_data[fixed_idx] = {d: all_marginals[ai + 1][d] for d in range(D)}
+
+    # Build role-aware per-sample style lists so colors/markers always reflect
+    # fixed role (0=path=red, 1=ben=blue, 2=gnomad=grey, 3=syn=green) even when
+    # one or more roles are absent and effective indices are compacted.
+    _eff_to_fixed = {}
+    for fixed_idx, eff_idx in [(0, analysis.p_idx), (1, analysis.b_idx),
+                                (2, analysis.g_idx), (3, analysis.s_idx)]:
+        if eff_idx is not None:
+            _eff_to_fixed[eff_idx] = fixed_idx
+    sample_style = {
+        'colors':  [SAMPLE_COLORS[_eff_to_fixed.get(i, i) % len(SAMPLE_COLORS)]
+                    for i in range(S)],
+        'edges':   [_SAMPLE_EDGE_COLORS[_eff_to_fixed.get(i, i) % len(_SAMPLE_EDGE_COLORS)]
+                    for i in range(S)],
+        'markers': [SAMPLE_MARKERS[_eff_to_fixed.get(i, i) % len(SAMPLE_MARKERS)]
+                    for i in range(S)],
+    }
 
     gene = getattr(ms, 'scoreset_name', '')
     suptitle = (
@@ -934,7 +1078,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             model_label, n_boots_used, pad, n_grid, contour_levels,
             figsize, suptitle,
             aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data,
-            first_row_only=first_row_only,
+            first_row_only=first_row_only, sample_style=sample_style,
         )
     else:
         fig, info = _plot_mv_hd(
@@ -945,6 +1089,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
             model_label, n_boots_used, pad, n_grid, contour_levels,
             figsize, suptitle,
             aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data,
+            sample_style=sample_style,
             max_lr_pairs=max_lr_pairs,
         )
 
@@ -956,13 +1101,15 @@ _AUX_COLORS = ['#e6a817', '#8B4513', '#006400', '#800080', '#FF6600', '#4B0082']
 
 def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
                        dataset_names, sample_names, tau_p_log, tau_b_log,
-                       ylim_bound, path_pctile, ben_pctile, analysis):
+                       ylim_bound, path_pctile, ben_pctile, analysis,
+                       sample_style=None):
     """Draw one row: S sample density panels + primary pathogenic LR+ panel."""
     x_marg = md['x']
+    _sc = sample_style['colors']  if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
 
     for s_idx in range(min(S, n_cols - 1)):
         ax = fig.add_subplot(gs[row, s_idx])
-        color = SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)]
+        color = _sc[s_idx]
 
         s_data = md['sample'][s_idx] if md['sample'] is not None else None
         if s_data is not None:
@@ -1012,11 +1159,12 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
                 ax.text(x_marg[0], tau_p_log[pv - 1], f' +{pv}', fontsize=5, color='red',  va='bottom')
                 ax.text(x_marg[0], tau_b_log[pv - 1], f' -{pv}', fontsize=5, color='blue', va='top')
         ax.axhline(0, color='gray', lw=0.8, alpha=0.5)
-        obs_p = scores[sa[:, analysis.p_idx], dim]
-        obs_p = obs_p[~np.isnan(obs_p)]
-        if len(obs_p):
-            ax.plot(obs_p, np.full(len(obs_p), ylim_bound),
-                    '|', color='#CA7682', alpha=0.3, ms=3, mew=0.3)
+        if analysis.p_idx is not None:
+            obs_p = scores[sa[:, analysis.p_idx], dim]
+            obs_p = obs_p[~np.isnan(obs_p)]
+            if len(obs_p):
+                ax.plot(obs_p, np.full(len(obs_p), ylim_bound),
+                        '|', color='#CA7682', alpha=0.3, ms=3, mew=0.3)
         neg_idx = analysis.b_idx if analysis.b_idx is not None else analysis.s_idx
         if neg_idx is not None:
             obs_b = scores[sa[:, neg_idx], dim]
@@ -1098,11 +1246,14 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
                 aux_p_entries=None, aux_marginal_data=None,
-                first_row_only=False):
+                first_row_only=False, sample_style=None):
     """Layout for D=2: 2D grid, density contours, marginals."""
     aux_p_entries = aux_p_entries or []
     aux_marginal_data = aux_marginal_data or {}
     n_aux = len(aux_p_entries)
+    _sc = sample_style['colors']  if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
+    _se = sample_style['edges']   if sample_style else [_SAMPLE_EDGE_COLORS[i % len(_SAMPLE_EDGE_COLORS)] for i in range(S)]
+    _sm = sample_style['markers'] if sample_style else [SAMPLE_MARKERS[i % len(SAMPLE_MARKERS)] for i in range(S)]
 
     x1g = np.linspace(np.nanmin(scores[:, 0]) - pad, np.nanmax(scores[:, 0]) + pad, n_grid)
     x2g = np.linspace(np.nanmin(scores[:, 1]) - pad, np.nanmax(scores[:, 1]) + pad, n_grid)
@@ -1139,6 +1290,8 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         all_fits, x1g, x2g, scores.shape[1],
         analysis.b_idx, getattr(analysis, 's_idx', None),
         analysis.benign_method, _p_configs,
+        g_idx=getattr(analysis, 'g_idx', None),
+        prior=analysis.results[config].get('median_prior', None),
     )
     grid_points, lr_conservative = _all_grids[0]
 
@@ -1172,11 +1325,9 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         mask = sa[:, s_idx] & complete
         if not mask.any(): continue
         ax.scatter(scores[mask, 0], scores[mask, 1],
-                   color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
-                   s=14, alpha=0.7,
-                   edgecolors=_SAMPLE_EDGE_COLORS[s_idx % len(_SAMPLE_EDGE_COLORS)],
-                   linewidths=0.5, zorder=1,
-                   marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
+                   color=_sc[s_idx], s=14, alpha=0.7,
+                   edgecolors=_se[s_idx], linewidths=0.5, zorder=1,
+                   marker=_sm[s_idx])
     # Evidence colormap on top (semi-transparent so points show through)
     im = ax.pcolormesh(x1g, x2g, grid_points.T, cmap=POINT_CMAP,
                        norm=pt_norm, shading='auto', alpha=0.72, zorder=2)
@@ -1184,7 +1335,7 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
     ax.contour(x1g, x2g, lr_conservative.T, levels=[0], colors='black', linewidths=1, zorder=3)
     ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
     ax.set_xlim(x1_range); ax.set_ylim(x2_range)
-    ax.set_aspect('equal', adjustable='box')
+    ax.set_aspect('auto')
     ax.set_title(f'Point Regions\nprior={median_prior:.4f}', fontsize=9, fontweight='bold')
     ax.grid(lw=0.2, alpha=0.3, zorder=0)
 
@@ -1200,18 +1351,16 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
             mask = sa[:, s_idx] & complete
             if not mask.any(): continue
             ax.scatter(scores[mask, 0], scores[mask, 1],
-                       color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
-                       s=14, alpha=0.7,
-                       edgecolors=_SAMPLE_EDGE_COLORS[s_idx % len(_SAMPLE_EDGE_COLORS)],
-                       linewidths=0.5, zorder=1,
-                       marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
+                       color=_sc[s_idx], s=14, alpha=0.7,
+                       edgecolors=_se[s_idx], linewidths=0.5, zorder=1,
+                       marker=_sm[s_idx])
         im2 = ax.pcolormesh(x1g, x2g, aux_gp.T, cmap=POINT_CMAP,
                             norm=pt_norm, shading='auto', alpha=0.72, zorder=2)
         plt.colorbar(im2, ax=ax, label='Evidence Points', shrink=0.8)
         ax.contour(x1g, x2g, aux_lr_con.T, levels=[0], colors='black', linewidths=1, zorder=3)
         ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
         ax.set_xlim(x1_range); ax.set_ylim(x2_range)
-        ax.set_aspect('equal', adjustable='box')
+        ax.set_aspect('auto')
         _ar = analysis.results.get(config, {}).get('aux_results', {}).get(fixed_idx, {})
         _ap = _ar.get('median_prior', float('nan'))
         ax.set_title(f'Aux: {aux_name}\nprior={_ap:.4f}',
@@ -1225,9 +1374,9 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
     # ── Bottom legends (below all panels) ──────────────────────────────────
     # Sample handles — match actual scatter style
     sample_handles = [
-        Line2D([0], [0], marker=SAMPLE_MARKERS[s_idx],
-               color=_SAMPLE_EDGE_COLORS[s_idx % len(_SAMPLE_EDGE_COLORS)],
-               markerfacecolor=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+        Line2D([0], [0], marker=_sm[s_idx],
+               color=_se[s_idx],
+               markerfacecolor=_sc[s_idx],
                markersize=9, linewidth=0, markeredgewidth=0.8,
                label=f"{sample_names[s_idx]} (n={int(sa[:, s_idx].sum())})")
         for s_idx in range(min(S, 4))
@@ -1266,24 +1415,24 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                     if levels[-1] > levels[0]:
                         ax.contourf(x1g, x2g, d_mean.T, levels=levels, cmap=cmap_name, alpha=0.4)
                         ax.contour(x1g, x2g, d_mean.T, levels=levels,
-                                   colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                                   colors=_sc[s_idx],
                                    linewidths=0.5, alpha=0.6)
                     outer = levels[1] if len(levels) > 1 else levels[0]
                     for bound, ls in [(np.maximum(d_mean - d_std, 0), ':'), (d_mean + d_std, ':')]:
                         ax.contour(x1g, x2g, bound.T, levels=[outer],
-                                   colors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
+                                   colors=_sc[s_idx],
                                    linewidths=0.3, linestyles=ls, alpha=0.3)
                 mask = sa[:, s_idx] & complete
                 if mask.any():
                     ax.scatter(scores[mask, 0], scores[mask, 1],
-                               c=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)], s=4, alpha=0.3,
+                               c=_sc[s_idx], s=4, alpha=0.3,
                                edgecolors='none')
                 _plot_component_means(ax, all_fits, s_idx)
                 ax.set_xlim(x1_range); ax.set_ylim(x2_range)
                 ax.set_xlabel(dataset_names[0], fontsize=7); ax.set_ylabel(dataset_names[1], fontsize=7)
                 n_s = sa[:, s_idx].sum()
                 ax.set_title(f'{sample_names[s_idx]} (n={n_s})', fontsize=8, fontweight='bold',
-                             color=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)])
+                             color=_sc[s_idx])
                 ax.grid(lw=0.2, alpha=0.2)
         for c_idx in range(S, n_cols):
             fig.add_subplot(gs[1, c_idx]).axis('off')
@@ -1300,7 +1449,8 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                 continue
             _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
                                dataset_names, sample_names, tau_p_log, tau_b_log,
-                               ylim_bound, path_pctile, ben_pctile, analysis)
+                               ylim_bound, path_pctile, ben_pctile, analysis,
+                               sample_style=sample_style)
             for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
                 aux_md_dim = (aux_marginal_data.get(fixed_idx) or {}).get(dim)
                 aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
@@ -1330,7 +1480,8 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                 path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
-                aux_p_entries=None, aux_marginal_data=None, max_lr_pairs=10):
+                aux_p_entries=None, aux_marginal_data=None, max_lr_pairs=10,
+                sample_style=None):
     """Layout for D>2.
 
     Row 0: pairwise LR+ grids — all C(D,2) combinations up to max_lr_pairs,
@@ -1342,6 +1493,9 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
     aux_marginal_data = aux_marginal_data or {}
     n_aux = len(aux_p_entries)
     _aux_results = analysis.results.get(config, {}).get('aux_results', {})
+    _sc = sample_style['colors']  if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
+    _se = sample_style['edges']   if sample_style else [_SAMPLE_EDGE_COLORS[i % len(_SAMPLE_EDGE_COLORS)] for i in range(S)]
+    _sm = sample_style['markers'] if sample_style else [SAMPLE_MARKERS[i % len(SAMPLE_MARKERS)] for i in range(S)]
 
     all_dim_pairs = list(_combinations(range(D), 2))[:max_lr_pairs]
     n_pairs = len(all_dim_pairs)
@@ -1388,9 +1542,8 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
             ax.scatter(scores[mask, dim_i], scores[mask, dim_j],
                        c=points[mask], cmap=POINT_CMAP, norm=pt_norm,
                        s=8, alpha=0.5,
-                       edgecolors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
-                       linewidths=0.3,
-                       marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
+                       edgecolors=_sc[s_idx], linewidths=0.3,
+                       marker=_sm[s_idx])
 
         ax.set_xlabel(dataset_names[dim_i], fontsize=7)
         ax.set_ylabel(dataset_names[dim_j], fontsize=7)
@@ -1429,9 +1582,8 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                 ax.scatter(scores[mask, 0], scores[mask, 1],
                            c=aux_pts[mask], cmap=POINT_CMAP, norm=pt_norm,
                            s=8, alpha=0.5,
-                           edgecolors=SAMPLE_COLORS[s_idx % len(SAMPLE_COLORS)],
-                           linewidths=0.3,
-                           marker=SAMPLE_MARKERS[s_idx % len(SAMPLE_MARKERS)])
+                           edgecolors=_sc[s_idx], linewidths=0.3,
+                           marker=_sm[s_idx])
             ax.set_xlabel(dataset_names[0], fontsize=7)
             ax.set_ylabel(dataset_names[1], fontsize=7)
             ax.set_xlim(xi_range); ax.set_ylim(xj_range)
@@ -1459,7 +1611,8 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
             continue
         _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
                            dataset_names, sample_names, tau_p_log, tau_b_log,
-                           ylim_bound, path_pctile, ben_pctile, analysis)
+                           ylim_bound, path_pctile, ben_pctile, analysis,
+                           sample_style=sample_style)
         for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
             aux_md_dim = (aux_marginal_data.get(fixed_idx) or {}).get(dim)
             aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)

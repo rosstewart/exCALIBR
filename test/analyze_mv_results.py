@@ -112,9 +112,12 @@ def _bootstrap_job(fit_raw, scores, sa,
 
     aux_lrs = {}   # {eff_idx: {'lr': array, 'prior': float}}
 
-    if eff_p is None:
+    nu_mode = eff_p is None and (eff_b is not None or eff_s is not None) and eff_g is not None
+    pu_mode = eff_p is not None and eff_b is None and eff_s is None and eff_g is not None
+
+    if eff_p is None and not nu_mode:
         return None, f"pathogenic index {p_idx} out of range for weights with {n_w} rows"
-    if eff_b is None and eff_s is None:
+    if eff_b is None and eff_s is None and not pu_mode:
         return None, (
             f"neither benign ({b_idx}) nor synonymous ({s_idx}) valid for "
             f"weights with {n_w} rows"
@@ -154,10 +157,10 @@ def _bootstrap_job(fit_raw, scores, sa,
             pop_scores = scores[sa[:, eff_g].astype(bool)]
             N_pop = pop_scores.shape[0]
             K = len(params)
-            w_p = weights[eff_p]
+            w_pop = weights[eff_g]
 
-            log_fp = np.full(N_pop, np.nan)
-            log_fb = np.full(N_pop, np.nan)
+            log_f1 = np.full(N_pop, np.nan)  # "labeled class" density on pop observations
+            log_f2 = np.full(N_pop, np.nan)  # "reference class" density on pop observations
             pop_obs = ~np.isnan(pop_scores)
             pop_groups = {}
             for j in range(N_pop):
@@ -168,28 +171,107 @@ def _bootstrap_job(fit_raw, scores, sa,
 
             for obs_key, ilist in pop_groups.items():
                 jdx = np.array(ilist)
-                b_sup = _sample_supports(eff_b, obs_key)
-                s_sup = _sample_supports(eff_s, obs_key)
-                w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
-                if w_b is None:
-                    continue
                 x_sub = pop_scores[jdx]
-                log_fp[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                         for c in range(K)], axis=0)
-                log_fb[jdx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                         for c in range(K)], axis=0)
+                if nu_mode:
+                    # NU: labeled class = benign, reference = population.
+                    # Skip _sample_supports check: prior estimation only needs
+                    # the benign density evaluated at gnomAD points — we don't
+                    # need strict pattern overlap (unlike LR computation).
+                    w_b = _benign_w(weights, b_sup=True, s_sup=True)
+                    if w_b is None:
+                        continue
+                    log_f1[jdx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
+                    log_f2[jdx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
+                elif pu_mode:
+                    # PU: labeled class = pathogenic, reference = population
+                    w_p = weights[eff_p]
+                    log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
+                    log_f2[jdx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
+                else:
+                    # Standard: pathogenic vs benign
+                    b_sup = _sample_supports(eff_b, obs_key)
+                    s_sup = _sample_supports(eff_s, obs_key)
+                    w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                    if w_b is None:
+                        continue
+                    w_p = weights[eff_p]
+                    log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
+                    log_f2[jdx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
 
-            valid = np.isfinite(log_fp) & np.isfinite(log_fb)
-            fp, fb = np.exp(log_fp[valid]), np.exp(log_fb[valid])
-            prior = 0.5
-            for _ in range(10000):
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    posteriors = 1 / (1 + (1 - prior) / prior * fb / fp)
-                new_prior = np.nanmean(posteriors)
-                if abs(new_prior - prior) < 1e-6:
+            valid = np.isfinite(log_f1) & np.isfinite(log_f2)
+            f1, f2 = np.exp(log_f1[valid]), np.exp(log_f2[valid])
+            f1_at_pop = f1  # labeled-class density at gnomAD observations (alias for NU/PU path)
+
+            if nu_mode or pu_mode:
+                # Mean-matching estimator:
+                #   NU: α = 1 - E_{gnomAD}[fb] / E_{benign}[fb]
+                #   PU: α = E_{gnomAD}[fp] / E_{path}[fp]
+                #
+                # Requires only that pathogenic (benign) variants have low benign (path)
+                # density — far weaker than Blanchard-Recht's floor assumption, which breaks
+                # when fitted model weights don't satisfy fpop = α·fpath + (1-α)·fbenign.
+
+                # Compute labeled-class density at labeled-class observations
+                if nu_mode:
+                    labeled_scores = scores[sa[:, eff_b].astype(bool)]
+                else:
+                    labeled_scores = scores[sa[:, eff_p].astype(bool)]
+
+                labeled_obs = ~np.isnan(labeled_scores)
+                labeled_groups = {}
+                for j in range(len(labeled_scores)):
+                    key = frozenset(np.where(labeled_obs[j])[0])
+                    if not key:
+                        continue
+                    labeled_groups.setdefault(key, []).append(j)
+
+                log_f1_labeled = np.full(len(labeled_scores), np.nan)
+                for obs_key, ilist in labeled_groups.items():
+                    jdx = np.array(ilist)
+                    x_sub = labeled_scores[jdx]
+                    if nu_mode:
+                        w_b = _benign_w(weights, b_sup=True, s_sup=True)
+                        if w_b is None:
+                            continue
+                        log_f1_labeled[jdx] = logsumexp(
+                            [np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                             for c in range(K)], axis=0)
+                    else:
+                        w_p = weights[eff_p]
+                        log_f1_labeled[jdx] = logsumexp(
+                            [np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                             for c in range(K)], axis=0)
+
+                f1_at_labeled = np.exp(log_f1_labeled[np.isfinite(log_f1_labeled)])
+
+                if len(f1_at_pop) >= 5 and len(f1_at_labeled) >= 5:
+                    mean_pop = np.mean(f1_at_pop)
+                    mean_labeled = np.mean(f1_at_labeled)
+                    if mean_labeled > 0:
+                        if nu_mode:
+                            prior = float(np.clip(1.0 - mean_pop / mean_labeled, 0.001, 0.999))
+                        else:
+                            prior = float(np.clip(mean_pop / mean_labeled, 0.001, 0.999))
+                    else:
+                        prior = 0.1
+                else:
+                    prior = 0.1
+            else:
+                prior = 0.5
+                for _ in range(10000):
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        posteriors = 1 / (1 + (1 - prior) / prior * f2 / f1)
+                    new_prior = np.nanmean(posteriors)
+                    if abs(new_prior - prior) < 1e-6:
+                        prior = new_prior
+                        break
                     prior = new_prior
-                    break
-                prior = new_prior
     except Exception as e:
         import traceback
         return None, f"prior EM: {e}\n{traceback.format_exc()}"
@@ -294,18 +376,41 @@ def _bootstrap_job(fit_raw, scores, sa,
                     continue
                 idx = np.array(indices)
                 w = weights if obs_key == all_dims else marginal_w.get(obs_key, weights)
-                b_sup = _sample_supports(eff_b, obs_key)
-                s_sup = _sample_supports(eff_s, obs_key)
-                w_b = _benign_w(w, b_sup=b_sup, s_sup=s_sup)
-                if w_b is None:
-                    continue  # leave NaN
-                w_p = w[eff_p]
                 x_sub = scores[idx]
-                lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                 for c in range(K)], axis=0)
-                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                 for c in range(K)], axis=0)
-                log_lr[idx] = lfp - lfb
+                if nu_mode:
+                    b_sup = _sample_supports(eff_b, obs_key)
+                    s_sup = _sample_supports(eff_s, obs_key)
+                    w_b = _benign_w(w, b_sup=b_sup, s_sup=s_sup)
+                    if w_b is None:
+                        continue
+                    lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    lfpop = logsumexp([np.log(w[eff_g][c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                      for c in range(K)], axis=0)
+                    fp = np.maximum((np.exp(lfpop) - (1 - prior) * np.exp(lfb)) / prior,
+                                    np.exp(lfpop) * 1e-10)
+                    log_lr[idx] = np.log(fp) - lfb
+                elif pu_mode:
+                    w_p = w[eff_p]
+                    lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    lfpop = logsumexp([np.log(w[eff_g][c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                      for c in range(K)], axis=0)
+                    fb = np.maximum((np.exp(lfpop) - prior * np.exp(lfp)) / (1 - prior),
+                                    np.exp(lfpop) * 1e-10)
+                    log_lr[idx] = lfp - np.log(fb)
+                else:
+                    b_sup = _sample_supports(eff_b, obs_key)
+                    s_sup = _sample_supports(eff_s, obs_key)
+                    w_b = _benign_w(w, b_sup=b_sup, s_sup=s_sup)
+                    if w_b is None:
+                        continue
+                    w_p = w[eff_p]
+                    lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    log_lr[idx] = lfp - lfb
             lr = log_lr
         else:
             log_lr = np.full(N, np.nan)
@@ -317,18 +422,41 @@ def _bootstrap_job(fit_raw, scores, sa,
                 pat_groups.setdefault(key, []).append(j)
             for obs_key, indices in pat_groups.items():
                 idx = np.array(indices)
-                b_sup = _sample_supports(eff_b, obs_key)
-                s_sup = _sample_supports(eff_s, obs_key)
-                w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
-                if w_b is None:
-                    continue
-                w_p = weights[eff_p]
                 x_sub = scores[idx]
-                lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                 for c in range(K)], axis=0)
-                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                 for c in range(K)], axis=0)
-                log_lr[idx] = lfp - lfb
+                if nu_mode:
+                    b_sup = _sample_supports(eff_b, obs_key)
+                    s_sup = _sample_supports(eff_s, obs_key)
+                    w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                    if w_b is None:
+                        continue
+                    lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    lfpop = logsumexp([np.log(weights[eff_g][c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                      for c in range(K)], axis=0)
+                    fp = np.maximum((np.exp(lfpop) - (1 - prior) * np.exp(lfb)) / prior,
+                                    np.exp(lfpop) * 1e-10)
+                    log_lr[idx] = np.log(fp) - lfb
+                elif pu_mode:
+                    w_p = weights[eff_p]
+                    lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    lfpop = logsumexp([np.log(weights[eff_g][c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                      for c in range(K)], axis=0)
+                    fb = np.maximum((np.exp(lfpop) - prior * np.exp(lfp)) / (1 - prior),
+                                    np.exp(lfpop) * 1e-10)
+                    log_lr[idx] = lfp - np.log(fb)
+                else:
+                    b_sup = _sample_supports(eff_b, obs_key)
+                    s_sup = _sample_supports(eff_s, obs_key)
+                    w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                    if w_b is None:
+                        continue
+                    w_p = weights[eff_p]
+                    lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                     for c in range(K)], axis=0)
+                    log_lr[idx] = lfp - lfb
             lr = log_lr
 
         # ---- aux LR computation (same benign reference, different pathogenic weights) ----
@@ -494,12 +622,36 @@ class MVCalibrationAnalysis:
         self.g_idx = _eff_idx("gnomad", gnomad_idx)
         self.s_idx = _eff_idx("synonymous", synonymous_idx)
 
-        if self.p_idx is None:
-            raise ValueError(f"Pathogenic sample (role {pathogenic_idx}) has no observations.")
-        if self.b_idx is None and self.s_idx is None:
+        # Determine inference mode based on which labeled classes are present.
+        # NU (negative-unlabeled): pathogenic absent, benign/syn + gnomad present → derive fp from pop
+        # PU (positive-unlabeled): benign+syn absent, pathogenic + gnomad present → derive fb from pop
+        # Standard: both pathogenic and benign/syn present
+        _nu_mode = self.p_idx is None and (self.b_idx is not None or self.s_idx is not None) and self.g_idx is not None
+        _pu_mode = self.p_idx is not None and self.b_idx is None and self.s_idx is None and self.g_idx is not None
+
+        if self.p_idx is None and not _nu_mode:
+            raise ValueError(
+                f"Pathogenic sample (role {pathogenic_idx}) has no observations and NU mode "
+                f"is unavailable (need gnomad + benign/synonymous)."
+            )
+        if self.b_idx is None and self.s_idx is None and not _pu_mode:
             raise ValueError(
                 f"Neither benign (role {benign_idx}) nor synonymous (role {synonymous_idx}) "
-                f"has observations."
+                f"has observations and PU mode is unavailable (need gnomad + pathogenic)."
+            )
+
+        self.nu_mode = _nu_mode
+        self.pu_mode = _pu_mode
+
+        if _nu_mode:
+            warnings.warn(
+                f"Pathogenic sample (role {pathogenic_idx}) absent — using negative-unlabeled "
+                f"(NU) mode: fp derived from population unmixing."
+            )
+        if _pu_mode:
+            warnings.warn(
+                f"Benign/synonymous samples absent — using positive-unlabeled (PU) mode: "
+                f"fb derived from population unmixing."
             )
 
         # Auxiliary pathogenic samples — each gets its own point regions using
@@ -627,10 +779,10 @@ class MVCalibrationAnalysis:
         pop_scores = self.ms.scores[pop_mask]
         N_pop = pop_scores.shape[0]
         K = len(params)
-        w_p = weights[self.p_idx]
+        w_pop = weights[self.g_idx]
 
-        log_fp = np.full(N_pop, np.nan)
-        log_fb = np.full(N_pop, np.nan)
+        log_f1 = np.full(N_pop, np.nan)  # labeled-class density
+        log_f2 = np.full(N_pop, np.nan)  # reference density
         obs_mask = ~np.isnan(pop_scores)
         pat_groups = {}
         for j in range(N_pop):
@@ -641,33 +793,93 @@ class MVCalibrationAnalysis:
 
         for obs_key, indices in pat_groups.items():
             idx = np.array(indices)
-            b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
-            s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
-            try:
-                w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
-            except ValueError:
-                continue
             x_sub = pop_scores[idx]
-            log_fp[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                     for c in range(K)], axis=0)
-            log_fb[idx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                     for c in range(K)], axis=0)
+            if self.nu_mode:
+                try:
+                    w_b = self._get_benign_weights(weights, b_supports=True, s_supports=True)
+                except ValueError:
+                    continue
+                log_f1[idx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                         for c in range(K)], axis=0)
+                log_f2[idx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                         for c in range(K)], axis=0)
+            elif self.pu_mode:
+                w_p = weights[self.p_idx]
+                log_f1[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                         for c in range(K)], axis=0)
+                log_f2[idx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                         for c in range(K)], axis=0)
+            else:
+                w_p = weights[self.p_idx]
+                b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
+                s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
+                try:
+                    w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
+                except ValueError:
+                    continue
+                log_f1[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                         for c in range(K)], axis=0)
+                log_f2[idx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                         for c in range(K)], axis=0)
 
-        valid = np.isfinite(log_fp) & np.isfinite(log_fb)
-        fp = np.exp(log_fp[valid])
-        fb = np.exp(log_fb[valid])
+        f1_at_pop = np.exp(log_f1[np.isfinite(log_f1)])
 
-        prior = 0.5
-        for _ in range(10000):
-            with np.errstate(divide='ignore', invalid='ignore'):
-                posteriors = 1 / (1 + (1 - prior) / prior * fb / fp)
-            new_prior = np.nanmean(posteriors)
-            if abs(new_prior - prior) < 1e-6:
-                return new_prior
-            prior = new_prior
+        if self.nu_mode or self.pu_mode:
+            # Mean-matching estimator (see _bootstrap_job for rationale)
+            sa = self.ms.sample_assignments
+            scores_all = self.ms.scores
+            labeled_idx = self.b_idx if self.nu_mode else self.p_idx
+            labeled_scores = scores_all[sa[:, labeled_idx].astype(bool)]
+            labeled_obs_mask = ~np.isnan(labeled_scores)
+            labeled_groups = {}
+            for j in range(len(labeled_scores)):
+                key = frozenset(np.where(labeled_obs_mask[j])[0])
+                if not key:
+                    continue
+                labeled_groups.setdefault(key, []).append(j)
+
+            log_f1_lab = np.full(len(labeled_scores), np.nan)
+            for obs_key, indices in labeled_groups.items():
+                idx = np.array(indices)
+                x_sub = labeled_scores[idx]
+                if self.nu_mode:
+                    try:
+                        w_b = self._get_benign_weights(weights, b_supports=True, s_supports=True)
+                    except ValueError:
+                        continue
+                    log_f1_lab[idx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                                 for c in range(K)], axis=0)
+                else:
+                    w_p = weights[self.p_idx]
+                    log_f1_lab[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                                 for c in range(K)], axis=0)
+
+            f1_at_lab = np.exp(log_f1_lab[np.isfinite(log_f1_lab)])
+            if len(f1_at_pop) >= 5 and len(f1_at_lab) >= 5:
+                mean_pop = np.mean(f1_at_pop)
+                mean_lab = np.mean(f1_at_lab)
+                if mean_lab > 0:
+                    if self.nu_mode:
+                        prior = float(np.clip(1.0 - mean_pop / mean_lab, 0.001, 0.999))
+                    else:
+                        prior = float(np.clip(mean_pop / mean_lab, 0.001, 0.999))
+                else:
+                    prior = 0.1
+            else:
+                prior = 0.1
+        else:
+            prior = 0.5
+            for _ in range(10000):
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    posteriors = 1 / (1 + (1 - prior) / prior * f2 / f1)
+                new_prior = np.nanmean(posteriors)
+                if abs(new_prior - prior) < 1e-6:
+                    prior = new_prior
+                    break
+                prior = new_prior
         return prior
 
-    def _compute_variant_lr(self, params, weights):
+    def _compute_variant_lr(self, params, weights, prior=None):
         """Compute log LR+ for every variant in ms.scores.
 
         Groups variants by their observation pattern so the benign-class
@@ -678,7 +890,7 @@ class MVCalibrationAnalysis:
         scores = self.ms.scores
         N, _ = scores.shape
         obs_mask = ~np.isnan(scores)
-        w_p = weights[self.p_idx]
+        w_pop = weights[self.g_idx] if self.g_idx is not None else None
 
         log_lr = np.full(N, np.nan)
         pat_groups = {}
@@ -690,18 +902,45 @@ class MVCalibrationAnalysis:
 
         for obs_key, indices in pat_groups.items():
             idx = np.array(indices)
-            b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
-            s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
-            try:
-                w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
-            except ValueError:
-                continue  # leave NaN — neither sample supports this pattern
             x_sub = scores[idx]
-            log_fp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                for c in range(K)], axis=0)
-            log_fb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                for c in range(K)], axis=0)
-            log_lr[idx] = log_fp - log_fb
+            if self.nu_mode:
+                b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
+                s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
+                try:
+                    w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
+                except ValueError:
+                    continue
+                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfpop = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                   for c in range(K)], axis=0)
+                _p = prior if prior is not None else 0.1
+                fp = np.maximum((np.exp(lfpop) - (1 - _p) * np.exp(lfb)) / _p,
+                                np.exp(lfpop) * 1e-10)
+                log_lr[idx] = np.log(fp) - lfb
+            elif self.pu_mode:
+                w_p = weights[self.p_idx]
+                lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfpop = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                   for c in range(K)], axis=0)
+                _p = prior if prior is not None else 0.1
+                fb = np.maximum((np.exp(lfpop) - _p * np.exp(lfp)) / (1 - _p),
+                                np.exp(lfpop) * 1e-10)
+                log_lr[idx] = lfp - np.log(fb)
+            else:
+                w_p = weights[self.p_idx]
+                b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
+                s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
+                try:
+                    w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
+                except ValueError:
+                    continue
+                log_fp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                    for c in range(K)], axis=0)
+                log_fb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                    for c in range(K)], axis=0)
+                log_lr[idx] = log_fp - log_fb
         return log_lr
 
     def _cap_lr_by_density_fraction(self, lr_matrix, config, density_fraction_threshold=0.05):
@@ -737,7 +976,7 @@ class MVCalibrationAnalysis:
         N, _ = scores.shape
         K = len(params)
 
-        w_p = weights[self.p_idx]
+        w_pop = weights[self.g_idx] if self.g_idx is not None else None
         log_fp = np.full(N, np.nan)
         log_fb = np.full(N, np.nan)
         obs_mask = ~np.isnan(scores)
@@ -750,21 +989,48 @@ class MVCalibrationAnalysis:
 
         for obs_key, indices in pat_groups.items():
             idx = np.array(indices)
-            b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
-            s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
-            try:
-                w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
-            except ValueError:
-                continue
             x_sub = scores[idx]
-            log_fp[idx] = logsumexp([
-                np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                for c in range(K)
-            ], axis=0)
-            log_fb[idx] = logsumexp([
-                np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                for c in range(K)
-            ], axis=0)
+            if self.nu_mode:
+                b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
+                s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
+                try:
+                    w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
+                except ValueError:
+                    continue
+                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfpop = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                   for c in range(K)], axis=0)
+                fp = np.maximum((np.exp(lfpop) - (1 - median_prior) * np.exp(lfb)) / median_prior,
+                                np.exp(lfpop) * 1e-10)
+                log_fp[idx] = np.log(fp)
+                log_fb[idx] = lfb
+            elif self.pu_mode:
+                w_p = weights[self.p_idx]
+                lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfpop = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                   for c in range(K)], axis=0)
+                fb = np.maximum((np.exp(lfpop) - median_prior * np.exp(lfp)) / (1 - median_prior),
+                                np.exp(lfpop) * 1e-10)
+                log_fp[idx] = lfp
+                log_fb[idx] = np.log(fb)
+            else:
+                w_p = weights[self.p_idx]
+                b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
+                s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
+                try:
+                    w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
+                except ValueError:
+                    continue
+                log_fp[idx] = logsumexp([
+                    np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                    for c in range(K)
+                ], axis=0)
+                log_fb[idx] = logsumexp([
+                    np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                    for c in range(K)
+                ], axis=0)
 
         log_total = np.logaddexp(log_fp, log_fb)
         path_fraction = np.exp(log_fp - log_total)
@@ -818,7 +1084,7 @@ class MVCalibrationAnalysis:
 
         return marginal_weights
 
-    def _compute_variant_lr_reestimated(self, params, weights, marginal_weights_by_pattern):
+    def _compute_variant_lr_reestimated(self, params, weights, marginal_weights_by_pattern, prior=None):
         """Compute log LR+ per variant, using re-estimated marginal weights for partials."""
         scores = self.ms.scores
         N, D = scores.shape
@@ -843,25 +1109,46 @@ class MVCalibrationAnalysis:
             else:
                 w = marginal_weights_by_pattern.get(obs_key, weights)
 
-            b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
-            s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
-            w_p = w[self.p_idx]
-            try:
-                w_b = self._get_benign_weights(w, b_supports=b_sup, s_supports=s_sup)
-            except ValueError:
-                continue  # leave NaN — neither sample supports this pattern
-
             x_sub = scores[idx]
-            log_fp = logsumexp([
-                np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                for c in range(K)
-            ], axis=0)
-            log_fb = logsumexp([
-                np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                for c in range(K)
-            ], axis=0)
-
-            log_lr[idx] = log_fp - log_fb
+            w_pop = w[self.g_idx] if self.g_idx is not None else None
+            if self.nu_mode:
+                b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
+                s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
+                try:
+                    w_b = self._get_benign_weights(w, b_supports=b_sup, s_supports=s_sup)
+                except ValueError:
+                    continue
+                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfpop = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                   for c in range(K)], axis=0)
+                _p = prior if prior is not None else 0.1
+                fp = np.maximum((np.exp(lfpop) - (1 - _p) * np.exp(lfb)) / _p,
+                                np.exp(lfpop) * 1e-10)
+                log_lr[idx] = np.log(fp) - lfb
+            elif self.pu_mode:
+                w_p = w[self.p_idx]
+                lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                 for c in range(K)], axis=0)
+                lfpop = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                   for c in range(K)], axis=0)
+                _p = prior if prior is not None else 0.1
+                fb = np.maximum((np.exp(lfpop) - _p * np.exp(lfp)) / (1 - _p),
+                                np.exp(lfpop) * 1e-10)
+                log_lr[idx] = lfp - np.log(fb)
+            else:
+                b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
+                s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
+                w_p = w[self.p_idx]
+                try:
+                    w_b = self._get_benign_weights(w, b_supports=b_sup, s_supports=s_sup)
+                except ValueError:
+                    continue
+                log_fp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                    for c in range(K)], axis=0)
+                log_fb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                    for c in range(K)], axis=0)
+                log_lr[idx] = log_fp - log_fb
 
         return log_lr
 
@@ -896,9 +1183,9 @@ class MVCalibrationAnalysis:
                     obs_dims = np.array(sorted(pattern))
                     marginal_w[pattern] = self._reestimate_marginal_weights(
                         params, weights, obs_dims)
-                lr = self._compute_variant_lr_reestimated(params, weights, marginal_w)
+                lr = self._compute_variant_lr_reestimated(params, weights, marginal_w, prior=prior)
             else:
-                lr = self._compute_variant_lr(params, weights)
+                lr = self._compute_variant_lr(params, weights, prior=prior)
         except Exception as e:
             return None, str(e)
 
@@ -1042,11 +1329,12 @@ class MVCalibrationAnalysis:
                 n_capped = (lr_matrix != lr_matrix_raw).any(axis=0).sum()
                 print(f"  Variants with any LR+ capped: {n_capped}/{N}")
 
-                path_mask_check = sa[:, self.p_idx]
-                raw_min = np.nanmin(lr_matrix_raw[:, path_mask_check], axis=0)
-                capped_min = np.nanmin(lr_matrix[:, path_mask_check], axis=0)
-                n_plp_protected = ((raw_min < 0) & (capped_min >= 0)).sum()
-                print(f"  P/LP variants protected from benign LR+: {n_plp_protected}")
+                if self.p_idx is not None:
+                    path_mask_check = sa[:, self.p_idx]
+                    raw_min = np.nanmin(lr_matrix_raw[:, path_mask_check], axis=0)
+                    capped_min = np.nanmin(lr_matrix[:, path_mask_check], axis=0)
+                    n_plp_protected = ((raw_min < 0) & (capped_min >= 0)).sum()
+                    print(f"  P/LP variants protected from benign LR+: {n_plp_protected}")
 
             lr_median = np.nanmedian(lr_matrix, axis=0)
             lr_5th = np.nanpercentile(lr_matrix, path_percentile, axis=0)
@@ -1084,7 +1372,8 @@ class MVCalibrationAnalysis:
             for pv in self.point_values:
                 points[lr_95th <= tau_b_log[pv - 1]] = -pv
 
-            path_mask = sa[:, self.p_idx]
+            path_mask = (sa[:, self.p_idx] if self.p_idx is not None
+                         else np.zeros(N, bool))
             ben_mask = (sa[:, self.b_idx] if self.b_idx is not None
                         else np.zeros(N, bool))
             syn_mask = (sa[:, self.s_idx] if self.s_idx is not None
@@ -1632,7 +1921,8 @@ class MVCalibrationAnalysis:
         scores = self.ms.scores
         sa = self.ms.sample_assignments
         K = scores.shape[1]
-        path_mask = sa[:, self.p_idx]
+        path_mask = (sa[:, self.p_idx] if self.p_idx is not None
+                     else np.zeros(len(scores), bool))
         ben_mask = sa[:, self.b_idx] if self.b_idx is not None else np.zeros(len(scores), bool)
         if self.s_idx is not None:
             ben_mask = ben_mask | sa[:, self.s_idx]
