@@ -217,9 +217,22 @@ def _bootstrap_job(fit_raw, scores, sa,
                 # density — far weaker than Blanchard-Recht's floor assumption, which breaks
                 # when fitted model weights don't satisfy fpop = α·fpath + (1-α)·fbenign.
 
-                # Compute labeled-class density at labeled-class observations
+                # Compute effective labeled-class density at labeled-class observations.
+                # Use the full effective benign sample consistent with benign_method:
+                #   'avg'        → benign ∪ synonymous observations
+                #   'synonymous' → synonymous observations only
+                #   'benign'     → benign observations only
+                # For PU: pathogenic observations only.
                 if nu_mode:
-                    labeled_scores = scores[sa[:, eff_b].astype(bool)]
+                    b_mask = sa[:, eff_b].astype(bool) if eff_b is not None else np.zeros(len(scores), bool)
+                    s_mask = sa[:, eff_s].astype(bool) if eff_s is not None else np.zeros(len(scores), bool)
+                    if benign_method == 'synonymous':
+                        labeled_mask = s_mask
+                    elif benign_method == 'avg':
+                        labeled_mask = b_mask | s_mask
+                    else:
+                        labeled_mask = b_mask
+                    labeled_scores = scores[labeled_mask]
                 else:
                     labeled_scores = scores[sa[:, eff_p].astype(bool)]
 
@@ -250,7 +263,7 @@ def _bootstrap_job(fit_raw, scores, sa,
 
                 f1_at_labeled = np.exp(log_f1_labeled[np.isfinite(log_f1_labeled)])
 
-                if len(f1_at_pop) >= 5 and len(f1_at_labeled) >= 5:
+                if len(f1_at_pop) > 0 and len(f1_at_labeled) > 0:
                     mean_pop = np.mean(f1_at_pop)
                     mean_labeled = np.mean(f1_at_labeled)
                     if mean_labeled > 0:
@@ -828,8 +841,18 @@ class MVCalibrationAnalysis:
             # Mean-matching estimator (see _bootstrap_job for rationale)
             sa = self.ms.sample_assignments
             scores_all = self.ms.scores
-            labeled_idx = self.b_idx if self.nu_mode else self.p_idx
-            labeled_scores = scores_all[sa[:, labeled_idx].astype(bool)]
+            if self.nu_mode:
+                b_mask = sa[:, self.b_idx].astype(bool) if self.b_idx is not None else np.zeros(len(scores_all), bool)
+                s_mask = sa[:, self.s_idx].astype(bool) if self.s_idx is not None else np.zeros(len(scores_all), bool)
+                if self.benign_method == 'synonymous':
+                    labeled_mask = s_mask
+                elif self.benign_method == 'avg':
+                    labeled_mask = b_mask | s_mask
+                else:
+                    labeled_mask = b_mask
+            else:
+                labeled_mask = sa[:, self.p_idx].astype(bool)
+            labeled_scores = scores_all[labeled_mask]
             labeled_obs_mask = ~np.isnan(labeled_scores)
             labeled_groups = {}
             for j in range(len(labeled_scores)):
@@ -855,7 +878,7 @@ class MVCalibrationAnalysis:
                                                  for c in range(K)], axis=0)
 
             f1_at_lab = np.exp(log_f1_lab[np.isfinite(log_f1_lab)])
-            if len(f1_at_pop) >= 5 and len(f1_at_lab) >= 5:
+            if len(f1_at_pop) > 0 and len(f1_at_lab) > 0:
                 mean_pop = np.mean(f1_at_pop)
                 mean_lab = np.mean(f1_at_lab)
                 if mean_lab > 0:
