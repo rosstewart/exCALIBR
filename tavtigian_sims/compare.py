@@ -32,19 +32,22 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 
 from .suite import SimulationSuite
-from .bayesian import PiecewiseSuite, PiecewiseAdditiveSuite, ContinuousSuite
+from .bayesian import PiecewiseSuite, PiecewiseAdditiveSuite, LPAnchoredSuite, ContinuousSuite
 from .core import ACMG_TIER_CODES, CLASSIFICATION_BOUNDARIES, POSTERIOR_TARGETS
 from .analysis import boundary_validity
 
 # ── Colour palettes ───────────────────────────────────────────────────────────
 
 # Per-code strength colours: pathogenic (warm reds), benign (cool blues)
+# Extended to ±12 codes
 STRENGTH_COLOR = {
+    -12: '#2f5a70', -11: '#3a6b81', -10: '#4b91a6', -9: '#516d8a',
     -8: '#4b91a6', -7: '#5DA3BD', -6: '#6FAACE', -5: '#74ABCE',
     -4: '#7ab5d1', -3: '#99c8dc', -2: '#d0e8f0', -1: '#e4f1f6',
      0: '#e0e0e0',
      1: '#e6b1b8',  2: '#d68f99',  3: '#ca7682',  4: '#b85c6b',
      5: '#B1535F',  6: '#AA4E58',  7: '#A2484F',  8: '#943744',
+     9: '#7d2e38', 10: '#6b2830', 11: '#59221f', 12: '#472015',
 }
 
 # Boundary colours (P, LP, LB, B) keyed to strength-colour anchors
@@ -60,6 +63,7 @@ _METHOD_STYLE = {
     "tavtigian":          {"ls": "-",   "lw": 2.0, "alpha": 0.95, "label": "Tavtigian (C*)"},
     "piecewise":          {"ls": "--",  "lw": 2.0, "alpha": 0.85, "label": "Piecewise α (ACMG)"},
     "piecewise_additive": {"ls": "-.",  "lw": 2.0, "alpha": 0.85, "label": "Piecewise-Add (6·11·6)"},
+    "lp_anchored":        {"ls": "-.",  "lw": 2.0, "alpha": 0.85, "label": "LP-Anchored (additive)"},
     "continuous":         {"ls": ":",   "lw": 2.5, "alpha": 0.80, "label": "Continuous (Bayes)"},
 }
 
@@ -69,20 +73,42 @@ _METHOD_BND_T = {
     "tavtigian":          {"P": 10, "LP":  6, "LB": -1, "B": -7},
     "piecewise":          {"P": 10, "LP":  6, "LB": -1, "B": -7},
     "piecewise_additive": {"P": 17, "LP": 11, "LB":  0, "B": -6},
+    "lp_anchored":        {"P": 10, "LP":  6, "LB": -1, "B": -7},
 }
 
-_ALL_CODES = list(range(1, 9))   # 1..8
+_ALL_CODES = list(range(1, 13))   # 1..12
+
+
+# ── Error metrics helper functions ────────────────────────────────────────────
+
+def log_odds_error(posterior: np.ndarray, target: float) -> np.ndarray:
+    """Signed log-odds error: log(post/(1-post)) - log(target/(1-target)).
+
+    Measures error in the native space of Bayesian reasoning.
+    Zero means exact. Positive means overestimate, negative means underestimate.
+    """
+    import math
+    eps = 1e-10
+    post_clip = np.clip(posterior, eps, 1.0 - eps)
+    target_clip = np.clip(target, eps, 1.0 - eps)
+    return np.log(post_clip / (1.0 - post_clip)) - math.log(target_clip / (1.0 - target_clip))
+
+
+def abs_log_odds_error(posterior: np.ndarray, target: float) -> np.ndarray:
+    """Absolute log-odds error."""
+    return np.abs(log_odds_error(posterior, target))
 
 
 def run_all_methods(priors: np.ndarray, n_jobs: int = -1) \
-        -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Run all four suites; return (tav_df, pw_df, pw_add_df, cont_df)."""
+        -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run all five suites; return (tav_df, pw_df, pw_add_df, lp_anch_df, cont_df)."""
     t_suite  = SimulationSuite(priors=priors, n_jobs=n_jobs).run()
     p_suite  = PiecewiseSuite(priors=priors).run()
     pa_suite = PiecewiseAdditiveSuite(priors=priors).run()
+    lpa_suite = LPAnchoredSuite(priors=priors).run()
     c_suite  = ContinuousSuite(priors=priors).run()
     return (t_suite.to_dataframe(), p_suite.to_dataframe(),
-            pa_suite.to_dataframe(), c_suite.to_dataframe())
+            pa_suite.to_dataframe(), lpa_suite.to_dataframe(), c_suite.to_dataframe())
 
 
 def _apply_xscale(ax, log_scale: bool):
@@ -98,9 +124,10 @@ def plot_three_way_comparison(
     tav_df:     Optional[pd.DataFrame] = None,
     pw_df:      Optional[pd.DataFrame] = None,
     pw_add_df:  Optional[pd.DataFrame] = None,
+    lpa_df:     Optional[pd.DataFrame] = None,
     cont_df:    Optional[pd.DataFrame] = None,
-    methods: List[str] = ("tavtigian", "piecewise", "continuous"),
-    codes = "all",
+    methods: List[str] = ("tavtigian", "piecewise", "lp_anchored", "continuous"),
+    codes = "key",
     figsize  = (11, 6),
     log_scale: bool = False,
 ) -> Tuple[plt.Figure, plt.Axes]:
@@ -110,15 +137,15 @@ def plot_three_way_comparison(
     ----------
     methods : list of str
         Any subset of
-        ``{"tavtigian", "piecewise", "piecewise_additive", "continuous"}``.
+        ``{"tavtigian", "piecewise", "piecewise_additive", "lp_anchored", "continuous"}``.
         Pass a single-element list to plot only one method.
         ``"continuous"`` is always drawn as thin black dotted reference lines
         regardless of whether it appears in ``methods`` — pass ``cont_df=None``
         to suppress it entirely.
     codes : ``"all"`` | ``"key"`` | list of int
-        ``"all"``  → codes 1–8 (default)
-        ``"key"``  → codes 1, 2, 4, 8 only
-        list       → explicit subset, e.g. ``[1, 4, 8]``
+        ``"all"``  → codes 1–12 (all extended codes)
+        ``"key"``  → codes 1, 2, 4, 8 only (ACMG tiers; default)
+        list       → explicit subset, e.g. ``[1, 2, 4, 8, 12]``
     """
     # Resolve codes
     if codes == "all":
@@ -129,7 +156,7 @@ def plot_three_way_comparison(
         _codes = list(codes)
 
     _DF = {"tavtigian": tav_df, "piecewise": pw_df,
-           "piecewise_additive": pw_add_df}
+           "piecewise_additive": pw_add_df, "lp_anchored": lpa_df}
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -190,9 +217,9 @@ def plot_three_way_comparison(
             handles.append(Line2D([0], [0], color="grey",
                                   ls=s["ls"], lw=s["lw"],
                                   label=s["label"]))
-    handles.append(Line2D([0], [0], color=STRENGTH_COLOR[8], lw=3,
+    handles.append(Line2D([0], [0], color=STRENGTH_COLOR[_codes[-1]], lw=3,
                           label=f"Code ±{_codes[-1]} (strongest)"))
-    handles.append(Line2D([0], [0], color=STRENGTH_COLOR[1], lw=3,
+    handles.append(Line2D([0], [0], color=STRENGTH_COLOR[_codes[0]], lw=3,
                           label=f"Code ±{_codes[0]} (weakest)"))
 
     ax.legend(handles=handles, fontsize=9, loc="best", framealpha=0.8)
@@ -213,6 +240,7 @@ def plot_boundary_posteriors_three_way(
     tav_df:    Optional[pd.DataFrame] = None,
     pw_df:     Optional[pd.DataFrame] = None,
     pw_add_df: Optional[pd.DataFrame] = None,
+    lpa_df:    Optional[pd.DataFrame] = None,  # [DEPRECATED] kept for compatibility
     cont_df:   Optional[pd.DataFrame] = None,   # accepted for backward compat, unused
     methods: List[str] = ("tavtigian", "piecewise"),
     figsize  = (12, 5),
@@ -234,7 +262,7 @@ def plot_boundary_posteriors_three_way(
         methods = ("tavtigian", "piecewise", "piecewise_additive")
 
     _DF = {"tavtigian": tav_df, "piecewise": pw_df,
-           "piecewise_additive": pw_add_df}
+           "piecewise_additive": pw_add_df, "lp_anchored": lpa_df}
 
     # Each method's boundary T values for the four named boundaries
     # (used in labels and to pull the right bnd_post_ column).
@@ -576,7 +604,6 @@ def plot_additivity_experiment(
     priors: tuple = (0.05, 0.10, 0.25, 0.50),
     figsize: tuple = (17, 9),
     tav_df: Optional[pd.DataFrame] = None,
-    pw_add_df: Optional[pd.DataFrame] = None,   # accepted but ignored (PA removed from defaults)
     log_scale: bool = False,
 ) -> Tuple[plt.Figure, np.ndarray]:
     """Diagnose the additivity / chokepoint structure of piecewise vs Tavtigian.
@@ -762,7 +789,6 @@ def plot_additivity_experiment(
 def plot_combined_error_comparison(
     priors: np.ndarray = None,
     tav_df: Optional[pd.DataFrame] = None,
-    pw_add_df: Optional[pd.DataFrame] = None,   # accepted but ignored
     combos: Optional[list] = None,
     figsize: tuple = (14, 12),
     log_scale: bool = False,
@@ -849,7 +875,7 @@ def plot_combined_error_comparison(
     ax_bar     = axes[1, 1]   # bar breakdown at two reference priors
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Panel (0,0): Single-assay boundary error
+    # Panel (0,0): Single-assay boundary error (MAE + log-odds)
     # ══════════════════════════════════════════════════════════════════════════
     for name, T_bnd, target, color in _BND_INFO:
         # Tavtigian: posterior at the ACMG integer boundary T
@@ -857,24 +883,27 @@ def plot_combined_error_comparison(
             bayes_posterior_from_lr(C_arr[i] ** (T_bnd / 8.0), float(p))
             for i, p in enumerate(priors)
         ])
-        tav_err = np.abs(tav_posts - target)
-        ax_single.plot(priors, tav_err, color=color, lw=2, ls="-",
-                       label=f"Tavtigian T={T_bnd} (→{target:.0%})")
+        tav_mae = np.abs(tav_posts - target)
+        tav_loe = abs_log_odds_error(tav_posts, target)
+        ax_single.plot(priors, tav_mae, color=color, lw=2, ls="-", alpha=0.7,
+                       label=f"Tavtigian T={T_bnd} MAE")
+        ax_single.plot(priors, tav_loe, color=color, lw=2, ls="--", alpha=0.5,
+                       label=f"Tavtigian T={T_bnd} log-odds")
 
     # Piecewise is exactly 0 at all four boundaries — draw a single flat reference
-    ax_single.axhline(0, color="grey", lw=1.2, ls="--", alpha=0.7,
+    ax_single.axhline(0, color="grey", lw=1.2, ls=":", alpha=0.7,
                       label="Piecewise = 0 (exact by construction)")
 
     ax_single.set_xlabel("Prior", fontsize=10)
-    ax_single.set_ylabel("|posterior − target|", fontsize=10)
+    ax_single.set_ylabel("Boundary error (MAE, log-odds units)", fontsize=10)
     ax_single.set_title(
-        "Single-assay boundary error\n"
+        "Single-assay boundary error: MAE (solid) vs log-odds (dashed)\n"
         "Piecewise: always 0 · Tavtigian: drifts from calibrated p=0.10",
         fontsize=10,
     )
     _apply_xscale(ax_single, log_scale)
     ax_single.axvline(0.10, color="#888", lw=0.8, ls=":", alpha=0.6)
-    ax_single.legend(fontsize=8, loc="upper right")
+    ax_single.legend(fontsize=7, loc="upper right", ncol=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Panel (0,1): Two-assay combination error vs prior
@@ -1050,28 +1079,27 @@ def plot_additivity_dilemma(
     figsize: tuple = (16, 10),
     log_scale: bool = False,
 ) -> Tuple[plt.Figure, np.ndarray]:
-    """Clinician-facing summary of the additivity dilemma.
+    """Head-to-head error comparison: Tavtigian posterior drift vs Piecewise additivity error.
+
+    Both errors measured against the same ground truth (Bayesian posterior from
+    piecewise per-code LR+ product). The question: which problem is bigger in practice?
 
     Layout (2 rows × 3 columns)
     ---------------------------
-    Row 0 — THE BOUNDARY PROBLEM (Tavtigian):
-      (0,0)  Posterior at LP boundary (T=6) vs prior.
-             Piecewise flat at 0.90; Tavtigian drifts.  ylim starts at 0.90.
-      (0,1)  Posterior at P boundary (T=10) vs prior.
-             Piecewise flat at 0.99; Tavtigian drifts.  ylim starts at 0.99.
-      (0,2)  |posterior − target| for all four ACMG boundaries vs prior.
+    Row 0 — SINGLE-ASSAY BOUNDARIES (single evidence at one tier):
+      (0,0)  LP (T=6): Tavtigian posterior vs exact 0.90 target.
+      (0,1)  P (T=10): Tavtigian posterior vs exact 0.99 target.
+      (0,2)  |error| at all four boundaries for both methods.
 
-    Row 1 — THE ADDITIVITY PROBLEM (Piecewise) — comprehensive all-combo sweep:
-      (1,0)  Bar chart: "1 VS vs 2 Strong" at demo_priors.
-             Expected (multiply LRs), piecewise, Tavtigian.
-      (1,1)  Envelope of |combo error| across ALL 36 evidence combinations
-             (k_A, k_B) with 1 ≤ k_A ≤ k_B ≤ 8, for piecewise (blue band)
-             and Tavtigian (red band), vs prior.
-             Both measured vs the piecewise per-code LR+ product as reference.
-      (1,2)  Fraction of all 36 combinations where piecewise is more accurate
-             than Tavtigian (measured vs the same piecewise LR+ reference).
-             A comprehensive answer to: "for how many real scenarios does
-             piecewise beat Tavtigian?"
+    Row 1 — MULTI-ASSAY COMBINATIONS (two pieces of evidence):
+      (1,0)  Example: "1 VS vs 2 Strong" (both → T=8).
+             Bar chart: expected posterior, piecewise result, Tavtigian result.
+             Ground truth = piecewise individual LR+ product.
+      (1,1)  All 36 evidence combinations (pathogenic, benign, mixed).
+             Error envelope: Tavtigian posterior error vs Piecewise additivity error.
+             Which method is more accurate across the full space?
+      (1,2)  Error comparison: which method has smaller error at each prior?
+             Shows the crossover: where does one become better than the other?
     """
     import math
     from assay_calibration.fit_utils.bayesian_thresholds import (
@@ -1092,6 +1120,17 @@ def plot_additivity_dilemma(
     else:
         C_arr = np.array([float(get_tavtigian_constant(float(p))) for p in priors])
 
+    # Demo C* for bar chart (retrieve for each demo_prior)
+    demo_C_tav = {}
+    if tav_df is not None and "C_star" in tav_df.columns:
+        for p in demo_priors:
+            demo_C_tav[p] = float(
+                tav_df.loc[(tav_df["prior"] - float(p)).abs().idxmin(), "C_star"]
+            )
+    else:
+        for p in demo_priors:
+            demo_C_tav[p] = float(get_tavtigian_constant(float(p)))
+
     _BND_INFO = [
         ("P",  10, 0.99, _BND_COLOR["P"]),
         ("LP",  6, 0.90, _BND_COLOR["LP"]),
@@ -1099,8 +1138,35 @@ def plot_additivity_dilemma(
         ("B",  -7, 0.01, _BND_COLOR["B"]),
     ]
 
-    # All unique (k_A, k_B) pairs, k_A ≤ k_B, both in 1..8
-    combos_all = [(kA, kB) for kA in range(1, 9) for kB in range(kA, 9)]  # 36 combos
+    # Full combination space: pathogenic, benign, and mixed.
+    # Codes use the ACMG tier integers: ±1, ±2, ±4, ±8.
+    # Negative codes = benign evidence (LR+ < 1, reduces pathogenicity probability).
+    _path_codes = [1, 2, 4, 8]
+    _ben_codes  = [-1, -2, -4, -8]
+    path_combos   = [(kA, kB) for kA in range(1, 9) for kB in range(kA, 9)]
+    benign_combos = [(-kA, -kB) for kA in [1, 2, 4, 8] for kB in [1, 2, 4, 8] if kB >= kA]
+    mixed_combos  = [(kA, -kB) for kA in [1, 2, 4, 8] for kB in [1, 2, 4, 8]]
+    combos_all = path_combos + benign_combos + mixed_combos
+
+    def _segment(t):
+        """Piecewise segment index: 0 = B–LB (T≤−1), 1 = LB–LP (−1<T≤6), 2 = LP–P (T>6)."""
+        return 0 if t <= -1 else (1 if t <= 6 else 2)
+
+    combo_types = []
+    for kA, kB in combos_all:
+        k_tot = kA + kB
+        if kA > 0 and kB > 0:          # both pathogenic
+            if _segment(kA) == _segment(kB) == _segment(k_tot):
+                combo_types.append("within_path")
+            else:
+                combo_types.append("cross_path")
+        elif kA < 0 and kB < 0:         # both benign
+            if _segment(kA) == _segment(kB) == _segment(k_tot):
+                combo_types.append("within_ben")
+            else:
+                combo_types.append("cross_ben")
+        else:                            # mixed pathogenic + benign
+            combo_types.append("mixed")
 
     fig, axes = plt.subplots(2, 3, figsize=figsize)
     ax_lp, ax_p, ax_drift = axes[0]
@@ -1111,12 +1177,13 @@ def plot_additivity_dilemma(
     # ══════════════════════════════════════════════════════════════════════════
     for ax, (name, T_bnd, target, color), ylim_lo in [
         (ax_lp, _BND_INFO[1], 0.88),   # LP  ylim starts at 0.88 (shows 0.90 clearly)
-        (ax_p,  _BND_INFO[0], 0.987),  # P   ylim starts at 0.987
+        (ax_p,  _BND_INFO[0], 0.985),  # P   ylim starts at 0.985
     ]:
         tav_posts = np.array([
             bayes_posterior_from_lr(C_arr[i] ** (T_bnd / 8.0), float(p))
             for i, p in enumerate(priors)
         ])
+
         ax.plot(priors, tav_posts, color=color, lw=2.5, ls="-",
                 label="Tavtigian (C*)")
         # Piecewise is exactly the target by construction — draw as dashed line
@@ -1126,7 +1193,7 @@ def plot_additivity_dilemma(
                    label="p=0.10 (calibration prior)")
         ax.fill_between(priors, tav_posts, target,
                         where=(tav_posts < target) if target > 0.5 else (tav_posts > target),
-                        alpha=0.18, color=color, label="Tavtigian error")
+                        alpha=0.12, color=color, label="Tavtigian error")
         _apply_xscale(ax, log_scale)
         ax.set_xlabel("Gene-specific prior", fontsize=10)
         ax.set_ylabel("Posterior probability", fontsize=10)
@@ -1161,64 +1228,56 @@ def plot_additivity_dilemma(
     _apply_xscale(ax_drift, log_scale)
     ax_drift.legend(fontsize=7, loc="upper right")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Row 1 left: "1 VS vs 2 Strong" bar chart at demo_priors
-    # ══════════════════════════════════════════════════════════════════════════
-    demo_C = {}
-    if tav_df is not None and "C_star" in tav_df.columns:
-        for p in demo_priors:
-            demo_C[p] = float(
-                tav_df.loc[(tav_df["prior"] - float(p)).abs().idxmin(), "C_star"]
-            )
-    else:
-        for p in demo_priors:
-            demo_C[p] = float(get_tavtigian_constant(float(p)))
+    # ── Bar chart: error for representative combos of each type ─────────────────
+    # Four representative combinations, one per combo type:
+    #   within_path:  M + M → T=4    (stays in LB–LP segment; piecewise error = 0)
+    #   cross_path:   S + S → T=8    (crosses T=6 knot; piecewise has kink error)
+    #   within_ben:   S_B+S_B → T=−8 (stays in B–LB segment; piecewise error = 0)
+    #   mixed:        VS + S_B → T=4  (Tavtigian error = 0 by construction)
+    rep_combos = [
+        (2, 2,  "M+M\n(within LB–LP)"),
+        (4, 4,  "S+S\n(cross T=6)"),
+        (-4, -4, "S$_B$+S$_B$\n(within B–LB)"),
+        (8, -4, "VS+S$_B$\n(mixed)"),
+    ]
+    bar_w   = 0.30
+    x_rep   = np.arange(len(rep_combos))
+    offsets = np.array([-0.5, 0.5]) * bar_w
 
-    n_groups  = len(demo_priors)
-    bar_w     = 0.22
-    group_x   = np.arange(n_groups)
-    offsets   = np.array([-1, 0, 1]) * bar_w
-    bar_cols  = ["#2ca02c", "#1f77b4", "#d62728"]
-    bar_lbls  = ["Expected\n(multiply LRs)", "Piecewise α", "Tavtigian (C*)"]
+    p_ref = 0.10
+    C_ref = demo_C_tav[p_ref]
 
-    for j, (label, col) in enumerate(zip(bar_lbls, bar_cols)):
-        heights = []
-        for p in demo_priors:
-            if j == 0:   # expected = piecewise LR(4) squared → Bayes posterior
-                lr4 = math.exp(float(piecewise_log_lr(4, float(p))))
-                heights.append(float(bayes_posterior_from_lr(lr4 ** 2, float(p))))
-            elif j == 1: # piecewise point-sum T=8
-                heights.append(float(piecewise_posterior(8, float(p))))
-            else:        # Tavtigian point-sum T=8
-                heights.append(float(bayes_posterior_from_lr(
-                    demo_C[p] ** 1.0, float(p)
-                )))
-        ax_bars.bar(group_x + offsets[j], heights, width=bar_w,
-                    color=col, alpha=0.85, label=label)
+    pw_heights  = []
+    tav_heights = []
+    for kA, kB, _ in rep_combos:
+        k_tot = kA + kB
+        lr_A = math.exp(float(piecewise_log_lr(kA, float(p_ref))))
+        lr_B = math.exp(float(piecewise_log_lr(kB, float(p_ref))))
+        ref  = float(bayes_posterior_from_lr(lr_A * lr_B, float(p_ref)))
+        pw_heights.append(abs(float(piecewise_posterior(k_tot, float(p_ref))) - ref))
+        tav_heights.append(abs(float(bayes_posterior_from_lr(
+            C_ref ** (k_tot / 8.0), float(p_ref))) - ref))
 
-    ax_bars.axhline(0.90, color="grey", lw=1.2, ls="--", alpha=0.7,
-                    label="LP target (0.90)")
-    ax_bars.set_xticks(group_x)
-    ax_bars.set_xticklabels([f"p = {p:.2f}" for p in demo_priors], fontsize=10)
-    ax_bars.set_ylabel("Posterior probability", fontsize=10)
-    ax_bars.set_ylim(0, 1.05)
+    ax_bars.bar(x_rep + offsets[0], pw_heights,  width=bar_w,
+                color="#1f77b4", alpha=0.85, label="Piecewise (additivity error)")
+    ax_bars.bar(x_rep + offsets[1], tav_heights, width=bar_w,
+                color="#d62728", alpha=0.85, label="Tavtigian (posterior error)")
+
+    ax_bars.axhline(0, color="grey", lw=0.8, ls=":", alpha=0.5)
+    ax_bars.set_xticks(x_rep)
+    ax_bars.set_xticklabels([lbl for _, _, lbl in rep_combos], fontsize=9)
+    ax_bars.set_ylabel("|error| vs Bayesian ground truth", fontsize=10)
     ax_bars.set_title(
-        "1 Very Strong = 2 Strong?  (both → T = 8)\n"
-        "A perfectly additive method matches the green bar exactly",
-        fontsize=10,
+        f"Representative combos at p = {p_ref:.2f}\n"
+        "Within-segment: piecewise error = 0 (exact additivity)\n"
+        "Tavtigian: error only from posterior drift, not combination arithmetic",
+        fontsize=9,
     )
-    ax_bars.legend(fontsize=8, loc="lower right")
+    ax_bars.legend(fontsize=8, loc="upper right")
     ax_bars.grid(True, alpha=0.25, axis="y")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Row 1 middle: comprehensive all-combo error envelopes
-    #
-    # For every (k_A, k_B) and every prior p:
-    #   reference  = Bayes(lr_pw(k_A, p) · lr_pw(k_B, p), p)   ← ground truth
-    #   pw_err     = |piecewise_posterior(k_A+k_B, p) − reference|
-    #   tav_err    = |Bayes(C^((k_A+k_B)/8), p)        − reference|
-    #
-    # Draw shaded min/max envelopes for both methods + highlight (4,4).
+    # Compute error matrices for ALL combo types (pathogenic, benign, mixed)
     # ══════════════════════════════════════════════════════════════════════════
     n_p = len(priors)
     n_c = len(combos_all)
@@ -1236,117 +1295,85 @@ def plot_additivity_dilemma(
                 C_arr[pi] ** (k_tot / 8.0), float(p)
             )) - ref)
 
-    pw_lo, pw_med, pw_hi   = (np.min(pw_err_mat,  axis=0),
-                               np.median(pw_err_mat,  axis=0),
-                               np.max(pw_err_mat,  axis=0))
-    tav_lo, tav_med, tav_hi = (np.min(tav_err_mat, axis=0),
-                                np.median(tav_err_mat, axis=0),
-                                np.max(tav_err_mat, axis=0))
-
-    # Shaded bands
-    ax_envelope.fill_between(priors, pw_lo,  pw_hi,  color="#1f77b4", alpha=0.18)
-    ax_envelope.fill_between(priors, tav_lo, tav_hi, color="#d62728",  alpha=0.18)
-    # Median lines
-    ax_envelope.plot(priors, pw_med,  color="#1f77b4", lw=2.0, ls="--",
-                     label="Piecewise α  (median, 36 combos)")
-    ax_envelope.plot(priors, tav_med, color="#d62728",  lw=2.0, ls="-",
-                     label="Tavtigian    (median, 36 combos)")
-    # Highlight worst-case combo (4,4) for piecewise
-    ci_44 = combos_all.index((4, 4))
-    ax_envelope.plot(priors, pw_err_mat[ci_44],  color="#1f77b4", lw=1.2,
-                     ls=":", alpha=0.7, label="Piecewise (4+4, worst common case)")
-
-    # Overlay Tavtigian LP boundary drift on a secondary y-axis so the
-    # anti-correlation is visible: Tavtigian wins on combinations exactly
-    # where its LP boundary is miscalibrated — the two errors are coupled.
-    tav_lp_drift = np.abs(np.array([
-        bayes_posterior_from_lr(C_arr[i] ** (6.0 / 8.0), float(p))
-        for i, p in enumerate(priors)
-    ]) - 0.90)
-    ax2 = ax_envelope.twinx()
-    ax2.plot(priors, tav_lp_drift, color="#ff7f0e", lw=1.8, ls="-.", alpha=0.85,
-             label="Tavtigian LP boundary drift (right axis)")
-    ax2.set_ylabel("|post(T=6) − 0.90|  (Tavtigian LP boundary drift)",
-                   fontsize=8, color="#ff7f0e")
-    ax2.tick_params(axis="y", labelcolor="#ff7f0e", labelsize=8)
-    ax2.set_ylim(bottom=0)
+    # ── Middle panel: median error per combo type ─────────────────────────────
+    # For each type, plot both piecewise and Tavtigian error.
+    # Key expectation:
+    #   within_path / within_ben: piecewise error ≈ 0 (exact additivity in segment)
+    #   cross_path / cross_ben:   piecewise error > 0 (kink at knot)
+    #   mixed:                    Tavtigian error ≈ 0 (C^(a+b) = C^a * C^b always)
+    type_spec = [
+        ("within_path", "#1f77b4", "--",  "#1f77b4", "-",  "Within-seg (path)"),
+        ("cross_path",  "#ff7f0e", "--",  "#ff7f0e", "-",  "Cross-knot (path)"),
+        ("within_ben",  "#4b91a6", ":",   "#4b91a6", "-.", "Within-seg (ben)"),
+        ("cross_ben",   "#9467bd", ":",   "#9467bd", "-.", "Cross-knot (ben)"),
+        ("mixed",       "#2ca02c", "--",  "#2ca02c", "-",  "Mixed (path+ben)"),
+    ]
+    for ctype, pw_col, pw_ls, tav_col, tav_ls, lbl in type_spec:
+        idx = [ci for ci, t in enumerate(combo_types) if t == ctype]
+        if not idx:
+            continue
+        pw_med  = np.median(pw_err_mat[idx, :],  axis=0)
+        tav_med = np.median(tav_err_mat[idx, :], axis=0)
+        ax_envelope.plot(priors, pw_med,  color=pw_col,  lw=1.8, ls=pw_ls,
+                         alpha=0.85, label=f"PW {lbl}")
+        ax_envelope.plot(priors, tav_med, color=tav_col, lw=1.8, ls=tav_ls,
+                         alpha=0.85, label=f"Tav {lbl}")
 
     ax_envelope.axhline(0, color="black", lw=0.5)
     ax_envelope.axvline(0.10, color="#888", lw=1.0, ls=":", alpha=0.7,
-                        label="p=0.10")
+                        label="p=0.10 (Tav calibrated)")
     ax_envelope.set_xlabel("Gene-specific prior", fontsize=10)
-    ax_envelope.set_ylabel("|combined posterior − expected|", fontsize=10)
+    ax_envelope.set_ylabel("|posterior error|", fontsize=10)
     ax_envelope.set_title(
-        "Combination error (all 36 combos) vs Tavtigian LP boundary drift\n"
-        "Tavtigian wins on combos exactly where its LP boundary is miscalibrated",
-        fontsize=10,
+        "Median error by combination type: Piecewise (dashed) vs Tavtigian (solid)\n"
+        "Within-segment: PW error = 0 (exact additivity) | Cross-knot: PW has bounded error\n"
+        "Mixed (path+ben): Tavtigian error = 0 (C$^{a+b}$ = C$^a$·C$^b$ by construction)",
+        fontsize=9,
     )
     _apply_xscale(ax_envelope, log_scale)
-    # Merge legends from both axes
-    h1, l1 = ax_envelope.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax_envelope.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper right")
+    ax_envelope.legend(fontsize=6, loc="upper right", ncol=2)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Row 1 right: fraction of 36 combos where piecewise is more accurate
-    # ══════════════════════════════════════════════════════════════════════════
-    # pw_wins[p] = fraction of combos where pw_err < tav_err
-    frac_pw_wins = np.mean(pw_err_mat < tav_err_mat, axis=0)
+    # ── Right panel: error difference (Piecewise − Tavtigian) per combo type ──
+    # Positive = piecewise better (smaller error); Negative = Tavtigian better.
+    type_diff_spec = [
+        ("within_path", "#1f77b4", "-",  "Within-seg path"),
+        ("cross_path",  "#ff7f0e", "--", "Cross-knot path"),
+        ("within_ben",  "#4b91a6", "-.", "Within-seg ben"),
+        ("cross_ben",   "#9467bd", ":",  "Cross-knot ben"),
+        ("mixed",       "#2ca02c", "-",  "Mixed"),
+    ]
+    for ctype, color, ls, lbl in type_diff_spec:
+        idx = [ci for ci, t in enumerate(combo_types) if t == ctype]
+        if not idx:
+            continue
+        pw_med  = np.median(pw_err_mat[idx, :],  axis=0)
+        tav_med = np.median(tav_err_mat[idx, :], axis=0)
+        ax_frac.plot(priors, pw_med - tav_med, color=color, lw=2.0, ls=ls, label=lbl)
 
-    ax_frac.plot(priors, frac_pw_wins * 100, color="#333333", lw=2.5,
-                 label="% combos piecewise wins (left axis)")
-    ax_frac.axhline(50, color="grey", lw=1.0, ls="--", alpha=0.7,
-                    label="50% — tied")
-    ax_frac.axhline(100, color="#1f77b4", lw=0.8, ls=":", alpha=0.5)
+    ax_frac.axhline(0, color="grey", lw=1.2, ls="-", alpha=0.8)
     ax_frac.axvline(0.10, color="#888", lw=1.0, ls=":", alpha=0.7,
-                    label="p=0.10")
+                    label="p=0.10 (Tav calibrated)")
 
-    # Find where piecewise wins majority (> 50%)
-    majority = frac_pw_wins > 0.50
-    crossings = np.where(np.diff(majority.astype(int)))[0]
-    for ci_cross in crossings:
-        px = float(priors[ci_cross])
-        ax_frac.axvline(px, color="#d62728", lw=1.2, ls=":", alpha=0.85)
-        ax_frac.text(px + 0.005, 5, f"p≈{px:.2f}",
-                     color="#d62728", fontsize=8, va="bottom")
+    # Shade the two regions
+    ymax = ax_frac.get_ylim()[1] if ax_frac.get_ylim()[1] > 0 else 0.05
+    ax_frac.text(0.02, 0.97, "← Piecewise wins", transform=ax_frac.transAxes,
+                 fontsize=8, color="#1f77b4", va="top")
+    ax_frac.text(0.02, 0.03, "← Tavtigian wins", transform=ax_frac.transAxes,
+                 fontsize=8, color="#d62728", va="bottom")
 
-    ax_frac.fill_between(priors, frac_pw_wins * 100, 50,
-                         where=(frac_pw_wins > 0.50),
-                         color="#e6b1b8", alpha=0.20, label="Piecewise wins majority")
-    ax_frac.fill_between(priors, frac_pw_wins * 100, 50,
-                         where=(frac_pw_wins < 0.50),
-                         color="#d0e8f0", alpha=0.20, label="Tavtigian wins majority on combos")
-
-    # Secondary axis: Tavtigian LP boundary drift — shows that Tavtigian's
-    # combination advantage at low priors is inseparable from its boundary
-    # miscalibration: when it wins on combos, it loses on single-assay accuracy.
-    ax_frac2 = ax_frac.twinx()
-    ax_frac2.plot(priors, tav_lp_drift * 100, color="#ff7f0e", lw=1.8,
-                  ls="-.", alpha=0.85,
-                  label="Tavtigian LP boundary error ×100 (right axis)")
-    ax_frac2.set_ylabel("|post(T=6) − 0.90| × 100  (Tavtigian LP drift %)",
-                        fontsize=8, color="#ff7f0e")
-    ax_frac2.tick_params(axis="y", labelcolor="#ff7f0e", labelsize=8)
-    ax_frac2.set_ylim(bottom=0)
-
-    ax_frac.set_ylim(0, 105)
     ax_frac.set_xlabel("Gene-specific prior", fontsize=10)
-    ax_frac.set_ylabel("% of combinations where piecewise is more accurate", fontsize=10)
+    ax_frac.set_ylabel("Error difference (PW − Tav)", fontsize=10)
     ax_frac.set_title(
-        "Piecewise wins on more combos exactly where Tavtigian's LP boundary drifts\n"
-        "Tavtigian's combination advantage at p<0.18 is inseparable from its miscalibration",
+        "Error advantage by combination type\n"
+        "Above 0: Piecewise more accurate | Below 0: Tavtigian more accurate",
         fontsize=10,
     )
     _apply_xscale(ax_frac, log_scale)
-    h1, l1 = ax_frac.get_legend_handles_labels()
-    h2, l2 = ax_frac2.get_legend_handles_labels()
-    ax_frac.legend(h1 + h2, l1 + l2, fontsize=7, loc="center right")
+    ax_frac.legend(fontsize=8, loc="center right")
 
     fig.suptitle(
-        "The additivity dilemma: why no discrete evidence system can be both "
-        "perfectly additive AND correctly calibrated at every prior\n"
-        "Tavtigian trades calibration accuracy for additivity · "
-        "Piecewise trades exact additivity for calibration accuracy",
+        "Error comparison by combination type: where does each method fail?\n"
+        "Within-knot: piecewise IS additive (same slope) | Across-knot: piecewise breaks (kinks) | Mixed: Tavtigian additivity test",
         fontsize=12, y=1.01,
     )
     fig.tight_layout()
@@ -1690,23 +1717,24 @@ def plot_combination_paths(
 
 def plot_slope_geometry(
     demo_priors: tuple = (0.05, 0.10, 0.25),
-    figsize: tuple = (15, 9),
+    figsize: tuple = (12, 9),
     log_scale: bool = False,
     tav_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[plt.Figure, np.ndarray]:
-    """Show the log(LR+) vs T geometry that makes the dilemma concrete.
+    """Show the log(LR+) vs T geometry: Tavtigian straight line vs Piecewise kinks.
 
-    For clinicians: "a straight line means combining evidence multiplies LRs
-    exactly; kinks mean there's a small error at the segment boundaries."
+    Visualizes the core additivity tradeoff:
+    - Tavtigian: straight (additive) but misses Bayesian target dots at non-canonical priors
+    - Piecewise: kinked line that hits all four target dots exactly at every prior
 
     Layout (2 rows × 3 columns, one column per prior)
     -----------------------------------------------
     Row 0 — log(LR+) vs T curves:
-        Tavtigian = straight line (additive) but misses the Bayesian target
-        dots at priors ≠ 0.10.  Piecewise = kinked line that hits every dot.
+        Target dots show where Bayesian posterior equals 0.01, 0.10, 0.90, 0.99.
+        Tavtigian = straight through all T, hits dots only at p=0.10.
+        Piecewise = kinked, hits dots exactly at every prior.
     Row 1 — implied posterior vs T:
-        Shows directly where each method classifies variants relative to
-        the four ACMG boundary posteriors (P, LP, LB, B).
+        Shows classification regions (P/LP/LB/B) and where each method lands.
     """
     import math
     from assay_calibration.fit_utils.bayesian_thresholds import (

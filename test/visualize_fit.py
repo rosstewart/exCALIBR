@@ -10,7 +10,10 @@ All evidence points displayed come directly from analysis.results[config]['point
 """
 
 import numpy as np
+import pandas as pd
+import warnings
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import matplotlib.gridspec as gridspec
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 from matplotlib.patches import Patch
@@ -599,6 +602,65 @@ def _compute_conservative_lr_grid(analysis, config, all_fits, x1g, x2g,
     return grid_points_flat.reshape(grid_shape), lr_conservative.reshape(grid_shape)
 
 
+def _compute_all_sample_density_grids(all_fits, S, x1g, x2g,
+                                       dim_i=0, dim_j=1, total_dims=None,
+                                       max_fits=20):
+    """Compute mean density grids for all S samples in a single pass over fits.
+
+    Uses at most max_fits bootstrap fits (subsampled evenly) — density contours
+    are visually indistinguishable with 20 vs 100 bootstraps and it's S× faster
+    than calling _compute_sample_density_grid separately for each sample.
+
+    Returns list of length S, each a dict {'mean': array, 'std': array} or None.
+    """
+    if not all_fits:
+        return [None] * S
+    if total_dims is None:
+        total_dims = all_fits[0]['component_params'][0][0].shape[0]
+
+    X1, X2 = np.meshgrid(x1g, x2g, indexing='ij')
+    grid_pts = np.full((X1.size, total_dims), np.nan)
+    grid_pts[:, dim_i] = X1.ravel()
+    grid_pts[:, dim_j] = X2.ravel()
+    grid_shape = (len(x1g), len(x2g))
+    n_grid_pts = X1.size
+
+    # Subsample fits evenly
+    step = max(1, len(all_fits) // max_fits)
+    fits = all_fits[::step]
+
+    # Accumulate log-densities per sample: S lists of arrays
+    log_densities = [[] for _ in range(S)]
+
+    for fit in fits:
+        params  = fit['component_params']
+        weights = fit['weights']
+        K = len(params)
+        n_w = len(weights)
+        # Component log-densities computed once, shared across all samples
+        comp_log = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+        for s in range(min(S, n_w)):
+            w_s = weights[s]
+            log_d = logsumexp([np.log(w_s[c] + 1e-300) + comp_log[c]
+                               for c in range(K)], axis=0)
+            log_densities[s].append(log_d)
+
+    results = []
+    for s in range(S):
+        ld = log_densities[s]
+        if not ld:
+            results.append(None)
+            continue
+        arr = np.array(ld)
+        mean_log = logsumexp(arr, axis=0) - np.log(arr.shape[0])
+        linear = np.exp(arr)
+        results.append({
+            'mean': np.exp(mean_log).reshape(grid_shape),
+            'std':  np.std(linear, axis=0).reshape(grid_shape),
+        })
+    return results
+
+
 def _compute_sample_density_grid(all_fits, s_idx, x1g, x2g, dim_i=0, dim_j=1, total_dims=None):
     """Compute mean density for sample s_idx on a 2D grid."""
     if total_dims is None and all_fits:
@@ -880,7 +942,7 @@ def _aggregate_marginal_dim(dim_results, x_grid, path_pctile, ben_pctile, S):
 def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
                                     b_idx, s_idx, benign_method, S,
                                     path_pctile, ben_pctile,
-                                    g_idx=None, prior=None):
+                                    g_idx=None, prior=None, n_jobs=-1):
     """Compute marginals for all p_indices in one parallel sweep.
 
     Component densities are computed ONCE per (bootstrap, dimension) and shared
@@ -903,7 +965,7 @@ def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
     if n_used == 0:
         return [[None] * D for _ in p_indices]
 
-    all_results = Parallel(n_jobs=-1)(
+    all_results = Parallel(n_jobs=n_jobs)(
         delayed(_eval_all_marginals_batch_p)(
             fit, x_2d_list, p_indices, b_idx, s_idx, benign_method, S,
             g_idx=g_idx, prior=prior)
@@ -967,13 +1029,14 @@ def _compute_lr_grids_for_all_p(all_fits, x1g, x2g, total_dims,
 # Main plot function
 # ──────────────────────────────────────
 
-def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
-                        contour_levels=6, first_row_only=False, max_lr_pairs=10):
-    """
-    Multivariate calibration visualization. Layout adapts to dimensionality.
+def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
+                            projection='umap', pivot_dim='activity_No_treatment'):
+    """Precompute all expensive data needed for plot_mv_calibration.
 
-    D=2: 2D point-region grid + per-sample density contours + marginals
-    D>2: LR+ distribution violin + per-dimension marginals for all D dims
+    Returns a dict that can be passed directly to render_mv_plot_data.
+    Separating precomputation from rendering means you can tweak plot
+    aesthetics (figsize, contour_levels, first_row_only, etc.) without
+    rerunning the parallel bootstrap sweeps.
     """
     r = analysis.results.get(config)
     if r is None:
@@ -985,72 +1048,299 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
     N, D = scores.shape
     S = sa.shape[1]
     dataset_names = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
-    _sn_raw = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
-    sample_names = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}' for i in range(S)]
 
-    latent_q   = r.get('latent_q', getattr(analysis, '_latent_q', 1))
-    model_label = f"CFUSN q={latent_q}" if latent_q > 1 else "MSN q=1"
+    r_cfg = analysis.results[config]
+    path_pctile = r_cfg.get('path_percentile', 5)
+    ben_pctile  = 100 - path_pctile
 
-    points      = r['points']
-    tau_p_log   = r['tau_p_log']
-    tau_b_log   = r['tau_b_log']
-    median_prior = r['median_prior']
-    C_path      = r.get('C_path', r.get('C', '?'))
-    C_ben       = r.get('C_ben', '?')
-    path_pctile = r.get('path_percentile', 5)
-    ben_pctile  = r.get('ben_percentile', 95)
-    max_pt      = max(analysis.point_values)
-    pt_norm     = TwoSlopeNorm(vmin=-max_pt, vcenter=0, vmax=max_pt)
-    ylim_bound  = max(abs(tau_p_log[-1]), abs(tau_b_log[-1]))
-    missing_frac = 1.0 - (~np.isnan(scores).any(axis=1)).mean()
-    pad = 0.5
-
-    # ── Marginals (all dims, single parallel sweep) ──
     x_grids = [
         np.linspace(np.nanmin(scores[:, d]) - pad, np.nanmax(scores[:, d]) + pad, 500)
         for d in range(D)
     ]
+    # Separate coarser grids for 2D pairwise display (n_grid × n_grid, not 500 × 500)
+    x_grids_plot = [
+        np.linspace(np.nanmin(scores[:, d]) - pad, np.nanmax(scores[:, d]) + pad, n_grid)
+        for d in range(D)
+    ]
+
     print(f"  Collecting bootstrap fits...")
-    all_fits     = _collect_valid_fits(analysis, config)
+    all_fits = _collect_valid_fits(analysis, config)
     n_boots_used = len(all_fits)
 
-    # Auxiliary pathogenic marginals
     aux_p_entries = getattr(analysis, 'aux_p_entries', [])
-
-    # Marginals — skip entirely when only the top row is needed
     all_p_indices = [analysis.p_idx] + [eff for _, eff in aux_p_entries]
-    r_cfg = analysis.results[config]
-    path_pctile = r_cfg.get('path_percentile', 5)
-    ben_pctile  = 100 - path_pctile
-    if first_row_only:
-        marginal_data   = {d: None for d in range(D)}
-        aux_marginal_data = {fixed_idx: {d: None for d in range(D)}
-                             for fixed_idx, _ in aux_p_entries}
-    else:
-        print(f"  Computing marginals for {len(all_p_indices)} pathogenic index(es) "
-              f"× {D} dims ({n_boots_used} boots)...")
-        all_marginals = _compute_all_marginals_batch_p(
-            all_fits, x_grids, all_p_indices,
+
+    print(f"  Computing marginals for {len(all_p_indices)} pathogenic index(es) "
+          f"× {D} dims ({n_boots_used} boots)...")
+    all_marginals = _compute_all_marginals_batch_p(
+        all_fits, x_grids, all_p_indices,
+        analysis.b_idx, getattr(analysis, 's_idx', None),
+        analysis.benign_method,
+        ms.sample_assignments.shape[1],
+        path_pctile, ben_pctile,
+        g_idx=getattr(analysis, 'g_idx', None),
+        prior=r.get('median_prior', None),
+        n_jobs=n_jobs,
+    )
+    marginal_data = {d: all_marginals[0][d] for d in range(D)}
+    aux_marginal_data = {}
+    for ai, (fixed_idx, _) in enumerate(aux_p_entries):
+        aux_marginal_data[fixed_idx] = {d: all_marginals[ai + 1][d] for d in range(D)}
+
+    # ── 2D point-region grid (D=2 only) ──────────────────────────────────────
+    lr_grids_2d = None
+    if D == 2:
+        x1g = np.linspace(np.nanmin(scores[:, 0]) - pad, np.nanmax(scores[:, 0]) + pad, n_grid)
+        x2g = np.linspace(np.nanmin(scores[:, 1]) - pad, np.nanmax(scores[:, 1]) + pad, n_grid)
+        r_cfg = analysis.results[config]
+        _p_configs = [{
+            'p_idx':        analysis.p_idx,
+            'tau_p_log':    r_cfg['tau_p_log'],
+            'tau_b_log':    r_cfg['tau_b_log'],
+            'path_pctile':  r_cfg.get('path_percentile', 5),
+            'ben_pctile':   r_cfg.get('ben_percentile', 95),
+            'point_values': analysis.point_values,
+        }]
+        for _, eff_idx in aux_p_entries:
+            _ar = r_cfg.get('aux_results', {})
+            _ar_entry = next((v for k, v in _ar.items() if v.get('eff_idx') == eff_idx), {})
+            _p_configs.append({
+                'p_idx':        eff_idx,
+                'tau_p_log':    _ar_entry.get('tau_p_log', r_cfg['tau_p_log']),
+                'tau_b_log':    _ar_entry.get('tau_b_log', r_cfg['tau_b_log']),
+                'path_pctile':  r_cfg.get('path_percentile', 5),
+                'ben_pctile':   r_cfg.get('ben_percentile', 95),
+                'point_values': analysis.point_values,
+            })
+        print(f"  Computing LR+ grid ({n_grid}×{n_grid}) for {len(_p_configs)} "
+              f"pathogenic index(es)...")
+        lr_grids_2d = _compute_lr_grids_for_all_p(
+            all_fits, x1g, x2g, scores.shape[1],
             analysis.b_idx, getattr(analysis, 's_idx', None),
-            analysis.benign_method,
-            ms.sample_assignments.shape[1],
-            path_pctile, ben_pctile,
+            analysis.benign_method, _p_configs,
             g_idx=getattr(analysis, 'g_idx', None),
             prior=r.get('median_prior', None),
         )
-        marginal_data = {d: all_marginals[0][d] for d in range(D)}
-        aux_marginal_data = {}
-        for ai, (fixed_idx, _) in enumerate(aux_p_entries):
-            aux_marginal_data[fixed_idx] = {d: all_marginals[ai + 1][d] for d in range(D)}
 
-    # Build role-aware per-sample style lists so colors/markers always reflect
-    # fixed role (0=path=red, 1=ben=blue, 2=gnomad=grey, 3=syn=green) even when
-    # one or more roles are absent and effective indices are compacted.
+    # ── Per-sample density grids (D=2 row 1 contours) ───────────────────────
+    density_grids_2d = None
+    if D == 2:
+        x1g = np.linspace(np.nanmin(scores[:, 0]) - pad, np.nanmax(scores[:, 0]) + pad, n_grid)
+        x2g = np.linspace(np.nanmin(scores[:, 1]) - pad, np.nanmax(scores[:, 1]) + pad, n_grid)
+        print(f"  Computing sample density grids ({S} samples, ≤20 bootstrap fits)...")
+        density_grids_2d = _compute_all_sample_density_grids(all_fits, S, x1g, x2g)
+
+    # ── Pairwise LR+ grids ───────────────────────────────────────────────────
+    pairwise_grids_hd = None
+    pairwise_dim_pairs = None
+    _do_pairwise = (D > 2 and projection == 'pairwise') or projection == 'activity_pairs'
+    if _do_pairwise:
+        from itertools import combinations as _combinations
+        if projection == 'pairwise':
+            pairwise_dim_pairs = list(_combinations(range(D), 2))
+        else:
+            act_dims = [d for d, n in enumerate(dataset_names) if pivot_dim.lower() in n.lower()]
+            assert len(act_dims) == 1, \
+                f"Expected exactly one '{pivot_dim}' dimension, found {len(act_dims)}: " \
+                f"{[dataset_names[d] for d in act_dims]}"
+            act_d = act_dims[0]
+            pairwise_dim_pairs = [(act_d, d) for d in range(D) if d != act_d]
+        pairwise_grids_hd = []
+        for dim_i, dim_j in pairwise_dim_pairs:
+            print(f"  Computing pairwise LR+ grid: {dataset_names[dim_i]} vs {dataset_names[dim_j]}...")
+            pairwise_grids_hd.append(_compute_conservative_lr_grid(
+                analysis, config, all_fits,
+                x_grids_plot[dim_i], x_grids_plot[dim_j],
+                dim_i=dim_i, dim_j=dim_j, total_dims=D,
+            ))
+
+    # ── UMAP embedding for D>2 ───────────────────────────────────────────────
+    umap_data = None
+    if D > 2 and projection == 'umap':
+        try:
+            import sys, types
+            if 'importlib.metadata' not in sys.modules:
+                _meta = types.ModuleType('importlib.metadata')
+                _meta.version = lambda _pkg: '0.0.0'
+                class _PNF(Exception): pass
+                _meta.PackageNotFoundError = _PNF
+                sys.modules['importlib.metadata'] = _meta
+            import umap as umap_lib
+
+            # Build full score matrix from all variants in each scoreset
+            # (including VUS/unclassified, not just the four calibration samples)
+            all_scores_by_key = {}   # hgvs_key -> {dim: score}
+            for d, scoreset in enumerate(ms.scoresets):
+                df_s = scoreset.dataframe
+                sc = getattr(scoreset, 'score_col', 'auth_reported_score')
+                for _, row in df_s.iterrows():
+                    # Use the same key strategy as MultiScoreset._get_variant_keys
+                    strategy = getattr(scoreset, '_code_strategy', 'genomic')
+                    if strategy == 'hgvs_p':
+                        key = str(row.get('hgvs_p', ''))
+                    elif strategy == 'hgvs_c':
+                        key = str(row.get('hgvs_c', ''))
+                    else:
+                        key = str(tuple(row.get(c, '') for c in ms.group_cols))
+                    if key and key != 'nan':
+                        if key not in all_scores_by_key:
+                            all_scores_by_key[key] = {}
+                        val = pd.to_numeric(row.get(sc), errors='coerce')
+                        if not np.isnan(val):
+                            all_scores_by_key[key][d] = float(val)
+
+            all_keys = list(all_scores_by_key.keys())
+            N_full = len(all_keys)
+            full_scores = np.full((N_full, D), np.nan)
+            for i, key in enumerate(all_keys):
+                for d, v in all_scores_by_key[key].items():
+                    full_scores[i, d] = v
+
+            # Map ms._variants_kept back to indices in all_keys.
+            # ms._variants_kept contains canonical union-find atoms — try all
+            # plausible string representations to find a match.
+            key_to_idx = {k: i for i, k in enumerate(all_keys)}
+            sample_indices = []
+            for vk in ms._variants_kept:
+                idx = -1
+                # vk is a tuple; try element 0 first (hgvs_p / hgvs_c strategy)
+                candidates = [vk[0] if len(vk) >= 1 else None,
+                              str(vk),
+                              str(vk[0]) if len(vk) >= 1 else None]
+                for cand in candidates:
+                    if cand is not None and cand in key_to_idx:
+                        idx = key_to_idx[cand]
+                        break
+                sample_indices.append(idx)
+            sample_indices = np.array(sample_indices)
+            valid_sample = sample_indices >= 0
+            n_missing = (~valid_sample).sum()
+            if n_missing > 0:
+                print(f"  Warning: {n_missing}/{N} sample variants not matched "
+                      f"in full scoreset — they will be absent from UMAP.")
+
+            print(f"  Computing pairwise distance matrix "
+                  f"({N_full} total variants incl. VUS, D={D})...")
+            # For each pair of variants, compute Euclidean distance using only
+            # dims both have observed, normalized by the number of shared dims.
+            # Variants with no shared dims get max distance (handled below).
+            observed = ~np.isnan(full_scores)   # (N_full, D)
+            dist = np.zeros((N_full, N_full), dtype=np.float32)
+            for d in range(D):
+                obs_d = observed[:, d]
+                both = obs_d[:, None] & obs_d[None, :]
+                diff = np.nan_to_num(full_scores[:, d], nan=0.0)
+                sq_diff = (diff[:, None] - diff[None, :]) ** 2
+                dist += sq_diff * both.astype(np.float32)
+
+            shared_dims = (observed[:, None, :] & observed[None, :, :]).sum(axis=2)
+            shared_dims = np.maximum(shared_dims, 1)
+            dist = np.sqrt(dist / shared_dims)
+            no_shared = (observed[:, None, :] | observed[None, :, :]).sum(axis=2) == 0
+            dist[no_shared] = dist[~no_shared].max() if (~no_shared).any() else 0.0
+            np.fill_diagonal(dist, 0.0)
+
+            print(f"  Fitting UMAP on precomputed distances...")
+            reducer = umap_lib.UMAP(n_components=2, metric='precomputed',
+                                    random_state=42, n_jobs=1)
+            full_embedding = reducer.fit_transform(dist)   # (N_full, 2)
+
+            # Extract embedding rows for the calibration sample variants
+            embedding = np.full((N, 2), np.nan)
+            embedding[valid_sample] = full_embedding[sample_indices[valid_sample]]
+            imputed_mask = np.isnan(scores).any(axis=1)
+
+            umap_data = {
+                'embedding':    embedding,      # (N, 2) — sample variants only
+                'imputed_mask': imputed_mask,   # (N,) — partial obs among samples
+            }
+            print(f"  UMAP done.")
+        except Exception as _umap_err:
+            print(f"  UMAP skipped: {type(_umap_err).__name__}: {_umap_err}")
+
+    return {
+        'analysis':           analysis,
+        'config':             config,
+        'all_fits':           all_fits,
+        'marginal_data':      marginal_data,
+        'aux_marginal_data':  aux_marginal_data,
+        'x_grids':            x_grids,
+        'x_grids_plot':       x_grids_plot,
+        'lr_grids_2d':        lr_grids_2d,
+        'density_grids_2d':   density_grids_2d,
+        'pairwise_grids_hd':  pairwise_grids_hd,
+        'pairwise_dim_pairs': pairwise_dim_pairs,
+        'umap_data':          umap_data,
+        'n_boots_used':       n_boots_used,
+        'n_grid':             n_grid,
+        'pad':                pad,
+    }
+
+
+def render_mv_plot_data(precomputed, figsize=None, contour_levels=6,
+                        first_row_only=False, max_lr_pairs=10,
+                        sample_names=None, projection='umap'):
+    """Render a plot from precomputed data returned by precompute_mv_plot_data.
+
+    All expensive bootstrap computation is already done; this only runs the
+    matplotlib drawing code so you can iterate on aesthetics cheaply.
+    """
+    analysis      = precomputed['analysis']
+    config        = precomputed['config']
+    all_fits      = precomputed['all_fits']
+    marginal_data = precomputed['marginal_data']
+    aux_marginal_data = precomputed['aux_marginal_data']
+    x_grids       = precomputed['x_grids']
+    n_boots_used  = precomputed['n_boots_used']
+    n_grid        = precomputed['n_grid']
+    pad           = precomputed['pad']
+
+    r = analysis.results[config]
+    ms = analysis.ms
+    scores = ms.scores
+    sa = ms.sample_assignments
+    N, D = scores.shape
+    S = sa.shape[1]
+    dataset_names = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
+
+    # Map effective sample indices to fixed roles (0=P/LP, 1=B/LB, 2=gnomAD, 3=Syn)
     _eff_to_fixed = {}
     for fixed_idx, eff_idx in [(0, analysis.p_idx), (1, analysis.b_idx),
                                 (2, analysis.g_idx), (3, analysis.s_idx)]:
         if eff_idx is not None:
             _eff_to_fixed[eff_idx] = fixed_idx
+
+    if sample_names is None:
+        _sn_raw = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+        sample_names = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}' for i in range(S)]
+    else:
+        # custom names indexed by fixed role; map to effective indices via _eff_to_fixed
+        sample_names = [sample_names[_eff_to_fixed.get(i, i)] if _eff_to_fixed.get(i, i) < len(sample_names)
+                        else f'Sample {i}' for i in range(S)]
+
+    latent_q    = r.get('latent_q', getattr(analysis, '_latent_q', 1))
+    model_label = f"CFUSN q={latent_q}" if latent_q > 1 else "MSN q=1"
+    points       = r['points']
+    tau_p_log    = r['tau_p_log']
+    tau_b_log    = r['tau_b_log']
+    median_prior = r['median_prior']
+    C_path       = r.get('C_path', r.get('C', '?'))
+    C_ben        = r.get('C_ben', '?')
+    path_pctile  = r.get('path_percentile', 5)
+    ben_pctile   = r.get('ben_percentile', 95)
+    max_pt       = max(analysis.point_values)
+    pt_norm      = TwoSlopeNorm(vmin=-max_pt, vcenter=0, vmax=max_pt)
+    ylim_bound   = max(abs(tau_p_log[-1]), abs(tau_b_log[-1]))
+    missing_frac = 1.0 - (~np.isnan(scores).any(axis=1)).mean()
+
+    if first_row_only:
+        marginal_data_render   = {d: None for d in range(D)}
+        aux_marginal_data_render = {fid: {d: None for d in range(D)}
+                                    for fid, _ in getattr(analysis, 'aux_p_entries', [])}
+    else:
+        marginal_data_render      = marginal_data
+        aux_marginal_data_render  = aux_marginal_data
+
     sample_style = {
         'colors':  [SAMPLE_COLORS[_eff_to_fixed.get(i, i) % len(SAMPLE_COLORS)]
                     for i in range(S)],
@@ -1060,6 +1350,7 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
                     for i in range(S)],
     }
 
+    aux_p_entries = getattr(analysis, 'aux_p_entries', [])
     gene = getattr(ms, 'scoreset_name', '')
     suptitle = (
         f'{gene} — {config}\n'
@@ -1067,33 +1358,57 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
         f'missing={missing_frac*100:.1f}%'
     )
 
-    info = {'marginal_data': marginal_data, 'n_boots_used': n_boots_used, 'latent_q': latent_q}
-
-    if D == 2:
+    if D == 2 and projection != 'activity_pairs':
         fig, info = _plot_mv_2d(
-            analysis, config, all_fits, marginal_data, x_grids,
+            analysis, config, all_fits, marginal_data_render, x_grids,
             scores, sa, N, D, S, dataset_names, sample_names,
             points, tau_p_log, tau_b_log, median_prior, C_path, C_ben,
             path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound, missing_frac,
             model_label, n_boots_used, pad, n_grid, contour_levels,
             figsize, suptitle,
-            aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data,
+            aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data_render,
             first_row_only=first_row_only, sample_style=sample_style,
+            lr_grids_2d=precomputed.get('lr_grids_2d'),
+            density_grids_2d=precomputed.get('density_grids_2d'),
         )
-    else:
-        fig, info = _plot_mv_hd(
-            analysis, config, all_fits, marginal_data, x_grids,
-            scores, sa, N, D, S, dataset_names, sample_names,
-            points, tau_p_log, tau_b_log, median_prior, C_path, C_ben,
-            path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound,
-            model_label, n_boots_used, pad, n_grid, contour_levels,
-            figsize, suptitle,
-            aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data,
-            sample_style=sample_style,
-            max_lr_pairs=max_lr_pairs,
-        )
-
+    else:  # D>2, or D==2 with activity_pairs
+        umap_data = precomputed.get('umap_data')
+        use_umap = (projection == 'umap' and umap_data is not None)
+        if use_umap:
+            fig, info = _plot_mv_umap(
+                analysis, config, scores, sa, N, D, S,
+                dataset_names, sample_names, points, max_pt, pt_norm,
+                model_label, n_boots_used, missing_frac,
+                umap_data, figsize, suptitle, sample_style,
+                first_row_only=first_row_only,
+            )
+        else:
+            fig, info = _plot_mv_hd(
+                analysis, config, all_fits, marginal_data_render,
+                precomputed.get('x_grids_plot', x_grids),
+                scores, sa, N, D, S, dataset_names, sample_names,
+                points, tau_p_log, tau_b_log, median_prior, C_path, C_ben,
+                path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound,
+                model_label, n_boots_used, pad, n_grid, contour_levels,
+                figsize, suptitle,
+                aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data_render,
+                sample_style=sample_style,
+                max_lr_pairs=max_lr_pairs,
+                pairwise_grids_hd=precomputed.get('pairwise_grids_hd'),
+                pairwise_dim_pairs=precomputed.get('pairwise_dim_pairs'),
+                first_row_only=first_row_only,
+            )
     return fig, info
+
+
+def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
+                        contour_levels=6, first_row_only=False, max_lr_pairs=10):
+    """Convenience wrapper: precompute + render in one call."""
+    precomputed = precompute_mv_plot_data(analysis, config, n_grid=n_grid)
+    return render_mv_plot_data(precomputed, figsize=figsize,
+                               contour_levels=contour_levels,
+                               first_row_only=first_row_only,
+                               max_lr_pairs=max_lr_pairs)
 
 
 _AUX_COLORS = ['#e6a817', '#8B4513', '#006400', '#800080', '#FF6600', '#4B0082']
@@ -1239,6 +1554,67 @@ def _draw_aux_lr_row(fig, gs, row, dim, aux_md, aux_name, aux_color,
     ax.grid(lw=0.2, alpha=0.2)
 
 
+def _add_marginal_strips(ax, scores_2d, mask, ev_vals, dim_x, dim_y,
+                         pt_norm, cmap, marker, x_range, y_range,
+                         dim_x_name='', dim_y_name=''):
+    """Attach 1D rug strips for partial-observation variants.
+
+    Top strip: variants observed only in dim_x (x score known, y missing).
+      → dots at fixed y=0, no y-axis (y is meaningless).
+    Right strip: variants observed only in dim_y (y score known, x missing).
+      → dots at fixed x=0, no x-axis (x is meaningless).
+    Both colored by evidence value.
+    """
+    has_x = ~np.isnan(scores_2d[:, dim_x])
+    has_y = ~np.isnan(scores_2d[:, dim_y])
+    partial_x = mask & has_x & ~has_y
+    partial_y = mask & has_y & ~has_x
+
+    if not partial_x.any() and not partial_y.any():
+        return None
+
+    divider = make_axes_locatable(ax)
+    rng = np.random.default_rng(42)
+    ax_top = None
+
+    if partial_x.any():
+        ax_top = divider.append_axes('top', size='10%', pad=0.03, sharex=ax)
+        ax_top.set_xlim(x_range)
+        jitter = rng.uniform(-0.15, 0.15, partial_x.sum())
+        ax_top.scatter(scores_2d[partial_x, dim_x], jitter,
+                       c=ev_vals[partial_x], cmap=cmap, norm=pt_norm,
+                       s=14, alpha=0.85, linewidths=0.3,
+                       edgecolors='#333333', marker=marker)
+        ax_top.set_ylim(-0.5, 0.5)
+        ax_top.set_yticks([])
+        ax_top.tick_params(labelbottom=False, bottom=False, left=False)
+        label_x = dim_x_name or f'dim {dim_x}'
+        ax_top.set_ylabel(f'{label_x} only\n(n={partial_x.sum()})', fontsize=5,
+                          rotation=0, labelpad=44, va='center')
+        ax_top.set_facecolor('#f4f4f4')
+        for sp in ax_top.spines.values():
+            sp.set_linewidth(0.3); sp.set_color('#cccccc')
+
+    if partial_y.any():
+        ax_right = divider.append_axes('right', size='10%', pad=0.03, sharey=ax)
+        ax_right.set_ylim(y_range)
+        jitter = rng.uniform(-0.15, 0.15, partial_y.sum())
+        ax_right.scatter(jitter, scores_2d[partial_y, dim_y],
+                         c=ev_vals[partial_y], cmap=cmap, norm=pt_norm,
+                         s=14, alpha=0.85, linewidths=0.3,
+                         edgecolors='#333333', marker=marker)
+        ax_right.set_xlim(-0.5, 0.5)
+        ax_right.set_xticks([])
+        ax_right.tick_params(labelleft=False, left=False, bottom=False)
+        label_y = dim_y_name or f'dim {dim_y}'
+        ax_right.set_xlabel(f'{label_y} only\n(n={partial_y.sum()})', fontsize=5, labelpad=2)
+        ax_right.set_facecolor('#f4f4f4')
+        for sp in ax_right.spines.values():
+            sp.set_linewidth(0.3); sp.set_color('#cccccc')
+
+    return ax_top
+
+
 def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                 scores, sa, N, D, S, dataset_names, sample_names,
                 points, tau_p_log, tau_b_log, median_prior, C_path, C_ben,
@@ -1246,7 +1622,8 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
                 aux_p_entries=None, aux_marginal_data=None,
-                first_row_only=False, sample_style=None):
+                first_row_only=False, sample_style=None, lr_grids_2d=None,
+                density_grids_2d=None):
     """Layout for D=2: 2D grid, density contours, marginals."""
     aux_p_entries = aux_p_entries or []
     aux_marginal_data = aux_marginal_data or {}
@@ -1261,58 +1638,150 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
     x2_range = (x2g[0], x2g[-1])
     complete = ~np.isnan(scores).any(axis=1)
 
-    # Build p_configs for primary + all aux in one batch
-    r_cfg      = analysis.results[config]
-    _aux_res   = r_cfg.get('aux_results', {})
-    _p_configs = [{
-        'p_idx':       analysis.p_idx,
-        'tau_p_log':   r_cfg['tau_p_log'],
-        'tau_b_log':   r_cfg['tau_b_log'],
-        'path_pctile': r_cfg.get('path_percentile', 5),
-        'ben_pctile':  r_cfg.get('ben_percentile', 95),
-        'point_values': analysis.point_values,
-    }]
-    for _, eff_idx in aux_p_entries:
-        _ar = _aux_res.get(eff_idx, {})   # keyed by eff_idx in aux_results
-        # aux_results is keyed by fixed_idx; find it
-        _ar = next((v for k, v in _aux_res.items() if v.get('eff_idx') == eff_idx), {})
-        _p_configs.append({
-            'p_idx':       eff_idx,
-            'tau_p_log':   _ar.get('tau_p_log', r_cfg['tau_p_log']),
-            'tau_b_log':   _ar.get('tau_b_log', r_cfg['tau_b_log']),
+    if lr_grids_2d is not None:
+        _all_grids = lr_grids_2d
+    else:
+        r_cfg      = analysis.results[config]
+        _aux_res   = r_cfg.get('aux_results', {})
+        _p_configs = [{
+            'p_idx':       analysis.p_idx,
+            'tau_p_log':   r_cfg['tau_p_log'],
+            'tau_b_log':   r_cfg['tau_b_log'],
             'path_pctile': r_cfg.get('path_percentile', 5),
             'ben_pctile':  r_cfg.get('ben_percentile', 95),
             'point_values': analysis.point_values,
-        })
-    print(f"  Computing LR+ grid ({n_grid}×{n_grid}) for {len(_p_configs)} "
-          f"pathogenic index(es)...")
-    _all_grids = _compute_lr_grids_for_all_p(
-        all_fits, x1g, x2g, scores.shape[1],
-        analysis.b_idx, getattr(analysis, 's_idx', None),
-        analysis.benign_method, _p_configs,
-        g_idx=getattr(analysis, 'g_idx', None),
-        prior=analysis.results[config].get('median_prior', None),
-    )
+        }]
+        for _, eff_idx in aux_p_entries:
+            _ar = next((v for k, v in _aux_res.items() if v.get('eff_idx') == eff_idx), {})
+            _p_configs.append({
+                'p_idx':       eff_idx,
+                'tau_p_log':   _ar.get('tau_p_log', r_cfg['tau_p_log']),
+                'tau_b_log':   _ar.get('tau_b_log', r_cfg['tau_b_log']),
+                'path_pctile': r_cfg.get('path_percentile', 5),
+                'ben_pctile':  r_cfg.get('ben_percentile', 95),
+                'point_values': analysis.point_values,
+            })
+        print(f"  Computing LR+ grid ({n_grid}×{n_grid}) for {len(_p_configs)} "
+              f"pathogenic index(es)...")
+        _all_grids = _compute_lr_grids_for_all_p(
+            all_fits, x1g, x2g, scores.shape[1],
+            analysis.b_idx, getattr(analysis, 's_idx', None),
+            analysis.benign_method, _p_configs,
+            g_idx=getattr(analysis, 'g_idx', None),
+            prior=analysis.results[config].get('median_prior', None),
+        )
     grid_points, lr_conservative = _all_grids[0]
 
-    # Row 0: primary grid + aux grids (no separate legend column — legend goes below)
+    # ── first_row_only: col=sample, single row (D=2) ─────────────────────────
+    if first_row_only:
+        n_cols_s = S
+        if figsize is None:
+            figsize = (4.8 * n_cols_s, 5.5)
+        # constrained_layout=False: make_axes_locatable (for marginal strips)
+        # is incompatible with tight_layout/constrained_layout
+        fig = plt.figure(figsize=figsize, constrained_layout=False)
+        gs = gridspec.GridSpec(1, n_cols_s, figure=fig,
+                               hspace=0.4, wspace=0.45,
+                               left=0.08, right=0.97, top=0.88, bottom=0.22)
+
+        # Map each variant to its calibrated evidence value via nearest grid cell
+        from scipy.interpolate import RegularGridInterpolator
+        _gp_interp = RegularGridInterpolator(
+            (x1g, x2g), grid_points.astype(float),
+            method='nearest', bounds_error=False, fill_value=0,
+        )
+
+        for s_idx in range(S):
+            ax = fig.add_subplot(gs[0, s_idx])
+            mask_any = sa[:, s_idx]  # all variants in this sample
+            mask = mask_any & complete  # only complete (both dims observed)
+            n_s = int(mask_any.sum())
+
+            # Evidence for all variants in this sample via nearest-grid lookup
+            ev_all = np.zeros(len(scores), dtype=int)
+            ev_all[mask_any] = points[mask_any]  # use pre-computed point assignments
+
+            if mask.any():
+                # Scatter complete variants colored by evidence
+                ax.scatter(scores[mask, 0], scores[mask, 1],
+                           c=ev_all[mask], cmap=POINT_CMAP, norm=pt_norm,
+                           s=14, alpha=0.85, linewidths=0.3,
+                           edgecolors='#333333', zorder=2,
+                           marker=_sm[s_idx])
+
+            # Faint evidence region background + ±1 boundary contours
+            if grid_points.any():
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    ax.contourf(x1g, x2g, grid_points.T,
+                                levels=[-8.5, -0.5, 0.5, 8.5],
+                                colors=['#2c7bb6', '#f7f7f7', '#d7191c'],
+                                alpha=0.07, zorder=1)
+                    for lvl, col in [(0.5, '#d7191c'), (-0.5, '#2c7bb6')]:
+                        try:
+                            ax.contour(x1g, x2g, grid_points.T,
+                                       levels=[lvl], colors=[col],
+                                       linewidths=0.7, alpha=0.5, zorder=3)
+                        except Exception:
+                            pass
+
+            # Marginal strips for partial-observation variants
+            ax_top_strip = _add_marginal_strips(
+                ax, scores, mask_any, ev_all,
+                0, 1, pt_norm, POINT_CMAP,
+                _sm[s_idx], x1_range, x2_range,
+                dim_x_name=dataset_names[0],
+                dim_y_name=dataset_names[1])
+
+            ax.set_xlim(x1_range); ax.set_ylim(x2_range)
+            ax.set_xlabel(dataset_names[0], fontsize=8)
+            ax.set_ylabel(dataset_names[1], fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.set_facecolor('#f8f8f8')
+            ax.grid(lw=0.15, alpha=0.3, zorder=0, color='white')
+            # Set title on the top strip if it exists, otherwise on the main axes
+            title_ax = ax_top_strip if ax_top_strip is not None else ax
+            title_ax.set_title(f'{sample_names[s_idx]}  (n={n_s})',
+                               fontsize=9, fontweight='bold', color=_sc[s_idx],
+                               pad=3)
+
+        # Legends: samples (top row) + evidence points (bottom row)
+        sample_handles = [
+            Line2D([0], [0], marker=_sm[i], color='#333333',
+                   markerfacecolor=_sc[i], markersize=7,
+                   linewidth=0, markeredgewidth=0.4,
+                   label=f"{sample_names[i]} (n={int(sa[:, i].sum())})")
+            for i in range(min(S, 4)) if sa[:, i].sum() > 0
+        ]
+        present_evs = sorted({int(v) for v in np.unique(grid_points) if -8 <= v <= 8})
+        ev_handles = [
+            Patch(facecolor=POINT_CMAP(pt_norm(pv)), edgecolor='#333333',
+                  linewidth=0.3, label=f"{'+' if pv > 0 else ''}{pv}")
+            for pv in present_evs
+        ]
+        fig.suptitle(suptitle, fontsize=10, fontweight='bold')
+        # Single combined legend: sample handles on left, separator, evidence on right
+        sep = [Line2D([0], [0], color='none', label='  ')]
+        all_handles = sample_handles + sep + ev_handles
+        fig.legend(handles=all_handles, loc='lower center',
+                   bbox_to_anchor=(0.5, 0.01), ncol=len(all_handles),
+                   fontsize=7.5, frameon=True, title_fontsize=8,
+                   columnspacing=0.8, handletextpad=0.4)
+        info = {'grid_points': grid_points, 'lr_conservative': lr_conservative,
+                'n_boots_used': n_boots_used}
+        return fig, info
+
+    # ── full layout ────────────────────────────────────────────────────────────
     n_grid_cols = 1 + n_aux
-    n_cols = n_grid_cols if first_row_only else max(S, n_grid_cols)
+    n_cols = max(S, n_grid_cols)
 
     # Each of D=2 dimensions gets 1 primary row + n_aux aux-LR rows
     n_marg_rows = D * (1 + n_aux)
-    if first_row_only:
-        height_ratios = [1.2]
-        n_total_rows = 1
-    else:
-        height_ratios = [1.2, 1.2] + [0.8] + [0.5] * n_aux + [0.8] + [0.5] * n_aux
-        n_total_rows = 2 + n_marg_rows
+    height_ratios = [1.2, 1.2] + [0.8] + [0.5] * n_aux + [0.8] + [0.5] * n_aux
+    n_total_rows = 2 + n_marg_rows
 
     if figsize is None:
-        if first_row_only:
-            figsize = (5.5 * n_grid_cols, 6.5)   # extra vertical room for bottom legend
-        else:
-            figsize = (5.5 * n_cols, 5.0 + 4.0 * D + 2.0 * D * n_aux)
+        figsize = (5.5 * n_cols, 5.0 + 4.0 * D + 2.0 * D * n_aux)
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(n_total_rows, n_cols, figure=fig,
                            height_ratios=height_ratios,
@@ -1332,7 +1801,6 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
     im = ax.pcolormesh(x1g, x2g, grid_points.T, cmap=POINT_CMAP,
                        norm=pt_norm, shading='auto', alpha=0.72, zorder=2)
     plt.colorbar(im, ax=ax, label='Evidence Points', shrink=0.8)
-    ax.contour(x1g, x2g, lr_conservative.T, levels=[0], colors='black', linewidths=1, zorder=3)
     ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
     ax.set_xlim(x1_range); ax.set_ylim(x2_range)
     ax.set_aspect('auto')
@@ -1357,7 +1825,6 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         im2 = ax.pcolormesh(x1g, x2g, aux_gp.T, cmap=POINT_CMAP,
                             norm=pt_norm, shading='auto', alpha=0.72, zorder=2)
         plt.colorbar(im2, ax=ax, label='Evidence Points', shrink=0.8)
-        ax.contour(x1g, x2g, aux_lr_con.T, levels=[0], colors='black', linewidths=1, zorder=3)
         ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
         ax.set_xlim(x1_range); ax.set_ylim(x2_range)
         ax.set_aspect('auto')
@@ -1407,7 +1874,8 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         if all_fits:
             for s_idx in range(min(S, n_cols)):
                 ax = fig.add_subplot(gs[1, s_idx])
-                d = _compute_sample_density_grid(all_fits, s_idx, x1g, x2g)
+                d = (density_grids_2d[s_idx] if density_grids_2d is not None
+                     else _compute_sample_density_grid(all_fits, s_idx, x1g, x2g))
                 if d is not None:
                     d_mean, d_std = d['mean'], d['std']
                     levels = np.linspace(d_mean.max() * 0.01, d_mean.max() * 0.95, contour_levels)
@@ -1474,6 +1942,139 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
     return fig, info
 
 
+def _plot_mv_umap(analysis, config, scores, sa, N, D, S,
+                  dataset_names, sample_names, points, max_pt, pt_norm,
+                  model_label, n_boots_used, missing_frac,
+                  umap_data, figsize, suptitle, sample_style,
+                  first_row_only=False):
+    """UMAP projection plot for D>2.  Points colored by evidence; partial
+    observations (imputed dims) drawn with a hollow marker to distinguish them."""
+    embedding    = umap_data['embedding']     # (N, 2)
+    imputed_mask = umap_data['imputed_mask']  # (N,) bool
+
+    _sc = sample_style['colors']  if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
+    _se = sample_style['edges']   if sample_style else [_SAMPLE_EDGE_COLORS[i % len(_SAMPLE_EDGE_COLORS)] for i in range(S)]
+    _sm = sample_style['markers'] if sample_style else [SAMPLE_MARKERS[i % len(SAMPLE_MARKERS)] for i in range(S)]
+
+    complete = ~np.isnan(scores).any(axis=1)
+
+    # Global axis limits across all sample variants (ignoring NaN rows)
+    valid_emb = embedding[~np.isnan(embedding).any(axis=1)]
+    pad_umap  = 0.5
+    xlim = (valid_emb[:, 0].min() - pad_umap, valid_emb[:, 0].max() + pad_umap)
+    ylim = (valid_emb[:, 1].min() - pad_umap, valid_emb[:, 1].max() + pad_umap)
+
+    if first_row_only:
+        n_cols = S
+        if figsize is None:
+            figsize = (4.8 * n_cols, 5.5)
+        fig = plt.figure(figsize=figsize, constrained_layout=False)
+        gs  = gridspec.GridSpec(1, n_cols, figure=fig,
+                                hspace=0.4, wspace=0.45,
+                                left=0.08, right=0.97, top=0.88, bottom=0.22)
+
+        for s_idx in range(S):
+            ax = fig.add_subplot(gs[0, s_idx])
+            mask_any  = sa[:, s_idx].astype(bool)
+            mask_comp = mask_any & complete
+            mask_part = mask_any & ~complete
+            n_s = int(mask_any.sum())
+
+            if mask_any.any():
+                ax.scatter(embedding[mask_any, 0], embedding[mask_any, 1],
+                           c=points[mask_any], cmap=POINT_CMAP, norm=pt_norm,
+                           s=14, alpha=0.85, linewidths=0.3,
+                           edgecolors='#333333', zorder=2, marker=_sm[s_idx])
+
+            ax.set_xlim(xlim); ax.set_ylim(ylim)
+            ax.set_xlabel('UMAP 1', fontsize=8)
+            ax.set_ylabel('UMAP 2', fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.set_facecolor('#f8f8f8')
+            ax.grid(lw=0.15, alpha=0.3, zorder=0, color='white')
+            ax.set_title(f'{sample_names[s_idx]}  (n={n_s})',
+                         fontsize=9, fontweight='bold', color=_sc[s_idx], pad=3)
+
+        # Legend: samples + evidence patches + partial marker explanation
+        sample_handles = [
+            Line2D([0], [0], marker=_sm[i], color='#333333',
+                   markerfacecolor=_sc[i], markersize=7,
+                   linewidth=0, markeredgewidth=0.4,
+                   label=f"{sample_names[i]} (n={int(sa[:, i].sum())})")
+            for i in range(min(S, 4)) if sa[:, i].sum() > 0
+        ]
+        present_evs = sorted({int(v) for v in np.unique(points) if -8 <= v <= 8})
+        ev_handles = [
+            Patch(facecolor=POINT_CMAP(pt_norm(pv)), edgecolor='#333333',
+                  linewidth=0.3, label=f"{'+' if pv > 0 else ''}{pv}")
+            for pv in present_evs
+        ]
+        sep = [Line2D([0], [0], color='none', label='  ')]
+        all_handles = sample_handles + sep + ev_handles
+        fig.suptitle(suptitle, fontsize=10, fontweight='bold')
+        fig.legend(handles=all_handles, loc='lower center',
+                   bbox_to_anchor=(0.5, 0.01), ncol=len(all_handles),
+                   fontsize=7.5, frameon=True, columnspacing=0.8, handletextpad=0.4)
+        return fig, {'n_boots_used': n_boots_used}
+
+    # ── full layout: one panel per sample, arranged in a grid ────────────────
+    ncols = min(S, 3)
+    nrows = int(np.ceil(S / ncols))
+    if figsize is None:
+        figsize = (4.8 * ncols, 5.0 * nrows)
+    fig = plt.figure(figsize=figsize, constrained_layout=False)
+    gs  = gridspec.GridSpec(nrows, ncols, figure=fig,
+                            hspace=0.45, wspace=0.4,
+                            left=0.08, right=0.97, top=0.90, bottom=0.14)
+
+    for s_idx in range(S):
+        row, col = divmod(s_idx, ncols)
+        ax = fig.add_subplot(gs[row, col])
+        mask_any  = sa[:, s_idx].astype(bool)
+        mask_comp = mask_any & complete
+        mask_part = mask_any & ~complete
+        n_s = int(mask_any.sum())
+
+        if mask_comp.any():
+            ax.scatter(embedding[mask_comp, 0], embedding[mask_comp, 1],
+                       c=points[mask_comp], cmap=POINT_CMAP, norm=pt_norm,
+                       s=14, alpha=0.85, linewidths=0.3,
+                       edgecolors='#333333', zorder=2, marker=_sm[s_idx])
+        if mask_part.any():
+            ax.scatter(embedding[mask_part, 0], embedding[mask_part, 1],
+                       c=points[mask_part], cmap=POINT_CMAP, norm=pt_norm,
+                       s=18, alpha=0.75, linewidths=1.0,
+                       edgecolors=_sc[s_idx], facecolors='none',
+                       zorder=2, marker=_sm[s_idx])
+
+        ax.set_xlim(xlim); ax.set_ylim(ylim)
+        ax.set_xlabel('UMAP 1', fontsize=8)
+        ax.set_ylabel('UMAP 2', fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.set_facecolor('#f8f8f8')
+        ax.grid(lw=0.15, alpha=0.3, zorder=0, color='white')
+        ax.set_title(f'{sample_names[s_idx]}  (n={n_s})',
+                     fontsize=9, fontweight='bold', color=_sc[s_idx])
+
+    present_evs = sorted({int(v) for v in np.unique(points) if -8 <= v <= 8})
+    ev_handles = [
+        Patch(facecolor=POINT_CMAP(pt_norm(pv)), edgecolor='#333333',
+              linewidth=0.3, label=f"{'+' if pv > 0 else ''}{pv}")
+        for pv in present_evs
+    ]
+    partial_handle = Line2D([0], [0], marker='o', color='#888888',
+                            markerfacecolor='none', markersize=7,
+                            linewidth=0, markeredgewidth=1.0,
+                            label='partial obs. (imputed)')
+    sep = [Line2D([0], [0], color='none', label='  ')]
+    fig.suptitle(suptitle, fontsize=10, fontweight='bold')
+    fig.legend(handles=ev_handles + sep + [partial_handle],
+               loc='lower center', bbox_to_anchor=(0.5, 0.01),
+               ncol=len(ev_handles) + 2, fontsize=7.5, frameon=True,
+               columnspacing=0.8, handletextpad=0.4)
+    return fig, {'n_boots_used': n_boots_used}
+
+
 def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                 scores, sa, N, D, S, dataset_names, sample_names,
                 points, tau_p_log, tau_b_log, median_prior, C_path, C_ben,
@@ -1481,7 +2082,8 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
                 aux_p_entries=None, aux_marginal_data=None, max_lr_pairs=10,
-                sample_style=None):
+                sample_style=None, pairwise_grids_hd=None, pairwise_dim_pairs=None,
+                first_row_only=False):
     """Layout for D>2.
 
     Row 0: pairwise LR+ grids — all C(D,2) combinations up to max_lr_pairs,
@@ -1497,8 +2099,125 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
     _se = sample_style['edges']   if sample_style else [_SAMPLE_EDGE_COLORS[i % len(_SAMPLE_EDGE_COLORS)] for i in range(S)]
     _sm = sample_style['markers'] if sample_style else [SAMPLE_MARKERS[i % len(SAMPLE_MARKERS)] for i in range(S)]
 
-    all_dim_pairs = list(_combinations(range(D), 2))[:max_lr_pairs]
+    # Use precomputed pairs if provided, else fall back to all combinations
+    if pairwise_dim_pairs is not None:
+        all_dim_pairs = pairwise_dim_pairs[:max_lr_pairs]
+    else:
+        all_dim_pairs = list(_combinations(range(D), 2))[:max_lr_pairs]
     n_pairs = len(all_dim_pairs)
+    complete = ~np.isnan(scores).any(axis=1)
+
+    def _get_pair_grid(k, dim_i, dim_j):
+        if pairwise_grids_hd is not None and k < len(pairwise_grids_hd):
+            return pairwise_grids_hd[k]
+        print(f"  Computing LR+ grid: dim {dim_i} vs dim {dim_j}...")
+        return _compute_conservative_lr_grid(
+            analysis, config, all_fits, x_grids[dim_i], x_grids[dim_j],
+            dim_i=dim_i, dim_j=dim_j, total_dims=D,
+        )
+
+    # ── first_row_only: rows=dim pairs, cols=samples ──────────────────────────
+    if first_row_only:
+        n_rows_f = n_pairs
+        n_cols_f = S
+        if figsize is None:
+            figsize = (4.8 * n_cols_f, 5.0 * n_rows_f)
+        fig = plt.figure(figsize=figsize, constrained_layout=False)
+        gs = gridspec.GridSpec(n_rows_f, n_cols_f, figure=fig,
+                               hspace=0.5, wspace=0.45,
+                               left=0.08, right=0.97, top=0.93, bottom=0.22)
+
+        for k, (dim_i, dim_j) in enumerate(all_dim_pairs):
+            xig, xjg = x_grids[dim_i], x_grids[dim_j]
+            grid_points, lr_conservative = _get_pair_grid(k, dim_i, dim_j)
+            from scipy.interpolate import RegularGridInterpolator
+            _gp_interp = RegularGridInterpolator(
+                (xig, xjg), grid_points.astype(float),
+                method='nearest', bounds_error=False, fill_value=0,
+            )
+            has_i = ~np.isnan(scores[:, dim_i])
+            has_j = ~np.isnan(scores[:, dim_j])
+            complete_ij = has_i & has_j
+
+            for s_idx in range(S):
+                ax = fig.add_subplot(gs[k, s_idx])
+                mask_any = sa[:, s_idx]
+                mask = mask_any & complete_ij
+                n_s = int(mask_any.sum())
+
+                ev_all = points.copy()
+
+                if mask.any():
+                    ax.scatter(scores[mask, dim_i], scores[mask, dim_j],
+                               c=ev_all[mask], cmap=POINT_CMAP, norm=pt_norm,
+                               s=14, alpha=0.85, linewidths=0.3,
+                               edgecolors='#333333', zorder=2,
+                               marker=_sm[s_idx])
+
+                if grid_points.any():
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        ax.contourf(xig, xjg, grid_points.T,
+                                    levels=[-8.5, -0.5, 0.5, 8.5],
+                                    colors=['#2c7bb6', '#f7f7f7', '#d7191c'],
+                                    alpha=0.07, zorder=1)
+                        for lvl, col in [(0.5, '#d7191c'), (-0.5, '#2c7bb6')]:
+                            try:
+                                ax.contour(xig, xjg, grid_points.T,
+                                           levels=[lvl], colors=[col],
+                                           linewidths=0.7, alpha=0.5, zorder=3)
+                            except Exception:
+                                pass
+
+                ax_top_strip = _add_marginal_strips(
+                    ax, scores, mask_any, ev_all,
+                    dim_i, dim_j, pt_norm, POINT_CMAP,
+                    _sm[s_idx],
+                    (xig[0], xig[-1]), (xjg[0], xjg[-1]),
+                    dim_x_name=dataset_names[dim_i],
+                    dim_y_name=dataset_names[dim_j])
+
+                ax.set_xlim(xig[0], xig[-1]); ax.set_ylim(xjg[0], xjg[-1])
+                ax.set_xlabel(dataset_names[dim_i], fontsize=7)
+                ax.set_ylabel(dataset_names[dim_j], fontsize=7)
+                ax.tick_params(labelsize=6)
+                ax.set_facecolor('#f8f8f8')
+                ax.grid(lw=0.15, alpha=0.3, zorder=0, color='white')
+                if k == 0:
+                    title_ax = ax_top_strip if ax_top_strip is not None else ax
+                    title_ax.set_title(f'{sample_names[s_idx]} (n={n_s})',
+                                       fontsize=8, fontweight='bold',
+                                       color=_sc[s_idx], pad=3)
+                if s_idx == 0:
+                    ax.set_ylabel(
+                        f'{dataset_names[dim_i]} vs {dataset_names[dim_j]}\n{dataset_names[dim_j]}',
+                        fontsize=7)
+
+        all_gp = np.concatenate([_get_pair_grid(k, di, dj)[0].ravel()
+                                  for k, (di, dj) in enumerate(all_dim_pairs)])
+        present_evs = sorted({int(v) for v in np.unique(all_gp) if -8 <= v <= 8})
+        ev_handles = [
+            Patch(facecolor=POINT_CMAP(pt_norm(pv)), edgecolor='#333333',
+                  linewidth=0.3, label=f"{'+' if pv > 0 else ''}{pv}")
+            for pv in present_evs
+        ]
+        sample_handles = [
+            Line2D([0], [0], marker=_sm[i], color='#333333',
+                   markerfacecolor=_sc[i], markersize=7,
+                   linewidth=0, markeredgewidth=0.4,
+                   label=f"{sample_names[i]} (n={int(sa[:, i].sum())})")
+            for i in range(min(S, 4)) if sa[:, i].sum() > 0
+        ]
+        fig.suptitle(suptitle, fontsize=10, fontweight='bold')
+        sep = [Line2D([0], [0], color='none', label='  ')]
+        all_handles = sample_handles + sep + ev_handles
+        fig.legend(handles=all_handles, loc='lower center',
+                   bbox_to_anchor=(0.5, 0.01), ncol=len(all_handles),
+                   fontsize=7.5, frameon=True, title_fontsize=8,
+                   columnspacing=0.8, handletextpad=0.4)
+        return fig, {'n_boots_used': n_boots_used}
+
+    # ── full layout ────────────────────────────────────────────────────────────
     n_cols  = max(max(S, 2) + 1, n_pairs + n_aux)
     # Each dimension: 1 primary row + n_aux aux-LR rows
     n_rows  = 1 + D * (1 + n_aux)
@@ -1511,8 +2230,6 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                            height_ratios=height_ratios,
                            hspace=0.50, wspace=0.35)
 
-    complete = ~np.isnan(scores).any(axis=1)
-
     # ═══════════════════════════════════════
     # Row 0: primary pairwise grids then aux grids (dim 0 vs dim 1 for each aux)
     # ═══════════════════════════════════════
@@ -1522,18 +2239,12 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
         xi_range = (xig[0], xig[-1])
         xj_range = (xjg[0], xjg[-1])
 
-        print(f"  Computing LR+ grid: dim {dim_i} vs dim {dim_j}...")
-        grid_points, lr_conservative = _compute_conservative_lr_grid(
-            analysis, config, all_fits, xig, xjg,
-            dim_i=dim_i, dim_j=dim_j, total_dims=D,
-        )
+        grid_points, lr_conservative = _get_pair_grid(k, dim_i, dim_j)
 
         ax = fig.add_subplot(gs[0, k])
         im = ax.pcolormesh(xig, xjg, grid_points.T, cmap=POINT_CMAP,
                            norm=pt_norm, shading='auto', alpha=0.7)
         plt.colorbar(im, ax=ax, label='Points', shrink=0.8)
-        ax.contour(xig, xjg, lr_conservative.T, levels=[0],
-                   colors='black', linewidths=0.8)
 
         for s_idx in range(S):
             mask = sa[:, s_idx] & complete
@@ -1573,7 +2284,6 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
             im2 = ax.pcolormesh(xig, xjg, aux_gp.T, cmap=POINT_CMAP,
                                 norm=pt_norm, shading='auto', alpha=0.7)
             plt.colorbar(im2, ax=ax, label='Points', shrink=0.8)
-            ax.contour(xig, xjg, aux_lr_con.T, levels=[0], colors='black', linewidths=0.8)
             aux_r = analysis.results[config].get('aux_results', {}).get(fixed_idx, {})
             aux_pts = aux_r.get('points', points)
             for s_idx in range(S):

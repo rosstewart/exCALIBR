@@ -57,10 +57,10 @@ from assay_calibration.fit_utils.evidence_thresholds import (
 )
 
 # Evidence codes used by the pipeline (1..8, negatives for benign).
-POINT_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]
+POINT_VALUES = [1, 2, 3, 4, 5, 6, 7, 8]
 
 # The four "named" ACMG tiers and the classification boundary points.
-ACMG_TIER_CODES: list[int] = [1, 2, 4, 8]
+ACMG_TIER_CODES = [1, 2, 4, 8]
 
 # Classification boundary total-point values (Tavtigian 2020, Table 3).
 # Posteriors at these boundaries should satisfy the targets below.
@@ -69,8 +69,8 @@ CLASSIFICATION_BOUNDARIES: Dict[str, int] = {
     "LP_min":  6,   # ≥  6 pts → Likely Pathog.; target posterior ≥ 0.90
     "LP_max":  9,   # <  9 pts → not yet P;       target posterior < 0.99
     "LB_max": -1,   # ≤ -1 pts → Likely Benign;  target posterior < 0.10
-    "LB_min": -6,   # ≥ -6 pts → not yet B;       target posterior > 0.001
-    "B_max":  -7,   # ≤ -7 pts → Benign;          target posterior < 0.001
+    "LB_min": -6,   # ≥ -6 pts → not yet B;       target posterior > 0.01
+    "B_max":  -7,   # ≤ -7 pts → Benign;          target posterior < 0.01
 }
 
 POSTERIOR_TARGETS: Dict[str, tuple] = {

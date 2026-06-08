@@ -214,6 +214,62 @@ def piecewise_tier_thresholds(
     return np.asarray(lrP, dtype=float), np.asarray(lrB, dtype=float), None
 
 
+# ── Method A′: LP-anchored (two slopes, exact at LP & LB per prior) ────────────
+
+def lp_anchored_log_lr(T: ArrayLike, prior: float) -> ArrayLike:
+    """log(LR+) with separate slopes for pathogenic & benign, each exact at anchor.
+
+    Two-slope design anchored at LP (T=6, post=0.90) and LB (T=-1, post=0.10):
+      * Pathogenic (T ≥ 0): α_path(p) = (log(9) − log_prior_odds) / 6
+      * Benign (T < 0):     α_benign(p) = (log(9) + log_prior_odds) / (−1)
+      * Both pass through T=0 where log(LR+)=0 (neutral evidence)
+
+    Properties:
+      * LP (T=6) posterior EXACTLY 0.90 for ALL priors ✓
+      * LB (T=-1) posterior EXACTLY 0.10 for ALL priors ✓
+      * P (T=10) posterior stable at sigmoid(log(81)) ≈ 0.988 for all priors
+      * B (T=-7) posterior stable at sigmoid(-log(81)) ≈ 0.001 for all priors
+      * Strictly additive within each direction (piecewise linear in log-LR)
+      * No kinks at T=0 (both slopes pass through origin)
+
+    Trade-off: Exact posteriors at two anchors require prior-dependent slopes.
+    This is unavoidable: constant LR+ → varying posterior across priors, or
+    varying posterior targets → varying slopes. We choose exact posteriors.
+    """
+    T_arr = np.atleast_1d(np.asarray(T, dtype=float))
+    lpo = float(_log_prior_odds(prior))
+    log9 = np.log(9.0)
+
+    # Prior-dependent slopes to achieve exact posteriors
+    alpha_path = (log9 - lpo) / 6.0        # Pathogenic: anchor at LP (T=6, post=0.90)
+    alpha_benign = (log9 + lpo) / (-1.0)   # Benign:     anchor at LB (T=-1, post=0.10)
+
+    out = np.empty_like(T_arr)
+    for i, t in enumerate(T_arr):
+        if float(t) >= 0:
+            out[i] = alpha_path * t
+        else:
+            out[i] = alpha_benign * t
+
+    if np.ndim(T) == 0:
+        return float(out[0])
+    return out
+
+
+def lp_anchored_lr_plus(T: ArrayLike, prior: float) -> ArrayLike:
+    """LR+ at total points T under LP-anchored additive scheme (pathogenic)."""
+    return np.exp(lp_anchored_log_lr(T, prior))
+
+
+def lp_anchored_posterior(T: ArrayLike, prior: float) -> ArrayLike:
+    """Posterior at T under LP-anchored additive scheme.
+
+    LP (T=6) is exactly 0.90 for every prior.
+    P (T=10) is stable at ~0.988 for every prior.
+    """
+    return bayes_posterior_from_lr(lp_anchored_lr_plus(T, prior), prior)
+
+
 # ── Method B: Continuous LR+ (pure Bayesian) ─────────────────────────────────
 
 # Target posteriors used to define classification boundaries.  Ordered

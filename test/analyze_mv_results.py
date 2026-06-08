@@ -1747,6 +1747,28 @@ class MVCalibrationAnalysis:
                      fontsize=13, fontweight='bold', y=1.01)
         return fig
 
+    def precompute_plot_data(self, config, n_grid=120):
+        """Precompute expensive bootstrap data for plot_config_detail.
+
+        Returns a dict that can be passed to render_plot_data (or
+        visualize_fit.render_mv_plot_data) repeatedly without redoing
+        the parallel bootstrap sweeps.
+        """
+        from visualize_fit import precompute_mv_plot_data
+        return precompute_mv_plot_data(self, config, n_grid=n_grid)
+
+    def render_plot_data(self, precomputed, figsize=None, contour_levels=6,
+                         first_row_only=False, max_lr_pairs=10):
+        """Render a plot from data returned by precompute_plot_data.
+
+        Cheap — only runs matplotlib drawing, no bootstrap computation.
+        """
+        from visualize_fit import render_mv_plot_data
+        return render_mv_plot_data(precomputed, figsize=figsize,
+                                   contour_levels=contour_levels,
+                                   first_row_only=first_row_only,
+                                   max_lr_pairs=max_lr_pairs)
+
     def plot_config_detail(self, config, figsize=None, n_grid=120, contour_levels=6,
                            first_row_only=False, max_lr_pairs=10):
         """Detailed visualization using bootstrap-averaged densities.

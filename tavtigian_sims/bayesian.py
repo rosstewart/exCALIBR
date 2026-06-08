@@ -27,6 +27,7 @@ if _SRC not in sys.path:
 from assay_calibration.fit_utils.bayesian_thresholds import (
     piecewise_lr_plus, piecewise_posterior, piecewise_tier_thresholds,
     piecewise_additive_lr_plus, piecewise_additive_posterior,
+    lp_anchored_lr_plus, lp_anchored_posterior,
     continuous_lr_thresholds, bayes_posterior_from_lr,
     ACMG_KNOTS, ACMG_ADDITIVE_KNOTS,
 )
@@ -155,7 +156,39 @@ class PiecewiseAdditiveSuite(_PiecewiseSuiteBase):
     _METHOD       = "piecewise_additive"
 
 
-# ── Method B: continuous LR+ suite ───────────────────────────────────────────
+# ── Method A″: LP-anchored additive (pathogenic direction only) ──────────────
+
+class LPAnchoredSuite(_PiecewiseSuiteBase):
+    """[DEPRECATED] LP & LB anchored with separate prior-dependent slopes.
+
+    ⚠️  DEPRECATED: Fundamental three-way tradeoff makes this approach inferior
+    to Tavtigian and Piecewise. Keeping for reference only.
+
+    Two-slope approach: pathogenic (T≥0) anchored at LP, benign (T<0) at LB.
+    Each slope varies with prior to achieve exact posteriors at boundaries.
+
+    The Inescapable Tradeoff:
+    You can have any TWO of:
+      1. Strictly additive (constant slopes)
+      2. Exact posteriors at boundaries for all priors
+      3. Prior-independent slopes
+
+    - Tavtigian: (1) + (3) — additive, prior-independent, posteriors drift
+    - Piecewise: (2) + (3) — exact, prior-independent, has kinks
+    - LP-anchored: (1) + (2) — additive, exact, but slopes must vary with prior
+                              → "benign gets harder at low prior" artifact
+                              → no real advantage over Tavtigian + Piecewise
+
+    Use Tavtigian vs Piecewise for the substantive comparison.
+    """
+    _lr_fn        = staticmethod(lp_anchored_lr_plus)
+    _post_fn      = staticmethod(lp_anchored_posterior)
+    _BOUNDARIES   = CLASSIFICATION_BOUNDARIES
+    _POST_TARGETS = POSTERIOR_TARGETS
+    _METHOD       = "lp_anchored"
+
+
+# ── Method C: continuous LR+ suite ───────────────────────────────────────────
 
 @dataclass
 class ContinuousResult:

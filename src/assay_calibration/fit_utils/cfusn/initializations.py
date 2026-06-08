@@ -208,7 +208,11 @@ def kmeans_init_mv(X, **kwargs):
     X_complete = X[complete_mask]
     min_needed = n_clusters * max(10, K_dim + 2)
     if len(X_complete) < min_needed:
-        raise ValueError(f"Only {len(X_complete)}/{N} complete rows, need {min_needed}")
+        # No fully-complete rows (e.g. dims from non-overlapping experiments).
+        # Impute column means for k-means seeding only.
+        col_means = np.nanmean(X, axis=0)
+        X_complete = np.where(np.isnan(X), col_means[None, :], X)
+        complete_mask = np.ones(N, dtype=bool)
 
     # Fallback covariance computed once — used when a cluster is too small
     # to estimate its own covariance reliably.

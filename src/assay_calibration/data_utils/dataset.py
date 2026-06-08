@@ -1323,6 +1323,8 @@ def _plot_multiscoreset_scores(scoreset, dim_pairs=None, max_pairs=10):
         xi_all = scoreset._scores[:, di]
         xj_all = scoreset._scores[:, dj]
         valid_all = ~(np.isnan(xi_all) | np.isnan(xj_all))
+        if not valid_all.any():
+            continue
         xlim = (float(np.nanmin(xi_all[valid_all])), float(np.nanmax(xi_all[valid_all])))
         ylim = (float(np.nanmin(xj_all[valid_all])), float(np.nanmax(xj_all[valid_all])))
 
@@ -1563,14 +1565,23 @@ class MultiScoreset:
         # ── Allocate and fill matrices ─────────────────────────────────────────
         scores_matrix = np.full((n_variants, self.d), np.nan)
         sample_assignments = np.zeros((n_variants, 4), dtype=bool)
+        auth_labels_arr = np.empty(n_variants, dtype='U50')
 
         for assay_i in range(self.d):
             row_indices = assay_row_idx[assay_i]
             scores = scores_list[assay_i]
             samples = samples_list[assay_i]
+            s = self.scoresets[assay_i]
+            al = getattr(s, '_auth_labels', None)
             for k, idx in enumerate(row_indices):
                 scores_matrix[idx, assay_i] = scores[k]
                 sample_assignments[idx] |= samples[k]
+                if al is not None and k < len(al) and al[k]:
+                    label = al[k]
+                    current = auth_labels_arr[idx]
+                    # "abnormal" takes priority over anything; otherwise first non-empty wins
+                    if not current or (label.lower() == 'abnormal' and current.lower() != 'abnormal'):
+                        auth_labels_arr[idx] = label
 
         # ── Keep only variants with at least one observed score ────────────────
         missing_mask = np.isnan(scores_matrix)
@@ -1589,6 +1600,7 @@ class MultiScoreset:
         self._missing = missing_mask[keep_mask]
         self.variants = all_canonical
         self._sample_assignments = sample_assignments[keep_mask]
+        self._auth_labels = auth_labels_arr[keep_mask]
         self.n_variants = self._scores.shape[0]
 
         self._xlims = tuple(
@@ -1621,6 +1633,10 @@ class MultiScoreset:
     @property
     def kept_variants(self):
         return self._variants_kept
+
+    @property
+    def auth_labels(self):
+        return self._auth_labels
 
     @property
     def sample_assignments(self):

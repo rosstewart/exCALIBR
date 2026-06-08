@@ -1,0 +1,18 @@
+name: excalibr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy=1.26
+  - scipy=1.10
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - numba
+  - joblib
+  - tqdm
+  - ipykernel
+  - jupyterlab
+  - fire
+  - ffmpeg

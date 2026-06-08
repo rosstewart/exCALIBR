@@ -19,7 +19,7 @@ from .analysis import (
     summarize_suite,
 )
 from . import plots
-from .bayesian import PiecewiseSuite, PiecewiseAdditiveSuite, ContinuousSuite
+from .bayesian import PiecewiseSuite, PiecewiseAdditiveSuite, LPAnchoredSuite, ContinuousSuite
 from . import compare
 from . import additivity
 
@@ -44,6 +44,7 @@ __all__ = [
     "plots",
     "PiecewiseSuite",
     "PiecewiseAdditiveSuite",
+    "LPAnchoredSuite",
     "ContinuousSuite",
     "compare",
     "additivity",

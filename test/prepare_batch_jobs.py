@@ -33,7 +33,7 @@ import pandas as pd
 # STEP 1: Generate consolidated job manifest
 # ============================================================================
 
-def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2026", selected_components=None):
+def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2026", selected_components=None, population_type=None):
     """Process a single dataset and return consolidated jobs (one per bootstrap)."""
     if clinvar_release == "2026":
         dataset_name = dataset
@@ -47,9 +47,10 @@ def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_rel
     print(f"{dataset_name}: components={selected_components}")
 
     try:
-        ds = Scoreset(df[df["Dataset"] == dataset],
-                            clinvar_release=clinvar_release,
-                            min_clinvar_star=1)
+        scoreset_kwargs = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
+        if population_type is not None:
+            scoreset_kwargs["population_type"] = population_type
+        ds = Scoreset(df[df["Dataset"] == dataset], **scoreset_kwargs)
     except ValueError as e:
         print(f"{dataset} skipping: {e}")
         return
@@ -174,7 +175,7 @@ def requires_2018(df, dataset):
     
 
 def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30, run_downsample_discordance=False,
-                          config_file=None):
+                          config_file=None, dataframe_path=None, population_type=None):
     """
     Generate job manifest optimized for MAX_ARRAY_SIZE limit.
 
@@ -217,7 +218,10 @@ def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30, run_dow
     N_BOOTSTRAPS = 1000
     NUM_FITS = 100  # fits per bootstrap per component
 
-    df = pd.read_csv("/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz", sep='\t')
+    if dataframe_path is None:
+        dataframe_path = "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
+    sep = "\t" if dataframe_path.endswith(".tsv.gz") or dataframe_path.endswith(".tsv") else ","
+    df = pd.read_csv(dataframe_path, sep=sep)
     datasets = df.Dataset.unique()
 
     print(f"Target array size: {target_array_size}")
@@ -239,7 +243,8 @@ def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30, run_dow
             clinvar_release="2026" if not requires_2018(df, dataset) else "2018",
             selected_components=components_for(
                 dataset if not requires_2018(df, dataset) else f"{dataset}_clinvar_2018"
-            )
+            ),
+            population_type=population_type,
         ) for dataset in datasets
     )
     
@@ -542,6 +547,11 @@ if __name__ == "__main__":
                        help='Number of parallel workers for job generation (default: 30)')
     parser.add_argument('--run_downsample_discordance', action='store_true',
                    help='Generate jobs for downsampling and discordance analyses (default: False)')
+    parser.add_argument('--dataframe', type=str, default=None,
+                       help='Path to input dataframe (default: integrated_variant_effect_dataset.tsv.gz). '
+                            'CSV (.csv/.csv.gz) or TSV (.tsv/.tsv.gz) are auto-detected by extension.')
+    parser.add_argument('--population-type', type=str, default=None,
+                       help="Population type passed to Scoreset (e.g. 'all_missense_nsSNV'). Omit to use Scoreset default.")
     args = parser.parse_args()
 
     output_dir = args.output_dir
@@ -557,6 +567,8 @@ if __name__ == "__main__":
         n_jobs=args.n_jobs,
         run_downsample_discordance=args.run_downsample_discordance,
         config_file=args.config_file,
+        dataframe_path=args.dataframe,
+        population_type=args.population_type,
     )
     # create_worker_script(output_dir)
     # create_status_checker(output_dir)
