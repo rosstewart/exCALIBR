@@ -1212,28 +1212,14 @@ def plot_confusion_mat(danzs, auths):
     danzs: list of DanZ count DataFrames
     auths: list of author count DataFrames
     """
-    # ----------------------------------------------
-    # 0. Filter out datasets with zero row sums
-    # ----------------------------------------------
-    valid_indices = []
-    for i in range(len(danzs)):
-        if danzs[i] is None or auths[i] is None:
-            print(f"Skipping dataset index {i}: assingment matrix is None")
-            continue
-        
-        danz_row_sums = danzs[i].sum(axis=1)
-        auth_row_sums = auths[i].sum(axis=1)
-        
-        if (danz_row_sums == 0).any() or (auth_row_sums == 0).any():
-            print(f"Skipping dataset index {i}: has zero row sum")
-            continue
-        
-        valid_indices.append(i)
-    
-    # Filter to valid datasets only
+    valid_indices = [
+        i for i in range(len(danzs))
+        if danzs[i] is not None and auths[i] is not None
+    ]
+
     danzs_filtered = [danzs[i] for i in valid_indices]
     auths_filtered = [auths[i] for i in valid_indices]
-    
+
     if len(danzs_filtered) == 0:
         raise ValueError("No valid datasets remaining after filtering!")
     
@@ -2762,12 +2748,7 @@ def compute_aggregate_metrics(danzs, auths, dataset_names):
     for i, (danz_df, auth_df, dataset_name) in enumerate(zip(danzs, auths, dataset_names)):
         if danz_df is None or auth_df is None:
             continue
-        
-        # Skip datasets with zero row sums
-        if (danz_df.sum(axis=1) == 0).any() or (auth_df.sum(axis=1) == 0).any():
-            continue
-        
-        # Aggregate
+
         if danz_aggregate is None:
             danz_aggregate = danz_df.copy()
             auth_aggregate = auth_df.copy()
@@ -3083,24 +3064,20 @@ def plot_aggregate_confusion_matrices(danzs, auths, dataset_names, figsize=(13, 
         if danz_df is None or auth_df is None:
             continue
         
-        if (danz_df.sum(axis=1) == 0).any() or (auth_df.sum(axis=1) == 0).any():
-            print(f"Skipping {dataset_name}: has zero row sum")
-            continue
-        
         if danz_aggregate is None:
             danz_aggregate = danz_df.copy()
             auth_aggregate = auth_df.copy()
         else:
             danz_aggregate += danz_df
             auth_aggregate += auth_df
-        
+
         n_datasets += 1
-    
+
     if danz_aggregate is None:
         raise ValueError("No valid datasets to aggregate!")
-    
+
     print(f"Aggregated {n_datasets} datasets")
-    
+
     # Compute metrics with DORs
     danz_metrics = compute_classification_metrics(danz_aggregate)
     auth_metrics = compute_classification_metrics(auth_aggregate)
@@ -3361,11 +3338,6 @@ def plot_aggregate_confusion_diff_matrix(danzs, auths, dataset_names, figsize=(1
         if danz_df is None or auth_df is None:
             continue
         
-        # Skip datasets with zero row sums
-        if (danz_df.sum(axis=1) == 0).any() or (auth_df.sum(axis=1) == 0).any():
-            print(f"Skipping {dataset_name}: has zero row sum")
-            continue
-        
         # Aggregate
         if danz_aggregate is None:
             danz_aggregate = danz_df.copy()
@@ -3373,14 +3345,14 @@ def plot_aggregate_confusion_diff_matrix(danzs, auths, dataset_names, figsize=(1
         else:
             danz_aggregate += danz_df
             auth_aggregate += auth_df
-        
+
         n_datasets += 1
-    
+
     if danz_aggregate is None:
         raise ValueError("No valid datasets to aggregate!")
-    
+
     print(f"Aggregated {n_datasets} datasets")
-    
+
     # Compute aggregate metrics
     danz_metrics = compute_classification_metrics(danz_aggregate)
     auth_metrics = compute_classification_metrics(auth_aggregate)
@@ -4924,7 +4896,7 @@ def import_dataset_configurations():
         "FKRP_Ma_2024": ("3c", "avg"),
     }
     
-    with open('/home/rcstewart/assay_calibration/src/igvf_configs/dataset_configs_jan_2026.json','rt') as f:
+    with open('/home/rcstewart/exCALIBR/src/igvf_configs/dataset_configs_jan_2026.json','rt') as f:
         new_dataset_configs = json.load(f)
 
     # del new_dataset_configs['TP53_Fayer_2021_meta']
@@ -4932,9 +4904,13 @@ def import_dataset_configurations():
     # del new_dataset_configs['SFPQ_unpublished']
     
     keep_old_list = set()
-    with open('/data/ross/assay_calibration/old/keep_old_datasets.txt','r') as f:
-        for line in f:
-            keep_old_list.add(line.strip())
+    keep_old_path = '/data/ross/assay_calibration/old/keep_old_datasets.txt'
+    try:
+        with open(keep_old_path, 'r') as f:
+            for line in f:
+                keep_old_list.add(line.strip())
+    except FileNotFoundError:
+        pass
 
     return dataset_configs, dataset_relax_configs, new_dataset_configs, keep_old_list
 

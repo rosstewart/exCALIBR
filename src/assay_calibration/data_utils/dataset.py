@@ -100,6 +100,47 @@ INTERVAL_CLASS_NORMALIZATION = {
     "not specified": "Indeterminate",
 }
 
+LABELSEQ_COLUMN_MAP = {
+    # ClinVar
+    "clinvar.202601.clinical_significance": "clinvar_sig_2026",
+    "clinvar.202601.review_status":         "clinvar_star_2026",
+    "clinvar.202501.clinical_significance": "clinvar_sig_2025",
+    "clinvar.202501.review_status":         "clinvar_star_2025",
+    "clinvar.201801.clinical_significance": "clinvar_sig_2018",
+    "clinvar.201801.review_status":         "clinvar_star_2018",
+    # HGVS
+    "mapped_hgvs_c": "hgvs_c",
+    "mapped_hgvs_p": "hgvs_p",
+    # Protein-level coords
+    "mapped_hgvs_p_ref":   "aa_ref",
+    "mapped_hgvs_p_start": "aa_pos",
+    "mapped_hgvs_p_alt":   "aa_alt",
+    # SpliceAI
+    "spliceai.ds_ag": "spliceAI_DS_AG",
+    "spliceai.ds_al": "spliceAI_DS_AL",
+    "spliceai.ds_dg": "spliceAI_DS_DG",
+    "spliceai.ds_dl": "spliceAI_DS_DL",
+    # Genomic coords
+    "mapped_hgvs_g_chromosome": "Chrom",
+    "mapped_hgvs_g_start":      "hg38_start",
+    "mapped_hgvs_g_ref":        "ref_allele",
+    "mapped_hgvs_g_alt":        "alt_allele",
+    # gnomAD
+    "gnomad.v4_1.minor_allele_frequency": "gnomad_MAF",
+    # Gene (gene_symbol takes priority over protein if both present)
+    "gene_symbol": "Gene",
+    "protein":     "Gene",
+}
+
+VEP_CONSEQUENCE_MAP = {
+    "splice_acceptor_variant":             "splice_site_variant",
+    "splice_region_variant":               "splicing_variant",
+    "splice_donor_variant":                "splice_site_variant",
+    "splice_donor_region_variant":         "splicing_variant",
+    "splice_donor_5th_base_variant":       "splicing_variant",
+    "splice_polypyrimidine_tract_variant": "splicing_variant",
+}
+
 def classify_by_intervals(score, intervals):
     """
     intervals: list of dicts with keys:
@@ -314,8 +355,8 @@ class BasicScoreset:
                     self._sample_assignments[:, sample_index]
                 ], self.sample_names[sample_index]
 
-    def plot(self):
-        return _plot_scoreset_scores(self)
+    def plot(self, bins=None):
+        return _plot_scoreset_scores(self, bins=bins)
 
     # @property
     # def samples(self):
@@ -482,6 +523,151 @@ class Scoreset:
         dataframe = pd.DataFrame.from_records(data)
         return cls(dataframe, **kwargs)
 
+    @classmethod
+    def from_mavedb(
+        cls,
+        dataframe: pd.DataFrame,
+        score_col: str,
+        dataset_col: Union[str, list],
+        splice_measure: Union[str, bool] = "No",
+        dataset_sep: str = "_",
+        func_class_col: str = None,
+        func_class_cols: list = None,
+        **kwargs,
+    ) -> "Scoreset":
+        """
+        Create a Scoreset from a MaveDB / label-seq annotated DataFrame.
+
+        Parameters
+        ----------
+        dataframe : pd.DataFrame
+            Raw label-seq / MaveDB output (e.g. from a .tsv.gz annotated file).
+        score_col : str
+            Column holding the assay score (varies per assay, e.g. 'average score').
+            Renamed to 'auth_reported_score' internally.
+        dataset_col : str or list of str
+            Column(s) whose values become the 'Dataset' identifier.  Pass a single
+            column name (e.g. 'assay_treatment') or a list to concatenate multiple
+            columns (e.g. ['gene_symbol', 'assay', 'assay_treatment']).
+        splice_measure : str or bool
+            Whether the assay detects splicing effects. Accepts 'Yes'/'No' or
+            True/False. Defaults to 'No' / False.
+        dataset_sep : str
+            Separator used when joining multiple dataset_col values. Defaults to '_'.
+        func_class_col : str or None
+            Column whose values become 'auth_reported_func_class' for this scoreset.
+            Use to bind a single per-assay category column (e.g. 'Category activation').
+        func_class_cols : list of str or None
+            All category columns to carry through every scoreset so MultiScoreset
+            can build a (N, K) _raw_fc_per_dim independent of the number of score
+            dimensions.  E.g. ['Category activation', 'Category LOF', 'Category PemR',
+            'Category FutR'].  These are stored as sentinel columns _fcc_0_, _fcc_1_, …
+            and must be the same list for every scoreset passed to one MultiScoreset.
+        **kwargs
+            Forwarded to Scoreset.__init__ (clinvar_release, min_clinvar_star,
+            population_type, regularization_type, etc.).
+        """
+        df = dataframe.copy()
+
+        # Apply standard column renames; skip any target already present
+        rename = {
+            src: dst
+            for src, dst in LABELSEQ_COLUMN_MAP.items()
+            if src in df.columns and dst not in df.columns
+        }
+        df = df.rename(columns=rename)
+
+        # Translate caller-supplied column names through the rename map so that
+        # e.g. dataset_col="gene_symbol" still works after it has been renamed to "Gene".
+        score_col = rename.get(score_col, score_col)
+        if isinstance(dataset_col, str):
+            dataset_col = rename.get(dataset_col, dataset_col)
+        else:
+            dataset_col = [rename.get(c, c) for c in dataset_col]
+
+        # Score column → internal name
+        if score_col != "auth_reported_score":
+            if score_col not in df.columns:
+                raise KeyError(
+                    f"from_mavedb: score_col={score_col!r} not found in dataframe. "
+                    f"Available columns: {sorted(df.columns.tolist())}"
+                )
+            if "auth_reported_score" not in df.columns:
+                df = df.rename(columns={score_col: "auth_reported_score"})
+            else:
+                df["auth_reported_score"] = df[score_col]
+
+        # Per-assay functional class column → internal name used by _raw_func_classes
+        if func_class_col is not None:
+            if func_class_col not in df.columns:
+                raise KeyError(
+                    f"from_mavedb: func_class_col={func_class_col!r} not found in dataframe. "
+                    f"Available columns: {sorted(df.columns.tolist())}"
+                )
+            df["auth_reported_func_class"] = df[func_class_col]
+
+        # All category columns → sentinel columns _fcc_0_, _fcc_1_, … carried into
+        # every Scoreset so MultiScoreset can build a (N, K) category matrix later.
+        if func_class_cols is not None:
+            missing = [c for c in func_class_cols if c not in df.columns]
+            if missing:
+                raise KeyError(
+                    f"from_mavedb: func_class_cols columns not found: {missing}. "
+                    f"Available columns: {sorted(df.columns.tolist())}"
+                )
+            for i, col in enumerate(func_class_cols):
+                df[f"_fcc_{i}_"] = df[col]
+
+        # Dataset column (single or composite)
+        if "Dataset" not in df.columns:
+            if isinstance(dataset_col, str):
+                df["Dataset"] = df[dataset_col].astype(str)
+            else:
+                df["Dataset"] = df[list(dataset_col)].astype(str).agg(dataset_sep.join, axis=1)
+
+        # VEP consequence mapping
+        vep_col = "vep.most_severe_mutational_consequence"
+        if vep_col in df.columns and "simplified_consequence" not in df.columns:
+            df["simplified_consequence"] = df[vep_col].map(
+                lambda x: VEP_CONSEQUENCE_MAP.get(x, x)
+            )
+
+        # splice_measure sentinel (read by Scoreset.splicing_filter)
+        if "splice_measure" not in df.columns:
+            if isinstance(splice_measure, bool):
+                splice_measure = "Yes" if splice_measure else "No"
+            df["splice_measure"] = splice_measure
+
+        # Derive mavedb_variant_urn from assayed_variant_level when absent
+        if "mavedb_variant_urn" not in df.columns and "assayed_variant_level" in df.columns:
+            levels = df["assayed_variant_level"].unique()
+            if len(levels) != 1:
+                raise ValueError(
+                    f"assayed_variant_level must be constant across rows; got {levels.tolist()}"
+                )
+            level = levels[0]
+            gene_prefix = df["Gene"].astype(str) if "Gene" in df.columns else pd.Series("", index=df.index)
+            if level == "dna" and "mapped_hgvs_g" in df.columns:
+                df["mavedb_variant_urn"] = gene_prefix + "_" + df["mapped_hgvs_g"].astype(str)
+            elif level == "protein" and "hgvs_p" in df.columns:
+                df["mavedb_variant_urn"] = gene_prefix + "_" + df["hgvs_p"].astype(str)
+            else:
+                raise ValueError(
+                    f"Cannot derive mavedb_variant_urn: assayed_variant_level={level!r} "
+                    f"but the required HGVS column (mapped_hgvs_g or mapped_hgvs_p) is absent."
+                )
+
+        unique_datasets = df["Dataset"].unique()
+        if len(unique_datasets) != 1:
+            raise ValueError(
+                f"from_mavedb: dataframe contains {len(unique_datasets)} unique Dataset values "
+                f"but Scoreset requires exactly one.\n"
+                f"  Found: {sorted(unique_datasets)}\n"
+                f"  Filter the dataframe to a single dataset before calling from_mavedb, e.g.:\n"
+                f"    df[df['{dataset_col if isinstance(dataset_col, str) else dataset_col[0]}'] == '<value>']"
+            )
+
+        return cls(df, **kwargs)
 
     def _init_dataframe(self, dataframe: pd.DataFrame, **kwargs):
         """
@@ -636,13 +822,16 @@ class Scoreset:
         
         """
         self.has_synomyous = any([variant.is_synonymous for variant in self.variants])
-        self.NSamples = 4
+        self.parse_regularization_type(**kwargs)
+        self.NSamples = 5 if self.regularization_type is not None else 4
         self.sample_names = [
             "Pathogenic/Likely Pathogenic",
             "Benign/Likely Benign",
             "population",
             "Synonymous",
         ]
+        if self.regularization_type is not None:
+            self.sample_names.append(self.regularization_type)
         variants_by_id = self.get_variants_by_id()
         self.n_variants = len(variants_by_id)
         self._sample_assignments = np.zeros(
@@ -650,6 +839,13 @@ class Scoreset:
         )
         self._scores = np.zeros(self.n_variants)
         self._auth_labels = np.empty(self.n_variants, dtype='U50')
+        self._raw_func_classes = np.empty(self.n_variants, dtype=object)
+        _fcc_cols = sorted(
+            [c for c in self.dataframe.columns if c.startswith('_fcc_') and c.endswith('_')],
+            key=lambda c: int(c[5:-1])
+        )
+        _K = len(_fcc_cols)
+        self._extra_func_classes = np.empty((self.n_variants, _K), dtype=object) if _K else None
         self._snv_scores = []
         self._vus_scores = []
         self._all_scores = []
@@ -659,6 +855,7 @@ class Scoreset:
         self.parse_population_type(**kwargs)
         group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
         is_pop = self.is_population_member  # avoid repeated self-lookup in tight loop
+        is_reg = self.is_regularization_member if self.regularization_type is not None else None
 
         # Determine variant-matching strategy once for the whole scoreset.
         # Use .all() so a strategy is only chosen when it covers every variant.
@@ -696,6 +893,10 @@ class Scoreset:
             score0 = v0.assay_score
             self._scores[idx] = score0
             self._auth_labels[idx] = v0.auth_label
+            self._raw_func_classes[idx] = getattr(v0, 'auth_reported_func_class', '') or ''
+            if self._extra_func_classes is not None:
+                for ki, col in enumerate(_fcc_cols):
+                    self._extra_func_classes[idx, ki] = getattr(v0, col, '') or ''
             if v0.is_snv:
                 self._snv_scores.append(score0)
             self._all_scores.append(score0)
@@ -763,24 +964,32 @@ class Scoreset:
                 self._sample_assignments[idx, 0] = True
             if any(v.is_benign for v in variants):
                 self._sample_assignments[idx, 1] = True
+            if is_reg is not None and any(is_reg(v) for v in variants):
+                self._sample_assignments[idx, 4] = True
         
         keep_mask = self._sample_assignments.any(axis=1)
         self._keep_mask = keep_mask
         self._scores = self.scores[keep_mask]
         self._sample_assignments = self._sample_assignments[keep_mask]
         self._auth_labels = self._auth_labels[keep_mask]
+        self._raw_func_classes = self._raw_func_classes[keep_mask]
+        if self._extra_func_classes is not None:
+            self._extra_func_classes = self._extra_func_classes[keep_mask]
         self._aa_subs = self._aa_subs[keep_mask]
 
-        
+
         if self.discordance_pct != 0:
             self._sample_assignments = self.add_label_noise(self._sample_assignments, self.discordance_pct)
-        
+
         if self.downsample_n_variants is not None:
             keep_mask_downsample = self.downsample_controls(self._sample_assignments, self.downsample_n_variants, self.downsample_seed)
             self._keep_mask_downsample = keep_mask_downsample
             self._scores = self._scores[keep_mask_downsample]
             self._sample_assignments = self._sample_assignments[keep_mask_downsample]
             self._auth_labels = self._auth_labels[keep_mask_downsample]
+            self._raw_func_classes = self._raw_func_classes[keep_mask_downsample]
+            if self._extra_func_classes is not None:
+                self._extra_func_classes = self._extra_func_classes[keep_mask_downsample]
             self._aa_subs = self._aa_subs[keep_mask_downsample]
 
         self.n_variants = len(self._scores)
@@ -845,6 +1054,26 @@ class Scoreset:
         return keep
     
     
+
+    def parse_regularization_type(self, **kwargs):
+        regularization_type = kwargs.get("regularization_type", None)
+        valid = {None, 'all_missense_snv', 'all_assayed', 'all_snv', 'all_nsSNV'}
+        if regularization_type not in valid:
+            raise ValueError(
+                f"Invalid regularization_type {regularization_type!r}; must be one of {valid}"
+            )
+        self.regularization_type = regularization_type
+
+    def is_regularization_member(self, variant) -> bool:
+        if self.regularization_type == 'all_assayed':
+            return True
+        if self.regularization_type == 'all_snv':
+            return variant.is_snv
+        if self.regularization_type == 'all_nsSNV':
+            return variant.is_nsSNV
+        if self.regularization_type == 'all_missense_snv':
+            return variant.is_missense and variant.is_snv
+        return False
 
     def parse_population_type(self,**kwargs):
         population_type = kwargs.get("population_type",'gnomAD')
@@ -947,8 +1176,8 @@ class Scoreset:
     def keep_mask(self):
         return self._keep_mask
 
-    def plot(self):
-        return _plot_scoreset_scores(self)
+    def plot(self, bins=None):
+        return _plot_scoreset_scores(self, bins=bins)
 
     def __repr__(self):
         out = f"{self.scoreset_name}: {len(self.scores)} total variants\n"
@@ -993,8 +1222,19 @@ class Variant:
         self.aa_alt = ""
         self.hgvs_p = ""
         self.__dict__.update({str(k): v for k, v in variant_info.items()})
-        self.clinvar_sig = variant_info[f"clinvar_sig_{self.clinvar_release}"]
-        self.clinvar_star = variant_info[f"clinvar_star_{self.clinvar_release}"]
+        # Fall back 2026→2025 when the dataset predates the 2026 ClinVar release
+        effective_release = self.clinvar_release
+        if effective_release == "2026" and f"clinvar_sig_2026" not in variant_info:
+            effective_release = "2025"
+        self.clinvar_sig = variant_info[f"clinvar_sig_{effective_release}"]
+        self.clinvar_star = variant_info[f"clinvar_star_{effective_release}"]
+        # eval_quality / parse_clinvar_sig always access clinvar_star_2026 / clinvar_sig_2026
+        # directly for VUS classification; ensure they are populated even when the
+        # 2026 column is absent, falling back to 2025 (never the primary release,
+        # which may be 2018 for older datasets)
+        if "clinvar_star_2026" not in variant_info:
+            self.clinvar_star_2026 = variant_info.get("clinvar_star_2025", self.clinvar_star)
+            self.clinvar_sig_2026 = variant_info.get("clinvar_sig_2025", self.clinvar_sig)
         self.parse_gnomAD_MAF()
         self.parse_clinvar_sig()
         self.parse_consequences()
@@ -1009,10 +1249,10 @@ class Variant:
                          (self.aa_ref != self.aa_alt))
 
     def parse_consequences(self):
-        self.is_synonymous = (self.simplified_consequence.lower() == "synonymous") or (
-            self.simplified_consequence == "synonymous_variant"
-        )
-        self.is_missense = (self.simplified_consequence == 'missense_variant') or (self.simplified_consequence.lower() == 'missense')
+        cons = self.simplified_consequence
+        cons_str = cons if isinstance(cons, str) else ""
+        self.is_synonymous = (cons_str.lower() == "synonymous") or (cons_str == "synonymous_variant")
+        self.is_missense = (cons_str == 'missense_variant') or (cons_str.lower() == 'missense')
         self.is_snv = len(str(self.ref_allele)) == 1 and len(str(self.alt_allele)) == 1 and str(self.ref_allele) != str(self.alt_allele)
 
     def parse_clinvar_sig(self):
@@ -1248,7 +1488,7 @@ def csv_to_vcf(input_filepath, output_filepath):
 
 
 
-def _plot_scoreset_scores(scoreset):
+def _plot_scoreset_scores(scoreset, bins=None):
     """Histogram of scores per sample for a univariate Scoreset or BasicScoreset."""
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -1256,6 +1496,19 @@ def _plot_scoreset_scores(scoreset):
     scores = scoreset.scores
     score_range = [float(np.nanmin(scores)), float(np.nanmax(scores))]
     n_active = int((scoreset.sample_counts > 0).sum())
+
+    if bins is None:
+        # Use the bin count of the sample with the smallest natural bin width
+        # (largest sqrt(n)), so all panels share consistent resolution.
+        max_n_bins = 5
+        c = 0
+        for sn in range(len(scoreset.sample_counts)):
+            if scoreset.sample_counts[sn] == 0:
+                continue
+            n = int(scoreset.sample_assignments[:, c].sum())
+            max_n_bins = max(max_n_bins, int(np.clip(np.sqrt(n), 5, 30)))
+            c += 1
+        bins = max_n_bins
 
     fig, axes = plt.subplots(
         1, n_active, figsize=(7 * n_active, 6),
@@ -1272,9 +1525,8 @@ def _plot_scoreset_scores(scoreset):
         mask = scoreset.sample_assignments[:, col].astype(bool)
         sample_scores = scores[mask]
         n = int(mask.sum())
-        n_bins = int(np.clip(np.sqrt(n), 5, 30))
         sns.histplot(
-            sample_scores, bins=n_bins, binrange=score_range,
+            sample_scores, bins=bins, binrange=score_range,
             stat='density', ax=ax,
             alpha=ALPHAS.get(sample_num, 0.5),
             color=COLORS.get(sample_num, '#888888'),
@@ -1401,12 +1653,21 @@ class MultiScoreset:
             raise ValueError("dataset_names must match number of scoresets")
 
         self.dataset_names = dataset_names
-        self._sample_names = kwargs.get("sample_names", [
+        _base_names = [
             "Pathogenic/Likely Pathogenic",
             "Benign/Likely Benign",
             "population",
             "Synonymous",
-        ])
+        ]
+        if "sample_names" in kwargs:
+            self._sample_names = kwargs["sample_names"]
+        else:
+            extra = []
+            for s in scoresets:
+                for name in getattr(s, 'sample_names', _base_names)[4:]:
+                    if name not in extra:
+                        extra.append(name)
+            self._sample_names = _base_names + extra
 
         self._build()
 
@@ -1471,6 +1732,13 @@ class MultiScoreset:
     # ──────────────────────────────────────
 
     def _build(self):
+        n_samples_total = max(
+            s._sample_assignments.shape[1] if hasattr(s, '_sample_assignments')
+            else s.sample_assignments.shape[1]
+            for s in self.scoresets
+        )
+        n_samples_total = max(n_samples_total, 4)
+
         variant_keys = []   # per assay: list[frozenset[tuple]]
         scores_list = []
         samples_list = []
@@ -1503,16 +1771,11 @@ class MultiScoreset:
 
             if hasattr(s, '_sample_assignments'):
                 samples = s._sample_assignments
-                if samples.shape[1] < 4:
-                    pad = np.zeros((samples.shape[0], 4 - samples.shape[1]), dtype=bool)
-                    samples = np.hstack([samples, pad])
             else:
-                sa = s.sample_assignments
-                if sa.shape[1] < 4:
-                    pad = np.zeros((sa.shape[0], 4 - sa.shape[1]), dtype=bool)
-                    samples = np.hstack([sa, pad])
-                else:
-                    samples = sa
+                samples = s.sample_assignments
+            if samples.shape[1] < n_samples_total:
+                pad = np.zeros((samples.shape[0], n_samples_total - samples.shape[1]), dtype=bool)
+                samples = np.hstack([samples, pad])
 
             if not (len(keys) == len(scores) == samples.shape[0]):
                 raise ValueError(
@@ -1564,8 +1827,10 @@ class MultiScoreset:
 
         # ── Allocate and fill matrices ─────────────────────────────────────────
         scores_matrix = np.full((n_variants, self.d), np.nan)
-        sample_assignments = np.zeros((n_variants, 4), dtype=bool)
+        sample_assignments = np.zeros((n_variants, n_samples_total), dtype=bool)
         auth_labels_arr = np.empty(n_variants, dtype='U50')
+        raw_fc_matrix = np.empty((n_variants, self.d), dtype=object)
+        raw_fc_matrix[:] = ''
 
         for assay_i in range(self.d):
             row_indices = assay_row_idx[assay_i]
@@ -1573,6 +1838,7 @@ class MultiScoreset:
             samples = samples_list[assay_i]
             s = self.scoresets[assay_i]
             al = getattr(s, '_auth_labels', None)
+            rfc = getattr(s, '_raw_func_classes', None)
             for k, idx in enumerate(row_indices):
                 scores_matrix[idx, assay_i] = scores[k]
                 sample_assignments[idx] |= samples[k]
@@ -1582,6 +1848,8 @@ class MultiScoreset:
                     # "abnormal" takes priority over anything; otherwise first non-empty wins
                     if not current or (label.lower() == 'abnormal' and current.lower() != 'abnormal'):
                         auth_labels_arr[idx] = label
+                if rfc is not None and k < len(rfc):
+                    raw_fc_matrix[idx, assay_i] = rfc[k] or ''
 
         # ── Keep only variants with at least one observed score ────────────────
         missing_mask = np.isnan(scores_matrix)
@@ -1601,6 +1869,28 @@ class MultiScoreset:
         self.variants = all_canonical
         self._sample_assignments = sample_assignments[keep_mask]
         self._auth_labels = auth_labels_arr[keep_mask]
+
+        # If any scoreset carries _extra_func_classes (set via func_class_cols in
+        # from_mavedb), use those for _raw_fc_per_dim so K can differ from D.
+        # All scoresets from the same gene share the same category columns, so we
+        # use the first scoreset's data mapped through its assay_row_idx.
+        _extra_src = next(
+            (i for i, s in enumerate(self.scoresets)
+             if getattr(s, '_extra_func_classes', None) is not None),
+            None
+        )
+        if _extra_src is not None:
+            src_s   = self.scoresets[_extra_src]
+            src_efc = src_s._extra_func_classes          # (n_kept_src, K)
+            K       = src_efc.shape[1]
+            efc_matrix = np.empty((n_variants, K), dtype=object)
+            efc_matrix[:] = ''
+            for k, idx in enumerate(assay_row_idx[_extra_src]):
+                if k < len(src_efc):
+                    efc_matrix[idx] = src_efc[k]
+            self._raw_fc_per_dim = efc_matrix[keep_mask]
+        else:
+            self._raw_fc_per_dim = raw_fc_matrix[keep_mask]
         self.n_variants = self._scores.shape[0]
 
         self._xlims = tuple(

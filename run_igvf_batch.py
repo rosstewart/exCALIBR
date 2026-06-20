@@ -103,8 +103,11 @@ def run_single_dataset(
     if len(dataset_df) == 0:
         print(f"  SKIP {dataset_name}: no rows in dataset CSV")
         return None
-    # load_dataset_from_df re-filters by config.dataset_name, so relabel to match
-    dataset_df["Dataset"] = dataset_name
+
+    # Effective dataset name carries the method suffix; must be set on the
+    # DataFrame before load_dataset_from_df, which filters by config.dataset_name.
+    effective_name = dataset_name + output_name_suffix
+    dataset_df["Dataset"] = effective_name
 
     # Determine ClinVar release
     if clinvar_mode == "2018":
@@ -112,16 +115,13 @@ def run_single_dataset(
     elif "clinvar_2018" in dataset_name and "not_clinvar_2018" not in dataset_name:
         clinvar_release = "2018"
     else:
-        clinvar_release = "2025"
+        clinvar_release = getattr(args, "clinvar_release", "2026")
 
     # Build component list
     if n_c == "all":
         component_list = [2, 3]
     else:
         component_list = [int(n_c.replace("c", ""))]
-
-    # Effective dataset name (used in output filenames) carries the method suffix
-    effective_name = dataset_name + output_name_suffix
 
     # Build per-dataset config
     config = PipelineConfig(
@@ -207,7 +207,7 @@ def run_single_dataset(
                 dataset_splits=dataset_splits,
                 logger=logger,
             )
-            table_path = output_dir / f"{dataset_name}_{comp_key}_variants.csv"
+            table_path = output_dir / f"{config.dataset_name}_{comp_key}_variants.csv"
             variant_df.to_csv(table_path, index=False)
             logger.info(f"  Saved: {table_path} ({len(variant_df)} variants)")
 
@@ -265,7 +265,7 @@ def main():
                        help="Number of parallel jobs within each dataset (default: -1 = all CPUs)")
 
     # ClinVar
-    parser.add_argument("--clinvar-release", default="2025", choices=["2025", "2018"])
+    parser.add_argument("--clinvar-release", default="2026", choices=["2026", "2025", "2018"])
     parser.add_argument("--min-clinvar-star", type=int, default=1)
     parser.add_argument("--population-type", default="gnomAD",
                        choices=["all_variants", "all_nsSNV", "all_missense_nsSNV",
@@ -298,9 +298,8 @@ def main():
                                 "strict_additive", "all"],
                        default="tavtigian",
                        help="ACMG-mapping method (default: tavtigian). "
-                            "'strict_additive' = strictly additive integer-point system "
-                            "with prior-dependent LSQ-optimal alpha; 'all' runs all four "
-                            "methods and writes per-method output files for comparison.")
+                            "'all' runs tavtigian and piecewise and writes per-method "
+                            "output files for comparison.")
 
     args = parser.parse_args()
 
@@ -421,7 +420,7 @@ def main():
             clinvar_mode,
         ))
 
-    acmg_mapping_methods = (["tavtigian", "piecewise", "continuous", "strict_additive"]
+    acmg_mapping_methods = (["tavtigian", "piecewise"]
                              if args.acmg_mapping_method == "all"
                              else [args.acmg_mapping_method])
     suffix = (lambda m: "" if (len(acmg_mapping_methods) == 1 and m == "tavtigian")

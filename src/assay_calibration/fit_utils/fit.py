@@ -761,6 +761,7 @@ class Fit:
                     "train_sample_assignments": sample_assignments[train_indices],
                     "val_observations": observations[val_indices] if len(val_indices) else None,
                     "val_sample_assignments": sample_assignments[val_indices] if len(val_indices) else None,
+                    "val_variant_indices": val_indices if len(val_indices) else None,
                     "constrained": constrained,
                     "init_method": init_methods[i],
                     "init_constraint_adjustment": init_constraint_adjustments[i],

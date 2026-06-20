@@ -139,7 +139,7 @@ Examples:
                        help="Use p-value test instead of conservative 5th percentile")
 
     # ClinVar options
-    parser.add_argument("--clinvar-release", choices=["2025", "2018"], default="2025", help="ClinVar release year")
+    parser.add_argument("--clinvar-release", choices=["2026", "2025", "2018"], default="2026", help="ClinVar release year")
     parser.add_argument("--min-clinvar-star", type=int, default=1,
                        help="Minimum ClinVar review stars (default: 1)")
     
@@ -498,6 +498,7 @@ def _recover_splits_from_seeds(
             splits[seed] = {
                 'val_observations': jobs[0]['val_observations'],
                 'val_sample_assignments': jobs[0]['val_sample_assignments'],
+                'val_variant_indices': jobs[0].get('val_variant_indices'),
             }
 
     logger.info(f"  Recovered splits for {len(splits)} seeds")

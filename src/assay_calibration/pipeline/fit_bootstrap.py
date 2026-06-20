@@ -238,6 +238,7 @@ class BootstrapRunner:
             splits[seed] = {
                 'val_observations': shared['val_observations'],
                 'val_sample_assignments': shared['val_sample_assignments'],
+                'val_variant_indices': shared.get('val_variant_indices'),
             }
         return splits
     
@@ -269,6 +270,7 @@ class BootstrapRunner:
                     'train_sample_assignments': jobs[0]['train_sample_assignments'],
                     'val_observations': jobs[0]['val_observations'],
                     'val_sample_assignments': jobs[0]['val_sample_assignments'],
+                    'val_variant_indices': jobs[0].get('val_variant_indices'),
                 }
                 
                 # Create minimal job specs (without redundant data)

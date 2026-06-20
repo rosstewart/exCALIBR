@@ -108,19 +108,21 @@ def save_results(
             json.dump(serialize_dict(calibration_compact), f, indent=2)
         logger.info(f"  Saved calibration: {json_file}")
 
-        # # 2. LR interpolation over score range (always saved)
-        # if 'score_range' in calibration and 'log_lr_plus' in calibration:
-        #     lr_data = {
-        #         'dataset': config.dataset_name,
-        #         'n_c': component_key,
-        #         'score_range': calibration['score_range'],
-        #         'log_lr_plus': calibration['log_lr_plus'],
-        #     }
-        #     lr_file = output_dir / f"{config.dataset_name}_{component_key}_lr_values.json.gz"
-        #     with gzip.open(lr_file, 'wt', encoding='utf-8') as f:
-        #         json.dump(serialize_dict(lr_data), f)
-        #     lr_size_mb = lr_file.stat().st_size / 1e6
-        #     logger.info(f"  Saved LR values: {lr_file} ({lr_size_mb:.1f} MB)")
+        # 2. LR interpolation over score range (always saved)
+        if 'score_range' in calibration and 'log_lr_plus' in calibration:
+            lr_data = {
+                'dataset': config.dataset_name,
+                'n_c': component_key,
+                'score_range': calibration['score_range'],
+                'log_lr_plus': calibration['log_lr_plus'],
+                'prior': calibration['prior'],
+                'scoreset_flipped': calibration.get('scoreset_flipped', False),
+            }
+            lr_file = output_dir / f"{config.dataset_name}_{component_key}_lr_values.json.gz"
+            with gzip.open(lr_file, 'wt', encoding='utf-8') as f:
+                json.dump(serialize_dict(lr_data), f)
+            lr_size_mb = lr_file.stat().st_size / 1e6
+            logger.info(f"  Saved LR values: {lr_file} ({lr_size_mb:.1f} MB)")
 
     # ------------------------------------------------------------------
     # Bootstrap fits (gzipped JSON, only when computed fresh)

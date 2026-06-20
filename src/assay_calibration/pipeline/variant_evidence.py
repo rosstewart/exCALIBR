@@ -84,14 +84,69 @@ def _get_variant_ids(scoreset) -> List[str]:
 # Standard (in-bag) per-variant assignment
 # ---------------------------------------------------------------------------
 
+def _compute_bootstrap_lr_percentiles(
+    scores: np.ndarray,
+    calibration: Dict,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
+           Optional[np.ndarray], Optional[np.ndarray]]:
+    """Interpolate per-bootstrap LR+ curves at each variant score and return
+    (lr_plus_5th, lr_plus_95th, posterior_5th, posterior_95th) arrays of shape
+    (n_variants,), or (None, None, None, None) when bootstrap curves unavailable.
+    """
+    score_range = np.asarray(calibration.get("score_range", []))
+    if len(score_range) == 0:
+        return None, None, None, None
+
+    # Resolve per-bootstrap log-LR+ matrix: prefer log_lr_plus (direct), else
+    # compute from log_fp - log_fb
+    if "log_lr_plus" in calibration:
+        log_lr = np.asarray(calibration["log_lr_plus"])
+    elif "log_fp" in calibration and "log_fb" in calibration:
+        log_lr = np.asarray(calibration["log_fp"]) - np.asarray(calibration["log_fb"])
+    else:
+        return None, None, None, None
+
+    if log_lr.ndim != 2 or log_lr.shape[1] != len(score_range):
+        return None, None, None, None
+
+    prior = float(calibration["prior"])
+
+    # Interpolate each bootstrap curve at all variant scores: (n_boots, n_variants)
+    log_lr_at_scores = np.array([
+        np.interp(scores, score_range, log_lr[i],
+                  left=np.nan, right=np.nan)
+        for i in range(log_lr.shape[0])
+    ])
+
+    lr_5 = np.exp(np.nanpercentile(log_lr_at_scores, 5, axis=0))
+    lr_95 = np.exp(np.nanpercentile(log_lr_at_scores, 95, axis=0))
+
+    def _posterior(lr_arr: np.ndarray) -> np.ndarray:
+        out = np.full_like(lr_arr, np.nan)
+        valid = (lr_arr > 0) & ~np.isnan(lr_arr)
+        out[valid] = (prior * lr_arr[valid]) / (prior * lr_arr[valid] + (1.0 - prior))
+        return out
+
+    return lr_5, lr_95, _posterior(lr_5), _posterior(lr_95)
+
+
 def _build_standard_table(scoreset, calibration: Dict) -> pd.DataFrame:
-    """Assign every variant its evidence points from the global calibration."""
+    """Assign every variant its evidence points from the global calibration.
+
+    Always includes standard_points.  Also includes lr_plus_5th, lr_plus_95th,
+    posterior_5th, posterior_95th when bootstrap LR+ curves are present in the
+    calibration dict.
+    """
     flat = _flatten_point_ranges(calibration["point_ranges"])
     ids = _get_variant_ids(scoreset)
 
+    scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
+    lr_5, lr_95, post_5, post_95 = _compute_bootstrap_lr_percentiles(scores, calibration)
+    has_percentiles = lr_5 is not None
+
     rows = []
     for idx in range(len(scoreset.scores)):
-        score = float(scoreset.scores[idx])
+        score = scores[idx]
         pts = _assign_points(score, flat)
 
         sample = "Unknown"
@@ -100,12 +155,19 @@ def _build_standard_table(scoreset, calibration: Dict) -> pd.DataFrame:
                 sample = scoreset.sample_names[s_idx]
                 break
 
-        rows.append({
+        row = {
             "variant_id": ids[idx] if idx < len(ids) else f"variant_{idx}",
             "score": score,
             "sample": sample,
             "standard_points": pts,
-        })
+        }
+        if has_percentiles:
+            row["lr_plus_5th"] = float(lr_5[idx])
+            row["lr_plus_95th"] = float(lr_95[idx])
+            row["posterior_5th"] = float(post_5[idx])
+            row["posterior_95th"] = float(post_95[idx])
+
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -198,55 +260,79 @@ def _build_oob_mapping(
     print(f"  OOB debug: {n_seeds_in_splits} seeds in splits, "
           f"{n_seeds_valid} valid after prior filtering")
 
-    # Fast lookup: (score, class_idx) -> list of variant indices
-    score_cls_map = defaultdict(list)
-    for idx in range(len(scoreset.scores)):
-        sc = scoreset.scores[idx]
-        for cls in np.where(scoreset._sample_assignments[idx])[0]:
-            score_cls_map[(sc, int(cls))].append(idx)
-
-    print(f"  OOB debug: {len(score_cls_map)} unique (score, class) keys in scoreset, "
-          f"{len(scoreset.scores)} total variants")
+    # Check whether any split has val_variant_indices (new index-based format)
+    has_indices = any(
+        split.get("val_variant_indices") is not None
+        for split in dataset_splits.values()
+    )
 
     variant_oob: Dict[int, List[int]] = defaultdict(list)
-    n_val_obs_total = 0
-    n_val_obs_matched = 0
 
-    for seed, split in dataset_splits.items():
-        if seed not in seed_to_filtered:
-            continue
-        fidx = seed_to_filtered[seed]
-        for obs, assign in zip(split["val_observations"],
-                               split["val_sample_assignments"]):
-            n_val_obs_total += 1
-            cls = int(np.where(assign)[0][0])
-            matches = score_cls_map.get((obs, cls), [])
-            if matches:
-                n_val_obs_matched += 1
-            for vidx in matches:
-                variant_oob[vidx].append(fidx)
+    if has_indices:
+        n_index_total = 0
+        n_index_hits = 0
+        for seed, split in dataset_splits.items():
+            if seed not in seed_to_filtered:
+                continue
+            fidx = seed_to_filtered[seed]
+            indices = split.get("val_variant_indices")
+            if indices is None:
+                continue
+            for vidx in indices:
+                variant_oob[int(vidx)].append(fidx)
+                n_index_hits += 1
+            n_index_total += len(indices)
+        print(f"  OOB debug: index-based matching — {n_index_hits}/{n_index_total} "
+              f"observations mapped ({len(scoreset.scores)} total variants)")
+    else:
+        # Legacy fallback: match by (score, class_idx) float equality
+        score_cls_map = defaultdict(list)
+        for idx in range(len(scoreset.scores)):
+            sc = scoreset.scores[idx]
+            for cls in np.where(scoreset._sample_assignments[idx])[0]:
+                score_cls_map[(sc, int(cls))].append(idx)
 
-    print(f"  OOB debug: {n_val_obs_matched}/{n_val_obs_total} val observations "
-          f"matched a scoreset variant")
+        print(f"  OOB debug: score-based matching (legacy) — "
+              f"{len(score_cls_map)} unique (score, class) keys, "
+              f"{len(scoreset.scores)} total variants")
 
-    if n_val_obs_total > 0 and n_val_obs_matched == 0:
-        # Diagnose key mismatch
-        sample_split_key = None
-        for seed in list(dataset_splits.keys())[:1]:
-            if seed in seed_to_filtered:
-                obs = dataset_splits[seed]["val_observations"]
-                assign = dataset_splits[seed]["val_sample_assignments"]
-                if len(obs) > 0:
-                    sample_split_key = (obs[0], int(np.where(assign[0])[0][0]))
-                    break
-        sample_scoreset_key = next(iter(score_cls_map.keys()), None)
-        print(f"  OOB debug: KEY MISMATCH DETECTED")
-        print(f"    Sample split key:    {sample_split_key} "
-              f"(types: {type(sample_split_key[0]).__name__ if sample_split_key else '?'}, "
-              f"{type(sample_split_key[1]).__name__ if sample_split_key else '?'})")
-        print(f"    Sample scoreset key: {sample_scoreset_key} "
-              f"(types: {type(sample_scoreset_key[0]).__name__ if sample_scoreset_key else '?'}, "
-              f"{type(sample_scoreset_key[1]).__name__ if sample_scoreset_key else '?'})")
+        n_val_obs_total = 0
+        n_val_obs_matched = 0
+
+        for seed, split in dataset_splits.items():
+            if seed not in seed_to_filtered:
+                continue
+            fidx = seed_to_filtered[seed]
+            for obs, assign in zip(split["val_observations"],
+                                   split["val_sample_assignments"]):
+                n_val_obs_total += 1
+                cls = int(np.where(assign)[0][0])
+                matches = score_cls_map.get((obs, cls), [])
+                if matches:
+                    n_val_obs_matched += 1
+                for vidx in matches:
+                    variant_oob[vidx].append(fidx)
+
+        print(f"  OOB debug: {n_val_obs_matched}/{n_val_obs_total} val observations "
+              f"matched a scoreset variant")
+
+        if n_val_obs_total > 0 and n_val_obs_matched == 0:
+            sample_split_key = None
+            for seed in list(dataset_splits.keys())[:1]:
+                if seed in seed_to_filtered:
+                    obs = dataset_splits[seed]["val_observations"]
+                    assign = dataset_splits[seed]["val_sample_assignments"]
+                    if len(obs) > 0:
+                        sample_split_key = (obs[0], int(np.where(assign[0])[0][0]))
+                        break
+            sample_scoreset_key = next(iter(score_cls_map.keys()), None)
+            print(f"  OOB debug: KEY MISMATCH DETECTED")
+            print(f"    Sample split key:    {sample_split_key} "
+                  f"(types: {type(sample_split_key[0]).__name__ if sample_split_key else '?'}, "
+                  f"{type(sample_split_key[1]).__name__ if sample_split_key else '?'})")
+            print(f"    Sample scoreset key: {sample_scoreset_key} "
+                  f"(types: {type(sample_scoreset_key[0]).__name__ if sample_scoreset_key else '?'}, "
+                  f"{type(sample_scoreset_key[1]).__name__ if sample_scoreset_key else '?'})")
 
     # Report OOB coverage stats
     if variant_oob:

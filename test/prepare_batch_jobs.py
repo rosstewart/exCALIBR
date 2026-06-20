@@ -33,6 +33,99 @@ import pandas as pd
 # STEP 1: Generate consolidated job manifest
 # ============================================================================
 
+def process_mavedb_dataset(df, gene, score_col, dataset_col, output_dir, N_BOOTSTRAPS, NUM_FITS,
+                            selected_components=None, population_type=None,
+                            regularization_type=None, splice_measure=None):
+    """Process a single (gene, score_col) MaveDB combination and return consolidated jobs."""
+    dataset_name = f"{gene}_{score_col.replace(' ', '_')}"
+    save_dir = f'{output_dir}/{dataset_name}'
+    os.makedirs(save_dir, exist_ok=True)
+
+    if selected_components is None:
+        selected_components = [2, 3]
+    print(f"{dataset_name}: components={selected_components}")
+
+    try:
+        scoreset_kwargs = {}
+        if population_type is not None:
+            scoreset_kwargs["population_type"] = population_type
+        if regularization_type is not None:
+            scoreset_kwargs["regularization_type"] = regularization_type
+        ds = Scoreset.from_mavedb(
+            df[df[dataset_col] == gene],
+            dataset_col=dataset_col,
+            score_col=score_col,
+            splice_measure=splice_measure,
+            **scoreset_kwargs,
+        )
+    except (ValueError, KeyError) as e:
+        print(f"{dataset_name} skipping: {e}")
+        return
+
+    n_samples = len([s for s in ds.samples])
+    if n_samples < 2:
+        print(f"{dataset_name} skipping: insufficient samples")
+        return
+
+    fitter = Fit(ds)
+    all_jobs = []
+
+    for bootstrap_iter in range(N_BOOTSTRAPS):
+        jobs_2c = []
+        if 2 in selected_components:
+            jobs_2c = fitter.generate_fit_jobs(
+                component_range=[2],
+                bootstrap_seed=bootstrap_iter,
+                check_monotonic=True,
+                num_fits=NUM_FITS
+            )
+
+        jobs_3c = []
+        if 3 in selected_components:
+            jobs_3c = fitter.generate_fit_jobs(
+                component_range=[3],
+                bootstrap_seed=bootstrap_iter,
+                check_monotonic=True,
+                num_fits=NUM_FITS
+            )
+
+        reference_jobs = jobs_2c or jobs_3c
+        if reference_jobs:
+            shared_data = {
+                'train_observations': reference_jobs[0]['train_observations'],
+                'train_sample_assignments': reference_jobs[0]['train_sample_assignments'],
+                'val_observations': reference_jobs[0]['val_observations'],
+                'val_sample_assignments': reference_jobs[0]['val_sample_assignments'],
+            }
+        else:
+            shared_data = None
+
+        def _strip(jobs):
+            return [
+                {k: job[k] for k in ('job_id', 'bootstrap_seed', 'fit_idx', 'num_components',
+                                      'constrained', 'init_method', 'init_constraint_adjustment', 'kwargs')}
+                for job in jobs
+            ]
+
+        jobs_2c_minimal = _strip(jobs_2c)
+        jobs_3c_minimal = _strip(jobs_3c)
+
+        consolidated_job = {
+            'dataset_name': dataset_name,
+            'dataset_file': "",
+            'save_dir': save_dir,
+            'bootstrap_seed': bootstrap_iter,
+            'shared_data': shared_data,
+            'jobs_2c': jobs_2c_minimal,
+            'jobs_3c': jobs_3c_minimal,
+            'jobs_4c': [],
+            'num_fits_total': len(jobs_2c_minimal) + len(jobs_3c_minimal)
+        }
+        all_jobs.append(consolidated_job)
+
+    return all_jobs
+
+
 def process_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS, clinvar_release="2026", selected_components=None, population_type=None):
     """Process a single dataset and return consolidated jobs (one per bootstrap)."""
     if clinvar_release == "2026":
@@ -175,7 +268,9 @@ def requires_2018(df, dataset):
     
 
 def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30, run_downsample_discordance=False,
-                          config_file=None, dataframe_path=None, population_type=None):
+                          config_file=None, dataframe_path=None, population_type=None,
+                          selected_components=None, mode='default', dataset_col='gene_symbol',
+                          score_cols=None, regularization_type=None, splice_measure=False):
     """
     Generate job manifest optimized for MAX_ARRAY_SIZE limit.
 
@@ -185,68 +280,96 @@ def generate_job_manifest(output_dir, target_array_size=1000, n_jobs=30, run_dow
         n_jobs: Number of parallel workers for job generation
         config_file: Path to dataset config JSON (default: src/igvf_configs/dataset_configs_jan_2026.json)
     """
-    if config_file is None:
-        config_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                   "src", "igvf_configs", "dataset_configs_jan_2026.json")
+    default_dataframe_path = "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
+    using_default_dataframe = dataframe_path is None
+    if using_default_dataframe:
+        dataframe_path = default_dataframe_path
 
-    with open(config_file) as f:
-        dataset_config = json.load(f)
+    use_config = selected_components is None and (config_file is not None or using_default_dataframe)
+    if use_config:
+        if config_file is None:
+            config_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                       "src", "igvf_configs", "dataset_configs_jan_2026.json")
 
-    # Build new->old name mapping (strip _clinvar_2018 suffix before lookup)
-    name_map_df = pd.read_csv("/data/ross/assay_calibration/dataframe/new_dataset_names.csv")
-    new_to_old = dict(zip(name_map_df["New_names"], name_map_df["Old_names"]))
+        with open(config_file) as f:
+            dataset_config = json.load(f)
 
-    def components_for(dataset_name):
-        entry = dataset_config.get(dataset_name)
-        if entry is None:
-            # Strip _clinvar_2018 suffix for the name-mapping lookup, but keep
-            # dataset_name itself unchanged (only used to find the config entry)
-            base = dataset_name.removesuffix("_clinvar_2018")
-            old_name = new_to_old.get(base)
-            if old_name is not None:
-                # Re-attach the suffix if it was present
-                lookup = old_name + ("_clinvar_2018" if dataset_name.endswith("_clinvar_2018") else "")
-                entry = dataset_config.get(lookup)
-        if entry is None:
-            return [2, 3]  # default: both
-        nc_str = entry[0]  # "2c" or "3c"
-        return [int(nc_str[0])]
+        # Build new->old name mapping (strip _clinvar_2018 suffix before lookup)
+        name_map_df = pd.read_csv("/data/ross/assay_calibration/dataframe/new_dataset_names.csv")
+        new_to_old = dict(zip(name_map_df["New_names"], name_map_df["Old_names"]))
+
+        def components_for(dataset_name):
+            entry = dataset_config.get(dataset_name)
+            if entry is None:
+                base = dataset_name.removesuffix("_clinvar_2018")
+                old_name = new_to_old.get(base)
+                if old_name is not None:
+                    lookup = old_name + ("_clinvar_2018" if dataset_name.endswith("_clinvar_2018") else "")
+                    entry = dataset_config.get(lookup)
+            if entry is None:
+                return [2, 3]  # default: both
+            nc_str = entry[0]  # "2c" or "3c"
+            return [int(nc_str[0])]
+    else:
+        def components_for(dataset_name):
+            return [2, 3]  # unused when selected_components overrides
 
     jobs_dir = f"{output_dir}/jobs"
     os.makedirs(jobs_dir, exist_ok=True)
 
     N_BOOTSTRAPS = 1000
     NUM_FITS = 100  # fits per bootstrap per component
-
-    if dataframe_path is None:
-        dataframe_path = "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
     sep = "\t" if dataframe_path.endswith(".tsv.gz") or dataframe_path.endswith(".tsv") else ","
     df = pd.read_csv(dataframe_path, sep=sep)
-    datasets = df.Dataset.unique()
 
     print(f"Target array size: {target_array_size}")
     print(f"Parallel workers: {n_jobs if n_jobs > 0 else 'all CPUs'}")
-    print(f"Config file: {config_file}")
+    if use_config:
+        print(f"Config file: {config_file}")
 
-    # Print component selection summary
-    for dataset in sorted(datasets):
-        clinvar_release = "2018" if requires_2018(df, dataset) else "2026"
-        dataset_name = dataset if clinvar_release == "2026" else f"{dataset}_clinvar_{clinvar_release}"
-        comps = components_for(dataset_name)
-        print(f"  {dataset_name}: {comps}c")
+    if mode == 'mavedb':
+        if score_cols is None:
+            raise ValueError("--score-cols is required for --mode mavedb")
+        if splice_measure is None:
+            raise ValueError("--splice-measure is required for --mode mavedb")
+        genes = df[dataset_col].unique()
+        combinations = [(gene, sc) for gene in sorted(genes) for sc in score_cols]
+        print(f"MaveDB mode: {len(genes)} genes x {len(score_cols)} score cols = {len(combinations)} combinations")
+        for gene, sc in combinations:
+            print(f"  {gene} / {sc}: {selected_components or [2, 3]}c")
 
-    # Process all datasets in parallel
-    print("\nLoading datasets and generating jobs...")
-    all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(process_dataset)(
-            df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
-            clinvar_release="2026" if not requires_2018(df, dataset) else "2018",
-            selected_components=components_for(
-                dataset if not requires_2018(df, dataset) else f"{dataset}_clinvar_2018"
-            ),
-            population_type=population_type,
-        ) for dataset in datasets
-    )
+        print("\nLoading datasets and generating jobs...")
+        all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(process_mavedb_dataset)(
+                df, gene, score_col, dataset_col, output_dir, N_BOOTSTRAPS, NUM_FITS,
+                selected_components=selected_components or [2, 3],
+                population_type=population_type,
+                regularization_type=regularization_type,
+                splice_measure=splice_measure,
+            )
+            for gene, score_col in combinations
+        )
+    else:
+        datasets = df.Dataset.unique()
+        # Print component selection summary
+        for dataset in sorted(datasets):
+            clinvar_release = "2018" if requires_2018(df, dataset) else "2026"
+            dataset_name = dataset if clinvar_release == "2026" else f"{dataset}_clinvar_{clinvar_release}"
+            comps = selected_components if selected_components is not None else components_for(dataset_name)
+            print(f"  {dataset_name}: {comps}c")
+
+        # Process all datasets in parallel
+        print("\nLoading datasets and generating jobs...")
+        all_jobs_by_dataset = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(process_dataset)(
+                df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
+                clinvar_release="2026" if not requires_2018(df, dataset) else "2018",
+                selected_components=selected_components if selected_components is not None else components_for(
+                    dataset if not requires_2018(df, dataset) else f"{dataset}_clinvar_2018"
+                ),
+                population_type=population_type,
+            ) for dataset in datasets
+        )
     
     # Flatten
     print("\nFlattening and organizing jobs...")
@@ -552,6 +675,27 @@ if __name__ == "__main__":
                             'CSV (.csv/.csv.gz) or TSV (.tsv/.tsv.gz) are auto-detected by extension.')
     parser.add_argument('--population-type', type=str, default=None,
                        help="Population type passed to Scoreset (e.g. 'all_missense_nsSNV'). Omit to use Scoreset default.")
+    parser.add_argument('--components', nargs='+', type=int, default=None,
+                       help='Override component counts for all datasets (e.g. --components 3). '
+                            'If omitted, per-dataset counts are read from the config file.')
+    parser.add_argument('--mode', type=str, default='default', choices=['default', 'mavedb'],
+                       help="Input mode: 'default' (integrated TSV with Dataset column) or "
+                            "'mavedb' (MaveDB/label-seq annotated TSV, one row per variant). "
+                            "Default: default")
+    parser.add_argument('--dataset-col', type=str, default='gene_symbol',
+                       help="Column used to split MaveDB input into per-gene Scoresets (mavedb mode only). "
+                            "Default: gene_symbol")
+    parser.add_argument('--score-cols', nargs='+', type=str, default=None,
+                       help="Score columns to iterate over in mavedb mode (e.g. --score-cols 'Median activation' "
+                            "'Median PemR' 'Median FutR'). Required for --mode mavedb.")
+    parser.add_argument('--regularization-type', type=str, default=None,
+                       help="Regularization type passed to Scoreset.from_mavedb "
+                            "(e.g. 'all_assayed'). Omit to use Scoreset default.")
+    parser.add_argument('--splice-measure', type=lambda x: x.lower() in ('yes', 'true', '1'),
+                       required=('--mode' in sys.argv and sys.argv[sys.argv.index('--mode') + 1] == 'mavedb'),
+                       metavar='yes|no',
+                       help="Whether the assay detects splicing effects. Pass 'yes' or 'no'. "
+                            "Required for --mode mavedb.")
     args = parser.parse_args()
 
     output_dir = args.output_dir
@@ -569,6 +713,12 @@ if __name__ == "__main__":
         config_file=args.config_file,
         dataframe_path=args.dataframe,
         population_type=args.population_type,
+        selected_components=args.components,
+        mode=args.mode,
+        dataset_col=args.dataset_col,
+        score_cols=args.score_cols,
+        regularization_type=args.regularization_type,
+        splice_measure=args.splice_measure,
     )
     # create_worker_script(output_dir)
     # create_status_checker(output_dir)

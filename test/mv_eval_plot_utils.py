@@ -69,7 +69,7 @@ def _safe(n, d):
 
 def build_agg(results_df, gene_ms, percentile_analyses,
               compute_assay_labels_zscore, gene_to_analysis_cons_b0,
-              non_nu_genes=None):
+              non_nu_genes=None, assay_key="Assay"):
     """
     Aggregate confusion matrix counts across genes.
 
@@ -77,6 +77,9 @@ def build_agg(results_df, gene_ms, percentile_analyses,
     ----------
     non_nu_genes : set or None
         If provided, restrict to these genes only (non-NU subset).
+    assay_key : str
+        Key under which assay-based labels are stored in the returned agg dict.
+        Override when running multiple labelers so their results don't collide.
 
     Returns
     -------
@@ -97,14 +100,15 @@ def build_agg(results_df, gene_ms, percentile_analyses,
         if eval_mask.sum() == 0:
             continue
 
-        labels    = is_plp[eval_mask]
-        assay_pts = compute_assay_labels_zscore(ms)
-        n_snv     = int(is_snv.sum())
-        n_ctrl    = int(eval_mask.sum())
+        labels = is_plp[eval_mask]
+        n_snv  = int(is_snv.sum())
+        n_ctrl = int(eval_mask.sum())
 
-        _accumulate_into(agg, "Assay",
-                         labels, assay_pts[eval_mask],
-                         assay_pts[is_snv], n_snv, n_ctrl)
+        if compute_assay_labels_zscore is not None:
+            assay_pts = compute_assay_labels_zscore(ms)
+            _accumulate_into(agg, assay_key,
+                             labels, assay_pts[eval_mask],
+                             assay_pts[is_snv], n_snv, n_ctrl)
 
         for pctile, pdf in gdf.groupby("path_percentile"):
             r = gene_to_analysis_cons_b0 if pctile == 25 else \
@@ -122,6 +126,108 @@ def build_agg(results_df, gene_ms, percentile_analyses,
                              pts[is_snv], n_snv, n_ctrl)
 
     return agg
+
+
+# ── Category-based labeling ───────────────────────────────────────────────────
+
+# Ordinal severity shared across all category strings.
+# Neutral = 0; Potentially* = 1; Weakly* = 2; [base] = 3; Strongly* = 4.
+_SEVERITY = {
+    'Neutral':                0,
+    'Potentially activating': 1, 'Weakly activating':   2,
+    'Activating':             3, 'Strongly activating': 4,
+    'Weakly inactivating':    2, 'Inactivating':        3,
+    'Strongly inactivating':  4,
+    'Potentially resistant':  1, 'Weakly resistant':    2,
+    'Resistant':              3, 'Strongly resistant':  4,
+}
+
+_THRESHOLD_LEVEL = {'potentially': 1, 'weakly': 2, 'regular': 3, 'strongly': 4}
+
+THRESHOLDS = ['potentially', 'weakly', 'regular', 'strongly']
+
+
+def make_category_labeler(threshold):
+    """
+    Return a ``fn(ms) → np.ndarray{-1, 0, 1}`` that reads per-dimension raw
+    func-class strings from ``ms._raw_fc_per_dim`` (populated by MultiScoreset)
+    and applies threshold-based combining logic:
+
+      - any dim severity ≥ threshold  →  1  (Abnormal)
+      - all dims are Neutral (sev=0)  → -1  (Normal)
+      - otherwise                     →  0  (Indeterminate)
+
+    Parameters
+    ----------
+    threshold : str
+        One of 'potentially', 'weakly', 'regular', 'strongly'.
+    """
+    min_level = _THRESHOLD_LEVEL[threshold]
+
+    def _labeler(ms):
+        if not hasattr(ms, '_raw_fc_per_dim'):
+            raise AttributeError(
+                "ms missing _raw_fc_per_dim — rebuild MultiScoreset with the "
+                "updated dataset.py that stores per-dim raw func-class strings."
+            )
+        mat = ms._raw_fc_per_dim          # (N, D) object array of category strings
+        N = mat.shape[0]
+        pts = np.zeros(N, dtype=int)
+        for i in range(N):
+            sevs = np.array([_SEVERITY.get(str(v), 0) for v in mat[i]])
+            if np.any(sevs >= min_level):
+                pts[i] = 1
+            elif np.all(sevs == 0):
+                pts[i] = -1
+            # else: 0 (indeterminate — above neutral but below threshold)
+        return pts
+
+    return _labeler
+
+
+def build_agg_category_thresholds(results_df, gene_ms, percentile_analyses,
+                                  gene_to_analysis_cons_b0,
+                                  non_nu_genes=None,
+                                  thresholds=THRESHOLDS):
+    """
+    Run ``build_agg`` once per threshold using the same ``gene_ms`` and merge
+    all results into one agg dict.
+
+    Category keys are named ``'Category (≥potentially)'`` etc.
+    ExCALIBR-MV keys are accumulated from the first threshold run and are
+    identical across runs, so they are not double-counted.
+
+    Parameters
+    ----------
+    thresholds : list of str
+        Subset of THRESHOLDS to evaluate.  Defaults to all four.
+
+    Returns
+    -------
+    agg : defaultdict  keyed by method string
+    """
+    merged = defaultdict(lambda: defaultdict(int))
+    mv_keys_seen = set()
+
+    for thr in thresholds:
+        labeler = make_category_labeler(thr)
+        key     = f"Category (≥{thr})"
+        sub     = build_agg(results_df, gene_ms, percentile_analyses,
+                            labeler, gene_to_analysis_cons_b0,
+                            non_nu_genes=non_nu_genes,
+                            assay_key=key)
+        for method, counts in sub.items():
+            if method == key:
+                # Category method — accumulate fresh each time
+                for stat, val in counts.items():
+                    merged[method][stat] += val
+            elif method not in mv_keys_seen:
+                # MV / percentile methods — copy once to avoid double-counting
+                for stat, val in counts.items():
+                    merged[method][stat] += val
+        mv_keys_seen.update(k for k in sub if k != key)
+
+    return merged
 
 
 # ── LaTeX table ───────────────────────────────────────────────────────────────

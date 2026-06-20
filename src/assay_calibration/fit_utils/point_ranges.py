@@ -887,127 +887,245 @@ def create_oob_summary_plot(dataset, scoreset, variant_to_oob_boots, fit_priors,
 
 
 
-def _process_single_variant_oob_full(variant_idx, oob_boot_indices, variant_score, 
-                                      fit_priors, log_fp_all, log_fb_all, score_range,
-                                      point_values, scoreset_flipped, scoreset_name,
-                                      min_oob_samples=10, log_density_threshold=-7.0):
+_LIBERAL_FALSE_DATASETS = frozenset([
+    "GCK_Gersing_2023_complementation",
+    "DDX3X_Radford_2023_cLFC_day15",
+    "DDX3X_Radford_2023_cLFC_day15_clinvar_2018",
+    "F9_Popp_2025_heavy_chain",
+])
+
+
+def _compute_variant_oob_lr_percentiles(
+    variant_idx, oob_boot_indices, variant_score,
+    fit_priors, log_fp_all, log_fb_all, score_range,
+    min_oob_samples=10,
+):
+    """Compute per-variant OOB LR+ 5th/95th percentiles and median prior.
+
+    This is the method-independent first half of OOB evidence computation.
+    The result can be passed to _assign_oob_points_from_lr_percentiles with
+    any acmg_mapping_method without re-running the bootstrap subsetting.
+
+    Returns
+    -------
+    (variant_idx, result)
+        result is None on failure; otherwise a dict with keys:
+        'oob_prior', 'lr5', 'lr95', 'valid_score_range',
+        'n_oob', 'n_oob_valid', 'score'
     """
-    Process a single variant using EXACT in-bag logic but with OOB bootstraps only.
-    """
-    
-    # Skip if too few OOB samples
     if len(oob_boot_indices) < min_oob_samples:
         return variant_idx, None
-    
-    # Subset to OOB bootstraps
+
     oob_priors = fit_priors[oob_boot_indices]
     oob_log_fp = log_fp_all[oob_boot_indices, :]
     oob_log_fb = log_fb_all[oob_boot_indices, :]
-    
-    # Remove invalid priors
-    nan_mask = np.isnan(oob_priors)
-    invalid_range_mask = (oob_priors <= 0) | (oob_priors >= 1)
-    valid_oob_mask = ~(nan_mask | invalid_range_mask)
-    
+
+    valid_oob_mask = ~(np.isnan(oob_priors) | (oob_priors <= 0) | (oob_priors >= 1))
     oob_priors = oob_priors[valid_oob_mask]
     oob_log_fp = oob_log_fp[valid_oob_mask]
     oob_log_fb = oob_log_fb[valid_oob_mask]
-    
+
     if len(oob_priors) < min_oob_samples:
         return variant_idx, None
-    
-    # Compute OOB median prior
+
     oob_prior = np.nanmedian(oob_priors)
-    
     if oob_prior <= 0 or oob_prior >= 1:
         return variant_idx, None
-    
-    # Compute OOB LR+
+
     oob_log_lr_plus = oob_log_fp - oob_log_fb
-    
-    # Filter score range
-    nan_counts = np.isnan(oob_log_lr_plus).sum(0)
-    range_subset = nan_counts < oob_log_lr_plus.shape[0]
-    
+
+    # Drop score-range columns where every bootstrap is NaN
+    range_subset = np.isnan(oob_log_lr_plus).sum(0) < oob_log_lr_plus.shape[0]
     if not np.any(range_subset):
         return variant_idx, None
-    
-    # Apply subset
+
     valid_score_range = score_range[range_subset]
     valid_oob_lr_plus = oob_log_lr_plus[:, range_subset]
-    
-    # Calculate score ranges
-    try:
-        point_ranges_pathogenic, point_ranges_benign, C = calculate_score_ranges(
-            np.nanpercentile(valid_oob_lr_plus, 5, axis=0),
-            np.nanpercentile(valid_oob_lr_plus, 95, axis=0),
-            oob_prior,
-            valid_score_range,
-            point_values
-        )
-        
-        point_ranges = {**point_ranges_pathogenic, **point_ranges_benign}
-        
-        # Check if prior is valid (EXACT in-bag check in median_prior branch)
-        if oob_prior <= 0 or oob_prior >= 1:
-            for point in point_ranges:
-                point_ranges[point] = []
-        
-        # DON'T WRAP! calculate_score_ranges returns [[low, high]] already
-        # The in-bag median_prior branch does NOT wrap here
-        
-        # Apply hard-coded liberal setting
-        liberal = False if scoreset_name in [
-            "GCK_Gersing_2023_complementation", 
-            "DDX3X_Radford_2023_cLFC_day15", 
-            "DDX3X_Radford_2023_cLFC_day15_clinvar_2018", 
-            "F9_Popp_2025_heavy_chain"
-        ] else True
-        
-        # Enforce monotonicity (first pass)
-        enforce_monotonicity_point_ranges(
-            point_ranges, 
-            point_values, 
-            valid_score_range, 
-            scoreset_flipped=scoreset_flipped,
-            liberal=liberal,
-            log_f=None
-        )
-        
-        # Extend to xlims
-        extend_points_to_xlims(point_ranges, point_values, valid_score_range, scoreset_flipped, log_f=None)
-        
-        # Enforce monotonicity again (second pass)
-        enforce_monotonicity_point_ranges(
-            point_ranges, 
-            point_values, 
-            valid_score_range, 
-            scoreset_flipped=scoreset_flipped,
-            liberal=liberal,
-            log_f=None
-        )
-        
-        # Flatten for assignment
-        # flatten_point_ranges expects {1: [[low, high]], 2: []} format
-        flattened_point_ranges = flatten_point_ranges(point_ranges)
-        
-        # Assign points to this variant's score
-        assigned_points = assign_points(variant_score, flattened_point_ranges)
-        
-    except NotImplementedError as e:
-        if variant_idx < 5:
-            print(f"  Variant {variant_idx} FAILED: {type(e).__name__}: {str(e)[:200]}")
-        return variant_idx, None
-    
-    result = {
-        'points': assigned_points,
-        'n_oob': len(oob_boot_indices),
-        'n_oob_valid': len(oob_priors),
-        'oob_prior': oob_prior,
-        'score': variant_score,
+
+    lr5 = np.nanpercentile(valid_oob_lr_plus, 5, axis=0)
+    lr95 = np.nanpercentile(valid_oob_lr_plus, 95, axis=0)
+
+    return variant_idx, {
+        "oob_prior": oob_prior,
+        "lr5": lr5,
+        "lr95": lr95,
+        "valid_score_range": valid_score_range,
+        "n_oob": len(oob_boot_indices),
+        "n_oob_valid": len(oob_priors),
+        "score": variant_score,
     }
-    
-    return variant_idx, result
+
+
+def _assign_oob_points_from_lr_percentiles(
+    variant_score, lr5, lr95, oob_prior, valid_score_range,
+    point_values, scoreset_flipped, scoreset_name,
+    acmg_mapping_method="tavtigian",
+):
+    """Assign ACMG evidence points from pre-computed OOB LR+ percentile curves.
+
+    Mirrors the second half of _process_single_variant_oob_full but accepts any
+    acmg_mapping_method.  Applies the identical post-processing pipeline:
+    calculate_score_ranges → enforce_monotonicity (×2) → extend_to_xlims →
+    flatten → assign_points.
+
+    Returns
+    -------
+    int or None
+        Assigned evidence points, or None if assignment fails.
+    """
+    try:
+        point_ranges_pathogenic, point_ranges_benign, _ = calculate_score_ranges(
+            lr5, lr95, oob_prior, valid_score_range, point_values,
+            acmg_mapping_method=acmg_mapping_method,
+        )
+        point_ranges = {**point_ranges_pathogenic, **point_ranges_benign}
+
+        if oob_prior <= 0 or oob_prior >= 1:
+            for k in point_ranges:
+                point_ranges[k] = []
+
+        liberal = scoreset_name not in _LIBERAL_FALSE_DATASETS
+
+        enforce_monotonicity_point_ranges(
+            point_ranges, point_values, valid_score_range,
+            scoreset_flipped=scoreset_flipped, liberal=liberal, log_f=None,
+        )
+        extend_points_to_xlims(
+            point_ranges, point_values, valid_score_range, scoreset_flipped, log_f=None,
+        )
+        enforce_monotonicity_point_ranges(
+            point_ranges, point_values, valid_score_range,
+            scoreset_flipped=scoreset_flipped, liberal=liberal, log_f=None,
+        )
+
+        flattened = flatten_point_ranges(point_ranges)
+        return assign_points(variant_score, flattened)
+
+    except (NotImplementedError, AssertionError):
+        return None
+
+
+def compute_oob_variant_evidence_multi_method(
+    dataset, fits, scoreset, dataset_to_splits,
+    fit_priors, valid_mask, log_fp_all, log_fb_all, score_range,
+    point_values, benign_method, n_c,
+    scoreset_flipped=False, min_oob_samples=10,
+    n_jobs=-1, acmg_mapping_methods=("tavtigian",),
+):
+    """Compute OOB variant evidence for multiple ACMG mapping methods in one pass.
+
+    The expensive step — bootstrapping OOB LR+ percentiles — is run once per
+    variant.  Each ACMG method then applies its own threshold logic to those
+    shared percentile curves without re-running the bootstrap subsetting.
+
+    Parameters
+    ----------
+    acmg_mapping_methods : sequence of str
+        Methods to evaluate (e.g. ``["tavtigian", "piecewise"]``).  Each name
+        must be understood by ``calculate_score_ranges`` / ``thresholds_from_prior``.
+
+    Returns
+    -------
+    dict[str, dict[str, dict]]
+        ``{method: {variant_id: {'points': int, 'n_oob': int,
+                                  'n_oob_valid': int, 'oob_prior': float,
+                                  'score': float}}}``
+    """
+    if dataset not in dataset_to_splits:
+        raise ValueError(f"Dataset {dataset} not found in splits")
+
+    dataset_splits = dataset_to_splits[dataset]
+    variant_to_oob_boots = get_variant_oob_bootstrap_indices(scoreset, dataset_splits, valid_mask)
+
+    print(f"Computing OOB LR+ percentiles for {len(variant_to_oob_boots)} variants "
+          f"(methods: {list(acmg_mapping_methods)})...")
+
+    # --- Step 1: Compute LR+ percentiles for all variants in parallel (once) ---
+    lr_results = Parallel(n_jobs=n_jobs, verbose=5)(
+        delayed(_compute_variant_oob_lr_percentiles)(
+            variant_idx, oob_boot_indices, scoreset.scores[variant_idx],
+            fit_priors, log_fp_all, log_fb_all, score_range, min_oob_samples,
+        )
+        for variant_idx, oob_boot_indices in variant_to_oob_boots.items()
+    )
+
+    # Build kept-variant-index → variant_id mapping
+    variants_by_id = scoreset.get_variants_by_id()
+    kept_idx_to_variant_id = {}
+    kept_idx = 0
+    for all_idx, (_, variants) in enumerate(variants_by_id.items()):
+        if scoreset._keep_mask[all_idx]:
+            kept_idx_to_variant_id[kept_idx] = make_variant_id(variants[0])
+            kept_idx += 1
+
+    scoreset_name = scoreset.scoreset_name
+
+    # --- Step 2: Apply each ACMG method to the shared LR percentile curves ---
+    results_by_method = {m: {} for m in acmg_mapping_methods}
+
+    for variant_idx, lr_data in lr_results:
+        if lr_data is None:
+            continue
+        variant_id = kept_idx_to_variant_id.get(variant_idx)
+        if variant_id is None:
+            continue
+
+        for method in acmg_mapping_methods:
+            assigned_points = _assign_oob_points_from_lr_percentiles(
+                lr_data["score"], lr_data["lr5"], lr_data["lr95"],
+                lr_data["oob_prior"], lr_data["valid_score_range"],
+                point_values, scoreset_flipped, scoreset_name,
+                acmg_mapping_method=method,
+            )
+            if assigned_points is not None:
+                results_by_method[method][variant_id] = {
+                    "points": assigned_points,
+                    "n_oob": lr_data["n_oob"],
+                    "n_oob_valid": lr_data["n_oob_valid"],
+                    "oob_prior": lr_data["oob_prior"],
+                    "score": lr_data["score"],
+                }
+
+    for method, vmap in results_by_method.items():
+        print(f"  [{method}] assigned evidence for {len(vmap)} variants")
+
+    return results_by_method
+
+
+def _process_single_variant_oob_full(variant_idx, oob_boot_indices, variant_score,
+                                      fit_priors, log_fp_all, log_fb_all, score_range,
+                                      point_values, scoreset_flipped, scoreset_name,
+                                      min_oob_samples=10, log_density_threshold=-7.0,
+                                      acmg_mapping_method="tavtigian"):
+    """Process a single variant using EXACT in-bag logic but with OOB bootstraps only.
+
+    Delegates to _compute_variant_oob_lr_percentiles +
+    _assign_oob_points_from_lr_percentiles.  The acmg_mapping_method parameter
+    controls which threshold scheme is applied to the OOB LR+ percentile curves.
+    """
+    _, lr_data = _compute_variant_oob_lr_percentiles(
+        variant_idx, oob_boot_indices, variant_score,
+        fit_priors, log_fp_all, log_fb_all, score_range, min_oob_samples,
+    )
+    if lr_data is None:
+        return variant_idx, None
+
+    assigned_points = _assign_oob_points_from_lr_percentiles(
+        lr_data["score"], lr_data["lr5"], lr_data["lr95"],
+        lr_data["oob_prior"], lr_data["valid_score_range"],
+        point_values, scoreset_flipped, scoreset_name,
+        acmg_mapping_method=acmg_mapping_method,
+    )
+    if assigned_points is None:
+        return variant_idx, None
+
+    return variant_idx, {
+        "points": assigned_points,
+        "n_oob": lr_data["n_oob"],
+        "n_oob_valid": lr_data["n_oob_valid"],
+        "oob_prior": lr_data["oob_prior"],
+        "score": lr_data["score"],
+    }
 
 def _process_single_variant_oob_simple(variant_idx, oob_boot_indices, variant_score, 
                                         fit_priors, log_fp_all, log_fb_all, score_range,
