@@ -12,7 +12,7 @@ and reports per-dataset, per-component counts.
 """
 import sys
 import json
-import pickle
+import pickle  # used only to read the first bootstrap file for component discovery
 import argparse
 from pathlib import Path
 from collections import defaultdict
@@ -39,33 +39,45 @@ def count_bootstraps(output_dir: Path, verbose: bool = False) -> None:
         len(v["bootstraps"]) for v in expected.values()
     ) if expected else 0)
 
-    # Scan saved results
-    done: dict = defaultdict(lambda: defaultdict(set))  # dataset → seed → {components}
-
-    for ds, info in expected.items():
+    # Discover component keys from the first readable pickle found anywhere.
+    known_components: set = set()
+    for ds in expected:
         ds_dir = output_dir / ds
         if not ds_dir.is_dir():
             continue
         for pkl in sorted(ds_dir.glob("bootstrap_*_best_fits.pkl")):
+            try:
+                with open(pkl, "rb") as f:
+                    data = pickle.load(f)
+                known_components = {k for k, v in data.items() if v is not None}
+                if known_components:
+                    break
+            except Exception:
+                continue
+        if known_components:
+            break
+
+    # Scan saved results by file existence only.
+    done: dict = defaultdict(set)  # dataset → {seeds present}
+
+    for ds in expected:
+        ds_dir = output_dir / ds
+        if not ds_dir.is_dir():
+            continue
+        for pkl in ds_dir.glob("bootstrap_*_best_fits.pkl"):
             parts = pkl.stem.split("_")
             try:
                 seed = int(parts[1])
             except (IndexError, ValueError):
                 continue
-            try:
-                with open(pkl, "rb") as f:
-                    data = pickle.load(f)
-                components = {k for k, v in data.items() if v is not None}
-                done[ds][seed] = components
-            except Exception:
-                done[ds][seed] = set()
+            done[ds].add(seed)
 
     # Summarise
     all_datasets = sorted(expected.keys())
     n_datasets = len(all_datasets)
     total_expected_bs = sum(len(v["bootstraps"]) for v in expected.values())
     total_done_bs = sum(
-        sum(1 for seed in expected[ds]["bootstraps"] if done[ds][seed])
+        sum(1 for seed in expected[ds]["bootstraps"] if seed in done[ds])
         for ds in all_datasets
     )
 
@@ -75,44 +87,33 @@ def count_bootstraps(output_dir: Path, verbose: bool = False) -> None:
           f"({100 * total_done_bs / max(total_expected_bs, 1):.1f}%)")
     print()
 
+    comp_str_header = f"Components (from first file: {', '.join(sorted(known_components))})" \
+        if known_components else "Components"
     col_w = max(len(ds) for ds in all_datasets) + 2 if all_datasets else 20
-    header = f"{'Dataset':<{col_w}}  {'Done':>6}  {'Exp':>6}  {'Pct':>6}  Components"
+    header = f"{'Dataset':<{col_w}}  {'Done':>6}  {'Exp':>6}  {'Pct':>6}  {comp_str_header}"
     print(header)
     print("-" * len(header))
 
     for ds in all_datasets:
         bs_expected = sorted(expected[ds]["bootstraps"])
         n_exp = len(bs_expected)
-        n_done = sum(1 for seed in bs_expected if done[ds][seed])
+        n_done = sum(1 for seed in bs_expected if seed in done[ds])
         pct = 100 * n_done / max(n_exp, 1)
 
-        # Collect all component sets that appear
-        comp_counts: dict = defaultdict(int)
-        for seed in bs_expected:
-            for c in done[ds].get(seed, set()):
-                comp_counts[c] += 1
-        comp_str = "  ".join(f"{c}:{v}" for c, v in sorted(comp_counts.items()))
-
-        print(f"{ds:<{col_w}}  {n_done:>6}  {n_exp:>6}  {pct:>5.1f}%  {comp_str}")
+        print(f"{ds:<{col_w}}  {n_done:>6}  {n_exp:>6}  {pct:>5.1f}%")
 
         if verbose:
-            missing = [s for s in bs_expected if not done[ds][s]]
+            missing = [s for s in bs_expected if s not in done[ds]]
             if missing:
                 chunks = [missing[i:i+20] for i in range(0, len(missing), 20)]
                 for chunk in chunks:
                     print(f"  {'missing seeds:':20s} {chunk}")
 
     print()
-    total_2c = sum(
-        sum(1 for seed in expected[ds]["bootstraps"] if "2c" in done[ds].get(seed, set()))
-        for ds in all_datasets
-    )
-    total_3c = sum(
-        sum(1 for seed in expected[ds]["bootstraps"] if "3c" in done[ds].get(seed, set()))
-        for ds in all_datasets
-    )
-    print(f"Component totals:  2c={total_2c:,}  3c={total_3c:,}  "
-          f"(of {total_expected_bs:,} each, where applicable)")
+    # Assume all present files have all discovered components.
+    print(f"Component totals (assumed from first file): "
+          + "  ".join(f"{c}={total_done_bs:,}" for c in sorted(known_components))
+          + f"  (of {total_expected_bs:,} each)")
 
 
 if __name__ == "__main__":
