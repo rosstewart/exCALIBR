@@ -26,7 +26,7 @@ from ..fit_utils.point_ranges import (
 )
 from ..data_utils.dataset import Scoreset, BasicScoreset
 from ..fit_utils.utils import serialize_dict
-from ..plot_utils.utils import plot_scoreset_example_publication
+from ..plot_utils.utils import plot_scoreset_best_config
 
 from .config import PipelineConfig
 from .utils import load_dataset_from_df
@@ -134,7 +134,7 @@ def generate_visualizations(
         figure_path = output_dir / f"{config.dataset_name}_{component_key}_visualization.png"
         
         try:
-            fig = plot_scoreset_example_publication(
+            fig = plot_scoreset_best_config(
                 dataset=config.dataset_name,
                 scoreset=scoreset,
                 indv_summary=calibration,
