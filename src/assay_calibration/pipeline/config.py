@@ -95,6 +95,7 @@ class PipelineConfig:
     # ClinVar parameters
     clinvar_release: str = "2025"
     min_clinvar_star: int = 1
+    synonymous_exclusive: bool = False
 
     # Progress reporting (optional — used by web backend)
     # If set, the pipeline writes structured JSON progress updates to this path.

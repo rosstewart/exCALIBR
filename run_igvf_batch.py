@@ -145,6 +145,7 @@ def run_single_dataset(
         sample_names=args.sample_names if hasattr(args, "sample_names") else None,
         debug=args.debug if hasattr(args, "debug") else False,
         acmg_mapping_method=acmg_mapping_method,
+        synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
     )
 
     output_dir = Path(config.output_dir)
@@ -275,6 +276,11 @@ def main():
     parser.add_argument("--skip-existing", action="store_true",
                        help="Skip datasets whose calibration JSON output already exists "
                             "(useful for resuming a failed run)")
+
+    parser.add_argument("--synonymous-exclusive", action="store_true",
+                       help="Load Scoreset with synonymous_exclusive=True: synonymous variants "
+                            "are assigned only to the synonymous sample, not also to P/LP or B/LB. "
+                            "Matches the behaviour used in legacy author-label analysis.")
 
     # ClinVar 2018 gene override
     parser.add_argument("--no-clinvar-2018", action="store_true",

@@ -39,38 +39,37 @@ def count_bootstraps(output_dir: Path, verbose: bool = False) -> None:
         len(v["bootstraps"]) for v in expected.values()
     ) if expected else 0)
 
-    # Discover component keys from the first readable pickle found anywhere.
-    known_components: set = set()
-    for ds in expected:
-        ds_dir = output_dir / ds
-        if not ds_dir.is_dir():
-            continue
-        for pkl in sorted(ds_dir.glob("bootstrap_*_best_fits.pkl")):
-            try:
-                with open(pkl, "rb") as f:
-                    data = pickle.load(f)
-                known_components = {k for k, v in data.items() if v is not None}
-                if known_components:
-                    break
-            except Exception:
-                continue
-        if known_components:
-            break
+    # Scan saved results by file existence; also load the lowest-seed file per
+    # dataset to discover which components are present for that dataset.
+    done: dict = defaultdict(set)          # dataset → {seeds present}
+    ds_components: dict = defaultdict(set) # dataset → components found in lowest-seed file
 
-    # Scan saved results by file existence only.
-    done: dict = defaultdict(set)  # dataset → {seeds present}
+    all_known_components: set = set()
 
     for ds in expected:
         ds_dir = output_dir / ds
         if not ds_dir.is_dir():
             continue
+
+        seed_to_pkl: dict = {}
         for pkl in ds_dir.glob("bootstrap_*_best_fits.pkl"):
             parts = pkl.stem.split("_")
             try:
                 seed = int(parts[1])
             except (IndexError, ValueError):
                 continue
+            seed_to_pkl[seed] = pkl
             done[ds].add(seed)
+
+        if seed_to_pkl:
+            lowest_pkl = seed_to_pkl[min(seed_to_pkl)]
+            try:
+                with open(lowest_pkl, "rb") as f:
+                    data = pickle.load(f)
+                ds_components[ds] = {k for k, v in data.items() if v is not None}
+                all_known_components |= ds_components[ds]
+            except Exception:
+                pass
 
     # Summarise
     all_datasets = sorted(expected.keys())
@@ -87,20 +86,27 @@ def count_bootstraps(output_dir: Path, verbose: bool = False) -> None:
           f"({100 * total_done_bs / max(total_expected_bs, 1):.1f}%)")
     print()
 
-    comp_str_header = f"Components (from first file: {', '.join(sorted(known_components))})" \
-        if known_components else "Components"
+    sorted_components = sorted(all_known_components)
     col_w = max(len(ds) for ds in all_datasets) + 2 if all_datasets else 20
-    header = f"{'Dataset':<{col_w}}  {'Done':>6}  {'Exp':>6}  {'Pct':>6}  {comp_str_header}"
+    comp_cols = "  ".join(f"{c:>8}" for c in sorted_components)
+    header = f"{'Dataset':<{col_w}}  {'Done':>6}  {'Exp':>6}  {'Pct':>6}  {comp_cols}"
     print(header)
     print("-" * len(header))
 
+    total_comp_done = defaultdict(int)
     for ds in all_datasets:
         bs_expected = sorted(expected[ds]["bootstraps"])
         n_exp = len(bs_expected)
         n_done = sum(1 for seed in bs_expected if seed in done[ds])
         pct = 100 * n_done / max(n_exp, 1)
 
-        print(f"{ds:<{col_w}}  {n_done:>6}  {n_exp:>6}  {pct:>5.1f}%")
+        present = ds_components.get(ds, set())
+        comp_str = "  ".join(f"{n_done if c in present else 0:>8}" for c in sorted_components)
+        for c in sorted_components:
+            if c in present:
+                total_comp_done[c] += n_done
+
+        print(f"{ds:<{col_w}}  {n_done:>6}  {n_exp:>6}  {pct:>5.1f}%  {comp_str}")
 
         if verbose:
             missing = [s for s in bs_expected if s not in done[ds]]
@@ -110,10 +116,8 @@ def count_bootstraps(output_dir: Path, verbose: bool = False) -> None:
                     print(f"  {'missing seeds:':20s} {chunk}")
 
     print()
-    # Assume all present files have all discovered components.
-    print(f"Component totals (assumed from first file): "
-          + "  ".join(f"{c}={total_done_bs:,}" for c in sorted(known_components))
-          + f"  (of {total_expected_bs:,} each)")
+    totals = "  ".join(f"{c}={total_comp_done[c]:,}" for c in sorted_components)
+    print(f"Component totals: {totals}  (of {total_expected_bs:,} each)")
 
 
 if __name__ == "__main__":

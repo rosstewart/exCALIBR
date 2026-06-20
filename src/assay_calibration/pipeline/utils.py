@@ -206,6 +206,7 @@ def load_dataset_from_df(df, config):
             clinvar_release=config.clinvar_release,
             min_clinvar_star=config.min_clinvar_star,
             population_type=config.population_type,
+            synonymous_exclusive=getattr(config, "synonymous_exclusive", False),
         )
 
     if "score" not in df.columns or "sample_assignments" not in df.columns:
