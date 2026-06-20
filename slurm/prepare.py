@@ -51,6 +51,67 @@ _DEFAULT_N_BOOTSTRAPS = 1000
 _DEFAULT_NUM_FITS = 100
 
 
+def _available_memory_mb() -> float:
+    """Return available system memory in MB (Linux /proc/meminfo MemAvailable)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024   # kB → MB
+    except OSError:
+        pass
+    # macOS / other: rough estimate from sysconf
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size / 1024 / 1024 * 0.5   # assume 50% free
+    except Exception:
+        return 8192   # 8 GB safe fallback
+
+
+def _estimate_worker_mb(df_slice: "pd.DataFrame | None" = None) -> int:
+    """Estimate peak RSS per worker in MB.
+
+    Each worker imports src.assay_calibration (~800 MB) and holds one dataset
+    slice (typically a few hundred rows — negligible).  The bulk is the import.
+    """
+    base_mb = 800
+    if df_slice is not None:
+        # Rough in-memory size of the slice (bytes → MB), with 3× pandas overhead
+        try:
+            slice_mb = df_slice.memory_usage(deep=True).sum() / 1024 / 1024 * 3
+            return int(base_mb + slice_mb)
+        except Exception:
+            pass
+    return base_mb + 50   # generous slice overhead default
+
+
+def _resolve_n_jobs(n_jobs: int, sample_slice: "pd.DataFrame | None" = None) -> int:
+    """Cap n_jobs by both available CPUs and available memory."""
+    # CPU cap
+    if n_jobs == -1:
+        try:
+            cpu_cap = len(os.sched_getaffinity(0))
+        except AttributeError:
+            cpu_cap = os.cpu_count() or 1
+    else:
+        cpu_cap = n_jobs
+
+    # Memory cap
+    try:
+        avail_mb = _available_memory_mb()
+        worker_mb = _estimate_worker_mb(sample_slice)
+        mem_cap = max(1, int(avail_mb * 0.85 / worker_mb))
+        resolved = min(cpu_cap, mem_cap)
+        print(f"Workers: {resolved}  "
+              f"(CPU cap: {cpu_cap}, "
+              f"memory cap: {mem_cap} "
+              f"[{avail_mb:,.0f} MB avail / ~{worker_mb} MB per worker])")
+        return resolved
+    except Exception:
+        return cpu_cap
+
+
 # =============================================================================
 # Shared helpers
 # =============================================================================
@@ -180,7 +241,7 @@ def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
     return lookup
 
 
-def _process_default_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
+def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
@@ -196,7 +257,7 @@ def _process_default_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
         kw = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
         if population_type:
             kw["population_type"] = population_type
-        ds = Scoreset(df[df["Dataset"] == dataset], **kw)
+        ds = Scoreset(df_ds, **kw)
     except (ValueError, KeyError) as e:
         print(f"  {dataset_name} skipping: {e}")
         return None
@@ -232,7 +293,7 @@ def _process_default_dataset(df, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
     return all_jobs
 
 
-def _process_mavedb_dataset(df, gene, score_col, dataset_col, output_dir,
+def _process_mavedb_dataset(df_gene, gene, score_col, dataset_col, output_dir,
                              N_BOOTSTRAPS, NUM_FITS, selected_components,
                              population_type, regularization_type, splice_measure):
     from src.assay_calibration.data_utils.dataset import Scoreset
@@ -252,7 +313,7 @@ def _process_mavedb_dataset(df, gene, score_col, dataset_col, output_dir,
         if regularization_type:
             kw["regularization_type"] = regularization_type
         ds = Scoreset.from_mavedb(
-            df[df[dataset_col] == gene],
+            df_gene,
             dataset_col=dataset_col,
             score_col=score_col,
             splice_measure=splice_measure,
@@ -306,13 +367,18 @@ def run_default(args):
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
     df = pd.read_csv(df_path, sep=sep)
 
-    # Build component-selection function from config
-    if args.components is None:
+    # Component selection: explicit flag > config file > default [2, 3]
+    if args.components is not None:
+        _comp_for = lambda name: args.components  # noqa: E731
+        print(f"Components: {args.components} (explicit --components)")
+    elif args.config_file is not None:
         name_map_df = pd.read_csv("/data/ross/assay_calibration/dataframe/new_dataset_names.csv")
         new_to_old = dict(zip(name_map_df["New_names"], name_map_df["Old_names"]))
         _comp_for = _components_from_config(args.config_file, new_to_old)
+        print(f"Components: per-dataset from {args.config_file}")
     else:
-        _comp_for = lambda name: args.components  # noqa: E731
+        _comp_for = lambda name: [2, 3]  # noqa: E731
+        print("Components: [2, 3] for all datasets (no --config-file or --components given)")
 
     datasets = df.Dataset.unique()
     print(f"Datasets: {len(datasets)}")
@@ -321,12 +387,14 @@ def run_default(args):
         name = ds if rel == "2026" else f"{ds}_clinvar_{rel}"
         print(f"  {name}: {_comp_for(name)}c")
 
+    partitions = {ds: df[df["Dataset"] == ds] for ds in datasets}
+
     print("\nGenerating jobs...")
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_default_dataset)(
-            df, ds, output_dir, N_BOOTSTRAPS, NUM_FITS,
+            partitions[ds], ds, output_dir, N_BOOTSTRAPS, NUM_FITS,
             clinvar_release="2018" if _requires_2018(df, ds) else "2026",
-            selected_components=args.components if args.components else _comp_for(
+            selected_components=_comp_for(
                 ds if not _requires_2018(df, ds) else f"{ds}_clinvar_2018"
             ),
             population_type=args.population_type,
@@ -352,9 +420,11 @@ def run_mavedb(args):
     combinations = [(gene, sc) for gene in sorted(genes) for sc in args.score_cols]
     print(f"MaveDB mode: {len(genes)} genes × {len(args.score_cols)} score cols = {len(combinations)} combinations")
 
+    gene_partitions = {gene: df[df[args.dataset_col] == gene] for gene in genes}
+
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_mavedb_dataset)(
-            df, gene, score_col, args.dataset_col, output_dir, N_BOOTSTRAPS, NUM_FITS,
+            gene_partitions[gene], gene, score_col, args.dataset_col, output_dir, N_BOOTSTRAPS, NUM_FITS,
             selected_components=args.components,
             population_type=args.population_type,
             regularization_type=args.regularization_type,
@@ -431,27 +501,6 @@ def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
     return all_jobs
 
 
-def _load_basicscoreset_data(data_dir: str | None, dataframe: str | None) -> dict:
-    """Return {dataset_name → pd.DataFrame}."""
-    if data_dir is not None:
-        datasets = {}
-        for path in sorted(glob.glob(os.path.join(data_dir, "*.csv*"))):
-            name = os.path.basename(path).split(".")[0]
-            datasets[name] = pd.read_csv(path)
-        print(f"Found {len(datasets)} CSV files in {data_dir}")
-        return datasets
-
-    if dataframe is not None:
-        sep = "\t" if dataframe.endswith((".tsv.gz", ".tsv")) else ","
-        df = pd.read_csv(dataframe, sep=sep)
-        # Expect a Dataset column; split by it
-        if "Dataset" in df.columns:
-            return {ds: df[df["Dataset"] == ds] for ds in df["Dataset"].unique()}
-        raise ValueError("--dataframe must have a 'Dataset' column or use --data-dir")
-
-    raise ValueError("basicscoreset mode requires either --dataframe or --data-dir")
-
-
 def run_basicscoreset(args):
     N_BOOTSTRAPS = _DEFAULT_N_BOOTSTRAPS
     NUM_FITS = _DEFAULT_NUM_FITS
@@ -459,14 +508,24 @@ def run_basicscoreset(args):
     selected_components = args.components or [2, 3]
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
 
-    datasets = _load_basicscoreset_data(args.data_dir, args.dataframe)
-    print(f"\nGenerating jobs for {len(datasets)} datasets...")
+    if args.data_dir is not None:
+        paths = sorted(glob.glob(os.path.join(args.data_dir, "*.csv*")))
+        partitions = {os.path.basename(p).split(".")[0]: pd.read_csv(p) for p in paths}
+        print(f"Found {len(partitions)} CSV files in {args.data_dir}")
+    else:
+        sep = "\t" if args.dataframe.endswith((".tsv.gz", ".tsv")) else ","
+        df = pd.read_csv(args.dataframe, sep=sep)
+        if "Dataset" not in df.columns:
+            raise ValueError("--dataframe must have a 'Dataset' column or use --data-dir")
+        partitions = {ds: df[df["Dataset"] == ds] for ds in df["Dataset"].unique()}
+        print(f"Found {len(partitions)} datasets in {args.dataframe}")
 
+    print(f"\nGenerating jobs for {len(partitions)} datasets...")
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_basicscoreset_dataset)(
-            name, df, output_dir, N_BOOTSTRAPS, NUM_FITS, selected_components
+            name, df_ds, output_dir, N_BOOTSTRAPS, NUM_FITS, selected_components
         )
-        for name, df in datasets.items()
+        for name, df_ds in partitions.items()
     )
 
     all_jobs = [j for r in results if r for j in r]
@@ -511,7 +570,7 @@ def _discover_gene_groups(df, max_dimensions=None, manual_groups=None):
     return result
 
 
-def _process_multivariate_gene(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
+def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
                                 clinvar_release, component_range, constraint_modes,
                                 latent_q, init_strategy, population_type):
     from src.assay_calibration.data_utils.dataset import Scoreset, MultiScoreset
@@ -526,7 +585,7 @@ def _process_multivariate_gene(df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM
             kw = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
             if population_type:
                 kw["population_type"] = population_type
-            ds = Scoreset(df[df["Dataset"] == ds_name], **kw)
+            ds = Scoreset(df_gene[df_gene["Dataset"] == ds_name], **kw)
             if sum(1 for _ in ds.samples) < 2:
                 print(f"  {ds_name}: skipping (< 2 samples)")
                 continue
@@ -631,9 +690,15 @@ def run_multivariate(args):
     latent_q = 2
     genes_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}
 
+    # Pass only the rows relevant to each gene group
+    gene_partitions = {
+        gene: df[df["Dataset"].isin(datasets)]
+        for gene, datasets in gene_groups.items()
+    }
+
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_multivariate_gene)(
-            df, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
+            gene_partitions[gene], gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
             clinvar_release="2018" if gene in genes_2018 else "2026",
             component_range=component_range,
             constraint_modes=constraint_modes,
@@ -869,8 +934,25 @@ def main():
     p_pred.set_defaults(func=run_predictor_mv)
 
     args = parser.parse_args()
+
+    # Sample one dataset slice to estimate per-worker memory more accurately
+    _sample_slice = None
+    df_path = getattr(args, "dataframe", None)
+    if df_path and os.path.exists(df_path):
+        try:
+            sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
+            _df_peek = pd.read_csv(df_path, sep=sep)
+            if "Dataset" in _df_peek.columns:
+                first_ds = _df_peek["Dataset"].iloc[0]
+                _sample_slice = _df_peek[_df_peek["Dataset"] == first_ds]
+            else:
+                _sample_slice = _df_peek.iloc[:500]
+        except Exception:
+            pass
+
+    args.n_jobs = _resolve_n_jobs(args.n_jobs, sample_slice=_sample_slice)
     print("=" * 80)
-    print(f"ExCALIBR job manifest — mode: {args.mode}")
+    print(f"ExCALIBR job manifest — mode: {args.mode}  (workers: {args.n_jobs})")
     print("=" * 80)
     args.func(args)
 
