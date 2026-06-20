@@ -35,11 +35,11 @@ mkdir -p "$OUTPUT_DIR/logs"
 ACCOUNT="${SLURM_ACCOUNT:-predrag}"
 JOB_NAME="${SLURM_JOB_NAME:-excalibr_bootstrap}"
 TIME="${SLURM_TIME:-23:59:00}"
-MEM="${SLURM_MEM:-4G}"
+MEM="${SLURM_MEM:-1G}"
 CPUS="${SLURM_CPUS:-12}"
 PARTITION="${SLURM_PARTITION:-short}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-50}"        # max simultaneously running tasks
-PYTHON="${PYTHON:-/home/rcstewart/.conda/envs/pillar_project/bin/python}"
+PYTHON="${PYTHON:-/home/stewart.ro/.conda/envs/pillar_project/bin/python}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
