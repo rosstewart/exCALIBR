@@ -289,7 +289,7 @@ def _bootstrap_job(fit_raw, scores, sa,
         import traceback
         return None, f"prior EM: {e}\n{traceback.format_exc()}"
 
-    if not np.isfinite(prior) or prior <= 0 or prior >= 1:
+    if not np.isfinite(prior) or prior <= 0.001 or prior >= 0.999:
         return None, f"invalid prior {prior}"
 
     # ---- aux prior EM (one per auxiliary pathogenic sample) ----
@@ -492,8 +492,9 @@ def _bootstrap_job(fit_raw, scores, sa,
                                  for c in range(K)], axis=0)
                 aux_log_lr[idx] = lfp - lfb
             aux_lrs[aux_eff_p] = {
-                'lr': aux_log_lr,
-                'prior': aux_priors.get(aux_eff_p, 0.5),
+                'lr':     aux_log_lr,
+                'vsp_lr': aux_log_lr - log_lr,              # aux vs primary P
+                'prior':  aux_priors.get(aux_eff_p, 0.5),
             }
 
     except Exception as e:
@@ -1222,12 +1223,16 @@ class MVCalibrationAnalysis:
             cap_by_density=False, density_fraction_threshold=0.05,
             enforce_monotonicity=False, liberal_monotonicity=False,
             path_percentile=5,
+            aux_path_percentile=None,
+            aux_ben_percentile=None,
             reestimate_marginal_weights=True,
             enforce_marginal_monotonicity=True,
             liberal_marginal_monotonicity=True,
             n_jobs=-1):
         """Run analysis for all configs."""
         ben_percentile = 100 - path_percentile
+        _aux_path_pct = aux_path_percentile if aux_path_percentile is not None else path_percentile
+        _aux_ben_pct  = aux_ben_percentile  if aux_ben_percentile  is not None else (100 - _aux_path_pct)
         scores = self.ms.scores
         sa = self.ms.sample_assignments
         N, D = scores.shape
@@ -1282,7 +1287,8 @@ class MVCalibrationAnalysis:
 
             priors = []
             lr_matrix = []
-            aux_lr_matrices = {fixed: [] for fixed, _ in self.aux_p_entries}
+            aux_lr_matrices     = {fixed: [] for fixed, _ in self.aux_p_entries}
+            aux_vsp_lr_matrices = {fixed: [] for fixed, _ in self.aux_p_entries}
             aux_prior_collections = {fixed: [] for fixed, _ in self.aux_p_entries}
             n_valid = 0
             for result, err in parallel_results:
@@ -1298,6 +1304,7 @@ class MVCalibrationAnalysis:
                     fixed_idx = eff_to_fixed.get(eff_idx)
                     if fixed_idx is not None:
                         aux_lr_matrices[fixed_idx].append(aux_data['lr'])
+                        aux_vsp_lr_matrices[fixed_idx].append(aux_data['vsp_lr'])
                         aux_prior_collections[fixed_idx].append(aux_data['prior'])
 
             print(f"  Valid bootstraps: {n_valid}/{n_total}")
@@ -1514,8 +1521,8 @@ class MVCalibrationAnalysis:
                 if not mats:
                     continue
                 aux_lr_mat = np.array(mats)
-                aux_lr_5th = np.nanpercentile(aux_lr_mat, path_percentile, axis=0)
-                aux_lr_95th = np.nanpercentile(aux_lr_mat, ben_percentile, axis=0)
+                aux_lr_5th = np.nanpercentile(aux_lr_mat, _aux_path_pct, axis=0)
+                aux_lr_95th = np.nanpercentile(aux_lr_mat, _aux_ben_pct, axis=0)
                 aux_lr_median = np.nanmedian(aux_lr_mat, axis=0)
 
                 # Each aux sample has its own disease-specific prior and thresholds
@@ -1543,11 +1550,67 @@ class MVCalibrationAnalysis:
                                   if aux_path_mask.any() else np.nan)
                 aux_neg_correct = ((aux_points[neg_mask] < 0).mean()
                                    if neg_mask.any() else np.nan)
+                aux_neg_wrong   = ((aux_points[neg_mask] > 0).mean()
+                                   if neg_mask.any() else np.nan)
+
                 print(f"\n  ── Aux pathogenic sample {fixed_idx} ──")
+                print(f"  Percentiles: path={_aux_path_pct}th, ben={_aux_ben_pct}th")
                 print(f"  Prior: {aux_median_prior:.4f}  C_path: {aux_C_path:.2f}  C_ben: {aux_C_ben:.2f}")
-                print(f"  Path correct: {aux_path_correct*100:.1f}%  wrong: {aux_path_wrong*100:.1f}%")
-                print(f"  Ben+Syn correct: {aux_neg_correct*100:.1f}%")
-                print(f"  Point dist: {dict(sorted(Counter(aux_points).items()))}")
+                print(f"  vs Benign — Path correct: {aux_path_correct*100:.1f}%  wrong: {aux_path_wrong*100:.1f}%")
+                print(f"  vs Benign — Ben+Syn correct: {aux_neg_correct*100:.1f}%  wrong: {aux_neg_wrong*100:.1f}%")
+                print(f"  vs Benign point dist: {dict(sorted(Counter(aux_points).items()))}")
+
+                # ── Aux vs primary-P comparison ───────────────────────────
+                # LR = P(x | aux_P) / P(x | primary_P); use primary thresholds
+                vsp_mats = aux_vsp_lr_matrices.get(fixed_idx, [])
+                vsp_results = None
+                if vsp_mats:
+                    vsp_lr_mat    = np.array(vsp_mats)
+                    vsp_lr_5th    = np.nanpercentile(vsp_lr_mat, _aux_path_pct, axis=0)
+                    vsp_lr_95th   = np.nanpercentile(vsp_lr_mat, _aux_ben_pct,  axis=0)
+                    vsp_lr_median = np.nanmedian(vsp_lr_mat, axis=0)
+
+                    if enforce_marginal_monotonicity:
+                        vsp_lr_5th, vsp_lr_95th, _ = self._enforce_marginal_monotonicity(
+                            vsp_lr_5th, vsp_lr_95th, tau_p_log, tau_b_log,
+                            liberal=liberal_marginal_monotonicity,
+                            directions=self._infer_score_directions())
+
+                    vsp_points = np.zeros(N, dtype=int)
+                    for pv in self.point_values:
+                        vsp_points[vsp_lr_5th >= tau_p_log[pv - 1]] = pv
+                    for pv in self.point_values:
+                        vsp_points[vsp_lr_95th <= tau_b_log[pv - 1]] = -pv
+
+                    # aux variants more like aux_P than primary_P → positive (correct)
+                    vsp_aux_correct = ((vsp_points[aux_path_mask] > 0).mean()
+                                       if aux_path_mask.any() else np.nan)
+                    vsp_aux_wrong   = ((vsp_points[aux_path_mask] < 0).mean()
+                                       if aux_path_mask.any() else np.nan)
+                    # primary P variants more like primary_P than aux_P → negative
+                    vsp_path_neg    = ((vsp_points[path_mask] < 0).mean()
+                                       if path_mask.any() else np.nan)
+                    vsp_path_pos    = ((vsp_points[path_mask] > 0).mean()
+                                       if path_mask.any() else np.nan)
+
+                    print(f"  vs Primary P — aux correct: {vsp_aux_correct*100:.1f}%  "
+                          f"wrong: {vsp_aux_wrong*100:.1f}%  |  "
+                          f"P/LP neg: {vsp_path_neg*100:.1f}%  pos: {vsp_path_pos*100:.1f}%")
+                    print(f"  vs Primary P point dist: "
+                          f"{dict(sorted(Counter(vsp_points).items()))}")
+
+                    vsp_results = {
+                        'lr_matrix': vsp_lr_mat,
+                        'lr_median': vsp_lr_median,
+                        'lr_5th':    vsp_lr_5th,
+                        'lr_95th':   vsp_lr_95th,
+                        'points':    vsp_points,
+                        'aux_correct': vsp_aux_correct,
+                        'aux_wrong':   vsp_aux_wrong,
+                        'path_neg':    vsp_path_neg,
+                        'path_pos':    vsp_path_pos,
+                    }
+
 
                 aux_results[fixed_idx] = {
                     'lr_matrix': aux_lr_mat,
@@ -1564,7 +1627,11 @@ class MVCalibrationAnalysis:
                     'path_correct': aux_path_correct,
                     'path_wrong': aux_path_wrong,
                     'neg_correct': aux_neg_correct,
+                    'neg_wrong': aux_neg_wrong,
+                    'path_percentile': _aux_path_pct,
+                    'ben_percentile': _aux_ben_pct,
                     'eff_idx': eff_idx,
+                    'vsp_results': vsp_results,
                 }
             self.results[config]['aux_results'] = aux_results
 
@@ -1590,6 +1657,94 @@ class MVCalibrationAnalysis:
                 'latent_q': r.get('latent_q', 1),
             })
         return pd.DataFrame(rows)
+
+    def score_rpv_penetrance(self, config, fixed_idx,
+                             rpv_min_points=1, pen_min_points=0):
+        """Return a DataFrame of RPV-ness and penetrance scores for every variant.
+
+        Parameters
+        ----------
+        config          : str   — result config key (e.g. '3c_unc')
+        fixed_idx       : int   — sample-assignment column index for the aux/RPV sample
+        rpv_min_points  : int   — minimum aux Tavtigian points to be RPV-eligible (default 1 = supporting)
+        pen_min_points  : int   — vsp_points threshold separating low_pen_rpv from plp_like
+                                  (default 0: requires vsp_points >= 1 for low_pen_rpv;
+                                   vsp_points = 0 falls to intermediate)
+
+        Returns
+        -------
+        pd.DataFrame indexed by variant string with columns:
+          vs_B_5th, vs_B_median, vs_B_95th  — log LR+: RPV vs benign
+          vs_P_5th, vs_P_median, vs_P_95th  — log LR+: RPV vs primary-P
+          rpv_points   — Tavtigian points for vs_B (aux-specific thresholds, conservative)
+          vsp_points   — Tavtigian points for vs_P (aux/RPV thresholds, conservative)
+          rpv_class    — 'low_pen_rpv' | 'plp_like' | 'benign_like' | 'intermediate'
+
+        Classification rules (applied in priority order):
+          benign_like   : rpv_points <= -1
+          plp_like      : rpv_points >= rpv_min_points AND vsp_points <= pen_min_points
+          low_pen_rpv   : rpv_points >= rpv_min_points AND vsp_points > pen_min_points
+          intermediate  : everything else (rpv_points == 0, or ambiguous vsp)
+        """
+        r  = self.results[config]
+        ar = r['aux_results'][fixed_idx]
+        vsp = ar.get('vsp_results') or {}
+        variants = list(self.ms._variants_kept)
+        N = len(variants)
+
+        rpv_pts = ar['points']
+
+        # Recompute vsp_points using aux thresholds (derived from the RPV sample's own
+        # prior) rather than the primary prior stored in vsp_results['points'].
+        # The primary prior (disease prevalence) is wrong for the RPV-vs-P comparison;
+        # the RPV prior better reflects "what fraction of functional variants are RPV-like".
+        _aux_tau_p = ar.get('tau_p_log', r['tau_p_log'])
+        _aux_tau_b = ar.get('tau_b_log', r['tau_b_log'])
+        _path_pct  = ar.get('path_percentile', 5)
+        _ben_pct   = ar.get('ben_percentile',  95)
+        _vsp_mat   = vsp.get('lr_matrix')
+        if _vsp_mat is not None and len(_vsp_mat):
+            _vsp_5th  = np.nanpercentile(_vsp_mat, _path_pct, axis=0)
+            _vsp_95th = np.nanpercentile(_vsp_mat, _ben_pct,  axis=0)
+            vsp_pts = np.zeros(N, dtype=int)
+            for pv in self.point_values:
+                vsp_pts[_vsp_5th  >= _aux_tau_p[pv - 1]] =  pv
+            for pv in self.point_values:
+                vsp_pts[_vsp_95th <= _aux_tau_b[pv - 1]] = -pv
+        else:
+            vsp_pts = vsp.get('points', np.full(N, 0, dtype=int))
+
+        cls = np.full(N, 'intermediate', dtype=object)
+        cls[rpv_pts <= -1] = 'benign_like'
+        plp_mask = (rpv_pts >= rpv_min_points) & (vsp_pts <= pen_min_points)
+        rpv_mask = (rpv_pts >= rpv_min_points) & (vsp_pts >  pen_min_points)
+        cls[plp_mask] = 'plp_like'
+        cls[rpv_mask] = 'low_pen_rpv'
+
+        # penetrance_score: defined only for rpv_points >= 1 (disease-relevant variants).
+        # Scaled 0–1 from vs_P_median across that subset; flipped so that
+        # high vs_P (RPV > P, low penetrance) → 0 and low vs_P (P > RPV, high penetrance) → 1.
+        vsp_med   = np.asarray(vsp.get('lr_median', np.full(N, np.nan)), dtype=float)
+        eligible  = rpv_pts >= 1
+        pen_score = np.full(N, np.nan)
+        if eligible.sum() > 0:
+            vals = vsp_med[eligible]
+            vmin = np.nanmin(vals); vmax = np.nanmax(vals)
+            if vmax > vmin:
+                pen_score[eligible] = 1.0 - (vals - vmin) / (vmax - vmin)
+
+        return pd.DataFrame({
+            'vs_B_5th':         ar.get('lr_5th'),
+            'vs_B_median':      ar.get('lr_median'),
+            'vs_B_95th':        ar.get('lr_95th'),
+            'vs_P_5th':         vsp.get('lr_5th'),
+            'vs_P_median':      vsp.get('lr_median'),
+            'vs_P_95th':        vsp.get('lr_95th'),
+            'rpv_points':       rpv_pts,
+            'vsp_points':       vsp_pts,
+            'rpv_class':        cls,
+            'penetrance_score': pen_score,
+        }, index=variants)
 
     # ──────────────────────────────────────
     # Visualization

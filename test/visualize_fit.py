@@ -1029,6 +1029,20 @@ def _compute_lr_grids_for_all_p(all_fits, x1g, x2g, total_dims,
 # Main plot function
 # ──────────────────────────────────────
 
+def build_heatmap_data(analysis, config):
+    """Minimal precomputed dict for plot_variant_evidence_heatmap — no grid computation.
+
+    Per-dimension LR cells will show '—'; Total cells and aux_total='lr' work fully
+    since those values are read directly from analysis.results[config].
+    """
+    return {
+        'analysis':                    analysis,
+        'config':                      config,
+        'marginal_data':               {},
+        'aux_marginal_data':           {},
+        'aux_vs_primary_marginal_data': {},
+    }
+
 def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
                             projection='umap', pivot_dim='activity_No_treatment'):
     """Precompute all expensive data needed for plot_mv_calibration.
@@ -1068,12 +1082,16 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
     n_boots_used = len(all_fits)
 
     aux_p_entries = getattr(analysis, 'aux_p_entries', [])
-    all_p_indices = [analysis.p_idx] + [eff for _, eff in aux_p_entries]
 
-    print(f"  Computing marginals for {len(all_p_indices)} pathogenic index(es) "
-          f"× {D} dims ({n_boots_used} boots)...")
-    all_marginals = _compute_all_marginals_batch_p(
-        all_fits, x_grids, all_p_indices,
+    # Resolve aux-specific percentile (stored in aux_results when aux_path_percentile was set)
+    _aux_res_cfg = r_cfg.get('aux_results', {})
+    _first_aux_r = next(iter(_aux_res_cfg.values()), {}) if _aux_res_cfg else {}
+    aux_path_pctile = int(_first_aux_r.get('path_percentile', path_pctile))
+    aux_ben_pctile  = int(_first_aux_r.get('ben_percentile', ben_pctile))
+
+    print(f"  Computing primary marginals (1 pathogenic × {D} dims, {n_boots_used} boots)...")
+    primary_marginals = _compute_all_marginals_batch_p(
+        all_fits, x_grids, [analysis.p_idx],
         analysis.b_idx, getattr(analysis, 's_idx', None),
         analysis.benign_method,
         ms.sample_assignments.shape[1],
@@ -1082,10 +1100,42 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
         prior=r.get('median_prior', None),
         n_jobs=n_jobs,
     )
-    marginal_data = {d: all_marginals[0][d] for d in range(D)}
+    marginal_data = {d: primary_marginals[0][d] for d in range(D)}
+
     aux_marginal_data = {}
-    for ai, (fixed_idx, _) in enumerate(aux_p_entries):
-        aux_marginal_data[fixed_idx] = {d: all_marginals[ai + 1][d] for d in range(D)}
+    if aux_p_entries:
+        aux_eff_indices = [eff for _, eff in aux_p_entries]
+        print(f"  Computing aux marginals ({len(aux_eff_indices)} pathogenic × {D} dims, "
+              f"p{aux_path_pctile}/p{aux_ben_pctile})...")
+        aux_marginals = _compute_all_marginals_batch_p(
+            all_fits, x_grids, aux_eff_indices,
+            analysis.b_idx, getattr(analysis, 's_idx', None),
+            analysis.benign_method,
+            ms.sample_assignments.shape[1],
+            aux_path_pctile, aux_ben_pctile,
+            g_idx=getattr(analysis, 'g_idx', None),
+            prior=r.get('median_prior', None),
+            n_jobs=n_jobs,
+        )
+        for ai, (fixed_idx, _) in enumerate(aux_p_entries):
+            aux_marginal_data[fixed_idx] = {d: aux_marginals[ai][d] for d in range(D)}
+
+    # Aux-vs-primary marginals: numerator=aux_eff_idx, denominator=primary_p (treated as benign)
+    aux_vs_primary_marginal_data = {}
+    if aux_p_entries:
+        aux_eff_indices_vsp = [eff for _, eff in aux_p_entries]
+        print(f"  Computing aux-vs-primary marginals ({len(aux_eff_indices_vsp)} "
+              f"aux × {D} dims, p{aux_path_pctile}/p{aux_ben_pctile})...")
+        avp_all = _compute_all_marginals_batch_p(
+            all_fits, x_grids, aux_eff_indices_vsp,
+            b_idx=analysis.p_idx, s_idx=None,
+            benign_method=analysis.benign_method,
+            S=ms.sample_assignments.shape[1],
+            path_pctile=aux_path_pctile, ben_pctile=aux_ben_pctile,
+            g_idx=None, prior=None, n_jobs=n_jobs,
+        )
+        for ai, (fixed_idx, _) in enumerate(aux_p_entries):
+            aux_vs_primary_marginal_data[fixed_idx] = {d: avp_all[ai][d] for d in range(D)}
 
     # ── 2D point-region grid (D=2 only) ──────────────────────────────────────
     lr_grids_2d = None
@@ -1122,6 +1172,26 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
             prior=r.get('median_prior', None),
         )
 
+    # ── Aux-vs-primary 2D grids ───────────────────────────────────────────────
+    aux_vs_primary_grids_2d = None
+    if D == 2 and aux_p_entries:
+        _avp_configs = [{
+            'p_idx':        eff_idx,
+            'tau_p_log':    r_cfg['tau_p_log'],
+            'tau_b_log':    r_cfg['tau_b_log'],
+            'path_pctile':  r_cfg.get('path_percentile', 5),
+            'ben_pctile':   r_cfg.get('ben_percentile', 95),
+            'point_values': analysis.point_values,
+        } for _, eff_idx in aux_p_entries]
+        print(f"  Computing aux-vs-primary LR+ grids ({n_grid}×{n_grid})...")
+        aux_vs_primary_grids_2d = _compute_lr_grids_for_all_p(
+            all_fits, x1g, x2g, scores.shape[1],
+            b_idx=analysis.p_idx, s_idx=None,
+            benign_method=analysis.benign_method,
+            p_configs=_avp_configs,
+            g_idx=None, prior=None,
+        )
+
     # ── Per-sample density grids (D=2 row 1 contours) ───────────────────────
     density_grids_2d = None
     if D == 2:
@@ -1133,12 +1203,14 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
     # ── Pairwise LR+ grids ───────────────────────────────────────────────────
     pairwise_grids_hd = None
     pairwise_dim_pairs = None
-    _do_pairwise = (D > 2 and projection == 'pairwise') or projection == 'activity_pairs'
+    _do_pairwise = (D > 2 and projection == 'pairwise') or projection in ('activity_pairs', 'pairwise_dim0')
     if _do_pairwise:
         from itertools import combinations as _combinations
         if projection == 'pairwise':
             pairwise_dim_pairs = list(_combinations(range(D), 2))
-        else:
+        elif projection == 'pairwise_dim0':
+            pairwise_dim_pairs = [(0, d) for d in range(1, D)]
+        else:  # activity_pairs
             act_dims = [d for d, n in enumerate(dataset_names) if pivot_dim.lower() in n.lower()]
             assert len(act_dims) == 1, \
                 f"Expected exactly one '{pivot_dim}' dimension, found {len(act_dims)}: " \
@@ -1154,6 +1226,37 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
                 dim_i=dim_i, dim_j=dim_j, total_dims=D,
             ))
 
+    # ── Aux pairwise grids (aux-vs-benign, one per pair per aux) ────────────
+    aux_pairwise_grids_hd = None   # {fixed_idx: [grid per pair]}
+    if _do_pairwise and aux_p_entries and pairwise_dim_pairs:
+        aux_pairwise_grids_hd = {}
+        for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
+            _sn_tmp = getattr(ms, 'sample_names', None) or []
+            aux_name = _sn_tmp[fixed_idx] if fixed_idx < len(_sn_tmp) else f'Sample {fixed_idx}'
+            aux_pairwise_grids_hd[fixed_idx] = []
+            _ar = r_cfg.get('aux_results', {})
+            _ar_entry = next((v for k, v in _ar.items() if v.get('eff_idx') == eff_idx), {})
+            _pc = {
+                'p_idx':        eff_idx,
+                'tau_p_log':    _ar_entry.get('tau_p_log', r_cfg['tau_p_log']),
+                'tau_b_log':    _ar_entry.get('tau_b_log', r_cfg['tau_b_log']),
+                'path_pctile':  r_cfg.get('path_percentile', 5),
+                'ben_pctile':   r_cfg.get('ben_percentile', 95),
+                'point_values': analysis.point_values,
+            }
+            for dim_i, dim_j in pairwise_dim_pairs:
+                print(f"  Computing aux pairwise grid ({aux_name}): "
+                      f"{dataset_names[dim_i]} vs {dataset_names[dim_j]}...")
+                grids = _compute_lr_grids_for_all_p(
+                    all_fits, x_grids_plot[dim_i], x_grids_plot[dim_j], D,
+                    b_idx=analysis.b_idx, s_idx=getattr(analysis, 's_idx', None),
+                    benign_method=analysis.benign_method,
+                    p_configs=[_pc],
+                    g_idx=getattr(analysis, 'g_idx', None),
+                    prior=r.get('median_prior', None),
+                )
+                aux_pairwise_grids_hd[fixed_idx].append(grids[0])
+
     # ── UMAP embedding for D>2 ───────────────────────────────────────────────
     umap_data = None
     if D > 2 and projection == 'umap':
@@ -1167,57 +1270,67 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
                 sys.modules['importlib.metadata'] = _meta
             import umap as umap_lib
 
-            # Build full score matrix from all variants in each scoreset
-            # (including VUS/unclassified, not just the four calibration samples)
-            all_scores_by_key = {}   # hgvs_key -> {dim: score}
-            for d, scoreset in enumerate(ms.scoresets):
-                df_s = scoreset.dataframe
-                sc = getattr(scoreset, 'score_col', 'auth_reported_score')
-                for _, row in df_s.iterrows():
-                    # Use the same key strategy as MultiScoreset._get_variant_keys
-                    strategy = getattr(scoreset, '_code_strategy', 'genomic')
-                    if strategy == 'hgvs_p':
-                        key = str(row.get('hgvs_p', ''))
-                    elif strategy == 'hgvs_c':
-                        key = str(row.get('hgvs_c', ''))
-                    else:
-                        key = str(tuple(row.get(c, '') for c in ms.group_cols))
-                    if key and key != 'nan':
-                        if key not in all_scores_by_key:
-                            all_scores_by_key[key] = {}
-                        val = pd.to_numeric(row.get(sc), errors='coerce')
-                        if not np.isnan(val):
-                            all_scores_by_key[key][d] = float(val)
+            from src.assay_calibration.data_utils.dataset import BasicMultiScoreset
 
-            all_keys = list(all_scores_by_key.keys())
-            N_full = len(all_keys)
-            full_scores = np.full((N_full, D), np.nan)
-            for i, key in enumerate(all_keys):
-                for d, v in all_scores_by_key[key].items():
-                    full_scores[i, d] = v
+            if isinstance(ms, BasicMultiScoreset):
+                # BasicMultiScoreset already exposes the full score matrix as
+                # _scores — no dataframe or union-find key matching needed.
+                full_scores = ms._scores.copy()   # (N, D)
+                N_full = N
+                sample_indices = np.arange(N)
+                valid_sample = np.ones(N, dtype=bool)
+            else:
+                # Build full score matrix from all variants in each scoreset
+                # (including VUS/unclassified, not just the four calibration samples)
+                all_scores_by_key = {}   # hgvs_key -> {dim: score}
+                for d, scoreset in enumerate(ms.scoresets):
+                    df_s = scoreset.dataframe
+                    sc = getattr(scoreset, 'score_col', 'auth_reported_score')
+                    for _, row in df_s.iterrows():
+                        # Use the same key strategy as MultiScoreset._get_variant_keys
+                        strategy = getattr(scoreset, '_code_strategy', 'genomic')
+                        if strategy == 'hgvs_p':
+                            key = str(row.get('hgvs_p', ''))
+                        elif strategy == 'hgvs_c':
+                            key = str(row.get('hgvs_c', ''))
+                        else:
+                            key = str(tuple(row.get(c, '') for c in ms.group_cols))
+                        if key and key != 'nan':
+                            if key not in all_scores_by_key:
+                                all_scores_by_key[key] = {}
+                            val = pd.to_numeric(row.get(sc), errors='coerce')
+                            if not np.isnan(val):
+                                all_scores_by_key[key][d] = float(val)
 
-            # Map ms._variants_kept back to indices in all_keys.
-            # ms._variants_kept contains canonical union-find atoms — try all
-            # plausible string representations to find a match.
-            key_to_idx = {k: i for i, k in enumerate(all_keys)}
-            sample_indices = []
-            for vk in ms._variants_kept:
-                idx = -1
-                # vk is a tuple; try element 0 first (hgvs_p / hgvs_c strategy)
-                candidates = [vk[0] if len(vk) >= 1 else None,
-                              str(vk),
-                              str(vk[0]) if len(vk) >= 1 else None]
-                for cand in candidates:
-                    if cand is not None and cand in key_to_idx:
-                        idx = key_to_idx[cand]
-                        break
-                sample_indices.append(idx)
-            sample_indices = np.array(sample_indices)
-            valid_sample = sample_indices >= 0
-            n_missing = (~valid_sample).sum()
-            if n_missing > 0:
-                print(f"  Warning: {n_missing}/{N} sample variants not matched "
-                      f"in full scoreset — they will be absent from UMAP.")
+                all_keys = list(all_scores_by_key.keys())
+                N_full = len(all_keys)
+                full_scores = np.full((N_full, D), np.nan)
+                for i, key in enumerate(all_keys):
+                    for d, v in all_scores_by_key[key].items():
+                        full_scores[i, d] = v
+
+                # Map ms._variants_kept back to indices in all_keys.
+                # ms._variants_kept contains canonical union-find atoms — try all
+                # plausible string representations to find a match.
+                key_to_idx = {k: i for i, k in enumerate(all_keys)}
+                sample_indices = []
+                for vk in ms._variants_kept:
+                    idx = -1
+                    # vk is a tuple; try element 0 first (hgvs_p / hgvs_c strategy)
+                    candidates = [vk[0] if len(vk) >= 1 else None,
+                                  str(vk),
+                                  str(vk[0]) if len(vk) >= 1 else None]
+                    for cand in candidates:
+                        if cand is not None and cand in key_to_idx:
+                            idx = key_to_idx[cand]
+                            break
+                    sample_indices.append(idx)
+                sample_indices = np.array(sample_indices)
+                valid_sample = sample_indices >= 0
+                n_missing = (~valid_sample).sum()
+                if n_missing > 0:
+                    print(f"  Warning: {n_missing}/{N} sample variants not matched "
+                          f"in full scoreset — they will be absent from UMAP.")
 
             print(f"  Computing pairwise distance matrix "
                   f"({N_full} total variants incl. VUS, D={D})...")
@@ -1225,11 +1338,20 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
             # dims both have observed, normalized by the number of shared dims.
             # Variants with no shared dims get max distance (handled below).
             observed = ~np.isnan(full_scores)   # (N_full, D)
+            # Z-score each dim using only observed entries so dims with
+            # different scales contribute equally to pairwise distance.
+            full_scores_z = full_scores.copy()
+            for d in range(D):
+                vals = full_scores[observed[:, d], d]
+                if len(vals) > 1:
+                    mu, sigma = vals.mean(), vals.std()
+                    if sigma > 0:
+                        full_scores_z[observed[:, d], d] = (vals - mu) / sigma
             dist = np.zeros((N_full, N_full), dtype=np.float32)
             for d in range(D):
                 obs_d = observed[:, d]
                 both = obs_d[:, None] & obs_d[None, :]
-                diff = np.nan_to_num(full_scores[:, d], nan=0.0)
+                diff = np.nan_to_num(full_scores_z[:, d], nan=0.0)
                 sq_diff = (diff[:, None] - diff[None, :]) ** 2
                 dist += sq_diff * both.astype(np.float32)
 
@@ -1259,21 +1381,24 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
             print(f"  UMAP skipped: {type(_umap_err).__name__}: {_umap_err}")
 
     return {
-        'analysis':           analysis,
-        'config':             config,
-        'all_fits':           all_fits,
-        'marginal_data':      marginal_data,
-        'aux_marginal_data':  aux_marginal_data,
-        'x_grids':            x_grids,
-        'x_grids_plot':       x_grids_plot,
-        'lr_grids_2d':        lr_grids_2d,
-        'density_grids_2d':   density_grids_2d,
-        'pairwise_grids_hd':  pairwise_grids_hd,
-        'pairwise_dim_pairs': pairwise_dim_pairs,
-        'umap_data':          umap_data,
-        'n_boots_used':       n_boots_used,
-        'n_grid':             n_grid,
-        'pad':                pad,
+        'analysis':                     analysis,
+        'config':                       config,
+        'all_fits':                     all_fits,
+        'marginal_data':                marginal_data,
+        'aux_marginal_data':            aux_marginal_data,
+        'aux_vs_primary_marginal_data': aux_vs_primary_marginal_data,
+        'x_grids':                      x_grids,
+        'x_grids_plot':                 x_grids_plot,
+        'lr_grids_2d':                  lr_grids_2d,
+        'aux_vs_primary_grids_2d':      aux_vs_primary_grids_2d,
+        'density_grids_2d':             density_grids_2d,
+        'pairwise_grids_hd':            pairwise_grids_hd,
+        'aux_pairwise_grids_hd':        aux_pairwise_grids_hd,
+        'pairwise_dim_pairs':           pairwise_dim_pairs,
+        'umap_data':                    umap_data,
+        'n_boots_used':                 n_boots_used,
+        'n_grid':                       n_grid,
+        'pad':                          pad,
     }
 
 
@@ -1290,6 +1415,7 @@ def render_mv_plot_data(precomputed, figsize=None, contour_levels=6,
     all_fits      = precomputed['all_fits']
     marginal_data = precomputed['marginal_data']
     aux_marginal_data = precomputed['aux_marginal_data']
+    aux_vs_primary_marginal_data = precomputed.get('aux_vs_primary_marginal_data', {})
     x_grids       = precomputed['x_grids']
     n_boots_used  = precomputed['n_boots_used']
     n_grid        = precomputed['n_grid']
@@ -1334,12 +1460,15 @@ def render_mv_plot_data(precomputed, figsize=None, contour_levels=6,
     missing_frac = 1.0 - (~np.isnan(scores).any(axis=1)).mean()
 
     if first_row_only:
-        marginal_data_render   = {d: None for d in range(D)}
-        aux_marginal_data_render = {fid: {d: None for d in range(D)}
-                                    for fid, _ in getattr(analysis, 'aux_p_entries', [])}
+        marginal_data_render           = {d: None for d in range(D)}
+        aux_marginal_data_render       = {fid: {d: None for d in range(D)}
+                                          for fid, _ in getattr(analysis, 'aux_p_entries', [])}
+        aux_vs_primary_marginal_render = {fid: {d: None for d in range(D)}
+                                          for fid, _ in getattr(analysis, 'aux_p_entries', [])}
     else:
-        marginal_data_render      = marginal_data
-        aux_marginal_data_render  = aux_marginal_data
+        marginal_data_render           = marginal_data
+        aux_marginal_data_render       = aux_marginal_data
+        aux_vs_primary_marginal_render = aux_vs_primary_marginal_data
 
     sample_style = {
         'colors':  [SAMPLE_COLORS[_eff_to_fixed.get(i, i) % len(SAMPLE_COLORS)]
@@ -1367,8 +1496,10 @@ def render_mv_plot_data(precomputed, figsize=None, contour_levels=6,
             model_label, n_boots_used, pad, n_grid, contour_levels,
             figsize, suptitle,
             aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data_render,
+            aux_vs_primary_marginal_data=aux_vs_primary_marginal_render,
             first_row_only=first_row_only, sample_style=sample_style,
             lr_grids_2d=precomputed.get('lr_grids_2d'),
+            aux_vs_primary_grids_2d=precomputed.get('aux_vs_primary_grids_2d'),
             density_grids_2d=precomputed.get('density_grids_2d'),
         )
     else:  # D>2, or D==2 with activity_pairs
@@ -1392,9 +1523,11 @@ def render_mv_plot_data(precomputed, figsize=None, contour_levels=6,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
                 aux_p_entries=aux_p_entries, aux_marginal_data=aux_marginal_data_render,
+                aux_vs_primary_marginal_data=aux_vs_primary_marginal_render,
                 sample_style=sample_style,
-                max_lr_pairs=max_lr_pairs,
+                max_lr_pairs=(None if projection == 'pairwise_dim0' else max_lr_pairs),
                 pairwise_grids_hd=precomputed.get('pairwise_grids_hd'),
+                aux_pairwise_grids_hd=precomputed.get('aux_pairwise_grids_hd'),
                 pairwise_dim_pairs=precomputed.get('pairwise_dim_pairs'),
                 first_row_only=first_row_only,
             )
@@ -1411,18 +1544,953 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
                                max_lr_pairs=max_lr_pairs)
 
 
+def plot_variant_evidence_heatmap(precomputed, sample_idx=0,
+                                  variant_ids=None, figsize=None,
+                                  cell_fontsize=6, row_height=0.38,
+                                  show_aux='auto',
+                                  aux_total='points'):
+    """Heatmap of per-dimension marginal evidence for variants in one or more samples.
+
+    Rows   = variants, grouped by sample with a separator header row between groups.
+    Cols   = assay dimensions + 'Total' + optional aux-vs-benign and aux-vs-primary cols.
+    Color  = marginal evidence points for that dimension (POINT_CMAP scale).
+    Text   = path-pct LR on top line, ben-pct LR on bottom line.
+             Missing dimensions shown as gray with '—'.
+
+    Parameters
+    ----------
+    precomputed  : dict from precompute_mv_plot_data
+    sample_idx   : int or list of int — sample column(s) to display
+    variant_ids  : list of str, optional — explicit variant list (ignores sample_idx)
+    figsize      : (w, h) or None (auto)
+    cell_fontsize: font size inside cells
+    row_height   : inches per data row (separator rows count as 0.5×)
+    show_aux     : 'auto'        — show aux columns if aux data available
+                   'benign'      — only aux-vs-benign columns
+                   'pathogenic'  — only aux-vs-primary-pathogenic columns
+                   'both'        — both aux comparison column groups
+                   'none'        — only primary evidence columns
+    aux_total    : 'points'      — Total cell shows pre-computed Tavtigian joint points (default)
+                   'lr'          — Total cell shows joint log LR+ (p5/median/p95 across bootstraps)
+    """
+    analysis      = precomputed['analysis']
+    config        = precomputed['config']
+    marginal_data = precomputed['marginal_data']
+    aux_marginal_data          = precomputed.get('aux_marginal_data', {})
+    aux_vs_primary_marginal_data = precomputed.get('aux_vs_primary_marginal_data', {})
+
+    ms     = analysis.ms
+    scores = ms.scores
+    _sa_raw = ms._sample_assignments   # (N, n_raw_cols) — fixed column positions
+    N, D    = scores.shape
+    S_raw   = _sa_raw.shape[1]
+
+    r           = analysis.results[config]
+    joint_pts   = r['points']
+    tau_p_log   = r['tau_p_log']
+    tau_b_log   = r['tau_b_log']
+    path_pctile = r.get('path_percentile', 5)
+    ben_pctile  = r.get('ben_percentile', 95)
+    max_pt      = max(analysis.point_values)
+    pt_norm     = TwoSlopeNorm(vmin=-max_pt, vcenter=0, vmax=max_pt)
+
+    dataset_names    = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
+    _sn_raw          = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    sample_names_all = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}'
+                        for i in range(S_raw)]
+
+    variants_kept = list(ms._variants_kept)
+
+    # ── Resolve rows ─────────────────────────────────────────────────────────
+    # Each entry in `render_rows` is either:
+    #   ('variant', vi, label)          — a data row
+    #   ('separator', None, group_name) — a group header row
+    render_rows = []
+
+    if variant_ids is not None:
+        missing = [v for v in variant_ids if v not in variants_kept]
+        if missing:
+            print(f"Warning: {len(missing)} variant(s) not found: {missing[:5]}")
+        for v in variant_ids:
+            if v in variants_kept:
+                render_rows.append(('variant', variants_kept.index(v), v))
+    else:
+        indices = sample_idx if isinstance(sample_idx, (list, tuple)) else [sample_idx]
+        for si in indices:
+            if si >= S_raw:
+                print(f"sample_idx={si} out of range (raw cols: {S_raw}), skipping")
+                continue
+            mask = _sa_raw[:, si].astype(bool)
+            if not mask.any():
+                print(f"Sample {si} ({sample_names_all[si]}) is empty, skipping")
+                continue
+            sname = sample_names_all[si] if si < len(sample_names_all) else f'Sample {si}'
+            if len(indices) > 1:
+                render_rows.append(('separator', None, sname))
+            for vi in np.where(mask)[0].tolist():
+                render_rows.append(('variant', vi, variants_kept[vi]))
+
+    if not any(kind == 'variant' for kind, _, _ in render_rows):
+        print("No variants to display.")
+        return None
+
+    # ── Resolve aux comparison column groups ─────────────────────────────────
+    aux_p_entries = getattr(analysis, 'aux_p_entries', [])
+    r_cfg = analysis.results[config]
+    _aux_res = r_cfg.get('aux_results', {})
+    _sn_raw2 = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+
+    # Determine which aux column groups to show
+    has_aux = bool(aux_p_entries)
+    _show_b  = show_aux in ('auto', 'benign', 'both')     and has_aux
+    _show_p  = show_aux in ('auto', 'pathogenic', 'both') and has_aux
+    if show_aux == 'none':
+        _show_b = _show_p = False
+
+    # aux_col_groups: 8-tuple per group
+    #   (label, fixed_idx, data_dict, tau_p, tau_b, col_color, group_type, n_cols)
+    # group_type: 'vs_b' (D+1 wide), 'vs_p' (1 wide, Total only), 'pb' (1 wide, Total only)
+    aux_col_groups = []
+    for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
+        aux_name = (_sn_raw2[fixed_idx] if fixed_idx < len(_sn_raw2) else f'Sample {fixed_idx}')
+        aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
+        aux_r = _aux_res.get(fixed_idx, {})
+        p_name = (_sn_raw2[analysis.p_idx] if analysis.p_idx is not None
+                  and analysis.p_idx < len(_sn_raw2) else 'P/LP')
+        if _show_b:
+            aux_col_groups.append((
+                f'{aux_name}\nvs B', fixed_idx,
+                aux_marginal_data.get(fixed_idx, {}),
+                aux_r.get('tau_p_log', tau_p_log),
+                aux_r.get('tau_b_log', tau_b_log),
+                aux_color, 'vs_b', D + 1,
+            ))
+        if _show_p:
+            aux_col_groups.append((
+                f'{aux_name}\nvs {p_name}', fixed_idx,
+                {}, tau_p_log, tau_b_log,
+                aux_color, 'vs_p', 1,
+            ))
+
+    n_aux_col_groups = len(aux_col_groups)
+    n_cols_primary = D + 1
+    # col_start for each aux group computed explicitly (groups have variable width)
+    col_starts = []
+    cur = n_cols_primary
+    for *_, n_cols_grp in aux_col_groups:
+        col_starts.append(cur)
+        cur += n_cols_grp
+    n_cols_total = cur
+
+    # ── Compute per-cell values (variant rows only) ───────────────────────────
+    variant_rows = [(i, vi, lbl) for i, (kind, vi, lbl) in enumerate(render_rows)
+                    if kind == 'variant']
+    n_variant_rows = len(variant_rows)
+    n_sep_rows     = sum(1 for kind, _, _ in render_rows if kind == 'separator')
+
+    n_total = len(render_rows)
+    color_grid   = np.zeros((n_total, n_cols_total))
+    text_grid    = [[''] * n_cols_total for _ in range(n_total)]
+    missing_grid = np.zeros((n_total, n_cols_total), dtype=bool)
+    col_header_color = ['black'] * n_cols_total  # per-column header color
+
+    def _fill_single_lr_cell(row_pos, col, vi, lr_5th, lr_median, lr_95th, tp, tb, col_c):
+        """Fill one Total-only cell (for vs_p and pb 1-wide groups)."""
+        col_header_color[col] = col_c
+        if lr_5th is not None and vi < len(lr_5th) and not np.isnan(lr_5th[vi]):
+            lrp = float(lr_5th[vi])
+            lrm = float(lr_median[vi]) if lr_median is not None else float('nan')
+            lrb = float(lr_95th[vi])   if lr_95th  is not None else float('nan')
+            mpt = 0
+            for pv in range(max_pt, 0, -1):
+                if pv - 1 < len(tp) and lrp >= tp[pv - 1]: mpt = pv; break
+                if pv - 1 < len(tb) and lrb <= tb[pv - 1]: mpt = -pv; break
+            color_grid[row_pos, col] = mpt
+            sp = '+' if lrp >= 0 else ''
+            sm = '+' if lrm >= 0 else ''
+            sb = '+' if lrb >= 0 else ''
+            text_grid[row_pos][col] = f'{sp}{lrp:.2f}\n{sm}{lrm:.2f}\n{sb}{lrb:.2f}'
+        else:
+            missing_grid[row_pos, col] = True
+            text_grid[row_pos][col] = '—'
+
+    def _fill_lr_cols(row_pos, vi, col_start, dim_mdata, tp, tb, col_c,
+                      aux_pts_arr, aux_lr_5th=None, aux_lr_median=None, aux_lr_95th=None):
+        """Fill D + 1 cells starting at col_start for one aux comparison group.
+
+        The last cell (col_start + D) is a Total column.  Its content depends on
+        aux_total: 'points' shows the pre-computed Tavtigian joint points;
+        'lr' shows the joint log LR+ (p5/median/p95 across bootstraps).
+        """
+        col_header_color[col_start:col_start + D + 1] = [col_c] * (D + 1)
+        for d in range(D):
+            col = col_start + d
+            sc = scores[vi, d]
+            md = dim_mdata.get(d) if dim_mdata else None
+            if np.isnan(sc) or md is None or md.get('lr') is None:
+                missing_grid[row_pos, col] = True
+                text_grid[row_pos][col] = '—'
+                continue
+            lrp = float(np.interp(sc, md['x'], md['lr']['p5']))
+            lrm = float(np.interp(sc, md['x'], md['lr']['p50']))
+            lrb = float(np.interp(sc, md['x'], md['lr']['p95']))
+            mpt = 0
+            for pv in range(max_pt, 0, -1):
+                if pv - 1 < len(tp) and lrp >= tp[pv - 1]:
+                    mpt = pv; break
+                if pv - 1 < len(tb) and lrb <= tb[pv - 1]:
+                    mpt = -pv; break
+            color_grid[row_pos, col] = mpt
+            sp = '+' if lrp >= 0 else ''
+            sm = '+' if lrm >= 0 else ''
+            sb = '+' if lrb >= 0 else ''
+            text_grid[row_pos][col] = f'{sp}{lrp:.2f}\n{sm}{lrm:.2f}\n{sb}{lrb:.2f}'
+        # Total column
+        total_col = col_start + D
+        if aux_total == 'lr' and aux_lr_5th is not None and vi < len(aux_lr_5th):
+            lrp = float(aux_lr_5th[vi])
+            lrm = float(aux_lr_median[vi]) if aux_lr_median is not None else float('nan')
+            lrb = float(aux_lr_95th[vi])   if aux_lr_95th  is not None else float('nan')
+            mpt = 0
+            for pv in range(max_pt, 0, -1):
+                if pv - 1 < len(tp) and lrp >= tp[pv - 1]:
+                    mpt = pv; break
+                if pv - 1 < len(tb) and lrb <= tb[pv - 1]:
+                    mpt = -pv; break
+            color_grid[row_pos, total_col] = mpt
+            sp = '+' if lrp >= 0 else ''
+            sm = '+' if lrm >= 0 else ''
+            sb = '+' if lrb >= 0 else ''
+            text_grid[row_pos][total_col] = f'{sp}{lrp:.2f}\n{sm}{lrm:.2f}\n{sb}{lrb:.2f}'
+        elif aux_pts_arr is not None and vi < len(aux_pts_arr):
+            jp = int(aux_pts_arr[vi])
+            color_grid[row_pos, total_col] = jp
+            text_grid[row_pos][total_col] = f'{jp:+d}'
+        else:
+            missing_grid[row_pos, total_col] = True
+            text_grid[row_pos][total_col] = '—'
+
+    is_sep = [kind == 'separator' for kind, _, _ in render_rows]
+
+    for row_pos, vi, _ in variant_rows:
+        # Primary evidence columns
+        for d in range(D):
+            sc = scores[vi, d]
+            md = marginal_data.get(d)
+            if np.isnan(sc) or md is None or md.get('lr') is None:
+                missing_grid[row_pos, d] = True
+                text_grid[row_pos][d]    = '—'
+                continue
+            x   = md['x']
+            lrp = float(np.interp(sc, x, md['lr']['p5']))
+            lrb = float(np.interp(sc, x, md['lr']['p95']))
+            mpt = 0
+            for pv in range(max_pt, 0, -1):
+                if pv - 1 < len(tau_p_log) and lrp >= tau_p_log[pv - 1]:
+                    mpt = pv; break
+                if pv - 1 < len(tau_b_log) and lrb <= tau_b_log[pv - 1]:
+                    mpt = -pv; break
+            color_grid[row_pos, d] = mpt
+            sign_p = '+' if lrp >= 0 else ''
+            sign_b = '+' if lrb >= 0 else ''
+            text_grid[row_pos][d]  = f'{sign_p}{lrp:.2f}\n{sign_b}{lrb:.2f}'
+        jp = int(joint_pts[vi])
+        color_grid[row_pos, D] = jp
+        text_grid[row_pos][D]  = f'{jp:+d}'
+
+        # Aux comparison column groups
+        for gi, (glabel, fixed_idx, dim_mdata, tp, tb, gc, group_type, _) in enumerate(aux_col_groups):
+            col_start = col_starts[gi]
+            _ar = _aux_res.get(fixed_idx, {})
+            if group_type == 'vs_b':
+                aux_pts_arr     = _ar.get('points')   if aux_total == 'points' else None
+                aux_lr_5th_arr  = _ar.get('lr_5th')   if aux_total == 'lr' else None
+                aux_lr_med_arr  = _ar.get('lr_median') if aux_total == 'lr' else None
+                aux_lr_95th_arr = _ar.get('lr_95th')  if aux_total == 'lr' else None
+                _fill_lr_cols(row_pos, vi, col_start, dim_mdata, tp, tb, gc,
+                              aux_pts_arr, aux_lr_5th_arr, aux_lr_med_arr, aux_lr_95th_arr)
+            elif group_type == 'vs_p':
+                _vsp = (_ar.get('vsp_results') or {})
+                _fill_single_lr_cell(row_pos, col_start, vi,
+                                     _vsp.get('lr_5th'), _vsp.get('lr_median'), _vsp.get('lr_95th'),
+                                     tp, tb, gc)
+
+    # ── DataFrame (variant rows only, no separators) ──────────────────────────
+    table_records = []
+    for row_pos, vi, lbl in variant_rows:
+        rec = {'variant': lbl}
+        for d in range(D):
+            dn = dataset_names[d]
+            if missing_grid[row_pos, d]:
+                rec[f'{dn}__score'] = rec[f'{dn}__lr_path'] = rec[f'{dn}__lr_ben'] = rec[f'{dn}__pts'] = np.nan
+            else:
+                sc  = scores[vi, d]
+                md  = marginal_data.get(d)
+                lrp = float(np.interp(sc, md['x'], md['lr']['p5']))
+                lrb = float(np.interp(sc, md['x'], md['lr']['p95']))
+                rec[f'{dn}__score']   = sc
+                rec[f'{dn}__lr_path'] = lrp
+                rec[f'{dn}__lr_ben']  = lrb
+                rec[f'{dn}__pts']     = int(color_grid[row_pos, d])
+        rec['joint_pts'] = int(color_grid[row_pos, D])
+        for gi, (glabel, fixed_idx, dim_mdata, tp, tb, gc, group_type, _) in enumerate(aux_col_groups):
+            col_start = col_starts[gi]
+            if group_type == 'vs_b':
+                for d in range(D):
+                    dn = dataset_names[d]
+                    col = col_start + d
+                    if missing_grid[row_pos, col]:
+                        rec[f'{glabel}__{dn}__lr_path'] = rec[f'{glabel}__{dn}__lr_ben'] = np.nan
+                    else:
+                        md2 = (dim_mdata or {}).get(d)
+                        if md2 and md2.get('lr') is not None:
+                            sc = scores[vi, d]
+                            rec[f'{glabel}__{dn}__lr_path'] = float(np.interp(sc, md2['x'], md2['lr']['p5']))
+                            rec[f'{glabel}__{dn}__lr_ben']  = float(np.interp(sc, md2['x'], md2['lr']['p95']))
+                        else:
+                            rec[f'{glabel}__{dn}__lr_path'] = rec[f'{glabel}__{dn}__lr_ben'] = np.nan
+            total_col = col_start + (D if group_type == 'vs_b' else 0)
+            rec[f'{glabel}__total'] = (
+                int(color_grid[row_pos, total_col]) if not missing_grid[row_pos, total_col] else np.nan
+            )
+        table_records.append(rec)
+    table_df = pd.DataFrame(table_records).set_index('variant')
+
+    # ── Draw ─────────────────────────────────────────────────────────────────
+    # Column labels
+    col_labels = list(dataset_names) + ['Total\n(joint)']
+    for glabel, _, _, _, _, _, group_type, _ in aux_col_groups:
+        if group_type == 'vs_b':
+            col_labels += [f'{glabel}\n{dn}' for dn in dataset_names] + [f'{glabel}\nTotal']
+        else:
+            col_labels += [glabel]
+
+    n_cols = n_cols_total
+    col_w  = max(1.4, 7.0 / min(n_cols, D + 1))
+    total_height = n_variant_rows * row_height + n_sep_rows * row_height * 0.5
+    if figsize is None:
+        figsize = (col_w * n_cols + 2.5, total_height + 1.5)
+
+    # Map render_rows to y-coordinates (separator rows are half-height)
+    y_coords = []
+    y = 0.0
+    row_heights_list = []
+    for kind, _, _ in render_rows:
+        h = row_height * 0.5 if kind == 'separator' else row_height
+        y_coords.append(y)
+        row_heights_list.append(h)
+        y += h
+    total_y = y
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_xlim(0, n_cols)
+    ax.set_ylim(0, total_y)
+    ax.invert_yaxis()
+    ax.set_aspect('auto')
+    ax.axis('off')
+
+    # Column headers (above y=0)
+    _total_cols = {D} | {
+        col_starts[gi] + (D if gt == 'vs_b' else 0)
+        for gi, (*_, gt, _) in enumerate(aux_col_groups)
+    }
+    for col, lbl in enumerate(col_labels):
+        is_total = col in _total_cols
+        is_aux   = (col >= n_cols_primary)
+        color    = col_header_color[col] if is_aux else 'black'
+        weight   = 'bold' if is_total else 'normal'
+        ax.text(col + 0.5, -row_height * 0.5, lbl, ha='center', va='center',
+                fontsize=cell_fontsize + 1, fontweight=weight, rotation=45,
+                rotation_mode='anchor', color=color)
+    ax.text(-0.05, -row_height * 0.5, 'Variant', ha='right', va='center',
+            fontsize=cell_fontsize + 1, fontweight='bold')
+
+    # Draw vertical separator lines between column groups
+    _sep_cols = [n_cols_primary] + list(col_starts[1:])
+    for sc_x in _sep_cols:
+        ax.axvline(sc_x, color='#888888', lw=1.2, alpha=0.6, zorder=5)
+
+    for row_pos, (kind, vi, lbl) in enumerate(render_rows):
+        y0 = y_coords[row_pos]
+        rh = row_heights_list[row_pos]
+
+        if kind == 'separator':
+            rect = plt.Rectangle((0, y0), n_cols, rh,
+                                  facecolor='#404040', edgecolor='none')
+            ax.add_patch(rect)
+            ax.text(n_cols / 2, y0 + rh / 2, lbl,
+                    ha='center', va='center',
+                    fontsize=cell_fontsize + 1, fontweight='bold', color='white')
+            continue
+
+        ax.text(-0.05, y0 + rh / 2, lbl, ha='right', va='center',
+                fontsize=cell_fontsize - 1, color='black')
+
+        for col in range(n_cols):
+            if missing_grid[row_pos, col]:
+                face = '#d0d0d0'; tc = '#666666'
+            else:
+                face = POINT_CMAP(pt_norm(color_grid[row_pos, col]))
+                lum  = 0.299 * face[0] + 0.587 * face[1] + 0.114 * face[2]
+                tc   = 'white' if lum < 0.5 else 'black'
+            rect = plt.Rectangle((col, y0), 1, rh,
+                                  facecolor=face, edgecolor='white', linewidth=0.5)
+            ax.add_patch(rect)
+            ax.text(col + 0.5, y0 + rh / 2, text_grid[row_pos][col],
+                    ha='center', va='center',
+                    fontsize=cell_fontsize, color=tc, linespacing=1.3)
+
+    if variant_ids is not None:
+        title_label = 'selected variants'
+    elif isinstance(sample_idx, (list, tuple)):
+        title_label = ' + '.join(
+            sample_names_all[si] if si < len(sample_names_all) else f'Sample {si}'
+            for si in sample_idx
+        )
+    else:
+        title_label = (sample_names_all[sample_idx]
+                       if sample_idx < len(sample_names_all) else f'Sample {sample_idx}')
+    aux_note = ''
+    if aux_col_groups:
+        aux_note = f'  |  aux cols: {", ".join(g[0].replace(chr(10), " ") for g in aux_col_groups)}'
+    ax.set_title(
+        f'{title_label}  |  color = evidence points  |  '
+        f'text = p{path_pctile} / p{ben_pctile} LR\n'
+        f'Total = full joint evidence{aux_note}',
+        fontsize=cell_fontsize + 2, pad=20
+    )
+    plt.tight_layout()
+    return fig, table_df
+
+
+def plot_rpv_quadrant(precomputed, fixed_idx=None,
+                      pctile='median',
+                      samples=None,
+                      label_variants=None,
+                      tau_lines=True,
+                      show_classes=False,
+                      pad=0.5,
+                      xlim=None,
+                      ylim=None,
+                      sample_names=None,
+                      gvsr=None,
+                      gvsr_log=True,
+                      figsize=None, ax=None):
+    """Scatter of (aux vs B LR, aux vs P LR) for variants in selected samples.
+
+    Quadrant interpretation
+    -----------------------
+    top-right    (aux_vs_B > 0, aux_vs_P ≈ 0 / positive)  → true RPV, reduced penetrance
+    bottom-right (aux_vs_B > 0, aux_vs_P << 0)            → PLP-like, high penetrance
+    left         (aux_vs_B ≤ 0)                           → benign-like, no RPV signal
+
+    Parameters
+    ----------
+    precomputed    : dict from precompute_mv_plot_data (or build_heatmap_data)
+    fixed_idx      : which aux entry to plot; defaults to the first
+    pctile         : 'median' | 'conservative' | 'liberal'
+    samples        : list of raw sample indices to include; None = all
+    label_variants : list of variant IDs to annotate
+    tau_lines      : draw Tavtigian threshold lines on both axes
+    show_classes   : shade classification regions (low_pen_rpv / plp_like / benign_like)
+                     using the first Tavtigian threshold on each axis as the boundary
+    pad            : fractional padding around the data range for axis limits
+    gvsr           : pd.Series or dict mapping variant ID → GVSr value.
+                     When provided, only aux-sample (fixed_idx) variants with a
+                     GVSr value are plotted; color encodes GVSr magnitude.
+                     Other samples are drawn in gray as reference.
+    gvsr_log       : apply log10 scale to GVSr colormap (default True)
+    """
+    analysis = precomputed['analysis']
+    config   = precomputed['config']
+    r        = analysis.results[config]
+    ms       = analysis.ms
+    _sa_raw  = ms._sample_assignments
+    N        = ms.scores.shape[0]
+
+    variants_kept = list(ms._variants_kept)
+    aux_p_entries = getattr(analysis, 'aux_p_entries', [])
+    if not aux_p_entries:
+        print("No aux entries configured.")
+        return None
+
+    if fixed_idx is None:
+        fixed_idx = aux_p_entries[0][0]
+
+    aux_res = r.get('aux_results', {}).get(fixed_idx, {})
+    vsp_res = aux_res.get('vsp_results') or {}
+
+    if pctile == 'median':
+        x_arr = aux_res.get('lr_median')
+        y_arr = vsp_res.get('lr_median')
+    elif pctile == 'conservative':
+        x_arr = aux_res.get('lr_5th')
+        y_arr = vsp_res.get('lr_95th')
+    else:
+        x_arr = aux_res.get('lr_95th')
+        y_arr = vsp_res.get('lr_5th')
+
+    if x_arr is None or y_arr is None:
+        print("LR arrays missing — rerun run() to populate vsp_results.")
+        return None
+
+    x_arr = np.asarray(x_arr, float)
+    y_arr = np.asarray(y_arr, float)
+
+    tau_p     = r['tau_p_log']
+    tau_b     = r['tau_b_log']
+    aux_tau_p = aux_res.get('tau_p_log', tau_p)
+    aux_tau_b = aux_res.get('tau_b_log', tau_b)
+
+    _sn_raw  = sample_names or getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    S_raw    = _sa_raw.shape[1]
+    sample_names_all = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}'
+                        for i in range(S_raw)]
+
+    _sc_fixed = [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(4)]
+
+    if samples is None:
+        samples = list(range(S_raw))
+    # aux sample always drawn last (on top)
+    draw_order = [si for si in samples if si != fixed_idx]
+    if fixed_idx in samples:
+        draw_order.append(fixed_idx)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize or (7, 6))
+    else:
+        fig = ax.get_figure()
+
+    # ── Collect points that will be plotted (for axis limits) ─────────────
+    plotted_x, plotted_y = [], []
+    for si in draw_order:
+        if si >= S_raw:
+            continue
+        mask = _sa_raw[:, si].astype(bool)
+        xi = x_arr[mask]; yi = y_arr[mask]
+        valid = np.isfinite(xi) & np.isfinite(yi)
+        plotted_x.append(xi[valid]); plotted_y.append(yi[valid])
+
+    if not any(len(v) for v in plotted_x):
+        print("No valid (finite) LR values for selected samples.")
+        return None
+
+    all_x = np.concatenate(plotted_x); all_y = np.concatenate(plotted_y)
+    if xlim is None:
+        xspan = all_x.max() - all_x.min() or 1.0
+        xlim  = (all_x.min() - pad * xspan, all_x.max() + pad * xspan)
+    if ylim is None:
+        yspan = all_y.max() - all_y.min() or 1.0
+        ylim  = (all_y.min() - pad * yspan, all_y.max() + pad * yspan)
+
+    # ── Scatter ────────────────────────────────────────────────────────────
+    gvsr_mode = gvsr is not None
+    if gvsr_mode:
+        # normalise to dict {variant_id: value}
+        if hasattr(gvsr, 'to_dict'):
+            gvsr_dict = gvsr.to_dict()
+        else:
+            gvsr_dict = dict(gvsr)
+
+    for si, xi, yi in zip(draw_order, plotted_x, plotted_y):
+        if gvsr_mode:
+            if si == fixed_idx:
+                # aux sample: color by GVSr for variants that have it, skip others
+                mask = _sa_raw[:, si].astype(bool)
+                vi_indices = np.where(mask)[0]
+                gvsr_vals, gvsr_xi, gvsr_yi = [], [], []
+                for vi, xv, yv in zip(vi_indices, xi, yi):
+                    vid = variants_kept[vi]
+                    if vid in gvsr_dict and np.isfinite(gvsr_dict[vid]):
+                        gvsr_vals.append(gvsr_dict[vid])
+                        gvsr_xi.append(xv); gvsr_yi.append(yv)
+                if gvsr_vals:
+                    import matplotlib.colors as mcolors
+                    vals = np.array(gvsr_vals, dtype=float)
+                    cvals = np.log10(np.clip(vals, 1e-6, None)) if gvsr_log else vals
+                    norm  = mcolors.Normalize(vmin=cvals.min(), vmax=cvals.max())
+                    cmap  = plt.cm.plasma
+                    sc = ax.scatter(gvsr_xi, gvsr_yi, s=50, c=cvals, cmap=cmap,
+                                    norm=norm, alpha=0.85, zorder=4,
+                                    edgecolors='white', linewidths=0.4,
+                                    label=sample_names_all[si])
+                    cbar = plt.colorbar(sc, ax=ax, shrink=0.7, pad=0.02)
+                    clbl = f'log₁₀(GVSr)' if gvsr_log else 'GVSr'
+                    cbar.set_label(clbl, fontsize=8)
+                    cbar.ax.tick_params(labelsize=7)
+            else:
+                # other samples: gray reference
+                ax.scatter(xi, yi, s=20, color='#cccccc', alpha=0.35, zorder=1,
+                           edgecolors='none', label=sample_names_all[si])
+        else:
+            color = _AUX_COLORS[(si - 4) % len(_AUX_COLORS)] if si >= 4 else _sc_fixed[si % 4]
+            ax.scatter(xi, yi, s=30, color=color, alpha=0.65, zorder=2,
+                       edgecolors='white', linewidths=0.4, label=sample_names_all[si])
+
+    # ── Axis limits (tight around plotted data) ────────────────────────────
+    ax.set_xlim(xlim); ax.set_ylim(ylim)
+
+    # ── Classification region shading ──────────────────────────────────────
+    _class_legend_patches = None
+    if show_classes:
+        import matplotlib.patches as mpatches
+        x_rpv_thresh = float(aux_tau_p[0]) if len(aux_tau_p) else 0.0  # vs_B supporting
+        x_ben_thresh = float(aux_tau_b[0]) if len(aux_tau_b) else 0.0  # vs_B benign
+        y_rpv_thresh = float(tau_p[0])     if len(tau_p)     else 0.0  # vs_P >= 1 pt (low pen)
+        y_plp_thresh = float(tau_b[0])     if len(tau_b)     else 0.0  # vs_P <= -1 pt (plp-like)
+
+        rx0 = x_rpv_thresh
+        # low_pen_rpv: x > x_rpv_thresh, y > y_rpv_thresh (vsp_points >= 1)
+        ax.add_patch(mpatches.Rectangle(
+            (rx0, y_rpv_thresh), xlim[1] - rx0, ylim[1] - y_rpv_thresh,
+            color='#3cb371', alpha=0.07, zorder=0, linewidth=0))
+        # plp_like: x > x_rpv_thresh, y < y_plp_thresh (vsp_points <= -1)
+        ax.add_patch(mpatches.Rectangle(
+            (rx0, ylim[0]), xlim[1] - rx0, y_plp_thresh - ylim[0],
+            color='#e05c00', alpha=0.07, zorder=0, linewidth=0))
+        # benign_like: x < x_ben_thresh
+        ax.add_patch(mpatches.Rectangle(
+            (xlim[0], ylim[0]), x_ben_thresh - xlim[0], ylim[1] - ylim[0],
+            color='#2c7bb6', alpha=0.07, zorder=0, linewidth=0))
+
+        _class_legend_patches = [
+            mpatches.Patch(color='#3cb371', alpha=0.5, label='low-pen RPV'),
+            mpatches.Patch(color='#e05c00', alpha=0.5, label='PLP-like'),
+            mpatches.Patch(color='#2c7bb6', alpha=0.5, label='benign-like'),
+        ]
+
+    # ── Quadrant + threshold lines ─────────────────────────────────────────
+    ax.axvline(0, color='#555555', lw=1.0, ls='--', alpha=0.6, zorder=3)
+    ax.axhline(0, color='#555555', lw=1.0, ls='--', alpha=0.6, zorder=3)
+
+    if tau_lines:
+        for pv_i, (tp_v, tb_v) in enumerate(zip(aux_tau_p, aux_tau_b)):
+            a = min(0.12 + 0.06 * (pv_i + 1), 0.4)
+            ax.axvline(tp_v, color='#d7191c', lw=0.7, ls=':', alpha=a, zorder=3)
+            ax.axvline(tb_v, color='#2c7bb6', lw=0.7, ls=':', alpha=a, zorder=3)
+        for pv_i, (tp_v, tb_v) in enumerate(zip(tau_p, tau_b)):
+            a = min(0.12 + 0.06 * (pv_i + 1), 0.4)
+            ax.axhline(tp_v, color='#d7191c', lw=0.7, ls=':', alpha=a, zorder=3)
+            ax.axhline(tb_v, color='#2c7bb6', lw=0.7, ls=':', alpha=a, zorder=3)
+
+    # ── Quadrant labels (in axes-fraction coords, unaffected by data range) ─
+    def _qlabel(fx, fy, text, ha, va):
+        ax.text(fx, fy, text, ha=ha, va=va, fontsize=7, color='#333333',
+                fontstyle='italic', alpha=0.70, transform=ax.transAxes)
+
+    _qlabel(0.52, 0.97, 'RPV\n(reduced pen.)',  ha='left',  va='top')
+    _qlabel(0.52, 0.03, 'PLP-like\n(high pen.)', ha='left', va='bottom')
+    _qlabel(0.02, 0.97, 'benign-like',           ha='left',  va='top')
+
+    # ── Labels ────────────────────────────────────────────────────────────
+    aux_name = (_sn_raw[fixed_idx] if fixed_idx < len(_sn_raw) else f'Sample {fixed_idx}')
+    p_name   = (_sn_raw[analysis.p_idx] if analysis.p_idx is not None
+                and analysis.p_idx < len(_sn_raw) else 'P/LP')
+    ax.set_xlabel(f'log LR⁺  {aux_name} vs B  ({pctile})', fontsize=9)
+    ax.set_ylabel(f'log LR⁺  {aux_name} vs {p_name}  ({pctile})', fontsize=9)
+    ax.set_title(f'RPV quadrant — {aux_name}', fontsize=10)
+
+    if label_variants:
+        for vid in label_variants:
+            if vid not in variants_kept:
+                continue
+            vi = variants_kept.index(vid)
+            xv, yv = float(x_arr[vi]), float(y_arr[vi])
+            if np.isfinite(xv) and np.isfinite(yv):
+                ax.annotate(vid, (xv, yv), fontsize=6,
+                            xytext=(4, 4), textcoords='offset points',
+                            color='black', zorder=5)
+
+    sample_leg = ax.legend(fontsize=7, markerscale=1.2, framealpha=0.7,
+                           bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0)
+    if _class_legend_patches is not None:
+        import matplotlib.patches as mpatches
+        ax.add_artist(sample_leg)
+        ax.legend(handles=_class_legend_patches, fontsize=7, framealpha=0.7,
+                  bbox_to_anchor=(1.01, 0), loc='lower left', borderaxespad=0)
+    ax.grid(lw=0.3, alpha=0.3)
+    ax.tick_params(labelsize=8)
+    plt.tight_layout()
+    return fig, ax
+
+
+def inspect_variant(variant_id, precomputed, figsize=None):
+    """Print per-dimension log LR+ and evidence points for one variant,
+    then plot a marginal row per observed dimension.
+
+    Parameters
+    ----------
+    variant_id : str
+        Must match an entry in ms._variants_kept.
+    precomputed : dict
+        Output of precompute_mv_plot_data.
+    """
+    analysis      = precomputed['analysis']
+    config        = precomputed['config']
+    marginal_data = precomputed['marginal_data']
+    aux_marginal_data          = precomputed.get('aux_marginal_data', {})
+    aux_vs_primary_marginal_data = precomputed.get('aux_vs_primary_marginal_data', {})
+
+    ms     = analysis.ms
+    scores = ms.scores           # (N, D)
+    sa     = ms.sample_assignments  # (N, S)
+    N, D   = scores.shape
+    S      = sa.shape[1]
+
+    # ── Find the variant ──────────────────────────────────────────────────────
+    variants_kept = list(ms._variants_kept)
+    if variant_id not in variants_kept:
+        print(f"Variant '{variant_id}' not found in ms._variants_kept")
+        print(f"  First 10: {variants_kept[:10]}")
+        return None
+    idx = variants_kept.index(variant_id)
+
+    r           = analysis.results[config]
+    v_scores    = scores[idx]          # (D,)
+    v_points    = int(r['points'][idx])
+    tau_p_log   = r['tau_p_log']
+    tau_b_log   = r['tau_b_log']
+    path_pctile = r.get('path_percentile', 5)
+    ben_pctile  = r.get('ben_percentile', 95)
+    ylim_bound  = max(abs(tau_p_log[-1]), abs(tau_b_log[-1]))
+    max_pt      = max(analysis.point_values)
+
+    dataset_names = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
+    _sn_raw       = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    sample_names_all = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}' for i in range(S)]
+
+    _eff_to_fixed = {}
+    for fixed_idx, eff_idx in [(0, analysis.p_idx), (1, analysis.b_idx),
+                                (2, analysis.g_idx), (3, analysis.s_idx)]:
+        if eff_idx is not None:
+            _eff_to_fixed[eff_idx] = fixed_idx
+
+    # ── Text summary ──────────────────────────────────────────────────────────
+    sample_membership = [sample_names_all[i] for i in range(S) if sa[idx, i]]
+    print(f"Variant : {variant_id}")
+    print(f"Points  : {v_points:+d}")
+    print(f"Sample  : {', '.join(sample_membership) if sample_membership else 'none (VUS/unclassified)'}")
+    print()
+    print(f"{'Dim':<4}  {'Assay':<30}  {'Score':>8}  "
+          f"{'logLR+(path)':>13}  {'logLR+(med)':>11}  {'logLR+(ben)':>11}")
+    print("-" * 90)
+
+    obs_dims = []
+    for d in range(D):
+        sc = v_scores[d]
+        if np.isnan(sc):
+            print(f"{d:<4}  {dataset_names[d]:<30}  {'—':>8}")
+            continue
+        obs_dims.append(d)
+        md = marginal_data.get(d)
+        if md is None or md.get('lr') is None:
+            print(f"{d:<4}  {dataset_names[d]:<30}  {sc:>8.4f}  (no LR+ data)")
+            continue
+        x     = md['x']
+        lrp5  = float(np.interp(sc, x, md['lr']['p5']))
+        lrp50 = float(np.interp(sc, x, md['lr']['p50']))
+        lrp95 = float(np.interp(sc, x, md['lr']['p95']))
+        print(f"{d:<4}  {dataset_names[d]:<30}  {sc:>8.4f}  "
+              f"{lrp5:>+13.3f}  {lrp50:>+11.3f}  {lrp95:>+11.3f}")
+
+    if not obs_dims:
+        print("\nNo observed dimensions — nothing to plot.")
+        return None
+
+    # ── Build aux LR panel specs ──────────────────────────────────────────────
+    aux_p_entries = getattr(analysis, 'aux_p_entries', [])
+    r_cfg = analysis.results[config]
+    _aux_res = r_cfg.get('aux_results', {})
+    _sn_raw2 = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    _sn_fixed = [_sn_raw2[i] if i < len(_sn_raw2) else f'Sample {i}' for i in range(S)]
+
+    # Each aux entry: two extra LR panels (vs benign, vs primary pathogenic)
+    aux_lr_specs = []   # list of (title, dim_mdata_dict, tau_p, tau_b, color, rug_top, rug_bot)
+    for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
+        aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
+        aux_name = _sn_fixed[fixed_idx] if fixed_idx < len(_sn_fixed) else f'Sample {fixed_idx}'
+        aux_r = _aux_res.get(fixed_idx, {})
+        p_name = _sn_fixed[analysis.p_idx] if analysis.p_idx is not None and analysis.p_idx < len(_sn_fixed) else 'P/LP'
+        aux_lr_specs.append({
+            'title':    f'{aux_name} vs B',
+            'mdata':    aux_marginal_data.get(fixed_idx, {}),
+            'tau_p':    aux_r.get('tau_p_log', tau_p_log),
+            'tau_b':    aux_r.get('tau_b_log', tau_b_log),
+            'color':    aux_color,
+            'rug_top':  eff_idx,
+            'rug_bot':  analysis.b_idx,
+        })
+        aux_lr_specs.append({
+            'title':    f'{aux_name} vs {p_name}',
+            'mdata':    aux_vs_primary_marginal_data.get(fixed_idx, {}),
+            'tau_p':    tau_p_log,
+            'tau_b':    tau_b_log,
+            'color':    aux_color,
+            'rug_top':  eff_idx,
+            'rug_bot':  analysis.p_idx,
+        })
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    n_hist_cols  = min(S, 4)
+    n_extra_lr   = len(aux_lr_specs)
+    n_cols       = n_hist_cols + 1 + n_extra_lr  # density + primary LR + extra LR
+    n_rows       = len(obs_dims)
+    _sc_fixed    = [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(4)]
+
+    if figsize is None:
+        figsize = (4.5 * n_cols, 3.2 * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False,
+                             gridspec_kw={'hspace': 0.50, 'wspace': 0.32})
+
+    for row, d in enumerate(obs_dims):
+        sc = v_scores[d]
+        md = marginal_data.get(d)
+
+        # histogram panels
+        for col in range(n_hist_cols):
+            s_idx  = col
+            ax     = axes[row, col]
+            fi     = _eff_to_fixed.get(s_idx, s_idx)
+            color  = _sc_fixed[fi % len(_sc_fixed)]
+
+            if s_idx < S:
+                obs_s = scores[sa[:, s_idx].astype(bool), d]
+                obs_s = obs_s[~np.isnan(obs_s)]
+                if len(obs_s) > 0:
+                    ax.hist(obs_s, bins=40, density=True, alpha=0.3,
+                            color=color, edgecolor='white', linewidth=0.3)
+
+                if md is not None and md.get('sample') and md['sample'].get(s_idx) is not None:
+                    s_data = md['sample'][s_idx]
+                    ax.plot(md['x'], s_data['mean'], color=color, lw=1.5)
+                    ax.fill_between(md['x'],
+                                    np.maximum(s_data['mean'] - s_data['std'], 0),
+                                    s_data['mean'] + s_data['std'],
+                                    color=color, alpha=0.15)
+                n_obs_s = int((~np.isnan(scores[sa[:, s_idx].astype(bool), d])).sum()) if s_idx < S else 0
+            else:
+                n_obs_s = 0
+
+            ax.axvline(sc, color='black', lw=1.5, ls='--', alpha=0.85, zorder=5)
+            ax.set_xlabel(dataset_names[d], fontsize=7)
+            ax.set_ylabel('Density', fontsize=7)
+            ax.set_title(f'{sample_names_all[s_idx]} (n={n_obs_s})',
+                         fontsize=7, color=color, fontweight='bold')
+            ax.tick_params(labelsize=6)
+            ax.grid(lw=0.2, alpha=0.2)
+
+        # Primary LR+ panel
+        ax = axes[row, n_hist_cols]
+        if md is not None and md.get('lr') is not None:
+            x_marg = md['x']
+            p5, p50, p95 = md['lr']['p5'], md['lr']['p50'], md['lr']['p95']
+            ax.plot(x_marg, p50, color='black', lw=1.5, label='Median')
+            ax.plot(x_marg, p5,  color='#d7191c', lw=1.0, label=f'{path_pctile}th')
+            ax.plot(x_marg, p95, color='#2c7bb6', lw=1.0, label=f'{ben_pctile}th')
+            ax.fill_between(x_marg, p5, p95, color='gray', alpha=0.06)
+            for pv in range(1, len(tau_p_log) + 1):
+                alpha = min(0.15 + 0.05 * pv, 0.5)
+                ax.axhline(tau_p_log[pv - 1], color='red',  ls=':', lw=0.5, alpha=alpha)
+                ax.axhline(tau_b_log[pv - 1], color='blue', ls=':', lw=0.5, alpha=alpha)
+            for pv in [1, 4, max_pt]:
+                if pv - 1 < len(tau_p_log):
+                    ax.text(x_marg[0], tau_p_log[pv - 1], f' +{pv}', fontsize=5,
+                            color='red',  va='bottom')
+                    ax.text(x_marg[0], tau_b_log[pv - 1], f' -{pv}', fontsize=5,
+                            color='blue', va='top')
+            ax.axhline(0, color='gray', lw=0.8, alpha=0.5)
+            lr_med = float(np.interp(sc, x_marg, p50))
+            lr_pth = float(np.interp(sc, x_marg, p5))
+            ax.axvline(sc, color='black', lw=1.5, ls='--', alpha=0.85, zorder=5)
+            ax.plot(sc, lr_med, 'ko', ms=6, zorder=6)
+            ax.annotate(f'med={lr_med:+.2f}\npath={lr_pth:+.2f}',
+                        xy=(sc, lr_med), xytext=(6, 4),
+                        textcoords='offset points', fontsize=6,
+                        bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
+            ax.set_ylim(-ylim_bound, ylim_bound)
+        ax.set_xlabel(dataset_names[d], fontsize=7)
+        ax.set_ylabel('log LR+', fontsize=7)
+        ax.set_title(f'LR+ (P vs B) — {dataset_names[d]}', fontsize=8, fontweight='bold')
+        ax.legend(fontsize=5, framealpha=0.6)
+        ax.tick_params(labelsize=6)
+        ax.grid(lw=0.2, alpha=0.2)
+
+        # Extra aux LR panels
+        for ei, spec in enumerate(aux_lr_specs):
+            ax = axes[row, n_hist_cols + 1 + ei]
+            emd = spec['mdata'].get(d) if spec['mdata'] else None
+            ec = spec['color']
+            if emd is not None and emd.get('lr') is not None:
+                xm = emd['x']
+                ep5, ep50, ep95 = emd['lr']['p5'], emd['lr']['p50'], emd['lr']['p95']
+                ax.plot(xm, ep50, color=ec,   lw=1.5, label='Median')
+                ax.plot(xm, ep5,  color=ec,   lw=1.0, ls='--', label=f'{path_pctile}th')
+                ax.plot(xm, ep95, color=ec,   lw=1.0, ls=':',  label=f'{ben_pctile}th')
+                ax.fill_between(xm, ep5, ep95, color=ec, alpha=0.08)
+                tp, tb = spec['tau_p'], spec['tau_b']
+                for pv in range(1, len(tp) + 1):
+                    alpha = min(0.15 + 0.05 * pv, 0.5)
+                    ax.axhline(tp[pv - 1], color='red',  ls=':', lw=0.5, alpha=alpha)
+                    ax.axhline(tb[pv - 1], color='blue', ls=':', lw=0.5, alpha=alpha)
+                ax.axhline(0, color='gray', lw=0.8, alpha=0.5)
+                lr_med = float(np.interp(sc, xm, ep50))
+                lr_pth = float(np.interp(sc, xm, ep5))
+                ax.axvline(sc, color='black', lw=1.5, ls='--', alpha=0.85, zorder=5)
+                ax.plot(sc, lr_med, 'o', color=ec, ms=6, zorder=6)
+                ax.annotate(f'med={lr_med:+.2f}\np{path_pctile}={lr_pth:+.2f}',
+                            xy=(sc, lr_med), xytext=(6, 4),
+                            textcoords='offset points', fontsize=6,
+                            bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
+                # Rug ticks
+                rt, rb = spec.get('rug_top'), spec.get('rug_bot')
+                if rt is not None and rt < S:
+                    ot = scores[sa[:, rt], d]; ot = ot[~np.isnan(ot)]
+                    if len(ot): ax.plot(ot, np.full(len(ot), ylim_bound), '|', color=ec, alpha=0.4, ms=3, mew=0.3)
+                if rb is not None and rb < S:
+                    ob = scores[sa[:, rb], d]; ob = ob[~np.isnan(ob)]
+                    if len(ob): ax.plot(ob, np.full(len(ob), -ylim_bound), '|', color='#888888', alpha=0.3, ms=3, mew=0.3)
+                ax.set_ylim(-ylim_bound, ylim_bound)
+            ax.set_xlabel(dataset_names[d], fontsize=7)
+            ax.set_ylabel('log LR', fontsize=7)
+            ax.set_title(f'{spec["title"]} — {dataset_names[d]}', fontsize=7,
+                         fontweight='bold', color=ec)
+            ax.legend(fontsize=5, framealpha=0.6)
+            ax.tick_params(labelsize=6)
+            ax.grid(lw=0.2, alpha=0.2)
+
+    fig.suptitle(f'{variant_id}  |  total points = {v_points:+d}',
+                 fontsize=11, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    return fig
+
+
 _AUX_COLORS = ['#e6a817', '#8B4513', '#006400', '#800080', '#FF6600', '#4B0082']
 
 
 def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
                        dataset_names, sample_names, tau_p_log, tau_b_log,
                        ylim_bound, path_pctile, ben_pctile, analysis,
-                       sample_style=None):
-    """Draw one row: S sample density panels + primary pathogenic LR+ panel."""
+                       sample_style=None, extra_lr_cols=None):
+    """Draw one row: S sample density panels + primary LR+ + optional extra LR+ columns.
+
+    extra_lr_cols : list of dicts, each with keys:
+        md        : marginal_data dict for this dim (or None)
+        title     : panel title string
+        color     : line color for this comparison
+        tau_p     : tau_p_log array for threshold lines
+        tau_b     : tau_b_log array for threshold lines
+        rug_top   : sample index whose scores to show as rug ticks at top (numerator)
+        rug_bot   : sample index whose scores to show as rug ticks at bottom (denominator)
+    """
+    extra_lr_cols = extra_lr_cols or []
+    n_extra = len(extra_lr_cols)
+    # Primary LR+ column is at index S; extras follow at S+1, S+2, ...
+    lr_col = S
+
     x_marg = md['x']
     _sc = sample_style['colors']  if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
 
-    for s_idx in range(min(S, n_cols - 1)):
+    for s_idx in range(S):
         ax = fig.add_subplot(gs[row, s_idx])
         color = _sc[s_idx]
 
@@ -1457,8 +2525,8 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
                      fontsize=7, fontweight='bold', color=color)
         ax.grid(lw=0.2, alpha=0.2)
 
-    # Primary LR+ panel (last column)
-    ax = fig.add_subplot(gs[row, n_cols - 1])
+    # Primary LR+ panel (column S)
+    ax = fig.add_subplot(gs[row, lr_col])
     if md['lr'] is not None:
         p5, p50, p95 = md['lr']['p5'], md['lr']['p50'], md['lr']['p95']
         ax.plot(x_marg, p50, color='black', lw=1.5, label='Median')
@@ -1493,6 +2561,50 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
     ax.set_title(f'Marginal LR+ — {dataset_names[dim]}', fontsize=8, fontweight='bold')
     ax.legend(fontsize=5, framealpha=0.6)
     ax.grid(lw=0.2, alpha=0.2)
+
+    # Extra LR+ columns (aux comparisons)
+    for ei, ec in enumerate(extra_lr_cols):
+        ax = fig.add_subplot(gs[row, lr_col + 1 + ei])
+        emd = ec.get('md')
+        if emd is None or emd.get('lr') is None:
+            ax.axis('off')
+            continue
+        ec_col  = ec['color']
+        ec_tp   = ec.get('tau_p', tau_p_log)
+        ec_tb   = ec.get('tau_b', tau_b_log)
+        xm = emd['x']
+        ep5, ep50, ep95 = emd['lr']['p5'], emd['lr']['p50'], emd['lr']['p95']
+        ax.plot(xm, ep50, color=ec_col,   lw=1.5, label='Median')
+        ax.plot(xm, ep5,  color=ec_col,   lw=1.0, ls='--', label=f'{path_pctile}th')
+        ax.plot(xm, ep95, color=ec_col,   lw=1.0, ls=':',  label=f'{ben_pctile}th')
+        ax.fill_between(xm, ep5, ep95, color=ec_col, alpha=0.08)
+        for pv in range(1, len(ec_tp) + 1):
+            alpha = min(0.15 + 0.05 * pv, 0.5)
+            ax.axhline(ec_tp[pv - 1], color='red',  ls=':', lw=0.4, alpha=alpha)
+            ax.axhline(ec_tb[pv - 1], color='blue', ls=':', lw=0.4, alpha=alpha)
+        for pv in [1, 4, max(analysis.point_values)]:
+            if pv - 1 < len(ec_tp):
+                ax.text(xm[0], ec_tp[pv - 1], f' +{pv}', fontsize=5, color='red',  va='bottom')
+                ax.text(xm[0], ec_tb[pv - 1], f' -{pv}', fontsize=5, color='blue', va='top')
+        ax.axhline(0, color='gray', lw=0.8, alpha=0.5)
+        rug_top = ec.get('rug_top')
+        rug_bot = ec.get('rug_bot')
+        if rug_top is not None and rug_top < sa.shape[1]:
+            obs_t = scores[sa[:, rug_top], dim]; obs_t = obs_t[~np.isnan(obs_t)]
+            if len(obs_t):
+                ax.plot(obs_t, np.full(len(obs_t), ylim_bound),
+                        '|', color=ec_col, alpha=0.4, ms=3, mew=0.3)
+        if rug_bot is not None and rug_bot < sa.shape[1]:
+            obs_b2 = scores[sa[:, rug_bot], dim]; obs_b2 = obs_b2[~np.isnan(obs_b2)]
+            if len(obs_b2):
+                ax.plot(obs_b2, np.full(len(obs_b2), -ylim_bound),
+                        '|', color='#888888', alpha=0.3, ms=3, mew=0.3)
+        ax.set_ylim(-ylim_bound, ylim_bound)
+        ax.set_xlabel(dataset_names[dim], fontsize=7)
+        ax.set_ylabel('log LR', fontsize=7)
+        ax.set_title(ec['title'], fontsize=7, fontweight='bold', color=ec_col)
+        ax.legend(fontsize=5, framealpha=0.6)
+        ax.grid(lw=0.2, alpha=0.2)
 
 
 def _draw_aux_lr_row(fig, gs, row, dim, aux_md, aux_name, aux_color,
@@ -1622,11 +2734,14 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
                 aux_p_entries=None, aux_marginal_data=None,
+                aux_vs_primary_marginal_data=None,
                 first_row_only=False, sample_style=None, lr_grids_2d=None,
+                aux_vs_primary_grids_2d=None,
                 density_grids_2d=None):
     """Layout for D=2: 2D grid, density contours, marginals."""
     aux_p_entries = aux_p_entries or []
     aux_marginal_data = aux_marginal_data or {}
+    aux_vs_primary_marginal_data = aux_vs_primary_marginal_data or {}
     n_aux = len(aux_p_entries)
     _sc = sample_style['colors']  if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
     _se = sample_style['edges']   if sample_style else [_SAMPLE_EDGE_COLORS[i % len(_SAMPLE_EDGE_COLORS)] for i in range(S)]
@@ -1772,16 +2887,18 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         return fig, info
 
     # ── full layout ────────────────────────────────────────────────────────────
-    n_grid_cols = 1 + n_aux
-    n_cols = max(S, n_grid_cols)
+    # n_aux extra LR cols (aux vs benign) + n_aux extra LR cols (aux vs primary)
+    n_extra_lr = n_aux * 2
+    n_grid_cols = 1 + n_aux          # row 0 grid panels
+    # marginal rows: S density cols + 1 primary LR col + n_extra_lr extra LR cols
+    n_cols = max(n_grid_cols, S + 1 + n_extra_lr)
 
-    # Each of D=2 dimensions gets 1 primary row + n_aux aux-LR rows
-    n_marg_rows = D * (1 + n_aux)
-    height_ratios = [1.2, 1.2] + [0.8] + [0.5] * n_aux + [0.8] + [0.5] * n_aux
-    n_total_rows = 2 + n_marg_rows
+    n_marg_rows = D                  # one row per dimension (aux now in extra cols)
+    height_ratios = [1.2, 1.2] + [0.8] * D
+    n_total_rows = 2 + D
 
     if figsize is None:
-        figsize = (5.5 * n_cols, 5.0 + 4.0 * D + 2.0 * D * n_aux)
+        figsize = (5.5 * n_cols, 5.0 + 4.0 * D)
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(n_total_rows, n_cols, figure=fig,
                            height_ratios=height_ratios,
@@ -1789,7 +2906,6 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
 
     # Row 0 col 0: primary 2D point grid
     ax = fig.add_subplot(gs[0, 0])
-    # Points rendered first (behind evidence colormap)
     for s_idx in range(min(S, 4) - 1, -1, -1):   # descending: 3→0 so P/LP on top
         mask = sa[:, s_idx] & complete
         if not mask.any(): continue
@@ -1797,25 +2913,24 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                    color=_sc[s_idx], s=14, alpha=0.7,
                    edgecolors=_se[s_idx], linewidths=0.5, zorder=1,
                    marker=_sm[s_idx])
-    # Evidence colormap on top (semi-transparent so points show through)
     im = ax.pcolormesh(x1g, x2g, grid_points.T, cmap=POINT_CMAP,
                        norm=pt_norm, shading='auto', alpha=0.72, zorder=2)
     plt.colorbar(im, ax=ax, label='Evidence Points', shrink=0.8)
     ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
     ax.set_xlim(x1_range); ax.set_ylim(x2_range)
     ax.set_aspect('auto')
-    ax.set_title(f'Point Regions\nprior={median_prior:.4f}', fontsize=9, fontweight='bold')
+    ax.set_title(f'Point Regions (P vs B)\nprior={median_prior:.4f}', fontsize=9, fontweight='bold')
     ax.grid(lw=0.2, alpha=0.3, zorder=0)
 
-    # Row 0 cols 1..n_aux: aux 2D point grids
+    # Row 0 cols 1..n_aux: aux-vs-benign 2D point grids
+    _aux_results = analysis.results.get(config, {}).get('aux_results', {})
     for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
         ax = fig.add_subplot(gs[0, 1 + ai])
         aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
         aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
                     else f'Sample {fixed_idx}')
         aux_gp, aux_lr_con = _all_grids[1 + ai]
-        # Points first, evidence on top
-        for s_idx in range(min(S, 4) - 1, -1, -1):   # descending: 3→0
+        for s_idx in range(min(S, 4) - 1, -1, -1):
             mask = sa[:, s_idx] & complete
             if not mask.any(): continue
             ax.scatter(scores[mask, 0], scores[mask, 1],
@@ -1828,18 +2943,17 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         ax.set_xlabel(dataset_names[0], fontsize=8); ax.set_ylabel(dataset_names[1], fontsize=8)
         ax.set_xlim(x1_range); ax.set_ylim(x2_range)
         ax.set_aspect('auto')
-        _ar = analysis.results.get(config, {}).get('aux_results', {}).get(fixed_idx, {})
+        _ar = _aux_results.get(fixed_idx, {})
         _ap = _ar.get('median_prior', float('nan'))
-        ax.set_title(f'Aux: {aux_name}\nprior={_ap:.4f}',
+        ax.set_title(f'Aux vs B: {aux_name}\nprior={_ap:.4f}',
                      fontsize=9, fontweight='bold', color=aux_color)
         ax.grid(lw=0.2, alpha=0.3)
 
-    # Fill any unused row-0 columns (density rows may need more cols)
+    # Fill any unused row-0 columns
     for c_idx in range(n_grid_cols, n_cols):
         fig.add_subplot(gs[0, c_idx]).axis('off')
 
-    # ── Bottom legends (below all panels) ──────────────────────────────────
-    # Sample handles — match actual scatter style
+    # ── Bottom legends ──────────────────────────────────────────────────────
     sample_handles = [
         Line2D([0], [0], marker=_sm[s_idx],
                color=_se[s_idx],
@@ -1848,8 +2962,6 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                label=f"{sample_names[s_idx]} (n={int(sa[:, s_idx].sum())})")
         for s_idx in range(min(S, 4))
     ]
-
-    # Evidence handles — only levels actually present across any panel, including 0
     all_grid_arrays = [grid_points] + [_all_grids[1 + ai][0] for ai in range(n_aux)]
     present_evs = sorted({int(v) for gp in all_grid_arrays
                            for v in np.unique(gp) if -8 <= v <= 8})
@@ -1858,7 +2970,6 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
               label=f"{'+' if pv > 0 else ''}{pv}")
         for pv in present_evs
     ]
-
     leg_ev = fig.legend(handles=ev_handles, loc='lower center',
                         bbox_to_anchor=(0.5, 0.0), fontsize=7.5,
                         frameon=True, title='Evidence points', title_fontsize=8,
@@ -1883,18 +2994,15 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
                     if levels[-1] > levels[0]:
                         ax.contourf(x1g, x2g, d_mean.T, levels=levels, cmap=cmap_name, alpha=0.4)
                         ax.contour(x1g, x2g, d_mean.T, levels=levels,
-                                   colors=_sc[s_idx],
-                                   linewidths=0.5, alpha=0.6)
+                                   colors=_sc[s_idx], linewidths=0.5, alpha=0.6)
                     outer = levels[1] if len(levels) > 1 else levels[0]
                     for bound, ls in [(np.maximum(d_mean - d_std, 0), ':'), (d_mean + d_std, ':')]:
                         ax.contour(x1g, x2g, bound.T, levels=[outer],
-                                   colors=_sc[s_idx],
-                                   linewidths=0.3, linestyles=ls, alpha=0.3)
+                                   colors=_sc[s_idx], linewidths=0.3, linestyles=ls, alpha=0.3)
                 mask = sa[:, s_idx] & complete
                 if mask.any():
                     ax.scatter(scores[mask, 0], scores[mask, 1],
-                               c=_sc[s_idx], s=4, alpha=0.3,
-                               edgecolors='none')
+                               c=_sc[s_idx], s=4, alpha=0.3, edgecolors='none')
                 _plot_component_means(ax, all_fits, s_idx)
                 ax.set_xlim(x1_range); ax.set_ylim(x2_range)
                 ax.set_xlabel(dataset_names[0], fontsize=7); ax.set_ylabel(dataset_names[1], fontsize=7)
@@ -1905,33 +3013,48 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
         for c_idx in range(S, n_cols):
             fig.add_subplot(gs[1, c_idx]).axis('off')
 
-        # Rows 2+: marginals — one primary row + n_aux aux rows per dimension
-        _aux_results = analysis.results.get(config, {}).get('aux_results', {})
+        # Rows 2+: marginals — one row per dim, aux comparisons as extra LR columns
         for dim in range(D):
-            base_row = 2 + dim * (1 + n_aux)
+            base_row = 2 + dim
             md = marginal_data[dim]
             if md is None:
-                for r_ in range(1 + n_aux):
-                    for c in range(n_cols):
-                        fig.add_subplot(gs[base_row + r_, c]).axis('off')
+                for c in range(n_cols):
+                    fig.add_subplot(gs[base_row, c]).axis('off')
                 continue
+
+            # Build extra_lr_cols: aux-vs-benign then aux-vs-primary for each aux
+            extra_cols = []
+            for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
+                aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
+                aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
+                            else f'Sample {fixed_idx}')
+                aux_r = _aux_results.get(fixed_idx, {})
+                # aux vs benign
+                extra_cols.append({
+                    'md':      (aux_marginal_data.get(fixed_idx) or {}).get(dim),
+                    'title':   f'{aux_name}\nvs Benign — {dataset_names[dim]}',
+                    'color':   aux_color,
+                    'tau_p':   aux_r.get('tau_p_log', tau_p_log),
+                    'tau_b':   aux_r.get('tau_b_log', tau_b_log),
+                    'rug_top': eff_idx,
+                    'rug_bot': analysis.b_idx,
+                })
+                # aux vs primary pathogenic
+                p_name = sample_names[analysis.p_idx] if analysis.p_idx is not None else 'P/LP'
+                extra_cols.append({
+                    'md':      (aux_vs_primary_marginal_data.get(fixed_idx) or {}).get(dim),
+                    'title':   f'{aux_name}\nvs {p_name} — {dataset_names[dim]}',
+                    'color':   aux_color,
+                    'tau_p':   tau_p_log,
+                    'tau_b':   tau_b_log,
+                    'rug_top': eff_idx,
+                    'rug_bot': analysis.p_idx,
+                })
+
             _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
                                dataset_names, sample_names, tau_p_log, tau_b_log,
                                ylim_bound, path_pctile, ben_pctile, analysis,
-                               sample_style=sample_style)
-            for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
-                aux_md_dim = (aux_marginal_data.get(fixed_idx) or {}).get(dim)
-                aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
-                            else f'Sample {fixed_idx}')
-                aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
-                aux_r = _aux_results.get(fixed_idx, {})
-                aux_tau_p = aux_r.get('tau_p_log', tau_p_log)
-                aux_tau_b = aux_r.get('tau_b_log', tau_b_log)
-                _draw_aux_lr_row(fig, gs, base_row + 1 + ai, dim,
-                                 aux_md_dim, aux_name, aux_color,
-                                 eff_idx, aux_tau_p, aux_tau_b,
-                                 ylim_bound, path_pctile, ben_pctile,
-                                 dataset_names, analysis, n_cols)
+                               sample_style=sample_style, extra_lr_cols=extra_cols)
 
     fig.suptitle(suptitle, fontsize=11, fontweight='bold', y=1.02)
     info = {
@@ -2081,29 +3204,36 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                 path_pctile, ben_pctile, max_pt, pt_norm, ylim_bound,
                 model_label, n_boots_used, pad, n_grid, contour_levels,
                 figsize, suptitle,
-                aux_p_entries=None, aux_marginal_data=None, max_lr_pairs=10,
-                sample_style=None, pairwise_grids_hd=None, pairwise_dim_pairs=None,
+                aux_p_entries=None, aux_marginal_data=None,
+                aux_vs_primary_marginal_data=None,
+                max_lr_pairs=10,
+                sample_style=None, pairwise_grids_hd=None, aux_pairwise_grids_hd=None,
+                pairwise_dim_pairs=None,
                 first_row_only=False):
     """Layout for D>2.
 
     Row 0: pairwise LR+ grids — all C(D,2) combinations up to max_lr_pairs,
            followed by aux pairwise grids for each aux sample (dim 0 vs dim 1 only).
-    Rows 1..D: per-dimension marginals — [S sample density panels] + [marginal LR+].
+    Rows 1..D: per-dimension marginals — [S density cols] + [primary LR+] +
+               [aux-vs-benign LR+] + [aux-vs-primary LR+] for each aux.
     """
     from itertools import combinations as _combinations
     aux_p_entries = aux_p_entries or []
     aux_marginal_data = aux_marginal_data or {}
+    aux_vs_primary_marginal_data = aux_vs_primary_marginal_data or {}
     n_aux = len(aux_p_entries)
     _aux_results = analysis.results.get(config, {}).get('aux_results', {})
     _sc = sample_style['colors']  if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
     _se = sample_style['edges']   if sample_style else [_SAMPLE_EDGE_COLORS[i % len(_SAMPLE_EDGE_COLORS)] for i in range(S)]
     _sm = sample_style['markers'] if sample_style else [SAMPLE_MARKERS[i % len(SAMPLE_MARKERS)] for i in range(S)]
 
-    # Use precomputed pairs if provided, else fall back to all combinations
+    # Use precomputed pairs if provided, else fall back to all combinations.
+    # max_lr_pairs=None means no limit.
     if pairwise_dim_pairs is not None:
-        all_dim_pairs = pairwise_dim_pairs[:max_lr_pairs]
+        all_dim_pairs = pairwise_dim_pairs if max_lr_pairs is None else pairwise_dim_pairs[:max_lr_pairs]
     else:
-        all_dim_pairs = list(_combinations(range(D), 2))[:max_lr_pairs]
+        base = list(_combinations(range(D), 2))
+        all_dim_pairs = base if max_lr_pairs is None else base[:max_lr_pairs]
     n_pairs = len(all_dim_pairs)
     complete = ~np.isnan(scores).any(axis=1)
 
@@ -2116,16 +3246,24 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
             dim_i=dim_i, dim_j=dim_j, total_dims=D,
         )
 
-    # ── first_row_only: rows=dim pairs, cols=samples ──────────────────────────
+    # ── first_row_only: rows=dim pairs, cols=samples + aux-vs-B ─────────────
     if first_row_only:
         n_rows_f = n_pairs
-        n_cols_f = S
+        n_cols_f = S + n_aux
         if figsize is None:
             figsize = (4.8 * n_cols_f, 5.0 * n_rows_f)
         fig = plt.figure(figsize=figsize, constrained_layout=False)
         gs = gridspec.GridSpec(n_rows_f, n_cols_f, figure=fig,
                                hspace=0.5, wspace=0.45,
                                left=0.08, right=0.97, top=0.93, bottom=0.22)
+
+        def _get_aux_pair_grid(fixed_idx, k):
+            """Return (grid_points, lr_conservative) for aux fixed_idx, dim pair k."""
+            if aux_pairwise_grids_hd and fixed_idx in aux_pairwise_grids_hd:
+                grids = aux_pairwise_grids_hd[fixed_idx]
+                if k < len(grids):
+                    return grids[k]
+            return None, None
 
         for k, (dim_i, dim_j) in enumerate(all_dim_pairs):
             xig, xjg = x_grids[dim_i], x_grids[dim_j]
@@ -2193,6 +3331,51 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
                         f'{dataset_names[dim_i]} vs {dataset_names[dim_j]}\n{dataset_names[dim_j]}',
                         fontsize=7)
 
+            # Aux-vs-B columns (columns S..S+n_aux-1)
+            for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
+                aux_col = S + ai
+                aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
+                aux_name = sample_names[eff_idx] if eff_idx < len(sample_names) else f'Aux {ai}'
+                agp, _ = _get_aux_pair_grid(fixed_idx, k)
+                ax = fig.add_subplot(gs[k, aux_col])
+                mask_aux = sa[:, eff_idx] if eff_idx < S else np.zeros(N, dtype=bool)
+                mask_aux_ij = mask_aux & complete_ij
+
+                if mask_aux_ij.any():
+                    ax.scatter(scores[mask_aux_ij, dim_i], scores[mask_aux_ij, dim_j],
+                               c=[aux_color] * int(mask_aux_ij.sum()),
+                               s=14, alpha=0.85, linewidths=0.3,
+                               edgecolors='#333333', zorder=2,
+                               marker=_sm[eff_idx % len(_sm)])
+
+                if agp is not None and agp.any():
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        ax.contourf(xig, xjg, agp.T,
+                                    levels=[-8.5, -0.5, 0.5, 8.5],
+                                    colors=['#2c7bb6', '#f7f7f7', '#d7191c'],
+                                    alpha=0.07, zorder=1)
+                        for lvl, col in [(0.5, '#d7191c'), (-0.5, '#2c7bb6')]:
+                            try:
+                                ax.contour(xig, xjg, agp.T,
+                                           levels=[lvl], colors=[col],
+                                           linewidths=0.7, alpha=0.5, zorder=3)
+                            except Exception:
+                                pass
+
+                ax.set_xlim(xig[0], xig[-1]); ax.set_ylim(xjg[0], xjg[-1])
+                ax.set_xlabel(dataset_names[dim_i], fontsize=7)
+                ax.tick_params(labelsize=6)
+                ax.set_facecolor('#f8f8f8')
+                ax.grid(lw=0.15, alpha=0.3, zorder=0, color='white')
+                if k == 0:
+                    ax.set_title(f'{aux_name}\nvs Benign (n={int(mask_aux.sum())})',
+                                 fontsize=8, fontweight='bold', color=aux_color, pad=3)
+                if ai == 0:
+                    ax.set_ylabel(
+                        f'{dataset_names[dim_i]} vs {dataset_names[dim_j]}\n{dataset_names[dim_j]}',
+                        fontsize=7)
+
         all_gp = np.concatenate([_get_pair_grid(k, di, dj)[0].ravel()
                                   for k, (di, dj) in enumerate(all_dim_pairs)])
         present_evs = sorted({int(v) for v in np.unique(all_gp) if -8 <= v <= 8})
@@ -2218,13 +3401,15 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
         return fig, {'n_boots_used': n_boots_used}
 
     # ── full layout ────────────────────────────────────────────────────────────
-    n_cols  = max(max(S, 2) + 1, n_pairs + n_aux)
-    # Each dimension: 1 primary row + n_aux aux-LR rows
-    n_rows  = 1 + D * (1 + n_aux)
-    height_ratios = [1.6] + ([0.9] + [0.5] * n_aux) * D
+    n_extra_lr = n_aux * 2   # per dim: n_aux (vs benign) + n_aux (vs primary)
+    # Row 0 needs n_pairs + n_aux cols; marginal rows need S + 1 + n_extra_lr cols
+    n_cols  = max(n_pairs + n_aux, S + 1 + n_extra_lr)
+    # One row per dimension (aux comparisons are extra columns, not extra rows)
+    n_rows  = 1 + D
+    height_ratios = [1.6] + [0.9] * D
     if figsize is None:
         figsize = (max(4.5 * n_cols, 4.5 * (n_pairs + n_aux)),
-                   4.0 + 3.0 * D + 1.5 * D * n_aux)
+                   4.0 + 3.0 * D)
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(n_rows, n_cols, figure=fig,
                            height_ratios=height_ratios,
@@ -2276,11 +3461,15 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
             aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
                         else f'Sample {fixed_idx}')
             aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
-            print(f"  Computing aux LR+ grid for {aux_name} (idx={fixed_idx})...")
-            aux_gp, aux_lr_con = _compute_conservative_lr_grid(
-                analysis, config, all_fits, xig, xjg,
-                dim_i=0, dim_j=1, total_dims=D, p_idx_override=eff_idx,
-            )
+            _aux_precomputed = (aux_pairwise_grids_hd or {}).get(fixed_idx, [])
+            if _aux_precomputed:
+                aux_gp, aux_lr_con = _aux_precomputed[0]
+            else:
+                print(f"  Computing aux LR+ grid for {aux_name} (idx={fixed_idx})...")
+                aux_gp, aux_lr_con = _compute_conservative_lr_grid(
+                    analysis, config, all_fits, xig, xjg,
+                    dim_i=0, dim_j=1, total_dims=D, p_idx_override=eff_idx,
+                )
             im2 = ax.pcolormesh(xig, xjg, aux_gp.T, cmap=POINT_CMAP,
                                 norm=pt_norm, shading='auto', alpha=0.7)
             plt.colorbar(im2, ax=ax, label='Points', shrink=0.8)
@@ -2309,33 +3498,48 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
         fig.add_subplot(gs[0, c_idx]).axis('off')
 
     # ═══════════════════════════════════════
-    # Rows 1+: per-dimension marginals — primary row + n_aux aux-LR rows each
+    # Rows 1+: per-dimension marginals — one row per dim, aux as extra LR columns
     # ═══════════════════════════════════════
     for dim in range(D):
-        base_row = 1 + dim * (1 + n_aux)
+        base_row = 1 + dim
         md = marginal_data[dim]
         if md is None:
-            for r_ in range(1 + n_aux):
-                for c in range(n_cols):
-                    fig.add_subplot(gs[base_row + r_, c]).axis('off')
+            for c in range(n_cols):
+                fig.add_subplot(gs[base_row, c]).axis('off')
             continue
+
+        extra_cols = []
+        for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
+            aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
+            aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
+                        else f'Sample {fixed_idx}')
+            aux_r = _aux_results.get(fixed_idx, {})
+            # aux vs benign
+            extra_cols.append({
+                'md':      (aux_marginal_data.get(fixed_idx) or {}).get(dim),
+                'title':   f'{aux_name}\nvs Benign — {dataset_names[dim]}',
+                'color':   aux_color,
+                'tau_p':   aux_r.get('tau_p_log', tau_p_log),
+                'tau_b':   aux_r.get('tau_b_log', tau_b_log),
+                'rug_top': eff_idx,
+                'rug_bot': analysis.b_idx,
+            })
+            # aux vs primary pathogenic
+            p_name = sample_names[analysis.p_idx] if analysis.p_idx is not None else 'P/LP'
+            extra_cols.append({
+                'md':      (aux_vs_primary_marginal_data.get(fixed_idx) or {}).get(dim),
+                'title':   f'{aux_name}\nvs {p_name} — {dataset_names[dim]}',
+                'color':   aux_color,
+                'tau_p':   tau_p_log,
+                'tau_b':   tau_b_log,
+                'rug_top': eff_idx,
+                'rug_bot': analysis.p_idx,
+            })
+
         _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
                            dataset_names, sample_names, tau_p_log, tau_b_log,
                            ylim_bound, path_pctile, ben_pctile, analysis,
-                           sample_style=sample_style)
-        for ai, (fixed_idx, eff_idx) in enumerate(aux_p_entries):
-            aux_md_dim = (aux_marginal_data.get(fixed_idx) or {}).get(dim)
-            aux_name = (sample_names[fixed_idx] if fixed_idx < len(sample_names)
-                        else f'Sample {fixed_idx}')
-            aux_color = _AUX_COLORS[ai % len(_AUX_COLORS)]
-            aux_r = _aux_results.get(fixed_idx, {})
-            aux_tau_p = aux_r.get('tau_p_log', tau_p_log)
-            aux_tau_b = aux_r.get('tau_b_log', tau_b_log)
-            _draw_aux_lr_row(fig, gs, base_row + 1 + ai, dim,
-                             aux_md_dim, aux_name, aux_color,
-                             eff_idx, aux_tau_p, aux_tau_b,
-                             ylim_bound, path_pctile, ben_pctile,
-                             dataset_names, analysis, n_cols)
+                           sample_style=sample_style, extra_lr_cols=extra_cols)
 
     fig.suptitle(suptitle, fontsize=11, fontweight='bold', y=1.01)
     info = {

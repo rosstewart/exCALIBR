@@ -311,18 +311,29 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         # Get sample mask
         sample_mask = scoreset.sample_assignments[:,sample_num-num_skipped]
         
+        sample_scores = scoreset.scores[sample_mask]
+        # Cap bins to 100: Freedman-Diaconis can produce millions of bins when
+        # IQR is near zero (e.g. all P/LP scores clustered at one extreme).
+        n = len(sample_scores)
+        q1, q3 = np.percentile(sample_scores, [25, 75])
+        iqr = q3 - q1
+        fd_width = 2 * iqr * n ** (-1 / 3) if iqr > 0 else 0
+        score_range_width = sample_scores.max() - sample_scores.min()
+        bins = min(100, int(score_range_width / fd_width)) if fd_width > 0 else 50
+        bins = max(bins, 10)
+
         # Plot based on sample number (which category)
         if sample_num == 0:  # P/LP
-            sns.histplot(scoreset.scores[sample_mask], 
+            sns.histplot(sample_scores, bins=bins,
                          stat='density', ax=ax_fit, alpha=0.6, color='#CA7682')
         elif sample_num == 1:  # B/LB
-            sns.histplot(scoreset.scores[sample_mask], 
+            sns.histplot(sample_scores, bins=bins,
                          stat='density', ax=ax_fit, alpha=0.6, color='#1D7AAB')
         elif sample_num == 2:  # gnomAD
-            sns.histplot(scoreset.scores[sample_mask], 
+            sns.histplot(sample_scores, bins=bins,
                          stat='density', ax=ax_fit, alpha=0.3, color='#A0A0A0')
         elif sample_num == 3:  # Synonymous
-            sns.histplot(scoreset.scores[sample_mask], 
+            sns.histplot(sample_scores, bins=bins,
                          stat='density', ax=ax_fit, alpha=0.5, color='#6BAA75')
     
         max_hist_density = max([patch.get_height() for patch in ax_fit.patches]) if ax_fit.patches else 1.0
@@ -354,11 +365,13 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     for sample_num in range(n_samples):
         ax_points = ax[1, sample_num]
         
-        # Plot only this sample's point assignments
+        # Plot only this sample's point assignments (clip inf to xlim for rendering)
         for pointIdx, (pointVal, scoreRanges) in enumerate(point_ranges):
             for sr in scoreRanges:
-                ax_points.plot([sr[0], sr[1]], [pointIdx, pointIdx], 
-                             color='red' if pointVal > 0 else 'blue', 
+                x0 = xlim[0] if np.isneginf(sr[0]) else max(sr[0], xlim[0])
+                x1 = xlim[1] if np.isposinf(sr[1]) else min(sr[1], xlim[1])
+                ax_points.plot([x0, x1], [pointIdx, pointIdx],
+                             color='red' if pointVal > 0 else 'blue',
                              linestyle='-', alpha=0.7, linewidth=2)
         
         ax_points.set_ylim(-1, len(point_values))
@@ -633,12 +646,24 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
 def plot_scores_only(dataset, scoreset):
     n_samples = len([s for s in scoreset.samples])
     score_range = [min(scoreset.scores), max(scoreset.scores)]
-    
-    fig, ax = plt.subplots(1, n_samples, figsize=(7*n_samples, 6), 
+
+    fig, ax = plt.subplots(1, n_samples, figsize=(7*n_samples, 6),
                            squeeze=False, gridspec_kw={'hspace': 0.3, 'wspace': 0.3})
-    
+
     COLORS = {0: '#CA7682', 1: '#1D7AAB', 2: '#A0A0A0', 3: '#6BAA75'}
     ALPHAS  = {0: 0.6,      1: 0.6,      2: 0.3,      3: 0.5}
+
+    # Use a single bin width for every sample so histograms are comparable.
+    # Each sample's adaptive bin count (sqrt(n), floor=5, cap=30) implies a
+    # candidate width; take the smallest of these (i.e. the finest binning,
+    # from the sample with the most observations) as the shared bin edges.
+    n_bins_per_sample = [
+        int(np.clip(np.sqrt(scoreset.sample_counts[sample_num]), 5, 30))
+        for sample_num in range(len(scoreset.sample_counts))
+        if scoreset.sample_counts[sample_num] > 0
+    ]
+    shared_n_bins = max(n_bins_per_sample) if n_bins_per_sample else 1
+    bin_edges = np.linspace(score_range[0], score_range[1], shared_n_bins + 1)
 
     num_skipped = 0
     for sample_num in range(len(scoreset.sample_counts)):
@@ -650,13 +675,9 @@ def plot_scores_only(dataset, scoreset):
         sample_scores = scoreset.scores[sample_mask]
         n = sample_mask.sum()
 
-        # Adaptive bin count: sqrt(n) with floor=5, cap=30
-        n_bins = int(np.clip(np.sqrt(n), 5, 30))
-
         sns.histplot(
             sample_scores,
-            bins=n_bins,
-            binrange=score_range,   # pin to global range for comparability
+            bins=bin_edges,        # shared bin width across all samples
             stat='density',
             ax=ax_fit,
             alpha=ALPHAS.get(sample_num, 0.5),

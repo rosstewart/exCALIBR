@@ -99,20 +99,17 @@ class BootstrapRunner:
             for minimal_job in job_data['jobs']
         ]
 
-        # Build the joblib generator
-        # NOTE: verbose=10 is changed to verbose=0 since progress is now handled by reporter.track() instead of joblib's built-in printing.
-        job_gen = Parallel(n_jobs=self.config.n_jobs, verbose=0, return_as="generator")(
+        # Run all fits; return_as="generator" is joblib >=1.2.0 only so we
+        # collect as a plain list and accept that per-fit progress is coarser.
+        flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=0)(
             delayed(BootstrapRunner._execute_single_fit)(
                 minimal_job, shared_data, self.config.dataset_name
             )
             for _, _, minimal_job, shared_data in flat_tasks
         )
-
-        # Stream results — reporter.track() updates progress after each fit
         if self.reporter is not None:
-            flat_results = list(self.reporter.track(job_gen, total=len(flat_tasks)))
-        else:
-            flat_results = list(job_gen)
+            # reporter.track is a no-op here but keeps the interface intact
+            flat_results = list(self.reporter.track(iter(flat_results), total=len(flat_tasks)))
 
         # Aggregate: keep best fit by val_ll per (bootstrap_seed, component_key)
         best_fits: Dict = {}

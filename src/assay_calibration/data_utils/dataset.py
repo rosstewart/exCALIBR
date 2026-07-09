@@ -9,6 +9,7 @@ from tqdm import tqdm
 import json
 from joblib import Parallel, delayed  # noqa: F401
 from typing import Union
+import copy as _copy
 
 logging.basicConfig()
 logging.root.setLevel(logging.NOTSET)
@@ -258,7 +259,7 @@ def standardize_auth_label(
 
 class BasicScoreset:
     def __init__(self, scores, sample_assignments, ids=None, **kwargs):
-        self.scores = np.asarray(scores)
+        self.scores = np.asarray(scores, dtype=float)
         self._sample_assignments = np.asarray(sample_assignments)
         if ids is not None:
             ids = np.asarray(list(ids))
@@ -268,18 +269,35 @@ class BasicScoreset:
                     f"{len(self.scores)}"
                 )
         self._ids = ids
+
+        # Drop rows with NaN scores before any validation
+        nan_mask = np.isnan(self.scores)
+        if nan_mask.any():
+            import warnings
+            warnings.warn(
+                f"Dropping {nan_mask.sum()} row(s) with NaN scores.",
+                stacklevel=2,
+            )
+            keep = ~nan_mask
+            self.scores = self.scores[keep]
+            self._sample_assignments = self._sample_assignments[keep]
+            if self._ids is not None:
+                self._ids = self._ids[keep]
+
         self.validate_inputs()
         self.validate_sample_assignments()
         self.sample_counts = self._sample_assignments.sum(axis=0)
         self.scoreset_name = kwargs.get("scoreset_name", "BasicScoreset")
-        _default_names_4 = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD", "Synonymous"]
-        _default_names_3 = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD"]
+        _standard_4 = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD", "Synonymous"]
         if "sample_names" in kwargs:
-            self.sample_names = kwargs["sample_names"]
-        elif self.n_samples == 3:
-            self.sample_names = _default_names_3
+            self.sample_names = list(kwargs["sample_names"])
         else:
-            self.sample_names = _default_names_4[:self.n_samples]
+            # Columns 0-3 always get standard names; extras beyond 4 must be
+            # supplied via sample_names — default to generic "Sample N" placeholders.
+            names = list(_standard_4[:min(self.n_samples, 4)])
+            while len(names) < self.n_samples:
+                names.append(f"Sample {len(names)}")
+            self.sample_names = names
 
     def validate_inputs(self):
         n_observations = self.scores.shape[0]
@@ -297,12 +315,32 @@ class BasicScoreset:
                 #     "Assuming sample_assignments is list of comma-separated strings"
                 # )
                 # Always split on comma — single values like "2" split fine into ["2"]
-                all_keys = sorted({k for v in sample_vals for k in str(v).split(',')})
-                key_to_idx = {k: i for i, k in enumerate(all_keys)}
-                result = np.zeros((len(sample_vals), len(all_keys)), dtype=bool)
-                for row, v in enumerate(sample_vals):
-                    for k in str(v).split(','):
-                        result[row, key_to_idx[k]] = True
+                # Exclude empty strings and "nan" tokens (unassigned rows)
+                def _valid_key(k):
+                    return k and k.lower() != 'nan'
+                all_keys = sorted({k for v in sample_vals for k in str(v).split(',') if _valid_key(k)})
+                # When all keys are non-negative integers, use their numeric value as the
+                # column index so that gaps (e.g. no sample '3') become zero-count columns
+                # rather than being compressed out — preserving alignment with sample_names.
+                if all(k.lstrip('-').isdigit() and int(k) >= 0 for k in all_keys):
+                    # Always at least 4 columns so columns 0-3 always map to the
+                    # standard four samples (P/LP, B/LB, gnomAD, Synonymous), even
+                    # when some of those keys are absent from the data.  This keeps
+                    # the column layout identical to Scoreset so the same index-
+                    # shifting logic in visualize.py applies to both.
+                    n_cols = max(4, int(all_keys[-1]) + 1)
+                    result = np.zeros((len(sample_vals), n_cols), dtype=bool)
+                    for row, v in enumerate(sample_vals):
+                        for k in str(v).split(','):
+                            if _valid_key(k) and k.lstrip('-').isdigit() and int(k) >= 0:
+                                result[row, int(k)] = True
+                else:
+                    key_to_idx = {k: i for i, k in enumerate(all_keys)}
+                    result = np.zeros((len(sample_vals), len(all_keys)), dtype=bool)
+                    for row, v in enumerate(sample_vals):
+                        for k in str(v).split(','):
+                            if _valid_key(k) and k in key_to_idx:
+                                result[row, key_to_idx[k]] = True
                 self._sample_assignments = result
             else:
                 # print(
@@ -319,21 +357,6 @@ class BasicScoreset:
                 f"sample_assignments must be a 1D list of sample ids or 2D array of one-hot vectors, got {ndim} dimensions"
             )
 
-        # Warn if any sample has no exclusive variants — makeOneHot coverage will be
-        # infeasible for that sample, causing an error during bootstrap fitting.
-        sa = np.array(self._sample_assignments)
-        if sa.ndim == 2 and sa.shape[1] > 1:
-            shared_mask = sa.sum(axis=1) > 1
-            for s in range(sa.shape[1]):
-                n_exclusive = (sa[:, s] & ~shared_mask).sum()
-                if sa[:, s].any() and n_exclusive == 0:
-                    import warnings
-                    warnings.warn(
-                        f"Sample index {s} has no exclusive variants "
-                        f"(all {int(sa[:, s].sum())} variant(s) are shared with other samples). "
-                        f"Bootstrap one-hot assignment may be infeasible for this sample.",
-                        stacklevel=3,
-                    )
 
     @property
     def sample_assignments(self):
@@ -355,8 +378,8 @@ class BasicScoreset:
                     self._sample_assignments[:, sample_index]
                 ], self.sample_names[sample_index]
 
-    def plot(self, bins=None):
-        return _plot_scoreset_scores(self, bins=bins)
+    def plot(self, bins=None, **kwargs):
+        return _plot_scoreset_scores(self, bins=bins, **kwargs)
 
     # @property
     # def samples(self):
@@ -474,6 +497,80 @@ class Scoreset:
             A Scoreset object initialized with the given dataframe
         """
         return cls(dataframe, **kwargs)
+
+    @classmethod
+    def from_scoreset(
+        cls,
+        scoreset: "Scoreset",
+        discordance_pct: float = 0.0,
+        downsample_n_variants: int = None,
+        perturbation_seed: int = None,
+    ) -> "Scoreset":
+        """
+        Build a new Scoreset by applying discordance/downsampling to a copy of an
+        already-built Scoreset, without re-parsing the source dataframe/variants.
+
+        Parameters
+        ----------
+        scoreset : Scoreset
+            Source scoreset — typically one built with no discordance/downsampling
+            (discordance_pct=0.0, downsample_n_variants=None).
+        discordance_pct : float (default 0.0)
+            Fraction of P/B labels to swap; forwarded to add_label_noise.
+        downsample_n_variants : int or None (default None)
+            Max number of P/B variants to keep; forwarded to downsample_controls.
+        perturbation_seed : int or None (default None)
+            Random seed used for both label-noise sampling and downsampling (each
+            draws from its own independent RNG stream, so sharing one seed does not
+            correlate the two perturbations). If None and discordance_pct != 0,
+            falls back to the legacy deterministic seed derived from
+            discordance_pct. Required if downsample_n_variants is set.
+
+        Returns
+        -------
+        Scoreset
+            A new, independent Scoreset instance with freshly perturbed sample
+            arrays; the original `scoreset` is left untouched.
+        """
+        new = _copy.copy(scoreset)
+        new._scores = scoreset._scores.copy()
+        new._sample_assignments = scoreset._sample_assignments.copy()
+        new._auth_labels = scoreset._auth_labels.copy()
+        new._raw_func_classes = scoreset._raw_func_classes.copy()
+        new._extra_func_classes = (
+            scoreset._extra_func_classes.copy()
+            if scoreset._extra_func_classes is not None
+            else None
+        )
+        new._aa_subs = scoreset._aa_subs.copy()
+
+        new.discordance_pct = discordance_pct
+        new.discordance_seed = perturbation_seed
+        new.downsample_n_variants = downsample_n_variants
+        new.downsample_seed = perturbation_seed
+
+        if discordance_pct != 0:
+            new._sample_assignments = new.add_label_noise(
+                new._sample_assignments, discordance_pct, seed=perturbation_seed
+            )
+
+        if downsample_n_variants is not None:
+            keep_mask_downsample = new.downsample_controls(
+                new._sample_assignments, downsample_n_variants, perturbation_seed
+            )
+            new._keep_mask_downsample = keep_mask_downsample
+            new._scores = new._scores[keep_mask_downsample]
+            new._sample_assignments = new._sample_assignments[keep_mask_downsample]
+            new._auth_labels = new._auth_labels[keep_mask_downsample]
+            new._raw_func_classes = new._raw_func_classes[keep_mask_downsample]
+            if new._extra_func_classes is not None:
+                new._extra_func_classes = new._extra_func_classes[keep_mask_downsample]
+            new._aa_subs = new._aa_subs[keep_mask_downsample]
+
+        new.n_variants = len(new._scores)
+        new.sample_counts = new._sample_assignments.sum(axis=0)
+
+        return new
 
     @classmethod
     def from_json(cls, json_path: Union[Path, str], **kwargs):
@@ -736,6 +833,7 @@ class Scoreset:
 
         # for discordance and downsampling analyses
         self.discordance_pct = kwargs.get("discordance_pct",0.0)
+        self.discordance_seed = kwargs.get("discordance_seed",None)
         self.downsample_n_variants = kwargs.get("downsample_n_variants",None)
         self.downsample_seed = kwargs.get("downsample_seed",None)
         
@@ -979,7 +1077,9 @@ class Scoreset:
 
 
         if self.discordance_pct != 0:
-            self._sample_assignments = self.add_label_noise(self._sample_assignments, self.discordance_pct)
+            self._sample_assignments = self.add_label_noise(
+                self._sample_assignments, self.discordance_pct, seed=self.discordance_seed
+            )
 
         if self.downsample_n_variants is not None:
             keep_mask_downsample = self.downsample_controls(self._sample_assignments, self.downsample_n_variants, self.downsample_seed)
@@ -1000,18 +1100,24 @@ class Scoreset:
 
     
 
-    def add_label_noise(self, sample_assignments, discordance_pct):
+    def add_label_noise(self, sample_assignments, discordance_pct, seed=None):
         """
         Introduces label noise by overwriting a discordance_pct fraction of pathogenic
         (col 0) rows with randomly sampled benign rows, and vice versa. Each class is
         treated independently, so 1% discordance means exactly 1% of P and 1% of B
         are affected. Sampling is done from the original assignments to avoid
-        order-dependency. Seed is deterministic based on discordance_pct.
+        order-dependency.
+
+        seed : int or None
+            Random seed for sampling. If None, falls back to a seed deterministically
+            derived from discordance_pct (legacy behavior).
         """
         assert 0 <= discordance_pct <= 0.5, (
             f"discordance_pct must be between 0 and 0.5 inclusive, got {discordance_pct}"
         )
-        rng = np.random.default_rng(seed=int(discordance_pct * 1e6))
+        if seed is None:
+            seed = int(discordance_pct * 1e6)
+        rng = np.random.default_rng(seed=seed)
         assignments = sample_assignments.copy()
     
         path_idx = np.where(assignments[:, 0])[0]
@@ -1176,8 +1282,8 @@ class Scoreset:
     def keep_mask(self):
         return self._keep_mask
 
-    def plot(self, bins=None):
-        return _plot_scoreset_scores(self, bins=bins)
+    def plot(self, bins=None, **kwargs):
+        return _plot_scoreset_scores(self, bins=bins, **kwargs)
 
     def __repr__(self):
         out = f"{self.scoreset_name}: {len(self.scores)} total variants\n"
@@ -1488,8 +1594,12 @@ def csv_to_vcf(input_filepath, output_filepath):
 
 
 
-def _plot_scoreset_scores(scoreset, bins=None):
-    """Histogram of scores per sample for a univariate Scoreset or BasicScoreset."""
+def _plot_scoreset_scores(scoreset, bins=None, density=True, shared_ylim=None, **kwargs):
+    """Histogram of scores per sample for a univariate Scoreset or BasicScoreset.
+
+    shared_ylim : list of sample indices (raw, pre-filter) whose panels should
+                  share the same y-axis limit (the max across that group).
+    """
     import matplotlib.pyplot as plt
     import seaborn as sns
 
@@ -1497,17 +1607,17 @@ def _plot_scoreset_scores(scoreset, bins=None):
     score_range = [float(np.nanmin(scores)), float(np.nanmax(scores))]
     n_active = int((scoreset.sample_counts > 0).sum())
 
+    # Resolve which raw sample indices are active; use this list for both
+    # data access (via the filtered sample_assignments columns) and name/color lookup.
+    active_indices = [i for i in range(len(scoreset.sample_counts)) if scoreset.sample_counts[i] > 0]
+
     if bins is None:
         # Use the bin count of the sample with the smallest natural bin width
         # (largest sqrt(n)), so all panels share consistent resolution.
         max_n_bins = 5
-        c = 0
-        for sn in range(len(scoreset.sample_counts)):
-            if scoreset.sample_counts[sn] == 0:
-                continue
-            n = int(scoreset.sample_assignments[:, c].sum())
+        for col, _ in enumerate(active_indices):
+            n = int(scoreset.sample_assignments[:, col].sum())
             max_n_bins = max(max_n_bins, int(np.clip(np.sqrt(n), 5, 30)))
-            c += 1
         bins = max_n_bins
 
     fig, axes = plt.subplots(
@@ -1517,40 +1627,54 @@ def _plot_scoreset_scores(scoreset, bins=None):
     COLORS = {0: '#CA7682', 1: '#1D7AAB', 2: '#A0A0A0', 3: '#6BAA75'}
     ALPHAS  = {0: 0.6,      1: 0.6,      2: 0.3,      3: 0.5}
 
-    col = 0
-    for sample_num in range(len(scoreset.sample_counts)):
-        if scoreset.sample_counts[sample_num] == 0:
-            continue
+    panel_max_y = {}  # col -> max bar height, for shared_ylim post-pass
+
+    for col, sample_num in enumerate(active_indices):
         ax = axes[0, col]
         mask = scoreset.sample_assignments[:, col].astype(bool)
         sample_scores = scores[mask]
         n = int(mask.sum())
         sns.histplot(
             sample_scores, bins=bins, binrange=score_range,
-            stat='density', ax=ax,
+            stat='density' if density else 'count', ax=ax,
             alpha=ALPHAS.get(sample_num, 0.5),
             color=COLORS.get(sample_num, '#888888'),
         )
-        max_density = max((p.get_height() for p in ax.patches), default=1.0)
-        ax.set_title(f"{scoreset.sample_names[sample_num]}\n(n={n:,d})")
+        max_y = max((p.get_height() for p in ax.patches), default=1.0)
+        panel_max_y[col] = max_y
+        name = scoreset.sample_names[sample_num] if sample_num < len(scoreset.sample_names) else f"Sample {sample_num}"
+        ax.set_title(f"{name}\n(n={n:,d})")
         ax.set_xlabel("Score")
-        ax.set_ylabel("Density")
-        ax.set_ylim([0, max_density * 1.1])
+        ax.set_ylabel("Density" if density else "Count")
+        ax.set_ylim([0, max_y * 1.1])
         ax.grid(linewidth=0.5, alpha=0.3)
-        col += 1
+
+    # Equalize y-limits for the requested group of sample indices
+    if shared_ylim is not None:
+        shared_set = set(shared_ylim)
+        cols_in_group = [col for col, sample_num in enumerate(active_indices) if sample_num in shared_set]
+        if cols_in_group:
+            group_max = max(panel_max_y[col] for col in cols_in_group)
+            for col in cols_in_group:
+                axes[0, col].set_ylim([0, group_max * 1.1])
 
     fig.suptitle(scoreset.scoreset_name, fontsize=18, fontweight="heavy", y=1.02)
     return fig
 
 
-def _plot_multiscoreset_scores(scoreset, dim_pairs=None, max_pairs=10):
+def _plot_multiscoreset_scores(scoreset, dim_pairs=None, max_pairs=10, ref_dim=None):
     """2-D scatter of score dimensions per sample for a MultiScoreset or BasicMultiScoreset."""
     import matplotlib.pyplot as plt
     from itertools import combinations
 
     all_pairs = list(combinations(range(scoreset.d), 2))
     if dim_pairs is None:
-        dim_pairs = all_pairs[:max_pairs]
+        if ref_dim is not None:
+            dim_pairs = [(ref_dim, j) for j in range(scoreset.d) if j != ref_dim]
+        elif max_pairs is None:
+            dim_pairs = all_pairs
+        else:
+            dim_pairs = all_pairs[:max_pairs]
 
     n_pairs = len(dim_pairs)
     sa = scoreset.sample_assignments   # (N, n_active), empty columns dropped
@@ -1987,8 +2111,8 @@ class MultiScoreset:
     def synonymous_mask(self):
         return self._sample_assignments[:, 3]
 
-    def plot(self, dim_pairs=None, max_pairs=10):
-        return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs)
+    def plot(self, dim_pairs=None, max_pairs=10, ref_dim=None):
+        return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs, ref_dim=ref_dim)
 
     def __repr__(self):
         out = f"MultiScoreset: {self.scoreset_name}\n"
@@ -2069,13 +2193,30 @@ class BasicMultiScoreset:
         sa_vals = np.asarray(sa_vals)
         if sa_vals.ndim == 2:
             return sa_vals.astype(bool)
+
+        def _valid_key(k):
+            return k and k.lower() != 'nan'
+
         if sa_vals.dtype.kind in ('U', 'O'):
-            all_keys = sorted({k for v in sa_vals for k in str(v).split(',')})
-            key_to_idx = {k: i for i, k in enumerate(all_keys)}
-            result = np.zeros((len(sa_vals), len(all_keys)), dtype=bool)
-            for row, v in enumerate(sa_vals):
-                for k in str(v).split(','):
-                    result[row, key_to_idx[k]] = True
+            all_keys = sorted({
+                k for v in sa_vals for k in str(v).split(',') if _valid_key(k)
+            })
+            if all(k.lstrip('-').isdigit() and int(k) >= 0 for k in all_keys):
+                # Preserve gaps and always allocate at least 4 columns so
+                # columns 0-3 stay aligned with the standard four sample types.
+                n_cols = max(4, int(all_keys[-1]) + 1)
+                result = np.zeros((len(sa_vals), n_cols), dtype=bool)
+                for row, v in enumerate(sa_vals):
+                    for k in str(v).split(','):
+                        if _valid_key(k) and k.lstrip('-').isdigit() and int(k) >= 0:
+                            result[row, int(k)] = True
+            else:
+                key_to_idx = {k: i for i, k in enumerate(all_keys)}
+                result = np.zeros((len(sa_vals), len(all_keys)), dtype=bool)
+                for row, v in enumerate(sa_vals):
+                    for k in str(v).split(','):
+                        if _valid_key(k) and k in key_to_idx:
+                            result[row, key_to_idx[k]] = True
             return result
         # numeric — treat each value as a sample identifier
         unique_samples = sorted(set(sa_vals))
@@ -2311,8 +2452,8 @@ class BasicMultiScoreset:
             return self._sample_assignments[:, 3]
         return np.zeros(self.n_variants, dtype=bool)
 
-    def plot(self, dim_pairs=None, max_pairs=10):
-        return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs)
+    def plot(self, dim_pairs=None, max_pairs=10, ref_dim=None):
+        return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs, ref_dim=ref_dim)
 
     def __repr__(self):
         out = f"BasicMultiScoreset: {self.scoreset_name}\n"

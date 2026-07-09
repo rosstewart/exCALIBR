@@ -27,8 +27,9 @@ def setup_logging(output_dir: str, dataset_name: str) -> logging.Logger:
     
     log_file = log_dir / f"{dataset_name}_pipeline.log"
     
-    # Create logger
-    logger = logging.getLogger('calibration_pipeline')
+    # Use a per-call name so concurrent threads get independent loggers
+    # and don't accumulate each other's handlers.
+    logger = logging.getLogger(f'calibration_pipeline.{dataset_name}')
     logger.setLevel(logging.INFO)
     
     # Fix both problems
@@ -109,12 +110,22 @@ def save_results(
         logger.info(f"  Saved calibration: {json_file}")
 
         # 2. LR interpolation over score range (always saved)
+        # Store precomputed percentile curves (5th/50th/95th) rather than all
+        # 1000 bootstrap rows — reduces file size ~300× with no downstream loss.
         if 'score_range' in calibration and 'log_lr_plus' in calibration:
+            import numpy as _np
+            llr = _np.asarray(calibration['log_lr_plus'])
+            pct = _np.nanpercentile(llr, [5, 50, 95], axis=0)
+            priors_arr = _np.asarray(calibration.get('priors', calibration['prior']))
+            priors_pct = _np.nanpercentile(priors_arr, [5, 50, 95]).tolist()
             lr_data = {
                 'dataset': config.dataset_name,
                 'n_c': component_key,
                 'score_range': calibration['score_range'],
-                'log_lr_plus': calibration['log_lr_plus'],
+                'log_lr_plus_p5': pct[0].tolist(),
+                'log_lr_plus_p50': pct[1].tolist(),
+                'log_lr_plus_p95': pct[2].tolist(),
+                'priors_pct': priors_pct,
                 'prior': calibration['prior'],
                 'scoreset_flipped': calibration.get('scoreset_flipped', False),
             }

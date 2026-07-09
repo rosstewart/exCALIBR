@@ -289,7 +289,13 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
         # More robust than Blanchard-Recht: does not assume fpop/fbenign ≥ 1-α pointwise,
         # which breaks when fitted model weights don't satisfy the mixture decomposition.
         if mode == 'negative_unlabeled':
-            labeled = scores[sa[:, benign_idx]]
+            if benign_method == 'synonymous' and synonymous_idx is not None:
+                lab_mask = sa[:, synonymous_idx].astype(bool)
+            elif benign_method == 'avg' and synonymous_idx is not None:
+                lab_mask = sa[:, benign_idx].astype(bool) | sa[:, synonymous_idx].astype(bool)
+            else:
+                lab_mask = sa[:, benign_idx].astype(bool)
+            labeled = scores[lab_mask]
             labeled_density = density_utils.joint_densities(
                 labeled, params, weights[benign_idx] if benign_method != 'avg'
                 else (np.array(weights[benign_idx]) + np.array(weights[synonymous_idx])) / 2
@@ -409,10 +415,18 @@ def check_thresholds_reached(lrPlus, tau, point_values, pathogenicOrBenign):
 
 
 
+def _compute_log_fp_only(fit, score_range, pathogenic_idx):
+    """Compute only log pathogenic density for one bootstrap fit (top-level for pickling)."""
+    params = fit['fit']['component_params']
+    weights = fit['fit']['weights']
+    return density_utils.mixture_pdf(score_range, params, weights[pathogenic_idx])
+
+
 def compute_single_fit_log_densities(fit, prior, score_range, benign_method,
-                                     pathogenic_idx=0, benign_idx=1, 
+                                     pathogenic_idx=0, benign_idx=1,
                                      gnomad_idx=2, synonymous_idx=3,
-                                     log_density_threshold=-7.0):
+                                     log_density_threshold=-7.0,
+                                     precomputed_log_fp=None):
     """
     Compute log pathogenic and benign densities for a single fit.
     
@@ -450,7 +464,10 @@ def compute_single_fit_log_densities(fit, prior, score_range, benign_method,
         raise ValueError("Must have at least one of pathogenic or benign sample")
     
     if have_pathogenic:
-        log_fp = density_utils.mixture_pdf(score_range, params, weights[pathogenic_idx])
+        if precomputed_log_fp is not None:
+            log_fp = precomputed_log_fp
+        else:
+            log_fp = density_utils.mixture_pdf(score_range, params, weights[pathogenic_idx])
     else:
         # Get effective benign weights
         if benign_method == 'synonymous' and synonymous_idx is not None:

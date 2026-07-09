@@ -320,34 +320,493 @@ def print_latex_table(agg, keep=None):
     print(r'\end{tabular}')
 
 
+# ── Build agg from pre-computed results_df ───────────────────────────────────
+
+def build_agg_from_results_df(results_df, gene_ms, config='3c_unc', percentile=25):
+    """Build an agg dict from a results_df produced by the per-gene metrics loop.
+
+    results_df must have columns mv_TP, mv_TN, mv_FP, mv_FN (and assay_ equivalents)
+    as written by full_metrics().  gene_ms is used only to derive the uncertain split
+    (uncertain_path = n_plp - TP - FN, uncertain_benign = n_blb - TN - FP).
+
+    Returns
+    -------
+    agg      : defaultdict compatible with plot_confusion_matrices
+    mv_key   : the key used for the MV method
+    assay_key: the key used for the assay method
+    """
+    mv_key    = f"MV p{percentile} ({config})"
+    assay_key = 'Assay'
+    agg = defaultdict(lambda: defaultdict(int))
+
+    sub = results_df[
+        (results_df['config'] == config) &
+        (results_df['path_percentile'] == percentile)
+    ]
+
+    for _, row in sub.iterrows():
+        gene = row['gene']
+        ms   = gene_ms[gene]
+        n_plp = int(ms._sample_assignments[:, 0].sum())
+        n_blb = int(ms._sample_assignments[:, 1].sum())
+
+        for prefix, key in [('mv', mv_key), ('assay', assay_key)]:
+            tp = int(row[f'{prefix}_TP'])
+            tn = int(row[f'{prefix}_TN'])
+            fp = int(row[f'{prefix}_FP'])
+            fn = int(row[f'{prefix}_FN'])
+
+            agg[key]['TP']               += tp
+            agg[key]['TN']               += tn
+            agg[key]['FP']               += fp
+            agg[key]['FN']               += fn
+            agg[key]['uncertain_path']   += n_plp - tp - fn
+            agg[key]['uncertain_benign'] += n_blb - tn - fp
+            agg[key]['N_ctrl']           += n_plp + n_blb
+
+    return agg, mv_key, assay_key
+
+
+# ── Shared heatmap renderer (blue=Benign, gray=Indeterminate, red=Pathogenic) ──
+
+def _draw_cm_heatmap(df, ax):
+    """Render a confusion-matrix DataFrame as a styled heatmap on ax.
+
+    Column color assignment:
+      - contains 'Benign' / 'Normal'      → blue
+      - contains 'Indeterminate' / 'IR'   → gray
+      - contains 'Pathogenic' / 'Abnormal'→ red
+      - anything else                     → gray
+    Intensity is row-normalized; text flips white when cell > 45% of row max.
+    """
+    from matplotlib.colors import LinearSegmentedColormap
+    import matplotlib.patches as _mp
+
+    blue_cmap = LinearSegmentedColormap.from_list('_b', ['#F0F8FC', '#99C8DC', '#4B91A6', '#2E6B7E'])
+    red_cmap  = LinearSegmentedColormap.from_list('_r', ['#FCF0F2', '#E6B1B8', '#B85C6B', '#943744'])
+    gray_cmap = LinearSegmentedColormap.from_list('_g', ['#F5F5F5', '#CCCCCC', '#999999', '#666666'])
+
+    def _cmap_for(col_name):
+        s = str(col_name)
+        if any(k in s for k in ('Benign', 'Normal', 'BLB', 'B/LB')):
+            return blue_cmap
+        if any(k in s for k in ('Pathogenic', 'Abnormal', 'PLP', 'P/LP')):
+            return red_cmap
+        return gray_cmap
+
+    nrows, ncols = df.shape
+    for i in range(nrows):
+        row_max = df.iloc[i].max()
+        for j in range(ncols):
+            val  = df.iloc[i, j]
+            norm = val / row_max if row_max > 0 else 0
+            color = _cmap_for(df.columns[j])(norm)
+            ax.add_patch(_mp.Rectangle((j, i), 1, 1,
+                                       facecolor=color, edgecolor='white', linewidth=2.5))
+            text_color = 'white' if (row_max > 0 and norm > 0.45
+                                     and 'Indeterminate' not in str(df.columns[j])
+                                     and 'IR' not in str(df.columns[j])) else 'black'
+            ax.text(j + 0.5, i + 0.5, f'{val:,}',
+                    ha='center', va='center', fontsize=14, color=text_color)
+
+    ax.set_xlim(0, ncols); ax.set_ylim(0, nrows)
+    ax.invert_yaxis()
+    ax.set_aspect('equal')
+    ax.set_xticks(np.arange(ncols) + 0.5)
+    ax.set_yticks(np.arange(nrows) + 0.5)
+    ax.set_xticklabels(list(df.columns), rotation=0, fontsize=12)
+    ax.set_yticklabels(list(df.index),   rotation=0, fontsize=12)
+    ax.tick_params(length=0, labelsize=12)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_facecolor('#F9F9F9')
+
+
 # ── Confusion matrix plot ─────────────────────────────────────────────────────
 
 def plot_confusion_matrices(agg,
                             mv_key='MV p25 (3c_unc)', assay_key='Assay',
                             mv_title='ExCALIBR-MV',
                             assay_title='Synonymous z-score',
-                            figsize=(10, 4), save_path=None):
+                            figsize=(10, 4), save_path=None,
+                            extra_row_mv=None, extra_row_assay=None):
     """
     Plot aggregate confusion matrices for ExCALIBR-MV vs. assay z-score.
-    Uses pre-aggregated counts so per-gene zero-row-sum genes don't cause skips.
-    Overrides the hardcoded titles and removes suptitle post-hoc.
+
+    extra_row_mv / extra_row_assay : pd.DataFrame
+        Optional extra rows (e.g. Sample 4 / RPV) appended to each panel.
+        Must have the same columns as the base CM: ['Benign', 'Indeterminate', 'Pathogenic'].
+        Build with e.g.:
+            rpv_pts = analysis.results[config]['points'][rpv_mask]
+            extra_row_mv = pd.DataFrame({
+                'Benign':        [(rpv_pts < 0).sum()],
+                'Indeterminate': [(rpv_pts == 0).sum()],
+                'Pathogenic':    [(rpv_pts > 0).sum()],
+            }, index=['RPV'])
     """
-    fig, _, _ = plot_aggregate_confusion_matrices(
-        danzs=[_agg_to_cm(agg, mv_key)],
-        auths=[_agg_to_cm(agg, assay_key)],
-        dataset_names=['aggregate'],
-        figsize=figsize,
-        letters=True,
-    )
-    # Override hardcoded titles and strip suptitle
-    fig.suptitle('')
-    for ax in fig.axes:
-        title = ax.get_title()
-        if 'ExCALIBR Evidence' in title:
-            ax.set_title(mv_title, fontsize=18, fontweight='bold', pad=10)
-        elif 'Author Annotations' in title:
-            ax.set_title(assay_title, fontsize=18, fontweight='bold', pad=10)
+    mv_cm    = _agg_to_cm(agg, mv_key)
+    assay_cm = _agg_to_cm(agg, assay_key)
+    if extra_row_mv is not None:
+        mv_cm = pd.concat([mv_cm, extra_row_mv])
+    if extra_row_assay is not None:
+        assay_cm = pd.concat([assay_cm, extra_row_assay])
+
+    has_extra = (extra_row_mv is not None) or (extra_row_assay is not None)
+
+    if not has_extra:
+        # Original path — delegates to upstream function which computes full metrics
+        fig, _, _ = plot_aggregate_confusion_matrices(
+            danzs=[mv_cm],
+            auths=[assay_cm],
+            dataset_names=['aggregate'],
+            figsize=figsize,
+            letters=True,
+        )
+        fig.suptitle('')
+        for ax in fig.axes:
+            title = ax.get_title()
+            if 'ExCALIBR Evidence' in title:
+                ax.set_title(mv_title, fontsize=18, fontweight='bold', pad=10)
+            elif 'Author Annotations' in title:
+                ax.set_title(assay_title, fontsize=18, fontweight='bold', pad=10)
+    else:
+        # Self-contained path — avoids the 2×3 restriction in compute_classification_metrics
+        fig = plt.figure(figsize=figsize)
+        left = 0.08; gap = 0.05; pw = 0.35; bot = 0.15; top = 0.12
+        ax_mv    = fig.add_axes([left,          bot, pw, 1 - bot - top])
+        ax_assay = fig.add_axes([left + pw + gap, bot, pw, 1 - bot - top])
+
+        _draw_cm_heatmap(mv_cm,    ax_mv)
+        _draw_cm_heatmap(assay_cm, ax_assay)
+
+        ax_mv.text(-0.10, 1.11, '(A)', transform=ax_mv.transAxes,
+                   fontsize=18, fontweight='bold', va='top', ha='left')
+        ax_assay.text(-0.10, 1.11, '(B)', transform=ax_assay.transAxes,
+                      fontsize=18, fontweight='bold', va='top', ha='left')
+
+        ax_mv.set_title(mv_title,    fontsize=18, fontweight='bold', pad=10)
+        ax_assay.set_title(assay_title, fontsize=18, fontweight='bold', pad=10)
+        ax_mv.set_xlabel('Evidence Direction',    fontsize=14)
+        ax_mv.set_ylabel('ClinVar Classification', fontsize=14)
+        ax_assay.set_xlabel('Functional Annotation', fontsize=14)
+        ax_assay.set_ylabel('')
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
     return fig
+
+
+# ── ExCALIBR-MV confusion matrices, one panel per gene ─────────────────────────
+
+def plot_mv_confusion_by_gene(gene_ms, mv_points_by_gene,
+                               include_assay=False,
+                               compute_assay_labels_zscore=None,
+                               non_nu_genes=None, ncols=3,
+                               panel_size=(5.5, 5.5), save_path=None):
+    """
+    Plot a grid of ExCALIBR-MV-only confusion matrices, one per gene.
+
+    Parameters
+    ----------
+    gene_ms : dict {gene: MultiScoreset}
+    mv_points_by_gene : dict {gene: points_array}
+        E.g. {g: a.results['3c_unc']['points']
+              for g, a in gene_to_analysis_cons_b0_5.items()}
+    include_assay : bool
+        If True, also plot the synonymous z-score confusion matrix
+        side-by-side with ExCALIBR-MV for each gene. Requires
+        compute_assay_labels_zscore.
+    compute_assay_labels_zscore : callable(ms) -> points_array or None
+        Same function passed to build_agg; only needed if include_assay.
+    non_nu_genes : set or None
+        If provided, restrict to these genes only.
+    ncols : int
+        Number of gene columns in the subplot grid (each gene occupies
+        one or two axes, depending on include_assay).
+    panel_size : (w, h)
+        Size of each individual panel.
+    save_path : str or None
+
+    Returns
+    -------
+    fig
+    """
+    if include_assay and compute_assay_labels_zscore is None:
+        raise ValueError("include_assay=True requires compute_assay_labels_zscore")
+
+    genes = []
+    mv_cms = []
+    assay_cms = []
+    for gene, ms in gene_ms.items():
+        if non_nu_genes is not None and gene not in non_nu_genes:
+            continue
+        mv_pts = mv_points_by_gene.get(gene)
+        if mv_pts is None:
+            continue
+
+        sa = ms._sample_assignments
+        is_plp = sa[:, 0].astype(bool)
+        is_blb = sa[:, 1].astype(bool)
+        eval_mask = is_plp | is_blb
+        if eval_mask.sum() == 0:
+            continue
+
+        labels = is_plp[eval_mask]
+        genes.append(gene)
+        mv_cms.append(points_to_confusion(labels, mv_pts[eval_mask]))
+        if include_assay:
+            assay_pts = compute_assay_labels_zscore(ms)
+            assay_cms.append(points_to_confusion(labels, assay_pts[eval_mask]))
+
+    n = len(genes)
+    nrows = -(-n // ncols)  # ceil
+
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+
+    if include_assay:
+        fig_w = panel_size[0] * 2.15 * ncols
+        fig_h = panel_size[1] * 1.15 * nrows
+    else:
+        fig_w = panel_size[0] * ncols
+        fig_h = panel_size[1] * nrows
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    outer = GridSpec(nrows, ncols, figure=fig,
+                     wspace=0.25, hspace=0.35,
+                     left=0.04, right=0.98, top=0.9, bottom=0.05)
+
+    for i, gene in enumerate(genes):
+        row, col = divmod(i, ncols)
+
+        if include_assay:
+            inner = GridSpecFromSubplotSpec(1, 2, subplot_spec=outer[row, col],
+                                            wspace=0.12)
+            ax_mv = fig.add_subplot(inner[0, 0])
+            ax_assay = fig.add_subplot(inner[0, 1])
+
+            _draw_cm_heatmap(mv_cms[i], ax_mv)
+            _draw_cm_heatmap(assay_cms[i], ax_assay)
+            for ax in (ax_mv, ax_assay):
+                ax.tick_params(axis='x', labelsize=11)
+                ax.tick_params(axis='y', labelsize=11)
+            ax_mv.set_title('ExCALIBR-MV', fontsize=12, pad=4)
+            ax_assay.set_title('Synonymous z-score', fontsize=12, pad=4)
+            ax_assay.set_yticklabels([])
+            ax_assay.set_ylabel('')
+
+            pos_mv, pos_assay = ax_mv.get_position(), ax_assay.get_position()
+            fig.text((pos_mv.x0 + pos_assay.x1) / 2, pos_mv.y1 + 0.025, gene,
+                     ha='center', va='bottom', fontsize=15, fontweight='bold')
+        else:
+            ax_mv = fig.add_subplot(outer[row, col])
+            _draw_cm_heatmap(mv_cms[i], ax_mv)
+            ax_mv.tick_params(axis='x', labelsize=12)
+            ax_mv.tick_params(axis='y', labelsize=12)
+            ax_mv.set_title(gene, fontsize=15, fontweight='bold', pad=10)
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    return fig
+
+
+# ── RPV classification matrix ─────────────────────────────────────────────────
+
+def plot_rpv_classification_matrix(scores, ms,
+                                   sample_idx_map=None,
+                                   title='RPV Classification',
+                                   extra_plp_mask=None,
+                                   extra_plp_label='P/LP (non-called)',
+                                   figsize=None, ax=None,
+                                   save_path=None):
+    """Heatmap of RPV classification breakdown per sample.
+
+    Rows: samples (B/LB, P/LP, RPV by default)
+    Cols: rpv_class categories from score_rpv_penetrance
+
+    Parameters
+    ----------
+    scores          : pd.DataFrame from analysis.score_rpv_penetrance(...)
+    ms              : MultiScoreset (provides _sample_assignments, same N as scores)
+    sample_idx_map  : dict {display_name: sa_column_index}, ordered
+                      Default: {'B/LB': 1, 'P/LP': 0, 'RPV': 4}
+    extra_plp_mask  : bool array (N,) — subset of P/LP variants to show as an
+                      additional row, e.g. those not called pathogenic by the main model:
+                          plp_mask = ms._sample_assignments[:, 0].astype(bool)
+                          pts      = analysis.results[config]['points']
+                          extra_plp_mask = plp_mask & (pts <= 0)
+    extra_plp_label : row label for the extra P/LP row (default 'P/LP (non-called)')
+
+    Returns
+    -------
+    fig, ax
+    """
+    from collections import OrderedDict
+    from matplotlib.colors import LinearSegmentedColormap
+    import matplotlib.patches as mpatches
+
+    if sample_idx_map is None:
+        sample_idx_map = OrderedDict([('B/LB', 1), ('P/LP', 0), ('RPV', 4)])
+
+    ordered_classes = ['benign_like', 'intermediate', 'plp_like', 'low_pen_rpv']
+    col_labels      = ['Benign-like', 'Intermediate', 'PLP-like', 'Low-pen RPV']
+
+    sa = ms._sample_assignments
+    rows = {}
+    for name, si in sample_idx_map.items():
+        if si >= sa.shape[1]:
+            continue
+        mask   = sa[:, si].astype(bool)
+        subset = scores.iloc[np.where(mask)[0]]['rpv_class']
+        rows[name] = [int((subset == cls).sum()) for cls in ordered_classes]
+
+    if extra_plp_mask is not None:
+        subset = scores.iloc[np.where(extra_plp_mask)[0]]['rpv_class']
+        rows[extra_plp_label] = [int((subset == cls).sum()) for cls in ordered_classes]
+
+    df = pd.DataFrame(rows, index=col_labels).T  # (n_samples, n_classes)
+
+    blue_cmap  = LinearSegmentedColormap.from_list('blue',  ['#F0F8FC', '#2E6B7E'])
+    gray_cmap  = LinearSegmentedColormap.from_list('gray',  ['#F5F5F5', '#555555'])
+    red_cmap   = LinearSegmentedColormap.from_list('red',   ['#FCF0F2', '#943744'])
+    green_cmap = LinearSegmentedColormap.from_list('green', ['#F0FBF4', '#2E7D4F'])
+    col_cmaps  = [blue_cmap, gray_cmap, red_cmap, green_cmap]
+
+    nrows, ncols = df.shape
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize or (max(5, ncols * 1.8), max(2, nrows * 1.3)))
+    else:
+        fig = ax.get_figure()
+
+    colors = np.zeros((nrows, ncols, 4))
+    for i in range(nrows):
+        row_max = df.iloc[i].max()
+        for j in range(ncols):
+            val = df.iloc[i, j]
+            normalized = val / row_max if row_max > 0 else 0
+            colors[i, j] = col_cmaps[j](normalized)
+
+    for i in range(nrows):
+        row_max = df.iloc[i].max()
+        for j in range(ncols):
+            ax.add_patch(mpatches.Rectangle(
+                (j, i), 1, 1,
+                facecolor=colors[i, j], edgecolor='white', linewidth=2.5))
+            val = df.iloc[i, j]
+            text_color = 'white' if (row_max > 0 and val / row_max > 0.45) else 'black'
+            ax.text(j + 0.5, i + 0.5, str(val),
+                    ha='center', va='center', fontsize=13, color=text_color)
+
+    ax.set_xlim(0, ncols); ax.set_ylim(0, nrows)
+    ax.invert_yaxis()
+    ax.set_aspect('equal')
+    ax.set_xticks(np.arange(ncols) + 0.5)
+    ax.set_yticks(np.arange(nrows) + 0.5)
+    ax.set_xticklabels(df.columns, rotation=0, fontsize=11)
+    ax.set_yticklabels(df.index, rotation=0, fontsize=11)
+    ax.tick_params(length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_xlabel('RPV Classification', fontsize=12)
+    ax.set_ylabel('Sample', fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight='bold', pad=10)
+    ax.set_facecolor('#F9F9F9')
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    return fig, ax
+
+
+# ── Penetrance score histogram ────────────────────────────────────────────────
+
+def plot_penetrance_score_hist(scores, ms,
+                               sample_idx_map=None,
+                               extra_plp_mask=None,
+                               extra_plp_label='P/LP (indet.)',
+                               bins=20,
+                               title='Penetrance Score Distribution',
+                               figsize=None,
+                               save_path=None):
+    """Stacked per-sample histograms of penetrance_score.
+
+    One panel per sample (shared x-axis). Only variants with rpv_points >= 1
+    have a penetrance_score; the label shows n_eligible / n_total for each sample.
+
+    Parameters
+    ----------
+    scores          : pd.DataFrame from analysis.score_rpv_penetrance(...)
+    ms              : MultiScoreset
+    sample_idx_map  : dict {display_name: sa_column_index}, ordered
+                      Default: {'B/LB': 1, 'P/LP': 0, 'RPV': 4}
+    extra_plp_mask  : bool array (N,) for an additional group (e.g. P/LP non-called)
+    extra_plp_label : label for that group
+    bins            : number of histogram bins (default 20)
+    """
+    from collections import OrderedDict
+
+    if sample_idx_map is None:
+        sample_idx_map = OrderedDict([('B/LB', 1), ('P/LP', 0), ('RPV', 4)])
+
+    _palette = {
+        'B/LB':          '#2E6B7E',
+        'P/LP':          '#943744',
+        'RPV':           '#2E7D4F',
+        extra_plp_label: '#e05c00',
+    }
+    _default_colors = ['#555555', '#7B2D8B', '#B8860B', '#1A6B3C']
+
+    sa = ms._sample_assignments
+
+    # Build groups: (vals_with_score, n_total)
+    groups = {}
+    for name, si in sample_idx_map.items():
+        if si >= sa.shape[1]:
+            continue
+        mask  = sa[:, si].astype(bool)
+        rows  = scores.iloc[np.where(mask)[0]]
+        vals  = rows['penetrance_score'].dropna().values
+        groups[name] = (vals, int(mask.sum()))
+    if extra_plp_mask is not None:
+        rows = scores.iloc[np.where(extra_plp_mask)[0]]
+        vals = rows['penetrance_score'].dropna().values
+        groups[extra_plp_label] = (vals, int(extra_plp_mask.sum()))
+
+    n_panels = len(groups)
+    if n_panels == 0:
+        return None, None
+
+    fig, axes = plt.subplots(n_panels, 1,
+                             figsize=figsize or (6, 2.2 * n_panels),
+                             sharex=True)
+    if n_panels == 1:
+        axes = [axes]
+
+    fallback = iter(_default_colors)
+    for panel_i, (ax, (name, (vals, n_total))) in enumerate(zip(axes, groups.items())):
+        color = _palette.get(name) or next(fallback, '#888888')
+        if len(vals):
+            ax.hist(vals, bins=bins, range=(0, 1),
+                    color=color, alpha=0.75, edgecolor='white', linewidth=0.5)
+        ax.set_xlim(0, 1)
+        ax.set_ylabel('Count', fontsize=9)
+        ax.set_facecolor('#F9F9F9')
+        ax.tick_params(labelsize=8)
+        for spine in ('top', 'right'):
+            ax.spines[spine].set_visible(False)
+        label_x = 0.02 if panel_i == 1 else 0.98
+        label_ha = 'left' if panel_i == 1 else 'right'
+        ax.text(label_x, 0.95, f'{name}\n{len(vals)}/{n_total}',
+                transform=ax.transAxes, ha=label_ha, va='top',
+                fontsize=9, color=color, fontweight='bold')
+
+    axes[-1].set_xlabel(
+        'Penetrance score  (0 = low pen. / RPV-like,  1 = high pen. / PLP-like)',
+        fontsize=10)
+    axes[0].set_title(title, fontsize=12, fontweight='bold', pad=8)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    return fig, axes

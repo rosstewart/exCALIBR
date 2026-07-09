@@ -4,10 +4,11 @@ Visualization and calibration result generation
 import sys
 import os
 import json
+import signal
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Dict, Optional, Tuple, List
 from joblib import Parallel, delayed
 import logging
 
@@ -22,11 +23,18 @@ from ..fit_utils.point_ranges import (
     remove_insufficient_bootstrap_converage_points,
     check_thresholds_reached,
     extend_points_to_xlims,
-    compute_single_fit_log_densities
+    compute_single_fit_log_densities,
+    _compute_log_fp_only,
 )
 from ..data_utils.dataset import Scoreset, BasicScoreset
 from ..fit_utils.utils import serialize_dict
-from ..plot_utils.utils import plot_scoreset_best_config
+import logging as _logging
+_logging.getLogger("matplotlib").setLevel(_logging.ERROR)
+_logging.getLogger("matplotlib.font_manager").setLevel(_logging.ERROR)
+import matplotlib as _mpl
+_mpl.use('Agg')
+import matplotlib.pyplot as plt
+from ..plot_utils.utils import plot_scoreset_best_config, sample_density, add_thresholds
 
 from .config import PipelineConfig
 from .utils import load_dataset_from_df
@@ -126,32 +134,55 @@ def generate_visualizations(
             bootstrap_seeds=bootstrap_seeds,
         )
 
-        
+        if calibration is None:
+            continue
+
         results[component_key] = calibration
-        
-        # Generate visualization
+
+        # Generate visualization in a forked child so a hung C renderer can be
+        # killed from the parent.  signal.SIGALRM cannot interrupt C extensions
+        # (e.g. matplotlib's Agg backend), so fork + waitpid is the only reliable
+        # timeout mechanism on Linux.
         output_dir = Path(config.output_dir)
         figure_path = output_dir / f"{config.dataset_name}_{component_key}_visualization.png"
-        
-        try:
-            fig = plot_scoreset_best_config(
-                dataset=config.dataset_name,
-                scoreset=scoreset,
-                indv_summary=calibration,
-                fits=fits,
-                score_range=np.asarray(calibration['score_range']),
-                config=f"({config.benign_method})",
-                n_c=component_key,
-                n_samples=len([s for s in scoreset.samples]),
-                relax=False,
-                flipped=calibration.get('scoreset_flipped', False)
-            )
-            
-            fig.savefig(figure_path, bbox_inches='tight', dpi=300)
-            logger.info(f"  Saved visualization: {figure_path}")
-            
-        except Exception as e:
-            logger.error(f"  Failed to generate visualization: {e}")
+
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                fig = plot_scoreset_best_config(
+                    dataset=config.dataset_name,
+                    scoreset=scoreset,
+                    indv_summary=calibration,
+                    fits=fits,
+                    score_range=np.asarray(calibration['score_range']),
+                    config=f"({config.benign_method})",
+                    n_c=component_key,
+                    n_samples=len([s for s in scoreset.samples]),
+                    relax=False,
+                    flipped=calibration.get('scoreset_flipped', False)
+                )
+                fig.savefig(figure_path, dpi=150)
+                os._exit(0)
+            except Exception:
+                os._exit(1)
+        else:
+            import time
+            start = time.monotonic()
+            exit_status = None
+            while time.monotonic() - start < 600:
+                pid, st = os.waitpid(child_pid, os.WNOHANG)
+                if pid != 0:
+                    exit_status = st
+                    break
+                time.sleep(1)
+            if exit_status is None:
+                os.kill(child_pid, signal.SIGKILL)
+                os.waitpid(child_pid, 0)
+                logger.warning(f"  Visualization timed out after 600s, skipping")
+            elif os.WIFEXITED(exit_status) and os.WEXITSTATUS(exit_status) == 0:
+                logger.info(f"  Saved visualization: {figure_path}")
+            else:
+                logger.error(f"  Visualization process failed")
     
     return results
 
@@ -162,6 +193,8 @@ def process_component_fits(
     n_c: int,
     logger: logging.Logger,
     bootstrap_seeds: np.ndarray = None,
+    precomputed_log_fp_all: np.ndarray = None,
+    return_log_fp_all: bool = False,
 ) -> Dict:
     """
     Process bootstrap fits to generate calibration thresholds
@@ -184,8 +217,8 @@ def process_component_fits(
             gnomad_idx = i
         elif sample_name == "Synonymous":
             synonymous_idx = i
-        else:
-            raise ValueError(f"Invalid sample name: {sample_name}")
+        # Extra samples beyond the standard four are tracked in _sample_assignments
+        # for variant-table labelling but are not used in calibration — skip them.
     
     # More flexible validation - allow missing pathogenic OR missing benign/synonymous
     if gnomad_idx is None:
@@ -202,21 +235,23 @@ def process_component_fits(
         logger.warning(f"  No benign sample, setting benign_method from {config.benign_method} to synonymous")
         config.benign_method = 'synonymous'
 
-    # Adjust indices to match fit weight arrays.
-    # Scoreset (IGVF format) always has columns for all 4 sample types, but
-    # fits only include weights for non-empty samples, so indices must shift.
-    # BasicScoreset columns already match fit weights directly — no adjustment.
-    if not isinstance(scoreset, BasicScoreset):
-        if benign_idx is None:
+    # Adjust raw column indices to fit-weight indices.
+    # Both Scoreset and BasicScoreset keep all 4 standard columns in
+    # _sample_assignments (empty ones included), but the sample_assignments
+    # property and the fit weights only cover non-empty columns.  Shift each
+    # index down by the number of lower-indexed standard columns that are empty.
+    if benign_idx is None:
+        if gnomad_idx is not None:
             gnomad_idx -= 1
-            if synonymous_idx is not None:
-                synonymous_idx -= 1
-        if pathogenic_idx is None:
+        if synonymous_idx is not None:
+            synonymous_idx -= 1
+    if pathogenic_idx is None:
+        if gnomad_idx is not None:
             gnomad_idx -= 1
-            if benign_idx is not None:
-                benign_idx -= 1
-            if synonymous_idx is not None:
-                synonymous_idx -= 1
+        if benign_idx is not None:
+            benign_idx -= 1
+        if synonymous_idx is not None:
+            synonymous_idx -= 1
 
     # Validate indices against actual fit weight length
     n_weights = len(fits[0]['fit']['weights'])
@@ -236,6 +271,10 @@ def process_component_fits(
         config.benign_method = 'synonymous'
     
     logger.info(f"  Sample indices: P={pathogenic_idx}, B={benign_idx}, G={gnomad_idx}, S={synonymous_idx}")
+
+    # Save pre-filter snapshot for log_fp sharing with the benign combo
+    all_fits_prefilter = list(fits)
+    n_fits_prefilter = len(fits)
 
     # Debug: sample names, counts, and mean scores per sample
     if config.debug:
@@ -313,26 +352,56 @@ def process_component_fits(
         valid_bootstrap_seeds = bootstrap_seeds[valid_mask] if bootstrap_seeds is not None else np.array([])
         
         logger.info(f"  Valid priors: {len(fit_priors)}")
-        
+
+        if len(fits) == 0:
+            logger.warning(f"  No valid priors; skipping {component_key}")
+            return None
+
         # Compute prior
         prior = np.nanmedian(fit_priors)
         logger.info(f"  Prior: {prior:.6f}")
-    
+
+    # Indices into all_fits_prefilter that survived prior filtering
+    valid_original_indices = np.where(valid_mask)[0]
+
     # Setup score range
     observed_scores = scoreset.scores[scoreset._sample_assignments.any(1)]
     score_range = np.linspace(*np.percentile(observed_scores, [0, 100]), config.score_range_points)
-    
-    # Compute log likelihood ratios
+
+    # Build per-fit precomputed log_fp array (shape: n_fits_prefilter × score_range_points)
+    # when pathogenic samples exist.  Two cases:
+    #   1. Caller passed precomputed_log_fp_all — reuse it directly (benign combo path).
+    #   2. return_log_fp_all=True — compute upfront so the result can be handed to the
+    #      matching benign combo (avg combo path).
+    # When neither applies (normal single-combo usage) log_fp_prefilter stays None and
+    # compute_single_fit_log_densities computes log_fp internally as before.
+    log_fp_prefilter = None
     n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
+    if pathogenic_idx is not None:
+        if precomputed_log_fp_all is not None:
+            log_fp_prefilter = np.asarray(precomputed_log_fp_all)
+        elif return_log_fp_all:
+            log_fp_prefilter = np.array(Parallel(
+                n_jobs=min(n_fits_prefilter, n_cores), verbose=0
+            )(
+                delayed(_compute_log_fp_only)(fit, score_range, pathogenic_idx)
+                for fit in all_fits_prefilter
+            ))
+
+    # Compute log likelihood ratios
     results_fpfb = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
         delayed(compute_single_fit_log_densities)(
             fit, prior, score_range, config.benign_method,
             pathogenic_idx=pathogenic_idx,
             benign_idx=benign_idx,
             gnomad_idx=gnomad_idx,
-            synonymous_idx=synonymous_idx
+            synonymous_idx=synonymous_idx,
+            precomputed_log_fp=(
+                log_fp_prefilter[valid_original_indices[j]]
+                if log_fp_prefilter is not None else None
+            ),
         )
-        for fit, prior in zip(fits, fit_priors)
+        for j, (fit, prior) in enumerate(zip(fits, fit_priors))
     )
     
     # Unpack results
@@ -592,7 +661,7 @@ def process_component_fits(
     logger.info(f"  Final ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
     
     # Serialize and return
-    return serialize_dict({
+    result = {
         'prior': prior,
         'priors': fit_priors,
         'valid_bootstrap_seeds': valid_bootstrap_seeds,
@@ -606,4 +675,315 @@ def process_component_fits(
         'scoreset_flipped': scoreset_flipped,
         'n_valid_fits': len(fits),
         'acmg_mapping_method': acmg_mapping_method,
-    })
+    }
+    # Include pre-filter log_fp so callers can share it with a sibling benign combo.
+    # Only populated when return_log_fp_all=True and precomputed_log_fp_all was not given.
+    if return_log_fp_all and precomputed_log_fp_all is None and log_fp_prefilter is not None:
+        result['log_fp_all_fits'] = log_fp_prefilter
+    return serialize_dict(result)
+
+
+def _plot_confusion_panel(
+    ax: "plt.Axes",
+    m: Dict,
+    is_selected: bool,
+    best_metrics: Optional[Dict] = None,
+) -> None:
+    """Draw a 2×3 confusion matrix styled like plot_aggregate_confusion_matrices.
+
+    Blue/Gray/Red column-based colormaps, row-normalized intensity.
+    Each metric (MCC, Acc, Cov) is bolded independently where it is best across configs.
+    """
+    import matplotlib.patches as mpatches
+    from matplotlib.colors import LinearSegmentedColormap
+
+    if best_metrics is None:
+        best_metrics = {}
+
+    data = [
+        [m["TN"],     m["IR_BLB"], m["FP"]],   # B/LB row
+        [m["FN"],     m["IR_PLP"], m["TP"]],    # P/LP row
+    ]
+    col_labels = ["Benign", "Indet.", "Pathogenic"]
+    row_labels = ["B/LB", "P/LP"]
+
+    blue_cmap = LinearSegmentedColormap.from_list(
+        "blue_g", ["#F0F8FC", "#99C8DC", "#7AB5D1", "#4B91A6", "#2E6B7E"])
+    red_cmap  = LinearSegmentedColormap.from_list(
+        "red_g",  ["#FCF0F2", "#E6B1B8", "#D68F99", "#B85C6B", "#943744"])
+    gray_cmap = LinearSegmentedColormap.from_list(
+        "gray_g", ["#F5F5F5", "#CCCCCC", "#999999", "#666666"])
+    col_cmaps = [blue_cmap, gray_cmap, red_cmap]
+
+    for r in range(2):
+        row_max = max(data[r]) or 1
+        for c in range(3):
+            val = int(data[r][c])
+            norm = val / row_max
+            color = col_cmaps[c](norm)
+            ax.add_patch(mpatches.Rectangle(
+                (c, r), 1, 1,
+                facecolor=color, edgecolor="white", linewidth=2.5,
+            ))
+            txt_color = "black" if c == 1 else ("white" if norm > 0.45 else "black")
+            ax.text(c + 0.5, r + 0.5, str(val),
+                    ha="center", va="center", fontsize=9, color=txt_color)
+
+    ax.set_xlim(0, 3)
+    ax.set_ylim(0, 2)
+    ax.invert_yaxis()
+    ax.set_xticks([0.5, 1.5, 2.5])
+    ax.set_xticklabels(col_labels, fontsize=7)
+    ax.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False, length=0)
+    ax.set_yticks([0.5, 1.5])
+    ax.set_yticklabels(row_labels, fontsize=7)
+    ax.tick_params(axis="y", length=0)
+    ax.set_facecolor("#F9F9F9")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    if is_selected:
+        ax.patch.set_edgecolor("#006400")
+        ax.patch.set_linewidth(2.5)
+        ax.set_facecolor("#F0FFF0")
+
+    # Per-metric labels — bold independently where best
+    metric_items = [
+        (f"MCC={m['MCC']:.3f}",              best_metrics.get("MCC", False)),
+        (f"Acc={m.get('accuracy', 0.0):.3f}", best_metrics.get("accuracy", False)),
+        (f"Cov={m['coverage']:.3f}",          best_metrics.get("coverage", False)),
+    ]
+    for i, (text, is_best) in enumerate(metric_items):
+        ax.text(
+            (i + 0.5) / 3, 1.14, text,
+            transform=ax.transAxes,
+            ha="center", va="bottom",
+            fontsize=7.5,
+            fontweight="bold" if is_best else "normal",
+        )
+
+
+
+def plot_all_configs_comparison(
+    dataset_name: str,
+    scoreset,
+    fits_by_nc: Dict,
+    calibrations: Dict,
+    selected_config: tuple,
+    metrics: Optional[Dict] = None,
+) -> plt.Figure:
+    """
+    Grid comparison of all (2c/3c) × (avg/benign) calibration configs.
+
+    Layout (3 rows per n_c):
+      density row : [sample density + component fits] … | blank | blank
+      avg row     : [density + avg threshold shading] … | avg LR+ | avg confusion
+      benign row  : [density + benign shading]        … | benign LR+ | benign confusion
+
+    The selected config panels are highlighted with a green border and bold title.
+    """
+    import seaborn as sns
+
+    BENIGN_METHODS = ["avg", "benign"]
+    n_components = [nc for nc in ["2c", "3c"]
+                    if nc in fits_by_nc and any(f"{nc}_{b}" in calibrations for b in BENIGN_METHODS)]
+    if not n_components:
+        return None
+
+    n_samples = scoreset.n_samples
+    n_cols = n_samples + 2          # sample columns + LR+ + confusion
+    n_rows_per_nc = 3               # density, avg, benign
+    n_rows = len(n_components) * n_rows_per_nc
+    hist_colors = ["#CA7682", "#1D7AAB", "#A0A0A0", "#6BAA75"]
+
+    height_ratios = []
+    for _ in n_components:
+        height_ratios.extend([1.4, 1.0, 1.0])
+    total_height = sum(height_ratios) * 3.5
+    fig_width = 4.5 * n_cols
+
+    fig, ax = plt.subplots(
+        n_rows, n_cols,
+        figsize=(fig_width, total_height),
+        squeeze=False,
+        gridspec_kw={"hspace": 0.55, "wspace": 0.38, "height_ratios": height_ratios},
+    )
+
+    # Compute which config is best per metric (may tie → multiple bolded)
+    _best_metrics: Dict[str, Dict[str, bool]] = {}
+    if metrics:
+        best_mcc = max((v.get("MCC", -999) for v in metrics.values()), default=-999)
+        best_acc = max((v.get("accuracy", -999) for v in metrics.values()), default=-999)
+        best_cov = max((v.get("coverage", -999) for v in metrics.values()), default=-999)
+        for ck, mv in metrics.items():
+            _best_metrics[ck] = {
+                "MCC":      mv.get("MCC", -999) == best_mcc,
+                "accuracy": mv.get("accuracy", -999) == best_acc,
+                "coverage": mv.get("coverage", -999) == best_cov,
+            }
+
+    for nc_idx, n_c_str in enumerate(n_components):
+        row_density = nc_idx * n_rows_per_nc
+        row_avg     = nc_idx * n_rows_per_nc + 1
+        row_benign  = nc_idx * n_rows_per_nc + 2
+        fits = fits_by_nc.get(n_c_str, [])
+
+        # Score range reference (first available calibration for this n_c)
+        score_range_ref = None
+        for b in BENIGN_METHODS:
+            calib = calibrations.get(f"{n_c_str}_{b}")
+            if calib is not None:
+                score_range_ref = np.asarray(calib["score_range"])
+                break
+
+        # Blank right columns in density row
+        ax[row_density, n_samples].axis("off")
+        ax[row_density, n_samples + 1].axis("off")
+
+        # --- Row 0: density + component fits (shared across methods) ---
+        xlim = None
+        if score_range_ref is not None and fits:
+            s_col = 0  # filtered column index into sample_assignments / ax
+            for s_raw in range(len(scoreset.sample_counts)):
+                if scoreset.sample_counts[s_raw] == 0:
+                    continue
+                ax_fit = ax[row_density, s_col]
+                scores_s = scoreset.scores[scoreset.sample_assignments[:, s_col].astype(bool)]
+                n = len(scores_s)
+                q1, q3 = np.percentile(scores_s, [25, 75])
+                iqr = q3 - q1
+                fd_w = 2 * iqr * n ** (-1 / 3) if iqr > 0 else 0
+                w = scores_s.max() - scores_s.min()
+                bins = max(min(100, int(w / fd_w)) if fd_w > 0 else 50, 10)
+                sns.histplot(scores_s, bins=bins, stat="density", ax=ax_fit,
+                             alpha=0.5, color=hist_colors[s_raw % len(hist_colors)])
+                density = sample_density(score_range_ref, fits, s_col)
+                for c in range(density.shape[1]):
+                    d = np.nanpercentile(density[:, c, :], [5, 50, 95], axis=0)
+                    ax_fit.plot(score_range_ref, d[1], color=f"C{c}", linestyle="--",
+                                label=f"Comp {c+1}", linewidth=1.2)
+                d_tot = np.nansum(density, axis=1)
+                d_pct = np.nanpercentile(d_tot, [5, 50, 95], axis=0)
+                ax_fit.plot(score_range_ref, d_pct[1], color="black", alpha=0.5)
+                ax_fit.fill_between(score_range_ref, d_pct[0], d_pct[2], color="gray", alpha=0.2)
+                ax_fit.set_title(f"{n_c_str}: {scoreset.sample_names[s_raw]}\n(n={n:,d})", fontsize=8)
+                ax_fit.legend(fontsize=6)
+                ax_fit.grid(linewidth=0.5, alpha=0.3)
+                ax_fit.set_xlabel("Score", fontsize=7)
+                s_col += 1
+            xlim = ax[row_density, 0].get_xlim()
+
+        # Fallback xlim from score_range_ref when fits were absent (viz-only)
+        if xlim is None and score_range_ref is not None:
+            xlim = (float(score_range_ref[0]), float(score_range_ref[-1]))
+
+        # --- Rows 1 & 2: per-method (avg, benign) ---
+        for benign_method, row_m in [("avg", row_avg), ("benign", row_benign)]:
+            comp_key = f"{n_c_str}_{benign_method}"
+            calib = calibrations.get(comp_key)
+            is_selected = (n_c_str, benign_method) == selected_config
+            sel_color = "#006400" if is_selected else "black"
+
+            if calib is None:
+                for col in range(n_cols):
+                    ax[row_m, col].axis("off")
+                continue
+
+            score_range = np.asarray(calib["score_range"])
+            if "log_lr_pct" in calib:
+                llr = np.asarray(calib["log_lr_pct"])
+            else:
+                llr = np.nanpercentile(np.asarray(calib["log_lr_plus"]), [5, 50, 95], axis=0)
+            prior = float(calib["prior"])
+
+            def _sel_spine(a):
+                if is_selected:
+                    for sp in a.spines.values():
+                        sp.set_edgecolor("#006400")
+                        sp.set_linewidth(2.0)
+
+            # Per-sample: point ranges (mirrors plot_scoreset_best_config Row 1)
+            point_ranges = sorted([(int(k), v) for k, v in calib["point_ranges"].items()])
+            point_values = [pr[0] for pr in point_ranges]
+            # Always use the calibration's full score_range for xlim so that
+            # pathogenic/benign ranges are never clipped by sample 0's histogram xlim
+            if score_range is not None and len(score_range) > 1:
+                eff_xlim = (float(score_range[0]), float(score_range[-1]))
+            elif xlim is not None:
+                eff_xlim = xlim
+            else:
+                eff_xlim = None
+
+            s_col = 0  # filtered column index into sample_assignments / ax
+            for s_raw in range(len(scoreset.sample_counts)):
+                if scoreset.sample_counts[s_raw] == 0:
+                    continue
+                ax_m = ax[row_m, s_col]
+
+                for pointIdx, (pointVal, scoreRanges) in enumerate(point_ranges):
+                    for sr in scoreRanges:
+                        x0 = eff_xlim[0] if (eff_xlim and np.isneginf(sr[0])) else sr[0]
+                        x1 = eff_xlim[1] if (eff_xlim and np.isposinf(sr[1])) else sr[1]
+                        if eff_xlim:
+                            x0 = max(x0, eff_xlim[0])
+                            x1 = min(x1, eff_xlim[1])
+                        ax_m.plot([x0, x1], [pointIdx, pointIdx],
+                                  color="red" if pointVal > 0 else "blue",
+                                  linestyle="-", alpha=0.7, linewidth=2)
+
+                ax_m.set_ylim(-1, len(point_values))
+                ax_m.set_yticks(range(len(point_values)))
+                ax_m.set_yticklabels([f"{v:+d}" if v != 0 else "0" for v in point_values], fontsize=7)
+                ax_m.set_xlabel("Score", fontsize=7)
+                ax_m.set_ylabel("Points", fontsize=7)
+                if eff_xlim:
+                    ax_m.set_xlim(eff_xlim)
+                ax_m.grid(linewidth=0.5, alpha=0.3)
+                mark = " ✓" if is_selected else ""
+                ax_m.set_title(f"Point Assignments [{benign_method}{mark}]",
+                               fontsize=7.5, fontweight="bold" if is_selected else "normal",
+                               color=sel_color)
+                _sel_spine(ax_m)
+                s_col += 1
+
+            # LR+ panel
+            ax_lr = ax[row_m, n_samples]
+            for curve, color, lbl in zip(llr, ["red", "black", "blue"], ["5th", "Med", "95th"]):
+                ax_lr.plot(score_range, curve, color=color, label=lbl, linewidth=1.5)
+            pt_vals = sorted({abs(int(k)) for k in calib["point_ranges"]})
+            if 0 < prior < 1 and pt_vals:
+                try:
+                    tauP, tauB, _ = list(map(np.log, thresholds_from_prior(prior, pt_vals + [10])))
+                    add_thresholds(tauP[:-1], tauB[:-1], ax_lr)
+                    ax_lr.set_ylim([tauB[-1], tauP[-1]])
+                except Exception:
+                    pass
+            if "priors_pct" in calib:
+                pp = calib["priors_pct"]
+            elif "priors" in calib:
+                priors_arr = np.atleast_1d(calib["priors"])
+                pp = np.percentile(priors_arr, [5, 50, 95]) if len(priors_arr) > 1 else [prior] * 3
+            else:
+                pp = [prior, prior, prior]
+            ax_lr.set_title(f"{n_c_str} {benign_method} LR+\nprior {pp[1]:.3f} ({pp[0]:.3f}–{pp[2]:.3f})",
+                            fontsize=8, fontweight="bold" if is_selected else "normal", color=sel_color)
+            ax_lr.legend(fontsize=6, loc="best")
+            ax_lr.grid(linewidth=0.5, alpha=0.3)
+            ax_lr.set_xlabel("Score", fontsize=7)
+            ax_lr.set_ylabel("Log LR+", fontsize=7)
+            if xlim:
+                ax_lr.set_xlim(xlim)
+            _sel_spine(ax_lr)
+
+            # Confusion panel
+            ax_conf = ax[row_m, n_samples + 1]
+            m_data = metrics.get(comp_key) if metrics else None
+            if m_data is not None:
+                _plot_confusion_panel(ax_conf, m_data, is_selected, _best_metrics.get(comp_key, {}))
+            else:
+                ax_conf.axis("off")
+
+    sel_str = f"{selected_config[0]} {selected_config[1]}" if selected_config else "none"
+    fig.suptitle(f"{dataset_name}  —  all configs (selected: {sel_str})",
+                 fontsize=13, y=1.002)
+    return fig

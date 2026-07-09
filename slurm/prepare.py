@@ -442,8 +442,39 @@ def run_mavedb(args):
 # Mode: basicscoreset  (univariate BasicScoreset)
 # =============================================================================
 
+def _load_basicscoreset_config(config_file: str) -> dict:
+    """Load dataset_configs JSON → {dataset_name: {"n_c": int, ...}}."""
+    with open(config_file) as f:
+        raw = json.load(f)
+    # **v must come first so the explicit int override wins
+    return {k: {**v, "n_c": int(v["n_c"][0])} for k, v in raw.items()}
+
+
+def _lookup_nc(dataset_name: str, cfg: dict, name_strip_re, fallback_components: list) -> list:
+    """Return [nc] from config, stripping robustness suffix when needed.
+
+    Tries in order:
+      1. Exact match
+      2. After stripping the robustness suffix (e.g. _ds4_s2, _disc0.10_s3)
+      3. Stripped name + "_clinvar_2018" (for historic ClinVar-versioned keys)
+      4. fallback_components
+    """
+    if cfg is None:
+        return fallback_components
+
+    for candidate in [
+        dataset_name,
+        name_strip_re.sub("", dataset_name) if name_strip_re else None,
+        (name_strip_re.sub("", dataset_name) + "_clinvar_2018") if name_strip_re else None,
+    ]:
+        if candidate and candidate in cfg:
+            return [cfg[candidate]["n_c"]]
+
+    return fallback_components
+
+
 def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
-                                   N_BOOTSTRAPS, NUM_FITS, selected_components):
+                                   N_BOOTSTRAPS, num_fits_by_nc, selected_components):
     from src.assay_calibration.data_utils.dataset import BasicScoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -472,7 +503,9 @@ def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
     if n_samples < 2:
         print(f"  {dataset_name} skipping: only {n_samples} sample(s)")
         return None
-    print(f"  {dataset_name}: {n_samples} samples, components={selected_components}")
+    fits_desc = ", ".join(f"{nc}c×{num_fits_by_nc.get(nc, num_fits_by_nc.get('default', 8))}"
+                          for nc in selected_components)
+    print(f"  {dataset_name}: {n_samples} samples, components=[{fits_desc}]")
 
     fitter = Fit(ds)
     all_jobs = []
@@ -480,9 +513,10 @@ def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
         jobs_by_key = {}
         ref_jobs = None
         for nc in selected_components:
+            num_fits = num_fits_by_nc.get(nc, num_fits_by_nc.get("default", 8))
             jobs = fitter.generate_fit_jobs(
                 component_range=[nc], bootstrap_seed=bs,
-                check_monotonic=True, num_fits=NUM_FITS)
+                check_monotonic=True, num_fits=num_fits)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
             if ref_jobs is None:
                 ref_jobs = jobs
@@ -502,11 +536,26 @@ def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
 
 
 def run_basicscoreset(args):
-    N_BOOTSTRAPS = _DEFAULT_N_BOOTSTRAPS
-    NUM_FITS = _DEFAULT_NUM_FITS
+    import re
+    N_BOOTSTRAPS = getattr(args, "n_bootstraps", _DEFAULT_N_BOOTSTRAPS)
+    # Per-nc num_fits: 2^nc covers all lambda sign patterns exactly once.
+    fits_3c = getattr(args, "fits_3c", 8)
+    fits_2c = getattr(args, "fits_2c", 4)
+    num_fits_by_nc = {2: fits_2c, 3: fits_3c, "default": fits_3c}
+
     output_dir = args.output_dir
-    selected_components = args.components or [2, 3]
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
+
+    # Config-file based per-dataset n_c lookup
+    cfg = None
+    name_strip_re = None
+    if getattr(args, "config_file", None):
+        cfg = _load_basicscoreset_config(args.config_file)
+        print(f"Loaded per-dataset config from {args.config_file} ({len(cfg)} entries)")
+    if getattr(args, "name_strip", None):
+        name_strip_re = re.compile(args.name_strip)
+
+    fallback_components = args.components or [2, 3]
 
     if args.data_dir is not None:
         paths = sorted(glob.glob(os.path.join(args.data_dir, "*.csv*")))
@@ -520,10 +569,12 @@ def run_basicscoreset(args):
         partitions = {ds: df[df["Dataset"] == ds] for ds in df["Dataset"].unique()}
         print(f"Found {len(partitions)} datasets in {args.dataframe}")
 
-    print(f"\nGenerating jobs for {len(partitions)} datasets...")
+    print(f"\nGenerating jobs for {len(partitions)} datasets "
+          f"({N_BOOTSTRAPS} boots, fits/boot: 2c={fits_2c} 3c={fits_3c})...")
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_basicscoreset_dataset)(
-            name, df_ds, output_dir, N_BOOTSTRAPS, NUM_FITS, selected_components
+            name, df_ds, output_dir, N_BOOTSTRAPS, num_fits_by_nc,
+            _lookup_nc(name, cfg, name_strip_re, fallback_components),
         )
         for name, df_ds in partitions.items()
     )
@@ -890,7 +941,20 @@ def main():
     grp.add_argument("--data-dir", default=None,
                      help="Directory of per-dataset CSV files")
     p_bs.add_argument("--components", nargs="+", type=int, default=None,
-                      help="Component counts (default: 2 3)")
+                      help="Fallback component counts when no config-file match (default: 2 3)")
+    p_bs.add_argument("--n-bootstraps", type=int, default=_DEFAULT_N_BOOTSTRAPS,
+                      help=f"Bootstrap iterations (default: {_DEFAULT_N_BOOTSTRAPS})")
+    p_bs.add_argument("--fits-3c", type=int, default=_DEFAULT_NUM_FITS,
+                      help=f"Fits per bootstrap for 3c (default: {_DEFAULT_NUM_FITS}; "
+                           "set to 8 to cover exactly the 2^3 lambda sign patterns)")
+    p_bs.add_argument("--fits-2c", type=int, default=_DEFAULT_NUM_FITS,
+                      help=f"Fits per bootstrap for 2c (default: {_DEFAULT_NUM_FITS}; "
+                           "set to 4 to cover exactly the 2^2 lambda sign patterns)")
+    p_bs.add_argument("--config-file", default=None,
+                      help="dataset_configs JSON for per-dataset n_c lookup")
+    p_bs.add_argument("--name-strip", default=None,
+                      help="Regex to strip robustness suffix before config lookup "
+                           r"(e.g. '_ds[0-9]+_s[0-9]+$|_disc[0-9.]+_s[0-9]+$')")
     p_bs.set_defaults(func=run_basicscoreset)
 
     # ── multivariate ─────────────────────────────────────────────────────────
