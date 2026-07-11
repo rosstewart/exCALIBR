@@ -2367,6 +2367,35 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
     return fig
 
 
+def _update_weights(scores, means, stds, n_iter=200):
+    """EM with fixed component parameters; returns mixing proportions."""
+    from scipy.stats import norm as sp_norm
+    n_comp = len(means)
+    w = np.ones(n_comp) / n_comp
+    s = scores.flatten()
+    for _ in range(n_iter):
+        resp = np.column_stack([w[k] * sp_norm.pdf(s, means[k], stds[k]) for k in range(n_comp)])
+        row_sums = resp.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums == 0, 1e-300, row_sums)
+        resp /= row_sums
+        w = resp.mean(axis=0)
+        w = np.maximum(w, 1e-10)
+        w /= w.sum()
+    return w
+
+
+def _col_idx_for_sample_num(scoreset, target_num):
+    """Return the sample_assignments column index for a given sample_num."""
+    col = 0
+    for i in range(len(scoreset.sample_counts)):
+        if scoreset.sample_counts[i] == 0:
+            continue
+        if i == target_num:
+            return col
+        col += 1
+    return None
+
+
 def plot_four_datasets_gmm_scores(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list,
                                    figsize=(16, 13.33333), mode='gnomad_gmm'):
     """
@@ -2406,32 +2435,6 @@ def plot_four_datasets_gmm_scores(dataset_names, dataset_configs, dataset_relax_
 
     fig = plt.figure(figsize=figsize)
     outer_grid = GridSpec(2, 2, figure=fig, hspace=0.14, wspace=0.10)
-
-    def _update_weights(scores, means, stds, n_iter=200):
-        """EM with fixed component parameters; returns mixing proportions."""
-        n_comp = len(means)
-        w = np.ones(n_comp) / n_comp
-        s = scores.flatten()
-        for _ in range(n_iter):
-            resp = np.column_stack([w[k] * sp_norm.pdf(s, means[k], stds[k]) for k in range(n_comp)])
-            row_sums = resp.sum(axis=1, keepdims=True)
-            row_sums = np.where(row_sums == 0, 1e-300, row_sums)
-            resp /= row_sums
-            w = resp.mean(axis=0)
-            w = np.maximum(w, 1e-10)
-            w /= w.sum()
-        return w
-
-    def _col_idx_for_sample_num(scoreset, target_num):
-        """Return the sample_assignments column index for a given sample_num."""
-        col = 0
-        for i in range(len(scoreset.sample_counts)):
-            if scoreset.sample_counts[i] == 0:
-                continue
-            if i == target_num:
-                return col
-            col += 1
-        return None
 
     for panel_idx, (dataset, letter) in enumerate(zip(dataset_names, panel_letters)):
         if panel_idx > 0:

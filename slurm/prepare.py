@@ -242,7 +242,8 @@ def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
 
 
 def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
-                              clinvar_release, selected_components, population_type):
+                              clinvar_release, selected_components, population_type,
+                              force_gaussian=False):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -274,7 +275,8 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
         for nc in selected_components:
             jobs = fitter.generate_fit_jobs(
                 component_range=[nc], bootstrap_seed=bs,
-                check_monotonic=True, num_fits=NUM_FITS)
+                check_monotonic=True, num_fits=NUM_FITS,
+                force_gaussian=force_gaussian)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
             if ref_jobs is None:
                 ref_jobs = jobs
@@ -398,6 +400,7 @@ def run_default(args):
                 ds if not _requires_2018(df, ds) else f"{ds}_clinvar_2018"
             ),
             population_type=args.population_type,
+            force_gaussian=args.force_gaussian,
         )
         for ds in datasets
     )
@@ -915,6 +918,11 @@ def main():
     p_def.add_argument("--population-type", default=None)
     p_def.add_argument("--components", nargs="+", type=int, default=None,
                        help="Override component counts (default: per-config)")
+    p_def.add_argument("--force-gaussian", action="store_true",
+                       help="Ablation: lock skew=0 throughout init and every EM "
+                            "M-step, collapsing skew-normal components to plain "
+                            "Gaussians while keeping the rest of the pipeline "
+                            "(bootstraps, fit counts, constraints) identical")
     p_def.set_defaults(func=run_default)
 
     # ── mavedb ───────────────────────────────────────────────────────────────

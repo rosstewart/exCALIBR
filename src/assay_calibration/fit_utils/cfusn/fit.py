@@ -193,6 +193,7 @@ def single_fit(
     em_kwargs = {}
     em_kwargs["constraint_mode"] = constraint_mode
     em_kwargs["rng"] = rng
+    em_kwargs["force_gaussian"] = kwargs.get("force_gaussian", False)
     if mv and latent_q > 1:
         em_kwargs["n_mc_truncated"] = kwargs.get("n_mc_truncated", 500)
     if sample_weights_per_obs is not None:

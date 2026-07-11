@@ -305,6 +305,45 @@ if any(a is not None for a in auths):
     )
 
 # %% [markdown]
+# ### 3a2. ExCALIBR vs. acmgscaler (Badonyi & Marsh 2025)
+#
+# Runs acmgscaler::calibrate() (github.com/badonyi/acmgscaler, base-R, no
+# install needed -- see analysis.config.ACMGSCALER_DIR) against each
+# dataset's P/LP + B/LB scores with prior=0.1 (their simple/ungrouped
+# per-dataset model), maps its four evidence tiers per direction onto the
+# same points sign convention ExCALIBR uses, and builds a confusion matrix
+# the same way build_confusion_matrix does -- see analysis/comparison_methods.py.
+
+# %%
+from analysis.comparison_methods import run_acmgscaler, build_acmgscaler_confusion_matrix
+
+acmgscaler_conf = []
+for dataset in datasets:
+    df_ds = df[(df["dataset"] == dataset) & (df["method"] == primary_method)]
+    if df_ds.empty:
+        acmgscaler_conf.append(None)
+        continue
+    try:
+        df_acmg = run_acmgscaler(df_ds, prior=0.1)
+        acmgscaler_conf.append(build_acmgscaler_confusion_matrix(df_acmg, label=dataset))
+    except Exception as e:
+        print(f"  SKIP acmgscaler for {dataset}: {e}")
+        acmgscaler_conf.append(None)
+
+if any(m is not None for m in acmgscaler_conf):
+    make_confusion_figure(
+        danzs_m1=conf_by_method[primary_method], danzs_m2=acmgscaler_conf,
+        dataset_names=datasets, label1=primary_method, label2="acmgscaler",
+        figure_dir=FIGURE_DIR,
+    )
+    make_scatter_figure(
+        {primary_method: conf_by_method[primary_method], "acmgscaler": acmgscaler_conf},
+        datasets, primary_method, "acmgscaler", figure_dir=FIGURE_DIR,
+    )
+else:
+    print("  SKIP acmgscaler comparison: no dataset produced a matrix")
+
+# %% [markdown]
 # ### 3b. Aggregate performance report + manuscript LaTeX table
 #
 # `print_aggregate_performance` (src/assay_calibration/plot_utils/utils.py)

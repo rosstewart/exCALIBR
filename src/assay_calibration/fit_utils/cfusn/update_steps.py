@@ -1202,12 +1202,15 @@ def _em_update_univariate(
                 loc_cand, c, current_component_params, updated, xlims, **kwargs
             )
 
-        Delta_cand = get_Delta_update(loc_cand, observations, z, cp,
-                                      sample_weights=sample_weights)
-        if constrained:
-            Delta_cand = get_constrained_Delta_update(
-                Delta_cand, loc_cand, c, current_component_params, updated, xlims, **kwargs
-            )
+        if kwargs.get("force_gaussian"):
+            Delta_cand = 0.0
+        else:
+            Delta_cand = get_Delta_update(loc_cand, observations, z, cp,
+                                          sample_weights=sample_weights)
+            if constrained:
+                Delta_cand = get_constrained_Delta_update(
+                    Delta_cand, loc_cand, c, current_component_params, updated, xlims, **kwargs
+                )
 
         Gamma_cand = get_Gamma_update(loc_cand, Delta_cand, observations, z, cp,
                                       sample_weights=sample_weights)

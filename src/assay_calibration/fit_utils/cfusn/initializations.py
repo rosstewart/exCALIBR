@@ -24,6 +24,20 @@ import itertools
 # Univariate initializations (unchanged)
 # ══════════════════════════════════════════════
 
+def _lambda_signs(n_components, kwargs, rng):
+    """Return a length-n_components tuple of +/-1 skew signs.
+
+    Sourced from the enumerated sign pattern at kwargs["lambdaIndex"] (so that,
+    across a bootstrap's restarts, every 2^n_components sign combination is
+    covered exactly once) when lambdaIndex is supplied; otherwise falls back
+    to a random +/-1 draw per component.
+    """
+    if "lambdaIndex" in kwargs:
+        LambdasTable = list(itertools.product([-1, 1], repeat=n_components))
+        return LambdasTable[kwargs["lambdaIndex"] % len(LambdasTable)]
+    return tuple(rng.choice([-1, 1]) for _ in range(n_components))
+
+
 def kmeans_init(X, **kwargs):
     rng = kwargs.get("rng") or np.random.RandomState()
     repeat = 0
@@ -35,10 +49,12 @@ def kmeans_init(X, **kwargs):
         kmeans.fit(X)
         cluster_assignments = kmeans.predict(X)
         component_parameters = []
+        force_gaussian = kwargs.get("force_gaussian", False)
+        lambdas = _lambda_signs(n_clusters, kwargs, rng)
         for i in range(n_clusters):
             X_cluster = X[cluster_assignments == i]
             loc, scale = sps.norm.fit(X_cluster)
-            a = rng.uniform(-0.25, 0.25)
+            a = 0.0 if force_gaussian else lambdas[i] * rng.uniform(0, 0.25)
             component_parameters.append((a, float(loc), float(scale)))
         component_parameters = sorted(component_parameters, key=lambda x: x[1])
         if kwargs.get("constrained", True):
@@ -56,13 +72,15 @@ def kmeans_init(X, **kwargs):
     raise ValueError("Failed to initialize")
 
 
-def sn_method_of_moments_init(X, rng=None):
+def sn_method_of_moments_init(X, rng=None, force_gaussian=False):
     rng = rng or np.random.RandomState()
     m1 = np.mean(X)
     m2 = np.var(X)
-    m3 = sps.skew(X)
     if m2 < 1e-10:
         return []
+    if force_gaussian:
+        return 0.0, m1, max(np.sqrt(m2), 1e-6)
+    m3 = sps.skew(X)
     a1 = np.sqrt(2 / np.pi)
     c = (4 - np.pi) / 2  # skewness coefficient: gamma1 = c*(a1*delta)^3 / (1-a1^2*delta^2)^(3/2)
     try:
@@ -88,9 +106,7 @@ def sn_method_of_moments_init(X, rng=None):
 
 def methodOfMomentsInit(X, n_components, constrained, max_attempts=1000, **kwargs):
     rng = kwargs.get("rng") or np.random.RandomState()
-    LambdasTable = list(itertools.product([-1, 1], repeat=n_components))
-    if "lambdaIndex" in kwargs:
-        lambdas = LambdasTable[kwargs["lambdaIndex"]]
+    lambdas = _lambda_signs(n_components, kwargs, rng)
 
     for attempt in range(max_attempts):
         if rng.random() < 0.7:
@@ -117,12 +133,18 @@ def methodOfMomentsInit(X, n_components, constrained, max_attempts=1000, **kwarg
             if len(Xc) < max(10, int(0.05 * len(X))):
                 success = False
                 break
-            params = sn_method_of_moments_init(Xc, rng=rng)
+            params = sn_method_of_moments_init(
+                Xc, rng=rng, force_gaussian=kwargs.get("force_gaussian", False)
+            )
             if len(params) == 0:
                 success = False
                 break
             params = list(params)
-            params[0] = lambdas[i]
+            # Keep the moment-estimated magnitude; override only the sign with
+            # lambdas[i] so restarts still cover all 2^n_components sign
+            # patterns. (force_gaussian already zeroed params[0] above, and
+            # lambdas[i] * abs(0.0) stays 0.)
+            params[0] = lambdas[i] * abs(params[0])
             component_parameters.append(tuple(params))
 
         if success and all(len(p) > 0 for p in component_parameters):
@@ -749,6 +771,7 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
         # override α's *sign* with lambdas[c] to preserve the
         # bootstrap-wide 2^K sign-pattern coverage from lambdaIndex —
         # the magnitude stays data-driven.
+        force_gaussian = kwargs.get("force_gaussian", False)
         sn_params = sn_method_of_moments_init(Xc, rng=rng) if len(Xc) > 1 else []
         if sn_params and len(sn_params) == 3:
             alpha_data, _loc_unused, scale_data = sn_params
@@ -757,7 +780,7 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
         else:
             a_mag = float(rng.uniform(0.05, 0.4))
             scale = max(float(np.std(Xc, ddof=1)), 1e-3) if len(Xc) > 1 else 1e-3
-        alpha = float(lambdas[c]) * a_mag
+        alpha = 0.0 if force_gaussian else float(lambdas[c]) * a_mag
 
         component_parameters.append((alpha, loc, scale))
 

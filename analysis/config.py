@@ -115,6 +115,24 @@ ASSAY_METHOD_MAP_CSV = _env(
     "/data/ross/assay_calibration/dataframe/var_effect_measurements_dataset.csv",
 )
 
+# ---------------------------------------------------------------------------
+# Comparison methods (analysis.comparison_methods) -- other calibration
+# approaches ExCALIBR gets compared against, beyond the author's own calls.
+# ---------------------------------------------------------------------------
+
+# acmgscaler R package source checkout (github.com/badonyi/acmgscaler) --
+# base-R only, no install needed; analysis.comparison_methods sources the
+# R/*.R files directly from here rather than requiring `install.packages`.
+ACMGSCALER_DIR = _env("EXCALIBR_ACMGSCALER_DIR", "/data/tools/acmgscaler")
+
+# Simple 2-component GMM baseline (slurm/simple_gmm_baseline.py output) --
+# run separately/manually; None until you've run it.
+GMM_BASELINE_JSON = _env("EXCALIBR_GMM_BASELINE_JSON", None)
+
+# "Canonical" ExCALIBR fits rerun with force_gaussian=True -- a future
+# comparison method; output_dir not yet known, filled in once available.
+FORCE_GAUSSIAN_OUTPUT_DIR = _env("EXCALIBR_FORCE_GAUSSIAN_OUTPUT_DIR", None)
+
 
 def warn_if_missing(path: str, what: str) -> bool:
     """Print a warning and return True if `path` does not exist on disk.
