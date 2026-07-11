@@ -251,6 +251,7 @@ class BootstrapRunner:
                 bootstrap_seed=bootstrap_idx,
                 check_monotonic=True,
                 num_fits=self.config.num_fits_per_bootstrap,
+                master_seed=self.config.seed,
             )
             if self.config.sample_balance_beta != 0.0:
                 fit_kwargs["sample_balance_beta"] = self.config.sample_balance_beta

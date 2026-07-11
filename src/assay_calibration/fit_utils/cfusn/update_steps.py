@@ -227,7 +227,7 @@ def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
     For q != 2 the original MC path is used unchanged.
     """
     if rng is None:
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState()
 
     N, q = means.shape
 
@@ -323,7 +323,7 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
     N = observations.shape[0]
 
     if rng is None:
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState()
 
     has_missing = np.isnan(observations).any()
 
@@ -1343,7 +1343,7 @@ def _em_update_cfusn(
                 updated[c] = (mu_old, Delta_old, Gamma_old)
                 continue
 
-        rng = np.random.RandomState(kwargs.get("iterNum", 0) * K + c)
+        rng = kwargs.get("rng") or np.random.RandomState()
 
         # --- M-step using Lin (2009) equations ---
         # Step 1: location + compute eta, Psi

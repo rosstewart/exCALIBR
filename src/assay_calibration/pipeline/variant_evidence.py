@@ -80,6 +80,35 @@ def _get_variant_ids(scoreset) -> List[str]:
     return ids
 
 
+def _get_variant_is_vus(scoreset) -> Optional[List[bool]]:
+    """Per-kept-variant VUS flag, aligned 1:1 with _get_variant_ids's output.
+
+    Always ClinVar-2026-based, regardless of the Scoreset's own
+    clinvar_release (used only for that variant's own P/LP/B/LB
+    classification) -- see Variant.is_vus in data_utils/dataset.py, which is
+    hardcoded to clinvar_sig_2026 ("VUS ALWAYS 2026 SINCE NOT CONTROL") even
+    for clinvar_2018-mode datasets (BRCA1/MSH2/PTEN/TP53). Deriving VUS by
+    negation from the `sample` column instead (not P/LP, not B/LB, not
+    gnomAD, not Synonymous) would silently use whichever release the dataset
+    itself loaded controls from, which is wrong for clinvar_2018 datasets.
+
+    Returns None (not a per-row list) when the Scoreset has no per-variant
+    ClinVar annotation at all (e.g. BasicScoreset) -- same "only export if
+    the scoreset actually has this information" contract as auth_labels.
+    A group with multiple raw rows (deduplicated by ID) counts as VUS if ANY
+    row in the group does, matching how Scoreset itself builds _vus_scores
+    at construction time.
+    """
+    if not (hasattr(scoreset, "get_variants_by_id") and hasattr(scoreset, "_keep_mask")):
+        return None
+    is_vus = []
+    variants_by_id = scoreset.get_variants_by_id()
+    for all_idx, (_, variants) in enumerate(variants_by_id.items()):
+        if scoreset._keep_mask[all_idx]:
+            is_vus.append(any(getattr(v, "is_vus", False) for v in variants))
+    return is_vus
+
+
 # ---------------------------------------------------------------------------
 # Standard (in-bag) per-variant assignment
 # ---------------------------------------------------------------------------
@@ -143,17 +172,29 @@ def _build_standard_table(scoreset, calibration: Dict) -> pd.DataFrame:
     scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
     lr_5, lr_95, post_5, post_95 = _compute_bootstrap_lr_percentiles(scores, calibration)
     has_percentiles = lr_5 is not None
+    auth_labels = getattr(scoreset, "auth_labels", None)
+    is_vus = _get_variant_is_vus(scoreset)
 
     rows = []
     for idx in range(len(scoreset.scores)):
         score = scores[idx]
         pts = _assign_points(score, flat)
 
-        sample = "Unknown"
-        for s_idx in range(len(scoreset.sample_names)):
-            if scoreset._sample_assignments[idx, s_idx]:
-                sample = scoreset.sample_names[s_idx]
-                break
+        # scoreset._sample_assignments is a multi-label one-hot row — a
+        # variant can genuinely belong to more than one sample category at
+        # once (e.g. both Synonymous and gnomAD/population, since consequence
+        # type and population frequency are independent axes; see
+        # Scoreset._init_matrices's independent `if` checks, not `elif`).
+        # Keep every matching category, pipe-separated, rather than
+        # collapsing to whichever comes first — that collapse silently
+        # dropped real multi-label membership for anything downstream that
+        # filtered on exact-equality "sample" strings.
+        matched = [
+            scoreset.sample_names[s_idx]
+            for s_idx in range(len(scoreset.sample_names))
+            if scoreset._sample_assignments[idx, s_idx]
+        ]
+        sample = "|".join(matched) if matched else "Unknown"
 
         row = {
             "variant_id": ids[idx] if idx < len(ids) else f"variant_{idx}",
@@ -166,6 +207,10 @@ def _build_standard_table(scoreset, calibration: Dict) -> pd.DataFrame:
             row["lr_plus_95th"] = float(lr_95[idx])
             row["posterior_5th"] = float(post_5[idx])
             row["posterior_95th"] = float(post_95[idx])
+        if auth_labels is not None:
+            row["auth_label"] = auth_labels[idx]
+        if is_vus is not None:
+            row["is_vus"] = is_vus[idx]
 
         rows.append(row)
 
@@ -198,6 +243,8 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
 
     prior = float(calibration["prior"])
     ids = _get_variant_ids(scoreset)
+    auth_labels = getattr(scoreset, "auth_labels", None)
+    is_vus = _get_variant_is_vus(scoreset)
 
     # Interpolate LR+ at each variant's score
     def _interp_log_lr(s):
@@ -217,20 +264,28 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
             post_i = float(bayes_posterior_from_lr(lr_i, prior))
             label = str(continuous_classify(lr_i, prior))
 
-        sample = "Unknown"
-        for s_idx in range(len(scoreset.sample_names)):
-            if scoreset._sample_assignments[idx, s_idx]:
-                sample = scoreset.sample_names[s_idx]
-                break
+        # See _build_standard_table's identical logic — sample_assignments is
+        # multi-label; keep every matching category, pipe-separated.
+        matched = [
+            scoreset.sample_names[s_idx]
+            for s_idx in range(len(scoreset.sample_names))
+            if scoreset._sample_assignments[idx, s_idx]
+        ]
+        sample = "|".join(matched) if matched else "Unknown"
 
-        rows.append({
+        row = {
             "variant_id": ids[idx] if idx < len(ids) else f"variant_{idx}",
             "score": score,
             "sample": sample,
             "lr_plus": lr_i,
             "posterior": post_i,
             "classification": label,
-        })
+        }
+        if auth_labels is not None:
+            row["auth_label"] = auth_labels[idx]
+        if is_vus is not None:
+            row["is_vus"] = is_vus[idx]
+        rows.append(row)
 
     return pd.DataFrame(rows)
 

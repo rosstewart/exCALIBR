@@ -101,7 +101,10 @@ def save_results(
             'clinvar_2018': config.clinvar_release == '2018',
             'scoreset_flipped': calibration.get('scoreset_flipped', False),
             'uncalibratable_reason': None,
-            'model_selected': (component_key == f"{selected_k}c") if selected_k is not None else None,
+            # component_key may be bare ("3c") or compound ("3c_avg") depending
+            # on the caller -- compare only the n_c portion so this stays
+            # correct either way.
+            'model_selected': (component_key.split('_', 1)[0] == f"{selected_k}c") if selected_k is not None else None,
         }
 
         json_file = output_dir / f"{config.dataset_name}_{component_key}_calibration.json"

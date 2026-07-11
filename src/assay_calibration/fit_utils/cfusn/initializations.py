@@ -25,11 +25,12 @@ import itertools
 # ══════════════════════════════════════════════
 
 def kmeans_init(X, **kwargs):
+    rng = kwargs.get("rng") or np.random.RandomState()
     repeat = 0
     while repeat < 1000:
         n_clusters = kwargs.get("n_clusters", 2)
         init = kwargs.get("kmeans_init", "random")
-        kmeans = KMeans(n_clusters=n_clusters, init=init)
+        kmeans = KMeans(n_clusters=n_clusters, init=init, random_state=rng)
         X = np.array(X).reshape((-1, 1))
         kmeans.fit(X)
         cluster_assignments = kmeans.predict(X)
@@ -37,7 +38,7 @@ def kmeans_init(X, **kwargs):
         for i in range(n_clusters):
             X_cluster = X[cluster_assignments == i]
             loc, scale = sps.norm.fit(X_cluster)
-            a = np.random.uniform(-0.25, 0.25)
+            a = rng.uniform(-0.25, 0.25)
             component_parameters.append((a, float(loc), float(scale)))
         component_parameters = sorted(component_parameters, key=lambda x: x[1])
         if kwargs.get("constrained", True):
@@ -55,7 +56,8 @@ def kmeans_init(X, **kwargs):
     raise ValueError("Failed to initialize")
 
 
-def sn_method_of_moments_init(X):
+def sn_method_of_moments_init(X, rng=None):
+    rng = rng or np.random.RandomState()
     m1 = np.mean(X)
     m2 = np.var(X)
     m3 = sps.skew(X)
@@ -65,15 +67,15 @@ def sn_method_of_moments_init(X):
     c = (4 - np.pi) / 2  # skewness coefficient: gamma1 = c*(a1*delta)^3 / (1-a1^2*delta^2)^(3/2)
     try:
         if np.abs(m3) < 1e-10:
-            return np.random.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
+            return rng.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
         # Invert the SN skewness formula for delta (dimensionless, no m2):
         #   delta = sign(gamma1) / sqrt(a1^2 * (1 + (c/|gamma1|)^(2/3)))
         delta = np.sign(m3) / np.sqrt(a1**2 * (1 + (c / np.abs(m3)) ** (2/3)))
         if np.isnan(delta) or np.abs(delta) >= 0.99:
-            return np.random.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
+            return rng.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
         denom = 1 - a1**2 * delta**2
         if denom <= 1e-10:
-            return np.random.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
+            return rng.uniform(-0.25, 0.25), m1, max(np.sqrt(m2), 1e-6)
         sigma = max(np.sqrt(m2 / denom), 1e-6)
         mu = m1 - a1 * delta * sigma
         alpha = delta / np.sqrt(max(1 - delta**2, 1e-12))
@@ -85,19 +87,20 @@ def sn_method_of_moments_init(X):
 
 
 def methodOfMomentsInit(X, n_components, constrained, max_attempts=1000, **kwargs):
+    rng = kwargs.get("rng") or np.random.RandomState()
     LambdasTable = list(itertools.product([-1, 1], repeat=n_components))
     if "lambdaIndex" in kwargs:
         lambdas = LambdasTable[kwargs["lambdaIndex"]]
 
     for attempt in range(max_attempts):
-        if np.random.rand() < 0.7:
+        if rng.random() < 0.7:
             base = np.linspace(0, 100, n_components + 1)[1:-1]
             iqr = np.percentile(X, 75) - np.percentile(X, 25)
-            jitter = np.random.normal(0, iqr * 0.1, len(base))
+            jitter = rng.normal(0, iqr * 0.1, len(base))
             cutPoints = np.percentile(X, np.sort(np.clip(base + jitter, 1, 99)))
         else:
             cutPoints = np.sort(
-                np.random.uniform(
+                rng.uniform(
                     np.percentile(X, 5), np.percentile(X, 95), n_components - 1
                 )
             )
@@ -114,7 +117,7 @@ def methodOfMomentsInit(X, n_components, constrained, max_attempts=1000, **kwarg
             if len(Xc) < max(10, int(0.05 * len(X))):
                 success = False
                 break
-            params = sn_method_of_moments_init(Xc)
+            params = sn_method_of_moments_init(Xc, rng=rng)
             if len(params) == 0:
                 success = False
                 break
@@ -197,6 +200,7 @@ def kmeans_init_mv(X, **kwargs):
         Delta is (p,) for q=1, (p, q) for q>1
     kmeans : fitted KMeans object
     """
+    rng = kwargs.get("rng") or np.random.RandomState()
     n_clusters = kwargs.get("n_clusters", 2)
     constrained = kwargs.get("constrained", True)
     latent_q = kwargs.get("latent_q", 1)
@@ -235,7 +239,8 @@ def kmeans_init_mv(X, **kwargs):
             kmeans = KMeans(
                 n_clusters=n_clusters,
                 init=kwargs.get("kmeans_init", "random"),
-                n_init=1
+                n_init=1,
+                random_state=rng,
             )
             kmeans.fit(X_complete)
             labels = np.full(N, -1, dtype=int)
@@ -245,7 +250,7 @@ def kmeans_init_mv(X, **kwargs):
             for j in np.where(~complete_mask)[0]:
                 obs = ~np.isnan(X[j])
                 if not obs.any():
-                    labels[j] = np.random.randint(n_clusters)
+                    labels[j] = rng.randint(n_clusters)
                 else:
                     labels[j] = np.argmin([
                         np.sum((X[j, obs] - centers[c, obs])**2)
@@ -281,7 +286,7 @@ def kmeans_init_mv(X, **kwargs):
 
                 if latent_q == 1:
                     # Restricted MSN: Delta is (p,) vector
-                    Delta = np.random.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
+                    Delta = rng.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
                     Gamma = cov - np.outer(Delta, Delta)
                     eigvals_G = np.linalg.eigvalsh(Gamma)
                     if eigvals_G.min() < 1e-8:
@@ -299,7 +304,8 @@ def kmeans_init_mv(X, **kwargs):
                     # the enumerated sign pattern rather than unreliable skewness.
                     Delta = _init_delta_matrix(cov, K_dim, latent_q,
                                                Xc=None if small_cluster else Xc,
-                                               cluster_sign_pattern=cluster_sign_pattern)
+                                               cluster_sign_pattern=cluster_sign_pattern,
+                                               rng=rng)
                     Gamma = cov - Delta @ Delta.T
                     Gamma = 0.5 * (Gamma + Gamma.T)
                     eigvals_G = np.linalg.eigvalsh(Gamma)
@@ -355,7 +361,7 @@ def _format_vec(x):
 
 def _adaptive_anchor_centroid(
     Xc, mode="contrastive", direction_ref=None,
-    bic_delta=6.0, min_n=20, dim_label=None, comp_idx=None, verbose=False,
+    bic_delta=6.0, min_n=20, dim_label=None, comp_idx=None, verbose=False, rng=None,
 ):
     """Pick the anchor centroid μ for one component.
 
@@ -402,13 +408,14 @@ def _adaptive_anchor_centroid(
 
     try:
         from sklearn.mixture import GaussianMixture
+        gmm_rng = rng or np.random.RandomState()
         gm1 = GaussianMixture(
             n_components=1, covariance_type="full", reg_covar=1e-4,
-            random_state=0,
+            random_state=gmm_rng,
         ).fit(Xf)
         gm2 = GaussianMixture(
             n_components=2, covariance_type="full", reg_covar=1e-4,
-            n_init=3, random_state=0,
+            n_init=3, random_state=gmm_rng,
         ).fit(Xf)
     except Exception as e:
         _log("mean", f"GMM fit failed ({e}) → mu={_format_vec(nanmean)}")
@@ -532,6 +539,7 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
     component_parameters : list of (mu, Delta, Gamma) tuples
     kmeans : fitted sklearn KMeans (or None if all components anchored)
     """
+    rng = kwargs.get("rng") or np.random.RandomState()
     n_clusters = kwargs.get("n_clusters", 2)
     constrained = kwargs.get("constrained", True)
     latent_q = kwargs.get("latent_q", 1)
@@ -566,7 +574,7 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
         )
         mu, _branch = _adaptive_anchor_centroid(
             Xc, mode=anchor_mode, direction_ref=direction_ref,
-            dim_label="MV", comp_idx=c, verbose=anchor_verbose,
+            dim_label="MV", comp_idx=c, verbose=anchor_verbose, rng=rng,
         )
 
         # NaN-aware pairwise covariance (mirrors kmeans_init_mv)
@@ -585,7 +593,7 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
             cov += (1e-8 - eigvals.min()) * np.eye(K_dim)
 
         if latent_q == 1:
-            Delta = np.random.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
+            Delta = rng.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
             Gamma = cov - np.outer(Delta, Delta)
             eigvals_G = np.linalg.eigvalsh(Gamma)
             if eigvals_G.min() < 1e-8:
@@ -599,6 +607,7 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
             Delta = _init_delta_matrix(
                 cov, K_dim, latent_q, Xc=Xc,
                 cluster_sign_pattern=cluster_sign_pattern,
+                rng=rng,
             )
             Gamma = cov - Delta @ Delta.T
             Gamma = 0.5 * (Gamma + Gamma.T)
@@ -695,6 +704,7 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
         ``anchor_centroid_mode`` / ``anchor_centroid_verbose`` /
         ``lambdaIndex`` as in the MV anchored init.
     """
+    rng = kwargs.get("rng") or np.random.RandomState()
     n_clusters = kwargs.get("n_clusters", 2)
     constrained = kwargs.get("constrained", True)
     lambdaIndex = kwargs.get("lambdaIndex", 0)
@@ -729,7 +739,7 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
         )
         mu_arr, _branch = _adaptive_anchor_centroid(
             Xc, mode=anchor_mode, direction_ref=direction_ref,
-            dim_label="UV", comp_idx=c, verbose=anchor_verbose,
+            dim_label="UV", comp_idx=c, verbose=anchor_verbose, rng=rng,
         )
         loc = float(np.atleast_1d(mu_arr)[0])
 
@@ -739,13 +749,13 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
         # override α's *sign* with lambdas[c] to preserve the
         # bootstrap-wide 2^K sign-pattern coverage from lambdaIndex —
         # the magnitude stays data-driven.
-        sn_params = sn_method_of_moments_init(Xc) if len(Xc) > 1 else []
+        sn_params = sn_method_of_moments_init(Xc, rng=rng) if len(Xc) > 1 else []
         if sn_params and len(sn_params) == 3:
             alpha_data, _loc_unused, scale_data = sn_params
             a_mag = max(abs(float(alpha_data)), 0.05)
             scale = max(float(scale_data), 1e-3)
         else:
-            a_mag = float(np.random.uniform(0.05, 0.4))
+            a_mag = float(rng.uniform(0.05, 0.4))
             scale = max(float(np.std(Xc, ddof=1)), 1e-3) if len(Xc) > 1 else 1e-3
         alpha = float(lambdas[c]) * a_mag
 
@@ -789,7 +799,7 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
     return component_parameters, kmeans
 
 
-def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None):
+def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=None):
     """Initialize Delta (p, q) matrix for CFUSN.
 
     Uses the top-q eigenvectors of cov as skewness directions. Each column j
@@ -801,6 +811,7 @@ def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None):
 
     If cluster_sign_pattern is None, a random sign is used (original behaviour).
     """
+    rng = rng or np.random.RandomState()
     eigvals, eigvecs = np.linalg.eigh(cov)
     top_idx = np.argsort(eigvals)[::-1][:q]
 
@@ -823,12 +834,12 @@ def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None):
         enum_sign = (
             int(cluster_sign_pattern[j])
             if cluster_sign_pattern is not None
-            else np.random.choice([-1, 1])
+            else rng.choice([-1, 1])
         )
         Delta[:, j] = skew_sign * enum_sign * scale * evec
 
     # Add small random perturbation
-    Delta += np.random.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
+    Delta += rng.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
 
     # Verify Gamma = cov - Delta @ Delta.T is PD; shrink Delta if needed
     Gamma = cov - Delta @ Delta.T

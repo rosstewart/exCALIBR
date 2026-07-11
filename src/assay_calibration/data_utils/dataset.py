@@ -53,7 +53,7 @@ def _clean_clinsigs(values):
     return [v.split(";")[0] if isinstance(v, str) else "nan" for v in values]
 
 
-func_class_map = {#'BRCA1_Findlay_2018': {'LOF':'Abnormal','FUNC':'Normal','INT':'Indeterminate'},
+func_class_map = {'BRCA1_Findlay_2018': {'LOF':'Abnormal','FUNC':'Normal','INT':'Indeterminate'},
          'BAP1_Waters_2024': {'depleted':'Abnormal','unchanged':'Normal','enriched':'Not specified'},
          'BRCA2_Hu_2024': {'Abnormal': 'Abnormal', 'Normal': 'Normal', 'Intermediate': 'Indeterminate'},
          'CRX_Shepherdson_2024': {'low_activity': 'Abnormal','non-significant': 'Normal',
@@ -840,10 +840,18 @@ class Scoreset:
         self._init_matrices(**kwargs)
 
     def filter_invalid(self):
+        _dataset_name = self.dataframe["Dataset"].iloc[0] if "Dataset" in self.dataframe.columns and len(self.dataframe) else "?"
+
         if "Flag" in self.dataframe.columns:
+            _before = len(self.dataframe)
             self.dataframe = self.dataframe[self.dataframe["Flag"].ne("*")]
+            _dropped = _before - len(self.dataframe)
+            if _dropped:
+                print(f"  [{_dataset_name}] filter_invalid: dropped {_dropped}/{_before} "
+                      f"row(s) with Flag == '*'")
 
         if self.filter_nonsense:
+            _before = len(self.dataframe)
             # print('filtering nonsense variants within 50 aa of termini...')
             mask = (
                 # Keep all non-stop_gained variants
@@ -854,13 +862,19 @@ class Scoreset:
                  (self.dataframe['aa_pos'] <= 349))
             )
             self.dataframe = self.dataframe[mask]
+            _dropped = _before - len(self.dataframe)
+            if _dropped:
+                print(f"  [{_dataset_name}] filter_invalid: dropped {_dropped}/{_before} "
+                      f"nonsense variant row(s) outside aa 51-349")
 
     def splicing_filter(self, **kwargs):
+        _dataset_name = self.dataframe["Dataset"].iloc[0] if "Dataset" in self.dataframe.columns and len(self.dataframe) else "?"
         self.detects_splice = (
             self.dataframe.loc[:, "splice_measure"].unique()[0] == "Yes"  # type: ignore
         )
         # if assay does not detect effects of splicing, remove likely splicing aberrations
         if not self.detects_splice:
+            _before = len(self.dataframe)
             # Remove VEP (mapped/unmapped) consequences
             self.dataframe = self.dataframe[
                 ~self.dataframe.simplified_consequence.str.lower().isin([
@@ -870,11 +884,23 @@ class Scoreset:
                     "splice_donor_variant",
                 ])
             ]
-            
+            _dropped_consequence = _before - len(self.dataframe)
+
             # Remove SpliceAI scores
             spliceai_cols = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
+            _before_spliceai = len(self.dataframe)
             mask = self.dataframe[spliceai_cols].lt(0.2) | self.dataframe[spliceai_cols].isna()
             self.dataframe = self.dataframe[mask.all(axis=1)]
+            _dropped_spliceai = _before_spliceai - len(self.dataframe)
+
+            if _dropped_consequence or _dropped_spliceai:
+                print(f"  [{_dataset_name}] splicing_filter (assay does not detect splice effects): "
+                      f"dropped {_dropped_consequence} splice-consequence row(s) + "
+                      f"{_dropped_spliceai} SpliceAI-flagged row(s) "
+                      f"(of {_before} pre-filter)")
+        else:
+            print(f"  [{_dataset_name}] splicing_filter: assay detects splice effects "
+                  f"(splice_measure == 'Yes') — no splice-variant rows dropped")
 
     @staticmethod
     def remove_outliers(dataframe, **kwargs):

@@ -42,14 +42,15 @@ from src.assay_calibration.fit_utils.fit import Fit
 # ---------------------------------------------------------------------------
 
 def _run_one_fit(fit_spec):
-    """Execute a single fit job and return (bootstrap_seed, label, save_dir, result)."""
+    """Execute a single fit job and return (bootstrap_seed, label, save_dir, fit_idx, result)."""
     full_job, bootstrap_seed, label, save_dir = fit_spec
+    fit_idx = full_job.get("fit_idx")
     try:
         result = Fit.execute_fit_job(full_job)
     except Exception as e:
         print(f"  ✗ fit failed (bootstrap={bootstrap_seed}, label={label}): {e}")
         result = None
-    return bootstrap_seed, label, save_dir, result
+    return bootstrap_seed, label, save_dir, fit_idx, result
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +141,13 @@ def run_array_task(output_dir: str, array_idx: int) -> None:
     print(f"Submitting {len(fit_specs)} fits across {len(fits_per_bootstrap)} bootstrap(s)")
 
     # ── Run fits in parallel, track best per (bootstrap, label, save_dir) ──
-    best: dict = {}                              # key → (val_ll, result)
+    # ProcessPoolExecutor + as_completed() yields results in OS-scheduling
+    # order, not submission order, so the tie-break key below includes
+    # fit_idx (smaller wins on an exact val_ll tie) — this keeps the best-fit
+    # selection deterministic and independent of which worker finishes first,
+    # matching the joblib.Parallel-based pipeline path (which preserves
+    # submission order).
+    best: dict = {}                              # key → (val_ll, -fit_idx, result)
     remaining = dict(fits_per_bootstrap)
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
@@ -148,15 +155,16 @@ def run_array_task(output_dir: str, array_idx: int) -> None:
 
         for fut in concurrent.futures.as_completed(futures):
             try:
-                bs_seed, label, save_dir, result = fut.result()
+                bs_seed, label, save_dir, fit_idx, result = fut.result()
             except Exception as e:
                 print(f"  Future raised: {e}")
                 continue
 
             val_ll = (result.get("val_ll", -np.inf) if result else -np.inf)
+            sort_key = (val_ll, -(fit_idx if fit_idx is not None else 0))
             key = (bs_seed, label, save_dir)
-            if val_ll > best.get(key, (-np.inf, None))[0]:
-                best[key] = (val_ll, result)
+            if sort_key > best.get(key, (-np.inf, None, None))[:2]:
+                best[key] = (val_ll, -(fit_idx if fit_idx is not None else 0), result)
 
             bs_key = (bs_seed, save_dir)
             remaining[bs_key] -= 1
@@ -166,7 +174,7 @@ def run_array_task(output_dir: str, array_idx: int) -> None:
                 save_path = Path(save_dir) / f"bootstrap_{bs_seed}_best_fits.pkl"
                 new_results = {
                     lbl: res
-                    for (b, lbl, sd), (_, res) in best.items()
+                    for (b, lbl, sd), (_, _, res) in best.items()
                     if b == bs_seed and sd == save_dir
                 }
                 # Merge with pre-existing (preserves already-complete components)

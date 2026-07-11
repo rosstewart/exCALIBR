@@ -67,6 +67,14 @@ def single_fit(
     latent_q = kwargs.get("latent_q", 2)
     constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
 
+    # Single RNG for this fit (init draws + every EM iteration's MC/repulsion
+    # steps), seeded from fit_seed for reproducibility. Stored back into kwargs
+    # so it's picked up by every init routine via kwargs.get("rng") without
+    # having to edit each call site. None fit_seed (unseeded pipeline runs)
+    # falls back to RandomState(None) — the historical unseeded behaviour.
+    rng = kwargs.get("rng") or np.random.RandomState(kwargs.get("fit_seed"))
+    kwargs["rng"] = rng
+
     # Fail fast on deprecated 'line'/'marginal' modes (multivariate only); the
     # univariate density-ratio constraint is retained and ignores the mode.
     separation.validate_constraint_mode(constraint_mode, mv)
@@ -184,6 +192,7 @@ def single_fit(
 
     em_kwargs = {}
     em_kwargs["constraint_mode"] = constraint_mode
+    em_kwargs["rng"] = rng
     if mv and latent_q > 1:
         em_kwargs["n_mc_truncated"] = kwargs.get("n_mc_truncated", 500)
     if sample_weights_per_obs is not None:

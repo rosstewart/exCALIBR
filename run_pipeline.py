@@ -111,6 +111,10 @@ Examples:
                        help="Number of bootstrap iterations (default: 1000)")
     parser.add_argument("--fits-per-bootstrap", type=int, default=100,
                        help="Fits per bootstrap iteration (default: 100)")
+    parser.add_argument("--seed", type=int, default=None,
+                       help="Master seed for full reproducibility (train/val splits, EM "
+                            "initializations, and E-step Monte Carlo draws are all derived "
+                            "from this). Omit for the historical unseeded behavior.")
 
     # Execution mode
     parser.add_argument("--mode", choices=["slurm", "parallel", "single"],
@@ -179,6 +183,7 @@ Examples:
         splits_file=args.splits_file,
         n_bootstraps=args.n_bootstraps,
         num_fits_per_bootstrap=args.fits_per_bootstrap,
+        seed=args.seed,
         components=args.components,
         use_median_prior=not args.no_median_prior,
         use_2c_equation=args.use_equation,

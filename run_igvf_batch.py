@@ -22,6 +22,7 @@ import json
 import argparse
 import pickle
 import gzip
+import signal
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -148,6 +149,7 @@ def run_single_dataset(
         debug=args.debug if hasattr(args, "debug") else False,
         acmg_mapping_method=acmg_mapping_method,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        seed=getattr(args, "seed", None),
     )
 
     output_dir = Path(config.output_dir)
@@ -163,6 +165,59 @@ def run_single_dataset(
         n_samples = len([s for s in scoreset.samples])
         logger.info(f"Dataset {dataset_name}: {len(scoreset.scores)} variants, "
                      f"{n_samples} samples, components={component_list} {benign_method}")
+
+        # --viz-only fast path: when the calibration/LR-values for this exact
+        # (n_c, benign_method) are already on disk, just reload them (via the
+        # same _load_calibration_from_disk used by --all-configs' comparison
+        # viz -- see its docstring for why log_lr_plus must stay the full
+        # matrix there) and replot, instead of rerunning the full prior/
+        # threshold computation in generate_visualizations below. Only
+        # applies to a single concrete n_c (not "all", which needs the
+        # model-selection step to even know which component to plot).
+        if getattr(args, "viz_only", False) and n_c != "all":
+            comp_key = f"{n_c}_{benign_method}"
+            calib_path = output_dir / f"{dataset_name}_{comp_key}_calibration.json"
+            lr_path = output_dir / f"{dataset_name}_{comp_key}_lr_values.json.gz"
+            if calib_path.exists() and lr_path.exists():
+                logger.info(f"  --viz-only: reloading existing {comp_key} calibration/LR values "
+                            f"instead of recomputing")
+                indv_summary = _load_calibration_from_disk(calib_path, lr_path)
+                fits = [
+                    seed_results[n_c] for seed_results in bootstrap_results.values()
+                    if isinstance(seed_results, dict) and seed_results.get(n_c) is not None
+                ]
+                if not fits:
+                    logger.warning(f"  --viz-only: no '{n_c}' fits found in precomputed_fits for "
+                                    f"{dataset_name}, falling back to full recompute")
+                else:
+                    figure_path = output_dir / f"{dataset_name}_{comp_key}_visualization.png"
+                    # Fork + waitpid with a timeout, matching the other
+                    # plot_scoreset_best_config call sites in this file --
+                    # signal.SIGALRM can't interrupt a hung C renderer (e.g.
+                    # matplotlib's Agg backend), so this is the only reliable
+                    # way to keep one bad dataset from blocking the batch.
+                    child_pid = os.fork()
+                    if child_pid == 0:
+                        try:
+                            from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config
+                            fig = plot_scoreset_best_config(
+                                dataset=dataset_name, scoreset=scoreset, indv_summary=indv_summary,
+                                fits=fits, score_range=np.asarray(indv_summary["score_range"]),
+                                config=f"({benign_method})", n_c=comp_key, n_samples=n_samples,
+                                relax=False, flipped=indv_summary.get("scoreset_flipped", False),
+                            )
+                            fig.savefig(figure_path, dpi=150)
+                            os._exit(0)
+                        except Exception:
+                            os._exit(1)
+                    else:
+                        ok = _wait_child(child_pid, 600, str(figure_path), logger)
+                        if ok:
+                            logger.info(f"  Saved visualization: {figure_path}")
+                    return {comp_key: indv_summary}
+            else:
+                logger.info(f"  --viz-only: no existing {comp_key} calibration/LR values found "
+                            f"under {output_dir}, falling back to full recompute")
 
         # Build selected_components dict
         selected_components = {f"{c}c": c for c in component_list}
@@ -200,6 +255,26 @@ def run_single_dataset(
         if getattr(args, "viz_only", False):
             logger.info("  --viz-only: skipping variant table and calibration save")
             return results
+
+        # generate_visualizations() looks up precomputed bootstrap fits by bare
+        # component_key ("2c"/"3c") -- benign_method doesn't affect the fit
+        # itself, only the downstream threshold/prior, so `results` comes back
+        # keyed bare. Every *output filename* must disambiguate by
+        # benign_method too, though (this is the single-config counterpart of
+        # run_all_configs_for_dataset's comp_key = f"{n_c_str}_{benign_method}"),
+        # otherwise two datasets run with different benign_method choices for
+        # the same n_c collide on disk. Rename to compound keys here, once,
+        # right before anything gets written -- this must not touch
+        # `selected_components`/the generate_visualizations call above, which
+        # need the bare form for the precomputed-fits lookup.
+        bare_to_compound = {k: f"{k}_{benign_method}" for k in results}
+        for bare_key, compound_key in bare_to_compound.items():
+            old_png = output_dir / f"{config.dataset_name}_{bare_key}_visualization.png"
+            if old_png.exists():
+                new_png = output_dir / f"{config.dataset_name}_{compound_key}_visualization.png"
+                old_png.rename(new_png)
+                logger.info(f"  Renamed visualization: {new_png}")
+        results = {bare_to_compound[k]: v for k, v in results.items()}
 
         # Per-variant evidence table
         for comp_key, calibration in results.items():
@@ -255,6 +330,23 @@ def _load_calibration_from_disk(calib_path: Path, lr_path: Path):
 
     Supports both the compact (percentile-only) lr_values format and the
     legacy format that stored all 1000 bootstrap rows.
+
+    `log_lr_plus` in the returned dict must stay the FULL per-bootstrap
+    matrix whenever the file on disk has one -- plot_scoreset_best_config
+    computes np.nanpercentile(log_lr_plus, [5,50,95]) itself. Setting
+    log_lr_plus to the already-percentiled 3-row [p5,p50,p95] array (as this
+    function used to, for BOTH formats) is NOT a no-op under a second
+    np.nanpercentile pass: for the 5th percentile of 3 sorted values, linear
+    interpolation gives ~90% weight to element 0 (p5) and ~10% to element 1
+    (p50) -- i.e. 0.9*p5 + 0.1*p50 -- which measurably inflates the "5th
+    percentile" curve wherever the true median is far above the true p5
+    (exactly the bootstrap-instability signature of a dataset with very few
+    controls). Confirmed on ASPA_Grønbæk-Thygesen_2024_abundance: this bug
+    moved the reconstructed 5th-percentile peak from the correct 1.51 to
+    4.23, enough to spuriously cross the +1 evidence threshold in a
+    regenerated comparison plot even though the dataset's real point_ranges
+    (computed once, correctly, during the original calibration run) are
+    genuinely empty everywhere.
     """
     import gzip as _gzip
     with open(calib_path) as f:
@@ -262,25 +354,26 @@ def _load_calibration_from_disk(calib_path: Path, lr_path: Path):
     with _gzip.open(lr_path, "rt") as f:
         lr = json.load(f)
 
-    # New compact format: precomputed percentile arrays
+    # New compact format: precomputed percentile arrays (no raw per-bootstrap
+    # matrix on disk to fall back to -- re-percentiling downstream is
+    # unavoidable here and will carry the same small bias described above).
     if "log_lr_plus_p5" in lr:
         log_lr_pct = np.array([lr["log_lr_plus_p5"], lr["log_lr_plus_p50"], lr["log_lr_plus_p95"]])
         priors_pct = lr.get("priors_pct", [lr["prior"]] * 3)
+        log_lr_plus_full = log_lr_pct
     else:
-        # Legacy format: full 1000-row matrix — compute percentiles on load
+        # Legacy format: full 1000-row matrix — compute percentiles on load,
+        # but keep the full matrix itself as log_lr_plus.
         llr = np.asarray(lr["log_lr_plus"])
         log_lr_pct = np.nanpercentile(llr, [5, 50, 95], axis=0)
         priors_pct = [lr.get("prior")] * 3
+        log_lr_plus_full = llr
 
     return {
         "prior": c["prior"],
         "priors_pct": priors_pct,
-        # Aliases expected by plot_scoreset_best_config: priors as an array so
-        # np.percentile([p5,p50,p95],[5,50,95]) returns approximately the same
-        # values; log_lr_plus as the 3-row percentile matrix so
-        # np.nanpercentile(llr,[5,50,95],axis=0) is a no-op-equivalent.
         "priors": priors_pct,
-        "log_lr_plus": log_lr_pct,
+        "log_lr_plus": log_lr_plus_full,
         "point_ranges": {int(k): v for k, v in c["point_ranges"].items()},
         "score_range": lr["score_range"],
         "log_lr_pct": log_lr_pct,   # shape (3, n_score_points): p5, p50, p95
@@ -333,6 +426,7 @@ def _run_one_combo(
         n_jobs=n_bootstrap_jobs,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         acmg_mapping_method=getattr(args, "acmg_mapping_method", "tavtigian"),
+        seed=getattr(args, "seed", None),
     )
 
     # Reload scoreset inside the worker (avoids large object serialization)
@@ -566,6 +660,7 @@ def generate_all_configs_viz(
         point_values=[1, 2, 3, 4, 5, 6, 7, 8],
         n_jobs=1,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        seed=getattr(args, "seed", None),
     )
     scoreset = load_dataset_from_df(dataset_df, config_load)
 
@@ -724,6 +819,12 @@ def main():
                        help="Number of datasets to process in parallel (default: 1)")
     parser.add_argument("--n-jobs-inner", type=int, default=-1,
                        help="Number of parallel jobs within each dataset (default: -1 = all CPUs)")
+
+    # Reproducibility
+    parser.add_argument("--seed", type=int, default=None,
+                       help="Master seed for full reproducibility, forwarded to every "
+                            "PipelineConfig built in this batch run. Omit for the "
+                            "historical unseeded behavior.")
 
     # ClinVar
     parser.add_argument("--clinvar-release", default="2026", choices=["2026", "2025", "2018"])
@@ -909,11 +1010,14 @@ def main():
                 components_to_check = [c for c in ["2c", "3c"] if c in available] or ["2c", "3c"]
             else:
                 components_to_check = [n_c]
+            # run_single_dataset now writes compound "{n_c}_{benign_method}"
+            # filenames (see its comment on bare_to_compound) -- check that
+            # naming, not the bare n_c this dict used before.
             existing = [
                 c for c in components_to_check
                 if os.path.exists(os.path.join(
                     args.output_dir, effective_dataset_name,
-                    f"{effective_dataset_name}_{c}_calibration.json"
+                    f"{effective_dataset_name}_{c}_{benign_method}_calibration.json"
                 ))
             ]
             if set(existing) == set(components_to_check):

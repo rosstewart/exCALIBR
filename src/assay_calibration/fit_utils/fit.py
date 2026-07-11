@@ -229,6 +229,21 @@ def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, 
     return float((w * per_sample_mean_ll).sum())
 
 
+def derive_fit_seed(master_seed, bootstrap_idx, num_components, fit_idx):
+    """Derive an independent, collision-free seed for one (bootstrap, component-count,
+    restart) triple from a single top-level master_seed.
+
+    Uses SeedSequence rather than e.g. simple addition/multiplication of the inputs so
+    that streams for different (bootstrap_idx, num_components, fit_idx) combinations
+    don't collide or correlate. Returns None (→ unseeded) when master_seed is None,
+    preserving historical behaviour for callers that don't opt into reproducibility.
+    """
+    if master_seed is None:
+        return None
+    ss = np.random.SeedSequence([master_seed, bootstrap_idx, num_components, fit_idx])
+    return int(ss.generate_state(1)[0])
+
+
 class Fit:
     def __init__(self, scoreset):
         """Accept Scoreset, BasicScoreset, or MultiScoreset."""
@@ -257,164 +272,48 @@ class Fit:
 
         For CFUSN, pass latent_q=2 (or higher) in kwargs.
 
+        Thin wrapper around generate_fit_jobs(): job construction (one-hot
+        sample assignment, bootstrap split, init-method selection, per-restart
+        fit_seed derivation) is shared with the BootstrapRunner pipeline path
+        instead of being duplicated here with its own (previously unseeded)
+        copy of the same logic. Each job is executed via tryToFit (not
+        execute_fit_job) so the full result dict — including "likelihoods",
+        used by some callers for iteration counts — is preserved, matching
+        this method's historical return contract.
+
         Returns
         -------
         models : list of fit result dicts
         best_idx : int or None
         best_val_ll : float or None
         """
-        observations = self.scoreset.scores
-        mv = self.multivariate
+        core_limit = kwargs.pop("core_limit", -1)
+        verbose = kwargs.get("verbose", False)
 
-        if not mv and observations.ndim == 2 and observations.shape[1] > 1:
-            mv = True
-            self.multivariate = True
+        jobs = self.generate_fit_jobs(component_range, **kwargs)
+        if not jobs:
+            return [], None, None
 
-        if mv:
-            # For CFUSN q=2: 4^K distinct sign patterns (K = max components).
-            # Default NUM_FITS = min(4^K, 100); can be overridden by caller.
-            _latent_q = kwargs.get("latent_q", 2)
-            _max_K = max(component_range)
-            _default_fits = min((2 ** _latent_q) ** _max_K, 100)
-            NUM_FITS = kwargs.get("num_fits", _default_fits)
-        else:
-            NUM_FITS = kwargs.get("num_fits", 100)
-
-        if not mv:
-            kwargs["score_min"] = min(
-                kwargs.get("score_min", observations.min()), observations.min()
+        def _run_job(job):
+            return tryToFit(
+                job["train_observations"], job["train_sample_assignments"],
+                job["num_components"], job["constrained"],
+                job["init_method"], job["init_constraint_adjustment"],
+                multivariate=job["multivariate"], **job["kwargs"],
             )
-            kwargs["score_max"] = max(
-                kwargs.get("score_max", observations.max()), observations.max()
-            )
-
-        # Propagate latent_q for CFUSN
-        latent_q = kwargs.get("latent_q", 2)
-
-        bootstrap_seed = kwargs.get("bootstrap_seed", None)
-        onehot_rng = np.random.RandomState(bootstrap_seed)
-        sample_assignments = self.scoreset.sample_assignments
-        if kwargs.get("verbose", False):
-            print(f"sample counts: {sample_assignments.sum(0)}")
-        sample_assignments = makeOneHot(sample_assignments, rng=onehot_rng)
-        if kwargs.get("verbose", False):
-            print(f"sample counts (after one-hot): {sample_assignments.sum(0)}")
-            if latent_q > 1:
-                print(f"CFUSN mode: latent_q={latent_q}")
-
-        # Filter invalid rows
-        if mv:
-            include = sample_assignments.any(axis=1) & ~np.all(np.isnan(observations), axis=1)
-        else:
-            include = sample_assignments.any(axis=1) & ~np.isnan(observations)
-
-        observations = observations[include]
-        sample_assignments = sample_assignments[include]
-
-        # ── Overlap check: reduce dimensions if assays don't co-occur enough ──
-        if mv:
-            min_overlap = kwargs.get("min_overlap_rows", 30)
-            calibrated_dims = Fit._select_calibration_dims(observations, min_overlap)
-            if len(calibrated_dims) == 0:
-                print(
-                    f"[OVERLAP] No assay pair has ≥{min_overlap} shared observations. "
-                    f"Cannot run multivariate calibration — fall back to per-assay "
-                    f"1D calibrations."
-                )
-                return [], None, None
-            elif len(calibrated_dims) < observations.shape[1]:
-                excluded = sorted(set(range(observations.shape[1])) - set(calibrated_dims))
-                print(
-                    f"[OVERLAP] Assay dim(s) {excluded} lack ≥{min_overlap} shared rows "
-                    f"with the rest. Running {len(calibrated_dims)}D calibration on "
-                    f"dims {calibrated_dims}; use existing 1D calibrations for dim(s) "
-                    f"{excluded}."
-                )
-                observations = observations[:, calibrated_dims]
-                valid = (
-                    ~np.all(np.isnan(observations), axis=1)
-                    & sample_assignments.any(axis=1)
-                )
-                observations = observations[valid]
-                sample_assignments = sample_assignments[valid]
-            kwargs["calibrated_dims"] = calibrated_dims
-
-        train_indices = np.arange(len(observations))
-        val_indices = np.array([], dtype=int)
-        bootstrap_seed = kwargs.get("bootstrap_seed", None)
-        if kwargs.get("bootstrap", True):
-            if mv:
-                train_indices, val_indices = pattern_stratified_bootstrap(
-                    observations, sample_assignments, bootstrap_seed
-                )
-            else:
-                train_indices, val_indices = sample_specific_bootstrap(
-                    sample_assignments, bootstrap_seed
-                )
-
-        constrained = kwargs.get("check_monotonic", True)
-
-        init_method = kwargs.get("init_strategy", "random")
-        if init_method != "random":
-            init_methods = np.full(NUM_FITS, init_method)
-        else:
-            if mv:
-                init_methods = np.full(NUM_FITS, "kmeans")
-            else:
-                init_methods = np.random.choice(
-                    ["kmeans", "method_of_moments"], size=NUM_FITS
-                )
-
-        init_constraint_adjustment = kwargs.get("init_constraint_adjustment_param", "scale")
-        if init_constraint_adjustment != "random":
-            init_constraint_adjustments = np.full(NUM_FITS, init_constraint_adjustment)
-        else:
-            init_constraint_adjustments = np.random.choice(["skew", "scale"], size=NUM_FITS)
-
-        val_observations = observations[val_indices] if len(val_indices) else None
-        val_sample_assignments = sample_assignments[val_indices] if len(val_indices) else None
-        train_observations = observations[train_indices]
-        train_sample_assignments = sample_assignments[train_indices]
-
-        core_limit = kwargs.get("core_limit", -1)
-
-        def _lambda_index(i, num_components, mv, latent_q):
-            if mv:
-                n_patterns = min((2 ** latent_q) ** num_components, 100)
-            else:
-                n_patterns = 2 ** num_components
-            return i % n_patterns
-
-        _latent_q_run = kwargs.get("latent_q", 2)
 
         if core_limit == 1:
-            models = []
-            for num_components in component_range:
-                for i in range(NUM_FITS):
-                    kwargs["lambdaIndex"] = _lambda_index(i, num_components, mv, _latent_q_run)
-                    models.append(tryToFit(
-                        train_observations, train_sample_assignments,
-                        num_components, constrained,
-                        init_methods[i], init_constraint_adjustments[i],
-                        multivariate=mv, **kwargs,
-                    ))
+            models = [_run_job(job) for job in jobs]
         else:
-            verbosity = kwargs.get("verbose_level", 20) if kwargs.get("verbose", False) else 0
-            if kwargs.get("verbose", False):
-                print(f"Running {NUM_FITS} fits × {len(component_range)} components, cores={core_limit}")
+            verbosity = kwargs.get("verbose_level", 20) if verbose else 0
+            if verbose:
+                print(f"Running {len(jobs)} fits, cores={core_limit}")
             models = Parallel(n_jobs=core_limit, batch_size=1, verbose=verbosity)(
-                delayed(tryToFit)(
-                    train_observations, train_sample_assignments,
-                    num_components, constrained,
-                    init_methods[i], init_constraint_adjustments[i],
-                    **{**kwargs, "multivariate": mv,
-                       "lambdaIndex": _lambda_index(i, num_components, mv, _latent_q_run)}
-                )
-                for i in range(NUM_FITS)
-                for num_components in component_range
+                delayed(_run_job)(job) for job in jobs
             )
 
-        # Select best model
+        mv = jobs[0]["multivariate"]
+
         def _safe_ll(obs, sa, m):
             params = m.get("component_params")
             weights = m.get("weights")
@@ -430,11 +329,16 @@ class Fit:
             except Exception:
                 return -np.inf
 
+        val_observations = jobs[0]["val_observations"]
+        val_sample_assignments = jobs[0]["val_sample_assignments"]
+
         if kwargs.get("bootstrap", True) and val_observations is not None:
             val_lls = [_safe_ll(val_observations, val_sample_assignments, m) for m in models]
             best_idx = int(np.nanargmax(val_lls))
             return models, best_idx, val_lls[best_idx]
 
+        train_observations = jobs[0]["train_observations"]
+        train_sample_assignments = jobs[0]["train_sample_assignments"]
         train_lls = [_safe_ll(train_observations, train_sample_assignments, m) for m in models]
         best_idx = int(np.nanargmax(train_lls))
         return models, best_idx, train_lls[best_idx]
@@ -736,13 +640,14 @@ class Fit:
             if mv:
                 init_methods = np.full(NUM_FITS, "kmeans")
             else:
-                np.random.seed(bootstrap_seed)
-                init_methods = np.random.choice(["kmeans", "method_of_moments"], size=NUM_FITS)
+                init_method_rng = np.random.RandomState(bootstrap_seed)
+                init_methods = init_method_rng.choice(["kmeans", "method_of_moments"], size=NUM_FITS)
 
         init_constraint_adjustment = "scale"
         init_constraint_adjustments = np.full(NUM_FITS, init_constraint_adjustment)
 
         _latent_q_jobs = kwargs.get("latent_q", 2)
+        master_seed = kwargs.get("master_seed", None)
 
         jobs = []
         for i in range(NUM_FITS):
@@ -752,6 +657,7 @@ class Fit:
                 else:
                     n_patterns = 2 ** num_components
                 kwargs["lambdaIndex"] = i % n_patterns
+                kwargs["fit_seed"] = derive_fit_seed(master_seed, bootstrap_seed, num_components, i)
                 job = {
                     "job_id": f"b{bootstrap_seed}_f{i}_c{num_components}",
                     "bootstrap_seed": bootstrap_seed,

@@ -21,6 +21,11 @@ class PipelineConfig:
     n_bootstraps: int = 1000
     num_fits_per_bootstrap: int = 100
 
+    # Master seed for full reproducibility (train/val splits, EM initializations,
+    # and E-step Monte Carlo draws are all derived from this). None (default)
+    # preserves the historical unseeded behaviour.
+    seed: Optional[int] = None
+
     # Model parameters
     components: List[int] = None  # [2], [3], or [2, 3]
     use_median_prior: bool = True

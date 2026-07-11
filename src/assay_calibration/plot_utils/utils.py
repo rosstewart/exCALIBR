@@ -411,7 +411,22 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         ax_lr = ax[2, sample_num]
         
         log_lr_plus = indv_summary['log_lr_plus']
-        llr_curves = np.nanpercentile(np.array(log_lr_plus),[5,50,95],axis=0)
+        # Prefer a pre-computed [p5,p50,p95] percentile array when the caller
+        # provides one (log_lr_pct -- set by run_igvf_batch.py's/
+        # analysis/legacy_fits.py's disk-reload helpers) rather than always
+        # re-deriving via np.nanpercentile(log_lr_plus, ...). Re-deriving from
+        # an already-percentiled log_lr_plus (as happens when only percentiles
+        # were ever saved to disk, or when a caller mistakenly passes
+        # percentiles in that slot) is NOT equivalent to the true percentiles:
+        # taking the 5th percentile of 3 sorted values [p5,p50,p95] gives
+        # ~90% weight to p5 and ~10% to p50 (linear interpolation, n=3),
+        # which measurably inflates the reconstructed "5th percentile" curve
+        # wherever the true median is far above the true p5th percentile.
+        log_lr_pct = indv_summary.get('log_lr_pct')
+        if log_lr_pct is not None and np.asarray(log_lr_pct).shape[0] == 3:
+            llr_curves = np.asarray(log_lr_pct)
+        else:
+            llr_curves = np.nanpercentile(np.array(log_lr_plus),[5,50,95],axis=0)
         labels = ['5th percentile','Median','95th percentile']
         colors = ['red','black','blue']
         
@@ -1758,8 +1773,13 @@ def plot_scoreset_final_pillar_project_v2(dataset, scoreset_2018, scoreset, indv
     # Sample colors matching the original plot
     sample_colors = ['#CA7682', '#1D7AAB', '#A0A0A0', '#6BAA75']  # P/LP, B/LB, gnomAD, Synonymous
     sample_alphas = [0.5, 0.5, 0.15, 0.4]  # gnomAD more transparent as background
-    
-    # Component colors for fits (colorblind-friendly palette)
+
+    # Component colors for fits (colorblind-friendly palette).
+    # n_c is only ever used for this color count — callers historically pass
+    # None here (see test/plot_MSH2_ex.py), so fall back to inferring the
+    # component count directly from the fits themselves.
+    if n_c is None:
+        n_c = len(fits[0]['fit']['component_params'])
     component_colors = plt.cm.Set2(np.linspace(0, 1, n_c))
     
     # Threshold configuration
@@ -1852,7 +1872,8 @@ def plot_scoreset_final_pillar_project_v2(dataset, scoreset_2018, scoreset, indv
     sample_name_shortener = {
         "Pathogenic/Likely Pathogenic": "ClinVar P/LP",
         "Benign/Likely Benign": "ClinVar B/LB",
-        "gnomAD": "gnomAD"
+        "gnomAD": "gnomAD",
+        "population": "gnomAD",  # "population" is the literal sample name written to disk for some datasets
     }
     
     # ===== TOP ROW: Individual fits with components =====

@@ -337,7 +337,7 @@ def bhattacharyya_repulsion_step(updated_params, xlims, multivariate=True, **kwa
     p_dim = mus[0].shape[0]
     scales = [float(np.sqrt(max(np.trace(O) / p_dim, 1e-12))) for O in covs]
 
-    rng = np.random.RandomState(int(kwargs.get("iterNum", 0)) + 12345)
+    rng = kwargs.get("rng") or np.random.RandomState()
     new_params = []
     for i, (mu, Delta, Gamma) in enumerate(updated_params):
         shift = np.zeros(p_dim)
