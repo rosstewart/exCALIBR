@@ -40,6 +40,11 @@ from src.assay_calibration.fit_utils.cfusn.density_utils import (
     _single_component_logpdf,
     get_q,
 )
+from src.assay_calibration.fit_utils.point_ranges import (
+    estimate_prior_from_class_densities,
+    compute_pathomechanism_pathogenic_density,
+    _get_benign_reference_weights,
+)
 
 
 # ──────────────────────────────────────
@@ -70,7 +75,7 @@ CONFIG_LABELS = {
 def _bootstrap_job(fit_raw, scores, sa,
                    p_idx, b_idx, g_idx, s_idx, benign_method,
                    partial_patterns, reestimate_marginal_weights,
-                   extra_p_indices=None):
+                   extra_p_indices=None, pathomechanism_prior=True):
     """Process one bootstrap fit.  Standalone so joblib loky workers don't
     need to pickle the full MVCalibrationAnalysis object."""
     if fit_raw is None:
@@ -159,6 +164,39 @@ def _bootstrap_job(fit_raw, scores, sa,
             K = len(params)
             w_pop = weights[eff_g]
 
+            # ---- pathomechanism correction (default on; standard/PU only) ----
+            # Replaces the raw pathogenic-labeled weight vector with a
+            # corrected "assay-relevant" excess density before prior
+            # estimation, mirroring get_fit_prior's pathomechanism_prior
+            # (src/assay_calibration/fit_utils/point_ranges.py). Standard
+            # mode anchors against the UNRESTRICTED benign-method blend (no
+            # per-pattern support-gating -- the correction characterizes the
+            # pathogenic-labeled sample's overall mixture composition once,
+            # not per identifiability pattern); PU mode anchors against the
+            # raw gnomAD/population weights, same as UV. Computed once (not
+            # per pattern group): the missing-data-aware density functions
+            # (_single_component_logpdf's *_missing dispatch) already handle
+            # heterogeneous NaN patterns within one batched call. Not applied
+            # in NU mode (no pathogenic sample to correct) or to auxiliary
+            # pathogenic samples (open question, not a silent gap: aux
+            # samples represent different diseases and may warrant their own
+            # correction, but that's not implemented here).
+            pathomechanism_no_pu_support = False
+            f1_full = None
+            if pathomechanism_prior and eff_p is not None and not nu_mode:
+                w_N_anchor = weights[eff_g] if pu_mode else _get_benign_reference_weights(
+                    weights, benign_method, eff_b, eff_s)
+                labeled_scores = scores[sa[:, eff_p].astype(bool)]
+                corrected, _gamma_hat = compute_pathomechanism_pathogenic_density(
+                    labeled_scores, pop_scores, params, weights[eff_p], w_N_anchor,
+                    multivariate=True,
+                )
+                if corrected is None:
+                    return None, "pathomechanism correction: no assay-relevant excess"
+                f1_full = corrected
+                if pu_mode:
+                    pathomechanism_no_pu_support = not np.any(f1_full > 1e-300)
+
             log_f1 = np.full(N_pop, np.nan)  # "labeled class" density on pop observations
             log_f2 = np.full(N_pop, np.nan)  # "reference class" density on pop observations
             pop_obs = ~np.isnan(pop_scores)
@@ -186,9 +224,10 @@ def _bootstrap_job(fit_raw, scores, sa,
                                              for c in range(K)], axis=0)
                 elif pu_mode:
                     # PU: labeled class = pathogenic, reference = population
-                    w_p = weights[eff_p]
-                    log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                             for c in range(K)], axis=0)
+                    if f1_full is None:
+                        w_p = weights[eff_p]
+                        log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                                 for c in range(K)], axis=0)
                     log_f2[jdx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
                                              for c in range(K)], axis=0)
                 else:
@@ -198,93 +237,39 @@ def _bootstrap_job(fit_raw, scores, sa,
                     w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
                     if w_b is None:
                         continue
-                    w_p = weights[eff_p]
-                    log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                             for c in range(K)], axis=0)
+                    if f1_full is None:
+                        w_p = weights[eff_p]
+                        log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                                 for c in range(K)], axis=0)
                     log_f2[jdx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
                                              for c in range(K)], axis=0)
 
-            valid = np.isfinite(log_f1) & np.isfinite(log_f2)
-            f1, f2 = np.exp(log_f1[valid]), np.exp(log_f2[valid])
-            f1_at_pop = f1  # labeled-class density at gnomAD observations (alias for NU/PU path)
-
-            if nu_mode or pu_mode:
-                # Mean-matching estimator:
-                #   NU: α = 1 - E_{gnomAD}[fb] / E_{benign}[fb]
-                #   PU: α = E_{gnomAD}[fp] / E_{path}[fp]
-                #
-                # Requires only that pathogenic (benign) variants have low benign (path)
-                # density — far weaker than Blanchard-Recht's floor assumption, which breaks
-                # when fitted model weights don't satisfy fpop = α·fpath + (1-α)·fbenign.
-
-                # Compute effective labeled-class density at labeled-class observations.
-                # Use the full effective benign sample consistent with benign_method:
-                #   'avg'        → benign ∪ synonymous observations
-                #   'synonymous' → synonymous observations only
-                #   'benign'     → benign observations only
-                # For PU: pathogenic observations only.
-                if nu_mode:
-                    b_mask = sa[:, eff_b].astype(bool) if eff_b is not None else np.zeros(len(scores), bool)
-                    s_mask = sa[:, eff_s].astype(bool) if eff_s is not None else np.zeros(len(scores), bool)
-                    if benign_method == 'synonymous':
-                        labeled_mask = s_mask
-                    elif benign_method == 'avg':
-                        labeled_mask = b_mask | s_mask
-                    else:
-                        labeled_mask = b_mask
-                    labeled_scores = scores[labeled_mask]
-                else:
-                    labeled_scores = scores[sa[:, eff_p].astype(bool)]
-
-                labeled_obs = ~np.isnan(labeled_scores)
-                labeled_groups = {}
-                for j in range(len(labeled_scores)):
-                    key = frozenset(np.where(labeled_obs[j])[0])
-                    if not key:
-                        continue
-                    labeled_groups.setdefault(key, []).append(j)
-
-                log_f1_labeled = np.full(len(labeled_scores), np.nan)
-                for obs_key, ilist in labeled_groups.items():
-                    jdx = np.array(ilist)
-                    x_sub = labeled_scores[jdx]
-                    if nu_mode:
-                        w_b = _benign_w(weights, b_sup=True, s_sup=True)
-                        if w_b is None:
-                            continue
-                        log_f1_labeled[jdx] = logsumexp(
-                            [np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                             for c in range(K)], axis=0)
-                    else:
-                        w_p = weights[eff_p]
-                        log_f1_labeled[jdx] = logsumexp(
-                            [np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                             for c in range(K)], axis=0)
-
-                f1_at_labeled = np.exp(log_f1_labeled[np.isfinite(log_f1_labeled)])
-
-                if len(f1_at_pop) > 0 and len(f1_at_labeled) > 0:
-                    mean_pop = np.mean(f1_at_pop)
-                    mean_labeled = np.mean(f1_at_labeled)
-                    if mean_labeled > 0:
-                        if nu_mode:
-                            prior = float(np.clip(1.0 - mean_pop / mean_labeled, 0.001, 0.999))
-                        else:
-                            prior = float(np.clip(mean_pop / mean_labeled, 0.001, 0.999))
-                    else:
-                        prior = 0.1
-                else:
-                    prior = 0.1
+            # When the pathomechanism correction ran, f1 comes from the
+            # single precomputed f1_full array (already linear-space, indexed
+            # like pop_scores) rather than from log_f1 -- see the comment
+            # above on why this is computed once, not per pattern group.
+            # `valid` is still keyed off log_f2's finiteness either way, so
+            # a population row whose pattern never got a supported benign
+            # reference is excluded from both f1 and f2 identically.
+            if f1_full is not None:
+                valid = np.isfinite(log_f2)
+                f1, f2 = f1_full[valid], np.exp(log_f2[valid])
             else:
-                prior = 0.5
-                for _ in range(10000):
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        posteriors = 1 / (1 + (1 - prior) / prior * f2 / f1)
-                    new_prior = np.nanmean(posteriors)
-                    if abs(new_prior - prior) < 1e-6:
-                        prior = new_prior
-                        break
-                    prior = new_prior
+                valid = np.isfinite(log_f1) & np.isfinite(log_f2)
+                f1, f2 = np.exp(log_f1[valid]), np.exp(log_f2[valid])
+
+            # Shared with UV's get_fit_prior (src/assay_calibration/fit_utils/
+            # point_ranges.py::estimate_prior_from_class_densities) -- same
+            # EM loop / boundary-estimator math, same floor/discard policy
+            # for PU/NU.
+            if nu_mode:
+                prior = estimate_prior_from_class_densities(f1, f2, mode='negative_unlabeled')
+            elif pu_mode:
+                no_signal = 0.01 if pathomechanism_no_pu_support else 0.1
+                prior = estimate_prior_from_class_densities(
+                    f1, f2, mode='positive_unlabeled', no_signal_prior=no_signal)
+            else:
+                prior = estimate_prior_from_class_densities(f1, f2, mode='standard')
     except Exception as e:
         import traceback
         return None, f"prior EM: {e}\n{traceback.format_exc()}"
@@ -332,15 +317,15 @@ def _bootstrap_job(fit_raw, scores, sa,
                 valid_a = np.isfinite(log_fp_a) & np.isfinite(log_fb_a)
                 fp_a = np.exp(log_fp_a[valid_a])
                 fb_a = np.exp(log_fb_a[valid_a])
-                aux_prior = 0.5
-                for _ in range(10000):
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        post_a = 1 / (1 + (1 - aux_prior) / aux_prior * fb_a / fp_a)
-                    new_p = np.nanmean(post_a)
-                    if abs(new_p - aux_prior) < 1e-6:
-                        aux_prior = new_p
-                        break
-                    aux_prior = new_p
+                # Shared with UV's get_fit_prior and this file's main prior-EM
+                # loop above (estimate_prior_from_class_densities). Not
+                # pathomechanism-corrected -- see the comment on the main
+                # loop's f1_full: aux samples represent different diseases
+                # and may warrant their own correction, but that's not
+                # implemented here. Acceptance policy below (open (0,1),
+                # else 0.5) is this loop's own, distinct from the main loop's
+                # 0.001/0.999 gate -- kept as-is, not harmonized.
+                aux_prior = estimate_prior_from_class_densities(fp_a, fb_a, mode='standard')
                 if np.isfinite(aux_prior) and 0 < aux_prior < 1:
                     aux_priors[aux_eff_p] = aux_prior
                 else:
@@ -618,6 +603,7 @@ class MVCalibrationAnalysis:
         self.ms = ms
         self.point_values = point_values or list(range(1, 9))
         self.benign_method = benign_method
+        self.pathomechanism_prior = True  # overridden by run()'s kwarg of the same name
 
         # Map fixed role indices (0=path,1=ben,2=gnomad,3=syn) to effective indices
         # in ms.sample_assignments (public property, drops empty-sample columns).
@@ -795,6 +781,27 @@ class MVCalibrationAnalysis:
         K = len(params)
         w_pop = weights[self.g_idx]
 
+        # ---- pathomechanism correction (see _bootstrap_job for full
+        # rationale) -- default on via self.pathomechanism_prior (set by
+        # run()'s kwarg of the same name), standard/PU only, computed once
+        # rather than per pattern group. ----
+        pathomechanism_no_pu_support = False
+        f1_full = None
+        if (getattr(self, "pathomechanism_prior", True) and self.p_idx is not None
+                and not self.nu_mode):
+            w_N_anchor = weights[self.g_idx] if self.pu_mode else _get_benign_reference_weights(
+                weights, self.benign_method, self.b_idx, self.s_idx)
+            labeled_scores = self.ms.scores[self.ms.sample_assignments[:, self.p_idx]]
+            corrected, _gamma_hat = compute_pathomechanism_pathogenic_density(
+                labeled_scores, pop_scores, params, weights[self.p_idx], w_N_anchor,
+                multivariate=True,
+            )
+            if corrected is None:
+                return np.nan  # no assay-relevant excess -- discard this fit
+            f1_full = corrected
+            if self.pu_mode:
+                pathomechanism_no_pu_support = not np.any(f1_full > 1e-300)
+
         log_f1 = np.full(N_pop, np.nan)  # labeled-class density
         log_f2 = np.full(N_pop, np.nan)  # reference density
         obs_mask = ~np.isnan(pop_scores)
@@ -818,90 +825,48 @@ class MVCalibrationAnalysis:
                 log_f2[idx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
                                          for c in range(K)], axis=0)
             elif self.pu_mode:
-                w_p = weights[self.p_idx]
-                log_f1[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                         for c in range(K)], axis=0)
+                if f1_full is None:
+                    w_p = weights[self.p_idx]
+                    log_f1[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
                 log_f2[idx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
                                          for c in range(K)], axis=0)
             else:
-                w_p = weights[self.p_idx]
                 b_sup = self._sample_supports_pattern(self.b_idx, obs_key)
                 s_sup = self._sample_supports_pattern(self.s_idx, obs_key)
                 try:
                     w_b = self._get_benign_weights(weights, b_supports=b_sup, s_supports=s_sup)
                 except ValueError:
                     continue
-                log_f1[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                         for c in range(K)], axis=0)
+                if f1_full is None:
+                    w_p = weights[self.p_idx]
+                    log_f1[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                             for c in range(K)], axis=0)
                 log_f2[idx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
                                          for c in range(K)], axis=0)
 
-        f1_at_pop = np.exp(log_f1[np.isfinite(log_f1)])
-
-        if self.nu_mode or self.pu_mode:
-            # Mean-matching estimator (see _bootstrap_job for rationale)
-            sa = self.ms.sample_assignments
-            scores_all = self.ms.scores
-            if self.nu_mode:
-                b_mask = sa[:, self.b_idx].astype(bool) if self.b_idx is not None else np.zeros(len(scores_all), bool)
-                s_mask = sa[:, self.s_idx].astype(bool) if self.s_idx is not None else np.zeros(len(scores_all), bool)
-                if self.benign_method == 'synonymous':
-                    labeled_mask = s_mask
-                elif self.benign_method == 'avg':
-                    labeled_mask = b_mask | s_mask
-                else:
-                    labeled_mask = b_mask
-            else:
-                labeled_mask = sa[:, self.p_idx].astype(bool)
-            labeled_scores = scores_all[labeled_mask]
-            labeled_obs_mask = ~np.isnan(labeled_scores)
-            labeled_groups = {}
-            for j in range(len(labeled_scores)):
-                key = frozenset(np.where(labeled_obs_mask[j])[0])
-                if not key:
-                    continue
-                labeled_groups.setdefault(key, []).append(j)
-
-            log_f1_lab = np.full(len(labeled_scores), np.nan)
-            for obs_key, indices in labeled_groups.items():
-                idx = np.array(indices)
-                x_sub = labeled_scores[idx]
-                if self.nu_mode:
-                    try:
-                        w_b = self._get_benign_weights(weights, b_supports=True, s_supports=True)
-                    except ValueError:
-                        continue
-                    log_f1_lab[idx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                                 for c in range(K)], axis=0)
-                else:
-                    w_p = weights[self.p_idx]
-                    log_f1_lab[idx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                                 for c in range(K)], axis=0)
-
-            f1_at_lab = np.exp(log_f1_lab[np.isfinite(log_f1_lab)])
-            if len(f1_at_pop) > 0 and len(f1_at_lab) > 0:
-                mean_pop = np.mean(f1_at_pop)
-                mean_lab = np.mean(f1_at_lab)
-                if mean_lab > 0:
-                    if self.nu_mode:
-                        prior = float(np.clip(1.0 - mean_pop / mean_lab, 0.001, 0.999))
-                    else:
-                        prior = float(np.clip(mean_pop / mean_lab, 0.001, 0.999))
-                else:
-                    prior = 0.1
-            else:
-                prior = 0.1
+        # See _bootstrap_job's identical f1_full handling: valid is keyed off
+        # log_f2 either way, so this is a no-op swap when the correction is off.
+        if f1_full is not None:
+            valid = np.isfinite(log_f2)
+            f1_at_pop, f2_at_pop = f1_full[valid], np.exp(log_f2[valid])
         else:
-            prior = 0.5
-            for _ in range(10000):
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    posteriors = 1 / (1 + (1 - prior) / prior * f2 / f1)
-                new_prior = np.nanmean(posteriors)
-                if abs(new_prior - prior) < 1e-6:
-                    prior = new_prior
-                    break
-                prior = new_prior
-        return prior
+            valid = np.isfinite(log_f1) & np.isfinite(log_f2)
+            f1_at_pop, f2_at_pop = np.exp(log_f1[valid]), np.exp(log_f2[valid])
+
+        # Shared with UV's get_fit_prior and this file's _bootstrap_job
+        # (src/assay_calibration/fit_utils/point_ranges.py::
+        # estimate_prior_from_class_densities). Intentionally NO discard/
+        # bounds check on the returned value here (unlike _bootstrap_job's
+        # outer 0.001/0.999 gate) -- this call site has never had one; do
+        # not add one without a deliberate, separate decision to do so.
+        if self.nu_mode:
+            return estimate_prior_from_class_densities(f1_at_pop, f2_at_pop, mode='negative_unlabeled')
+        if self.pu_mode:
+            no_signal = 0.01 if pathomechanism_no_pu_support else 0.1
+            return estimate_prior_from_class_densities(
+                f1_at_pop, f2_at_pop, mode='positive_unlabeled', no_signal_prior=no_signal)
+        return estimate_prior_from_class_densities(f1_at_pop, f2_at_pop, mode='standard')
 
     def _compute_variant_lr(self, params, weights, prior=None):
         """Compute log LR+ for every variant in ms.scores.
@@ -1228,8 +1193,19 @@ class MVCalibrationAnalysis:
             reestimate_marginal_weights=True,
             enforce_marginal_monotonicity=True,
             liberal_marginal_monotonicity=True,
+            pathomechanism_prior=True,
             n_jobs=-1):
-        """Run analysis for all configs."""
+        """Run analysis for all configs.
+
+        pathomechanism_prior : bool, default True
+            Estimate the scalar prior from the pathomechanism-corrected
+            pathogenic density (excess over the benign/gnomAD anchor) rather
+            than the raw pathogenic-labeled density -- mirrors get_fit_prior's
+            pathomechanism_prior default in the univariate pipeline
+            (src/assay_calibration/fit_utils/point_ranges.py). Pass False to
+            reproduce this file's pre-pathomechanism behavior exactly.
+        """
+        self.pathomechanism_prior = pathomechanism_prior
         ben_percentile = 100 - path_percentile
         _aux_path_pct = aux_path_percentile if aux_path_percentile is not None else path_percentile
         _aux_ben_pct  = aux_ben_percentile  if aux_ben_percentile  is not None else (100 - _aux_path_pct)
@@ -1281,6 +1257,7 @@ class MVCalibrationAnalysis:
                     self.benign_method, partial_patterns,
                     reestimate_marginal_weights,
                     extra_p_indices=aux_eff_indices,
+                    pathomechanism_prior=pathomechanism_prior,
                 )
                 for _, bd in boot_items
             )

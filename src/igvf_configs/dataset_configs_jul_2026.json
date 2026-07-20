@@ -5,10 +5,11 @@
   },
   "ASPA_Gr\u00f8nb\u00e6k-Thygesen_2024_toxicity": {
     "n_c": "3c",
-    "benign_method": "avg"
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "BAP1_Waters_2024": {
-    "n_c": "3c",
+    "n_c": "2c",
     "benign_method": "avg"
   },
   "BARD1_IGVF": {
@@ -41,7 +42,7 @@
   },
   "BRCA2_Sahu_2023_exon13_Cisplatin_Resistance": {
     "n_c": "3c",
-    "benign_method": "avg"
+    "benign_method": "benign"
   },
   "BRCA2_Sahu_2023_exon13_Olaparib_Resistance": {
     "n_c": "3c",
@@ -60,7 +61,7 @@
     "benign_method": "avg"
   },
   "CALM1_CALM2_CALM3_Weile_2017": {
-    "n_c": "3c",
+    "n_c": "2c",
     "benign_method": "benign"
   },
   "CARD11_Meitlis_2020_SGE_Ibrutinib_GoF": {
@@ -72,8 +73,8 @@
     "benign_method": "avg"
   },
   "CBS_Sun_2020_high_B6": {
-    "n_c": "2c",
-    "benign_method": "benign"
+    "n_c": "3c",
+    "benign_method": "avg"
   },
   "CBS_Sun_2020_low_B6": {
     "n_c": "3c",
@@ -81,7 +82,7 @@
   },
   "CHEK2_Gebbia_2024": {
     "n_c": "2c",
-    "benign_method": "avg"
+    "benign_method": "benign"
   },
   "CHEK2_McCarthy_Leo_2024": {
     "n_c": "3c",
@@ -116,7 +117,7 @@
   },
   "F9_Popp_2025_light_chain": {
     "n_c": "2c",
-    "benign_method": "avg"
+    "benign_method": "benign"
   },
   "F9_Popp_2025_strep_2": {
     "n_c": "3c",
@@ -194,7 +195,7 @@
   },
   "LDLR_Tabet_2025_LDLR_cell_surface_abundance": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "LDLR_Tabet_2025_LDL_uptake": {
     "n_c": "3c",
@@ -211,7 +212,8 @@
   },
   "OTC_Lo_2023": {
     "n_c": "3c",
-    "benign_method": "avg"
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "PALB2_Boonen_2026": {
     "n_c": "3c",
@@ -226,7 +228,7 @@
     "benign_method": "avg"
   },
   "PAX6_McDonnell_2024_BLX_no_geneticin": {
-    "n_c": "2c",
+    "n_c": "3c",
     "benign_method": "avg"
   },
   "PAX6_McDonnell_2024_LE9_geneticin": {
@@ -239,23 +241,26 @@
   },
   "PTEN_Matreyek_2018_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "benign",
+    "liberal_monotonicity": false
   },
   "PTEN_Mighell_2018_clinvar_2018": {
-    "n_c": "3c",
-    "benign_method": "avg"
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "RAD51C_Olvera-Le\u00f3n_2024": {
     "n_c": "3c",
     "benign_method": "avg"
   },
   "RAD51D_IGVF": {
-    "n_c": "2c",
+    "n_c": "3c",
     "benign_method": "avg"
   },
   "RHO_Wan_2019": {
-    "n_c": "2c",
-    "benign_method": "avg"
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "SCN5A_Glazer_2020": {
     "n_c": "3c",
@@ -279,7 +284,7 @@
   },
   "TP53_Boettcher_2019_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign",
+    "benign_method": "avg",
     "liberal_monotonicity": false
   },
   "TP53_Fayer_2021_meta_clinvar_2018": {

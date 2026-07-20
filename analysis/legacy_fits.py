@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from analysis import config as cfg
-from analysis.discovery import discover_outputs, resolve_component, _parse_dataset_config_entry
+from analysis.discovery import discover_outputs, resolve_component, _parse_dataset_config_entry, load_master_df
 
 
 def _load_calibration_and_lr(
@@ -191,8 +191,7 @@ def load_scoreset_and_fits(
     from src.assay_calibration.pipeline.config import PipelineConfig
     from src.assay_calibration.pipeline.utils import load_dataset_from_df
 
-    sep = "\t" if str(dataset_tsv).endswith((".tsv", ".tsv.gz")) else ","
-    df_full = pd.read_csv(dataset_tsv, sep=sep, low_memory=False)
+    df_full = load_master_df(dataset_tsv)
     csv_name = dataset.replace("_clinvar_2018", "")
     df_ds = df_full[df_full["Dataset"] == csv_name].copy()
     if df_ds.empty:

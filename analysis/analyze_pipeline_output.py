@@ -100,6 +100,7 @@ else:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
 from analysis import config
 from analysis.discovery import discover_outputs, load_all_variants, resolve_component
@@ -111,11 +112,7 @@ from analysis.confusion import (
     make_single_confusion_figure,
 )
 from analysis.evidence import build_evidence_arrays, build_author_array, make_evidence_figure
-from analysis.scatter import make_scatter_figure
 from analysis.calibration_plots import load_lr_values, make_calibration_figure
-from analysis.legacy_fits import load_scoreset_and_fits
-from analysis.yang_distance import compute_bootstrap_yang_distances_parallel
-from src.assay_calibration.plot_utils.utils import plot_scoreset_final_pillar_project_v2
 from analysis.plot_common import save_and_show
 
 OUTPUT_DIR = Path(config.OUTPUT_DIR)
@@ -216,16 +213,6 @@ def main():
         all_author = build_author_array(df_m)
         make_evidence_figure(all_danz, all_author, all_clinvar, label=method_, figure_dir=figure_dir)
 
-    # Per-gene accuracy scatter: ExCALIBR vs author (not two ACMG-mapping
-    # methods against each other) -- same primary_method/auths pairing as the
-    # confusion figure above, just wrapped in the {label: matrices} shape
-    # make_scatter_figure expects.
-    if any(a is not None for a in auths_):
-        make_scatter_figure(
-            {primary_method_: conf_by_method_[primary_method_], "author": auths_},
-            datasets_, primary_method_, "author", figure_dir=figure_dir,
-        )
-
     print(f"\n{'=' * 80}\nANALYSIS COMPLETE\n{'=' * 80}")
     print(f"Figures saved to: {figure_dir}")
 
@@ -305,43 +292,327 @@ if any(a is not None for a in auths):
     )
 
 # %% [markdown]
-# ### 3a2. ExCALIBR vs. acmgscaler (Badonyi & Marsh 2025)
+# ### 3a2. ExCALIBR vs. other comparison methods
 #
-# Runs acmgscaler::calibrate() (github.com/badonyi/acmgscaler, base-R, no
-# install needed -- see analysis.config.ACMGSCALER_DIR) against each
-# dataset's P/LP + B/LB scores with prior=0.1 (their simple/ungrouped
-# per-dataset model), maps its four evidence tiers per direction onto the
-# same points sign convention ExCALIBR uses, and builds a confusion matrix
-# the same way build_confusion_matrix does -- see analysis/comparison_methods.py.
+# Each method below produces a per-dataset confusion matrix the same shape
+# as ExCALIBR's own (`build_confusion_matrix`'s [BLB,PLP] x [Normal,IR,
+# Abnormal]), then `_compare_vs_excalibr` (defined once, reused for every
+# method) produces two confusion figures for it (no per-gene scatter here --
+# that lives only in the combined scatter/OR/Brnich figure, section 7):
+#   all_datasets     : every dataset ExCALIBR has a matrix for is kept in the
+#                       aggregate -- any dataset the other method couldn't be
+#                       calibrated for contributes its full BLB/PLP row
+#                       totals to the IR (indeterminate) column instead of
+#                       being dropped, so the two methods' aggregate
+#                       denominators match exactly.
+#   matched_datasets  : restricted to only the datasets where the other
+#                       method actually produced a result -- a stricter
+#                       apples-to-apples comparison, but over fewer datasets.
+#
+# Methods (see analysis/comparison_methods.py):
+#   acmgscaler        : github.com/badonyi/acmgscaler (Badonyi & Marsh 2025),
+#                       prior=0.1, loaded from precomputed CSVs under
+#                       analysis.config.ACMGSCALER_OUTPUT_DIR -- run
+#                       run_acmgscaler_all.py beforehand to generate those
+#                       (it runs Rscript per dataset in parallel via joblib).
+#                       This notebook never invokes Rscript itself; a dataset
+#                       missing its CSV is treated as "could not be
+#                       calibrated" (e.g. <10 P or <10 B labeled variants).
+#   gmm_plp_blb / gmm_plp_blb_synon :
+#                       simple 2-component GMM baseline, prior=0.1, two
+#                       control-pooling variants (P/LP+B/LB only, vs.
+#                       P/LP+[B/LB union Synonymous]) -- a naive baseline
+#                       with no monotonicity constraint on its point ranges
+#                       (unlike ExCALIBR's own), loaded from
+#                       analysis.config.GMM_BASELINE_OUTPUT_DIR. Its
+#                       variants.csv already has ExCALIBR's own sample/
+#                       standard_points columns, so build_confusion_matrix
+#                       works on it completely unchanged -- no live
+#                       computation, no separate builder function needed.
 
 # %%
-from analysis.comparison_methods import run_acmgscaler, build_acmgscaler_confusion_matrix
+from analysis.comparison_methods import (
+    build_acmgscaler_confusion_matrix, load_acmgscaler_variants,
+    load_comparison_variants,
+)
 
-acmgscaler_conf = []
-for dataset in datasets:
-    df_ds = df[(df["dataset"] == dataset) & (df["method"] == primary_method)]
-    if df_ds.empty:
-        acmgscaler_conf.append(None)
-        continue
-    try:
-        df_acmg = run_acmgscaler(df_ds, prior=0.1)
-        acmgscaler_conf.append(build_acmgscaler_confusion_matrix(df_acmg, label=dataset))
-    except Exception as e:
-        print(f"  SKIP acmgscaler for {dataset}: {e}")
-        acmgscaler_conf.append(None)
+def _all_indeterminate_matrix(excalibr_matrix):
+    """Same BLB/PLP row totals as excalibr_matrix, but every count placed in
+    the IR column -- represents "this method could not be calibrated for
+    this dataset" without dropping it from the aggregate denominator. None
+    if excalibr_matrix itself is None (nothing to match totals against)."""
+    if excalibr_matrix is None:
+        return None
+    totals = excalibr_matrix.sum(axis=1)
+    return pd.DataFrame(
+        {"Normal": 0, "IR": totals, "Abnormal": 0}, index=excalibr_matrix.index,
+    )[["Normal", "IR", "Abnormal"]]
 
-if any(m is not None for m in acmgscaler_conf):
-    make_confusion_figure(
-        danzs_m1=conf_by_method[primary_method], danzs_m2=acmgscaler_conf,
-        dataset_names=datasets, label1=primary_method, label2="acmgscaler",
-        figure_dir=FIGURE_DIR,
+comparison_matches = {}  # method_label -> (matched_excalibr, matched_other, matched_datasets), filled below
+
+def _compare_vs_excalibr(conf_raw, method_label):
+    """conf_raw : per-dataset confusion matrices (or None) for `method_label`,
+    same order as `datasets`. Produces both the all_datasets and
+    matched_datasets confusion figures against conf_by_method[primary_method],
+    and records the matched-datasets triple in `comparison_matches` for the
+    aggregate performance report in 3b."""
+    n_missing = sum(
+        1 for m, d in zip(conf_raw, conf_by_method[primary_method])
+        if m is None and d is not None
     )
-    make_scatter_figure(
-        {primary_method: conf_by_method[primary_method], "acmgscaler": acmgscaler_conf},
-        datasets, primary_method, "acmgscaler", figure_dir=FIGURE_DIR,
-    )
+    print(f"  {method_label}: {len(datasets) - n_missing}/{len(datasets)} datasets calibrated "
+          f"({n_missing} treated as all-indeterminate in the all_datasets version)")
+
+    conf_all = [
+        m if m is not None else _all_indeterminate_matrix(d)
+        for m, d in zip(conf_raw, conf_by_method[primary_method])
+    ]
+    if any(m is not None for m in conf_all):
+        make_confusion_figure(
+            danzs_m1=conf_by_method[primary_method], danzs_m2=conf_all,
+            dataset_names=datasets, label1=primary_method, label2=method_label,
+            figure_dir=FIGURE_DIR, tag="all_datasets",
+        )
+    else:
+        print(f"  SKIP {method_label} comparison (all_datasets): no ExCALIBR matrices to pair with")
+
+    matched_idx = [i for i, m in enumerate(conf_raw) if m is not None]
+    if matched_idx:
+        matched_datasets = [datasets[i] for i in matched_idx]
+        matched_excalibr = [conf_by_method[primary_method][i] for i in matched_idx]
+        matched_other = [conf_raw[i] for i in matched_idx]
+        make_confusion_figure(
+            danzs_m1=matched_excalibr, danzs_m2=matched_other,
+            dataset_names=matched_datasets, label1=primary_method, label2=method_label,
+            figure_dir=FIGURE_DIR, tag="matched_datasets",
+        )
+        comparison_matches[method_label] = (matched_excalibr, matched_other, matched_datasets)
+    else:
+        print(f"  SKIP {method_label} comparison (matched_datasets): no dataset produced a matrix")
+
+# --- acmgscaler ---
+# Precomputed by run_acmgscaler_all.py (analysis.config.ACMGSCALER_OUTPUT_DIR)
+# for every dataset it could calibrate -- this is a disk read only, no live
+# Rscript call. A missing CSV means acmgscaler genuinely couldn't calibrate
+# that dataset (e.g. <10 P or <10 B controls), not "not computed yet"; run
+# run_acmgscaler_all.py separately (it parallelizes across datasets via
+# joblib) if ACMGSCALER_OUTPUT_DIR is stale or unset.
+if not config.warn_if_missing(config.ACMGSCALER_OUTPUT_DIR, "acmgscaler comparison"):
+    acmgscaler_conf_raw = [
+        build_acmgscaler_confusion_matrix(df_acmg, label=dataset)
+        if (df_acmg := load_acmgscaler_variants(dataset, config.ACMGSCALER_OUTPUT_DIR)) is not None
+        else None
+        for dataset in datasets
+    ]
+    _compare_vs_excalibr(acmgscaler_conf_raw, "acmgscaler")
+
+# --- simple GMM baseline, both pooling variants ---
+if config.GMM_BASELINE_OUTPUT_DIR:
+    for variant in config.GMM_BASELINE_VARIANTS:
+        gmm_conf_raw = []
+        for dataset in datasets:
+            df_gmm = load_comparison_variants(dataset, variant, config.GMM_BASELINE_OUTPUT_DIR)
+            gmm_conf_raw.append(
+                build_confusion_matrix(df_gmm, use_oob=False, label=f"{dataset}/gmm_{variant}")
+                if df_gmm is not None else None
+            )
+        _compare_vs_excalibr(gmm_conf_raw, f"gmm_{variant}")
 else:
-    print("  SKIP acmgscaler comparison: no dataset produced a matrix")
+    print("  SKIP GMM baseline comparison: analysis.config.GMM_BASELINE_OUTPUT_DIR not set")
+
+# %% [markdown]
+# ### 3a3. Skew-locked ExCALIBR comparison
+#
+# "Skew-locked" = the canonical pipeline rerun with each component's skew
+# parameter fixed (not freely fit), instead of ExCALIBR's normal freely-fit
+# skew-normal components. Unlike acmgscaler/gmm above, this is a full
+# ExCALIBR-shaped output tree (`analysis.config.SKEW_LOCKED_OUTPUT_DIR`) --
+# discovered/loaded with `analysis.discovery` exactly like `OUTPUT_DIR`
+# itself, not `analysis.comparison_methods`. Its `*_variants.csv` files
+# already carry `auth_label` (no `attach_author_labels` needed) but no
+# `oob_*` columns, so matrices are built with `use_oob=False`, same as the
+# GMM baseline. Compared against the primary method with the same
+# `_compare_vs_excalibr` helper used above, so its matched-datasets
+# aggregate performance is picked up automatically by 3b, and its evidence
+# distribution is added alongside section 4's.
+
+# %%
+if not config.warn_if_missing(config.SKEW_LOCKED_OUTPUT_DIR, "skew-locked ExCALIBR comparison"):
+    skew_tree, skew_model_selections, skew_calibrations = discover_outputs(Path(config.SKEW_LOCKED_OUTPUT_DIR))
+    skew_df = load_all_variants(
+        tree=skew_tree, model_selections=skew_model_selections, dataset_configs=dataset_configs,
+        methods_filter=None, datasets_filter=datasets, calibrations=skew_calibrations, min_controls=0,
+    )
+    skew_locked_conf_raw = []
+    for dataset in datasets:
+        df_sk = skew_df[skew_df["dataset"] == dataset] if not skew_df.empty else skew_df
+        skew_locked_conf_raw.append(
+            build_confusion_matrix(df_sk, use_oob=False, label=f"{dataset}/skew_locked")
+            if not df_sk.empty else None
+        )
+    _compare_vs_excalibr(skew_locked_conf_raw, "skew_locked")
+else:
+    skew_tree, skew_model_selections, skew_calibrations = {}, {}, {}
+    skew_df = pd.DataFrame()
+
+# %% [markdown]
+# ### 3a4. Skew-locked vs. regular ExCALIBR: per-bootstrap validation likelihood
+#
+# For each dataset's selected component (same `(n_c, benign_method)` chosen
+# by `resolve_component` for the regular run -- `tree`/`model_selections`
+# from section 1), pull every bootstrap's validation log-likelihood
+# (`val_ll`) for that component count from the full per-bootstrap fit files
+# (`analysis.config.PRECOMPUTED_FITS` / `SKEW_LOCKED_BOOTSTRAP_RESULTS`, both
+# `{dataset: {bootstrap_seed: {n_c: {"val_ll": float, ...}}}}`), pair up by
+# bootstrap seed (both runs share the same bootstrap resampling), and report
+# the median + IQR of the per-seed difference `skew_locked_val_ll -
+# regular_val_ll` for that dataset. A negative median means the skew-locked
+# fit's held-out likelihood is typically worse than the freely-fit skew
+# model's, i.e. locking skew costs fit quality on that dataset.
+
+# %%
+import gzip as _gzip
+
+def _load_bootstrap_json(path):
+    with _gzip.open(path, "rt") as f:
+        return json.load(f)
+
+if not skew_df.empty and not config.warn_if_missing(config.SKEW_LOCKED_BOOTSTRAP_RESULTS, "skew-locked bootstrap val_ll") \
+        and not config.warn_if_missing(config.PRECOMPUTED_FITS, "regular bootstrap val_ll"):
+    _regular_boot = _load_bootstrap_json(config.PRECOMPUTED_FITS)
+    _skew_boot = _load_bootstrap_json(config.SKEW_LOCKED_BOOTSTRAP_RESULTS)
+
+    _ll_rows = []
+    for dataset in datasets:
+        if dataset not in _regular_boot or dataset not in _skew_boot:
+            continue
+        available_comps = list(tree.get(dataset, {}).keys())
+        if not available_comps:
+            continue
+        comp = resolve_component(dataset, available_comps, model_selections, dataset_configs)
+        n_c = comp.split("_", 1)[0]
+
+        reg_by_seed = _regular_boot[dataset]
+        skew_by_seed = _skew_boot[dataset]
+        common_seeds = sorted(
+            set(reg_by_seed) & set(skew_by_seed),
+            key=lambda s: int(s),
+        )
+        diffs = [
+            skew_by_seed[s][n_c]["val_ll"] - reg_by_seed[s][n_c]["val_ll"]
+            for s in common_seeds
+            # .get(n_c) rather than "in" -- a seed can have an n_c key present
+            # but mapped to None (that bootstrap's fit for this component
+            # count failed to converge), which "in" alone doesn't catch.
+            if reg_by_seed[s].get(n_c) is not None and skew_by_seed[s].get(n_c) is not None
+        ]
+        if not diffs:
+            continue
+        diffs = np.array(diffs)
+        q25, q50, q75 = np.percentile(diffs, [25, 50, 75])
+        _ll_rows.append({
+            "dataset": dataset, "n_c": n_c, "n_bootstraps": len(diffs),
+            "median_diff": q50, "iqr_lo": q25, "iqr_hi": q75, "iqr_width": q75 - q25,
+        })
+
+    del _regular_boot, _skew_boot  # both are full 89-dataset JSONs, free memory once done
+
+    ll_diff_df = pd.DataFrame(_ll_rows)
+    if not ll_diff_df.empty:
+        ll_diff_df = ll_diff_df.sort_values("median_diff").reset_index(drop=True)
+        print(f"\n{'=' * 80}\nSKEW-LOCKED vs REGULAR: per-bootstrap val_ll difference "
+              f"(skew_locked - regular), by selected component\n{'=' * 80}")
+        print(ll_diff_df.to_string(index=False))
+    else:
+        print("  SKIP skew-locked vs regular val_ll comparison: no dataset had matching bootstrap data")
+else:
+    ll_diff_df = pd.DataFrame()
+
+ll_diff_df
+
+# %% [markdown]
+# ### 3a5. Robustness analysis (downsampling / label discordance)
+#
+# How sensitive is ExCALIBR's calibration to shrinking (downsampling) or
+# discordant (mislabeled) P/LP and B/LB control counts? Perturbed conditions
+# (see `test/downsample_discordance_test.ipynb`, not reproduced here) were
+# generated at 7 downsample levels (control count N in [1,2,4,8,16,32,64])
+# and 2 discordance levels (fraction relabeled in [0.01, 0.10]), each with
+# 10 random seeds, then run through the normal pipeline.
+#
+# Each perturbed condition's own confusion matrix / variant scores are NOT
+# used directly (too few variants, and downsampled `variant_id`s don't
+# correspond by position to the reference dataset — see
+# `analysis/robustness.py` module docstring). Instead, for every
+# (perturbation_type, level), `plot_robustness_config_summary` aggregates
+# across that level's 10 seeds and draws the same 3-row layout
+# `plot_scoreset_best_config` uses:
+#  - **fits row**: the reference (fixed, unperturbed) population's score
+#    histograms, overlaid with mixture-density curves computed from every
+#    seed's per-bootstrap fit at this level flattened into one bootstrap x
+#    seed pool — shaded by that pool's 5th/50th/95th percentile density.
+#  - **point-assignment row**: all 10 seeds' point-range bars overlaid at low
+#    alpha, so more-opaque regions are where more seeds agree on a call.
+#  - **Log LR+ row**: each seed already has its own correct [5th,50th,95th]
+#    percentile curve (across that seed's own bootstraps); the bands shown
+#    are the seed-to-seed IQR spread of the 5th-percentile curve and,
+#    separately, of the 95th-percentile curve, with the reference curve
+#    overlaid in bold black for comparison.
+#
+# Base datasets are discovered dynamically from whatever's on disk under
+# `analysis.config.ROBUSTNESS_OUTPUT_DIR` — not a hardcoded list.
+#
+# Confusion-matrix-based summary metrics (accuracy/coverage/DOR vs. level)
+# are still computed below and kept available for later use, but not plotted
+# here — right now, understanding *how* the calibration shifts under
+# perturbation (the plots above) matters more than a scalar accuracy trend.
+
+# %%
+from analysis.robustness import (
+    discover_robustness_base_datasets, load_reference_variants,
+    compute_robustness_confusion_matrices, robustness_confusion_matrices_to_metrics,
+    run_config_summary_plots_batch,
+)
+
+if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis"):
+    robustness_bases = discover_robustness_base_datasets(config.ROBUSTNESS_OUTPUT_DIR)
+    print(f"Discovered {len(robustness_bases)} base dataset(s) with robustness conditions: {robustness_bases}")
+
+    # Reference (unperturbed) population for every base dataset comes from
+    # the MAIN pipeline output (section 1's own tree/model_selections/
+    # calibrations) -- pass those in directly instead of letting
+    # load_reference_variants re-walk the whole ~89-dataset OUTPUT_DIR tree
+    # once per base dataset. The perturbed downsample/discordance conditions
+    # themselves (robustness_all.csv) are never loaded here -- only their
+    # already-computed calibration.json/lr_values.json.gz outputs under
+    # ROBUSTNESS_OUTPUT_DIR are used, via compute_robustness_confusion_matrices
+    # / run_config_summary_plots_batch below.
+    robustness_summaries = {}
+    config_summary_jobs = []
+    for base_ds in robustness_bases:
+        try:
+            reference_df, ref_cal_path = load_reference_variants(
+                base_ds, tree=tree, model_selections=model_selections, calibrations=calibrations,
+            )
+        except FileNotFoundError as e:
+            print(f"  SKIP {base_ds}: {e}")
+            continue
+
+        matrices = compute_robustness_confusion_matrices(
+            base_ds, reference_df, ref_cal_path, config.ROBUSTNESS_OUTPUT_DIR,
+        )
+        if matrices:
+            robustness_summaries[base_ds] = robustness_confusion_matrices_to_metrics(matrices, base_ds)
+
+        config_summary_jobs.append((base_ds, reference_df, ref_cal_path))
+
+    # All base datasets' (perturbation_type, level) config-summary figures
+    # rendered in one parallel batch -- each is an independent, self-
+    # contained unit of work (its own pooled_fits_for_level + sample_density
+    # call), the actual cost driver for this section.
+    run_config_summary_plots_batch(
+        config_summary_jobs, figure_dir=FIGURE_DIR, robustness_output_dir=config.ROBUSTNESS_OUTPUT_DIR,
+    )
 
 # %% [markdown]
 # ### 3b. Aggregate performance report + manuscript LaTeX table
@@ -371,6 +642,53 @@ if _auth_pairs:
 else:
     print("  SKIP aggregate performance report: no datasets with both ExCALIBR and author matrices")
 
+# Same aggregate report, restricted to the subset of datasets each comparison
+# method (acmgscaler, the gmm baselines) could actually be calibrated on --
+# `comparison_matches` was populated by `_compare_vs_excalibr` in 3a2, keyed
+# by method_label -> (matched_excalibr, matched_other, matched_datasets).
+for _method_label, (_matched_excalibr, _matched_other, _matched_names) in comparison_matches.items():
+    print(f"\n{'-' * 80}\nExCALIBR vs {_method_label} (matched datasets, n={len(_matched_names)})\n{'-' * 80}")
+    print_aggregate_performance(_matched_excalibr, _matched_other, _matched_names)
+
+# %% [markdown]
+# ### 3c. Per-dataset FP / FN breakdown (ranked)
+#
+# Raw false-positive (B/LB called Abnormal/Pathogenic) and false-negative
+# (P/LP called Normal/Benign) counts per dataset, read directly off the same
+# `conf_by_method[primary_method]` matrices built in section 3 (rows
+# [BLB,PLP] x cols [Normal,IR,Abnormal] -- see `build_confusion_matrix`) --
+# no recomputation. Ranked descending so the worst-offending datasets surface
+# first; ties broken by the other column.
+
+# %%
+_fp_fn_rows = [
+    {
+        "dataset": _ds,
+        "FP": int(_mat.loc["BLB", "Abnormal"]),
+        "FN": int(_mat.loc["PLP", "Normal"]),
+        "n_BLB": int(_mat.loc["BLB"].sum()),
+        "n_PLP": int(_mat.loc["PLP"].sum()),
+    }
+    for _ds, _mat in zip(datasets, conf_by_method[primary_method])
+    if _mat is not None
+]
+fp_fn_df = pd.DataFrame(_fp_fn_rows)
+
+if not fp_fn_df.empty:
+    fp_ranked = fp_fn_df.sort_values(["FP", "FN"], ascending=False).reset_index(drop=True)
+    fn_ranked = fp_fn_df.sort_values(["FN", "FP"], ascending=False).reset_index(drop=True)
+
+    print(f"\n{'=' * 80}\nPER-DATASET FP/FN ({primary_method} vs ClinVar), ranked descending\n{'=' * 80}")
+    print(f"\n-- Ranked by FP (B/LB called Pathogenic), n={len(fp_ranked)} datasets --")
+    print(fp_ranked[["dataset", "FP", "FN", "n_BLB", "n_PLP"]].to_string(index=False))
+    print(f"\n-- Ranked by FN (P/LP called Benign), n={len(fn_ranked)} datasets --")
+    print(fn_ranked[["dataset", "FN", "FP", "n_BLB", "n_PLP"]].to_string(index=False))
+else:
+    fp_ranked = fn_ranked = fp_fn_df
+    print("  SKIP per-dataset FP/FN breakdown: no ExCALIBR confusion matrices")
+
+fp_ranked
+
 # %% [markdown]
 # ## 4. Evidence distributions and per-gene accuracy scatter
 
@@ -381,15 +699,13 @@ for method in methods:
     all_author = build_author_array(df_m)
     make_evidence_figure(all_danz, all_author, all_clinvar, label=method, figure_dir=FIGURE_DIR)
 
-# Per-gene accuracy scatter: ExCALIBR vs author (not two ACMG-mapping methods
-# against each other) -- same primary_method/auths pairing as the confusion
-# figure above (section 3), just wrapped in the {label: matrices} shape
-# make_scatter_figure expects.
-if any(a is not None for a in auths):
-    make_scatter_figure(
-        {primary_method: conf_by_method[primary_method], "author": auths},
-        datasets, primary_method, "author", figure_dir=FIGURE_DIR,
-    )
+# Skew-locked evidence distribution, same shape as the loop above -- skew_df
+# is built in 3a3 (empty DataFrame if that section skipped, e.g.
+# SKEW_LOCKED_OUTPUT_DIR missing).
+if not skew_df.empty:
+    skew_all_danz, skew_all_clinvar = build_evidence_arrays(skew_df)
+    skew_all_author = build_author_array(skew_df)
+    make_evidence_figure(skew_all_danz, skew_all_author, skew_all_clinvar, label="skew_locked", figure_dir=FIGURE_DIR)
 
 # %% [markdown]
 # ### 4b. Combined author + ClinVar evidence distribution, and gene-wise evidence table
@@ -442,6 +758,13 @@ else:
 # reclassifying to avoid circularity against ExCALIBR's own functional-assay
 # evidence. Set `verbose_recode=True` in the call below to print every
 # evidence-code recode for auditing a specific run.
+#
+# Reuses section 1's `df_primary`/`tree`/`model_selections`/`calibrations`
+# directly (no separate discovery/loading pass) for every dataset except the
+# `_clinvar_2018`-suffixed ones (BRCA1/MSH2/PTEN/TP53), which get their
+# variant/points table reloaded fresh from the Scoreset -- see
+# `build_clingen_confusion`'s docstring for why (their on-disk
+# *_variants.csv can undercount VUS for exactly these datasets).
 
 # %%
 from analysis.clingen import build_clingen_confusion, convert_3x2_to_2x3, plot_2x3_confusions_nature
@@ -451,6 +774,7 @@ CLINGEN_DATASETS = datasets  # explicit, adjustable — narrow if desired
 
 clingen_confusion, clingen_genes = build_clingen_confusion(
     df_primary, DATASET_TSV, CLINGEN_DATASETS, use_oob=True,
+    tree=tree, model_selections=model_selections, calibrations=calibrations,
 )
 if clingen_genes:
     fig = plot_2x3_confusions_nature({
@@ -488,28 +812,49 @@ print(f"ExCALIBR datasets reaching pathogenic evidence ±X: {excalibr_path_count
 print(f"ExCALIBR datasets reaching benign evidence ±X: {excalibr_ben_counts}")
 
 if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-code CSV (author side)"):
+    from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
+
     df_op = pd.read_csv(config.OP_EVIDENCE_CODES_CSV)
     levels = [1, 2, 4, 8]
-    path_codes = ['PS3_supporting', 'PS3_moderate', 'PS3_strong', 'PS3_very_strong']
-    ben_codes = ['BS3_supporting', 'BS3_moderate', 'BS3_strong', 'BS3_very_strong']
+
+    # OP_EVIDENCE_CODES_CSV now carries raw OddsAbnormal_clinvar_18_25 /
+    # OddsNormal_clinvar_18_25 odds-of-pathogenicity values (plus a
+    # per-dataset prior) instead of precomputed "Evidence Code
+    # Abnormal"/"Evidence Code Normal" PS3/BS3 tier strings -- classify tiers
+    # here using the same Tavtigian-constant thresholds
+    # (C**(level/8), fixed prior=0.1, matching ExCALIBR's own
+    # thresholds_from_prior elsewhere in this codebase) rather than the
+    # row's own prior column. OddsAbnormal is a direct odds-of-pathogenicity
+    # (higher = stronger PS3 evidence); OddsNormal is computed within the
+    # benign-labeled subset and observed in [0, 1] (lower = stronger BS3
+    # evidence), so its thresholds are the reciprocal.
+    _C = get_tavtigian_constant(0.1)
+    _path_thresholds = {lvl: _C ** (lvl / 8) for lvl in levels}
+    _ben_thresholds = {lvl: 1.0 / (_C ** (lvl / 8)) for lvl in levels}
+
     auth_path_counts = {lvl: set() for lvl in levels}
     auth_ben_counts = {lvl: set() for lvl in levels}
     for ds in dataset_info_df_full["dataset"]:
         op_rows = df_op[df_op.Dataset == ds]
         if op_rows.empty:
             continue
-        path_evidence = op_rows["Evidence Code Abnormal"].iloc[0]
-        ben_evidence = op_rows["Evidence Code Normal"].iloc[0]
-        for i, code in enumerate(path_codes):
-            if path_evidence == code:
-                for j in range(i, -1, -1):
-                    auth_path_counts[2 ** j].add(ds)
-                break
-        for i, code in enumerate(ben_codes):
-            if ben_evidence == code:
-                for j in range(i, -1, -1):
-                    auth_ben_counts[2 ** j].add(ds)
-                break
+        odds_abnormal = pd.to_numeric(op_rows["OddsAbnormal_clinvar_18_25"].iloc[0], errors="coerce")
+        odds_normal = pd.to_numeric(op_rows["OddsNormal_clinvar_18_25"].iloc[0], errors="coerce")
+
+        if pd.notna(odds_abnormal):
+            for lvl in sorted(levels, reverse=True):
+                if odds_abnormal >= _path_thresholds[lvl]:
+                    for lvl2 in levels:
+                        if lvl2 <= lvl:
+                            auth_path_counts[lvl2].add(ds)
+                    break
+        if pd.notna(odds_normal):
+            for lvl in sorted(levels, reverse=True):
+                if odds_normal <= _ben_thresholds[lvl]:
+                    for lvl2 in levels:
+                        if lvl2 <= lvl:
+                            auth_ben_counts[lvl2].add(ds)
+                    break
     auth_path_counts = {k: len(v) for k, v in auth_path_counts.items()}
     auth_ben_counts = {k: len(v) for k, v in auth_ben_counts.items()}
     fig, _ = plot_evidence_comparison(
@@ -551,70 +896,36 @@ else:
     print(f"  No existing visualization.png found for {_example_dataset} under {OUTPUT_DIR / _example_dataset}")
 
 # %% [markdown]
-# ## 6. MSH2 example / "final pillar project" style figure — matches `test/plot_MSH2_ex.py`
+# ## 6. Yang distance bootstrap diagnostic
 #
-# Needs the full per-bootstrap mixture fits (`analysis.config.PRECOMPUTED_FITS`),
-# not just the LR+ percentile curves used above — see `analysis/legacy_fits.py`.
+# Yang-distance goodness-of-fit is slow to compute live (~1-3 min/dataset at
+# full bootstrap resolution — see `analysis/yang_distance.py`), so rather
+# than recomputing it here, this reads `analysis.config.EXCALIBR_DATASETS_TABLE_CSV`
+# — built once (offline) via `analysis/run_build_excalibr_datasets_table.py
+# --with-yang`, which computes it for every dataset in one batch and also
+# reconstructs the rest of `excalibr_datasets.csv` (calibration ranges,
+# sample counts, metadata) alongside it. Rerun that script if pipeline
+# output has changed since the table was last built.
 #
-# BRCA1/MSH2/PTEN/TP53 were only ever run through the pipeline under their
-# `_clinvar_2018` name (see `run_igvf_batch.py`'s `GENES_2018` auto-detection),
-# so `pipeline_dataset` points there for both scoresets; `dataset` +
-# `clinvar_release` control which ClinVar release labels each Scoreset itself
-# is built with.
+# (The MSH2 example / "final pillar project" figure previously shown here
+# was removed as redundant with section 7's Figure 4 / extended-data
+# appendix panels.)
 
 # %%
-from analysis.legacy_fits import resolve_component_for
-
-MSH2_DATASET = "MSH2_Jia_2021"
-MSH2_PIPELINE_KEY = f"{MSH2_DATASET}_clinvar_2018"
-
-try:
-    n_c_msh2, benign_method_msh2 = resolve_component_for(
-        MSH2_PIPELINE_KEY, output_dir=OUTPUT_DIR, dataset_configs_path=DATASET_CONFIGS_PATH,
-    )
-    scoreset_2018, indv_summary, fits, score_range, n_c_msh2, n_samples, flipped = load_scoreset_and_fits(
-        MSH2_DATASET, output_dir=OUTPUT_DIR, dataset_tsv=DATASET_TSV,
-        precomputed_fits=PRECOMPUTED_FITS, dataset_configs_path=DATASET_CONFIGS_PATH,
-        pipeline_dataset=MSH2_PIPELINE_KEY, clinvar_release="2018",
-        n_c=n_c_msh2, benign_method=benign_method_msh2,
-    )
-    scoreset_2025, _, _, _, _, _, _ = load_scoreset_and_fits(
-        MSH2_DATASET, output_dir=OUTPUT_DIR, dataset_tsv=DATASET_TSV,
-        precomputed_fits=PRECOMPUTED_FITS, dataset_configs_path=DATASET_CONFIGS_PATH,
-        pipeline_dataset=MSH2_PIPELINE_KEY, clinvar_release="2026",
-        n_c=n_c_msh2, benign_method=benign_method_msh2,
-    )
-    # Exact call from test/plot_MSH2_ex.py (config/n_c passed as None — see
-    # the fix to plot_scoreset_final_pillar_project_v2 in src/ that derives
-    # the component count from `fits` directly when n_c is None).
-    fig = plot_scoreset_final_pillar_project_v2(
-        MSH2_DATASET, scoreset_2018, scoreset_2025, indv_summary, fits, score_range,
-        None, None, n_samples, relax=None, flipped=flipped,
-    )
-    save_and_show(fig, FIGURE_DIR / "MSH2_final_pillar_project_v2.png")
-except (FileNotFoundError, KeyError, ValueError) as e:
-    print(f"  SKIP MSH2 example figure: {e}")
+if not config.warn_if_missing(config.EXCALIBR_DATASETS_TABLE_CSV, "Yang distance table"):
+    excalibr_datasets_table = pd.read_csv(config.EXCALIBR_DATASETS_TABLE_CSV)
+    yang_cols = [c for c in excalibr_datasets_table.columns if c.startswith("yang_dist_")]
+    in_scope = excalibr_datasets_table[excalibr_datasets_table["dataset"].isin(datasets)]
+    if yang_cols and not in_scope.empty:
+        print(f"\n{'=' * 80}\nYANG DISTANCE (goodness-of-fit), from {config.EXCALIBR_DATASETS_TABLE_CSV}\n{'=' * 80}")
+        print(in_scope[["dataset"] + yang_cols].to_string(index=False))
+    else:
+        print("  SKIP Yang distance table: no yang_dist_* columns, or none of section 1's datasets present "
+              "(rerun run_build_excalibr_datasets_table.py --with-yang)")
+    in_scope[["dataset"] + yang_cols] if yang_cols else None
 
 # %% [markdown]
-# ## 7. Yang distance bootstrap diagnostic — matches `test/yang_dist.py`
-
-# %%
-try:
-    scoreset, _, fits, _, n_c, _, _ = load_scoreset_and_fits(
-        MSH2_DATASET, output_dir=OUTPUT_DIR, dataset_tsv=DATASET_TSV,
-        precomputed_fits=PRECOMPUTED_FITS, dataset_configs_path=DATASET_CONFIGS_PATH,
-        pipeline_dataset=MSH2_PIPELINE_KEY, clinvar_release="2026",
-    )
-    yang_distances = compute_bootstrap_yang_distances_parallel(
-        MSH2_PIPELINE_KEY, n_c, fits, scoreset, dataset_to_splits=None, n_jobs=-1,
-    )
-    for sample_key, dists in yang_distances.items():
-        print(f"  {sample_key}: median={np.nanmedian(dists):.4f}  n={np.sum(~np.isnan(dists))}")
-except (FileNotFoundError, KeyError, ValueError) as e:
-    print(f"  SKIP Yang distance diagnostic: {e}")
-
-# %% [markdown]
-# ## 8. Figure 4, extended-data appendix, gene-performance/OR scatter
+# ## 7. Figure 4, extended-data appendix, gene-performance/OR scatter
 #
 # Ported from `test/auxiliary_fig_creation/`. Some panels need external,
 # non-pipeline comparison data (REVEL/AM/MutPred2 thresholds, OR estimates) —
@@ -637,8 +948,13 @@ figure4_driver.build_figure4(
 # %%
 from analysis import extended_data_appendix
 
+# dataset_list=datasets (section 1's own list) instead of the module default
+# (None -> _default_dataset_list_full, which re-discovers datasets from
+# OUTPUT_DIR itself and applies its own datasets_to_exclude.pkl + hardcoded
+# TP53/F9 exclusions) -- keeps the appendix in sync with whatever's actually
+# in scope for the rest of this notebook, with no separate exclusion list.
 extended_data_appendix.build_appendix_pdf(
-    dataset_list=None,  # None -> auto-discover from OUTPUT_DIR, per module default
+    dataset_list=datasets,
     output_path=FIGURE_DIR / "extended_data_appendix.pdf",
     plot_thresholds=True,
 )
@@ -649,7 +965,7 @@ from analysis import gene_performance_scatter
 gene_performance_scatter.build_gene_performance_scatter(output_dir=OUTPUT_DIR, figure_dir=FIGURE_DIR)
 
 # %% [markdown]
-# ## 9. Dataset description table
+# ## 8. Dataset description table
 
 # %%
 from analysis.gene_table import build_dataset_table

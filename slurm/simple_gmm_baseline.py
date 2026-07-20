@@ -6,8 +6,9 @@ no restarts), across all datasets.
 Fits a single deterministic sklearn GaussianMixture per dataset per variant,
 then computes log LR+ and maps it to ACMG evidence points using the same
 downstream machinery as run_pipeline.py / run_igvf_batch.py (calculate_score_ranges,
-enforce_monotonicity_point_ranges, extend_points_to_xlims, compute_variant_table,
-save_results) — so outputs are directly comparable to the main pipeline's:
+compute_variant_table, save_results) — so outputs are directly comparable to the
+main pipeline's. Unlike the main pipeline, point_ranges here is calculate_score_ranges's
+raw output: no enforce_monotonicity_point_ranges, no extend_points_to_xlims:
 
     <output_dir>/<dataset_name>/<dataset_name>_<variant>_calibration.json
     <output_dir>/<dataset_name>/<dataset_name>_<variant>_lr_values.json.gz
@@ -58,16 +59,13 @@ _DEFAULT_PRIOR = 0.1
 
 
 def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
-                  point_values, acmg_mapping_method, liberal_monotonicity):
+                  point_values, acmg_mapping_method):
     from sklearn.mixture import GaussianMixture
     from src.assay_calibration.plot_utils.utils import (
         _col_idx_for_sample_num, _update_weights,
     )
     from src.assay_calibration.fit_utils.cfusn.density_utils import mixture_pdf
     from src.assay_calibration.fit_utils.fit import calculate_score_ranges
-    from src.assay_calibration.fit_utils.point_ranges import (
-        enforce_monotonicity_point_ranges, extend_points_to_xlims,
-    )
 
     plp_col = _col_idx_for_sample_num(scoreset, SAMPLE_NUM_PLP)
     if plp_col is None:
@@ -129,14 +127,21 @@ def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
         _update_weights(sample_scores, means, stds)
         for sample_scores, _sample_name in scoreset.samples
     ]
-    fit_xlims = (float(combined.min()), float(combined.max()))
+    # xlims gates sample_density's NaN-masking (plot_utils/utils.py:sample_density) —
+    # in the real pipeline it's per-bootstrap-fit train-range, used to hide density
+    # outside what that particular fit was actually trained on. There's no such
+    # gap to guard here (one fit, no gnomAD involved in fitting), so use the full
+    # observed score range — same bounds as score_range — rather than the pooled
+    # P/LP+benign fitting range, or samples like gnomAD that extend beyond it
+    # (which never entered the fit) would get masked out of their own panel.
+    observed_scores = scoreset.scores[scoreset.sample_assignments.any(1)]
+    fit_xlims = (float(observed_scores.min()), float(observed_scores.max()))
     single_fit_obj = {"fit": {
         "component_params": params,
         "weights": per_sample_weights,
         "xlims": fit_xlims,
     }}
 
-    observed_scores = scoreset.scores[scoreset.sample_assignments.any(1)]
     score_range = np.linspace(observed_scores.min(), observed_scores.max(),
                                score_range_points)
 
@@ -152,16 +157,10 @@ def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
 
     scoreset_flipped = bool(plp_scores.mean() > benign_scores.mean())
 
-    # Same two-pass monotonicity + extend-to-xlims sequence generate_visualizations
-    # uses (visualize.py's non-continuous branch).
-    enforce_monotonicity_point_ranges(
-        point_ranges, point_values, score_range,
-        scoreset_flipped=scoreset_flipped, liberal=liberal_monotonicity)
-    extend_points_to_xlims(
-        point_ranges, point_values, score_range, scoreset_flipped, inf=True)
-    enforce_monotonicity_point_ranges(
-        point_ranges, point_values, score_range,
-        scoreset_flipped=scoreset_flipped, liberal=liberal_monotonicity)
+    # No post-processing (no enforce_monotonicity_point_ranges, no
+    # extend_points_to_xlims): point_ranges is the raw output of
+    # calculate_score_ranges's per-score-point threshold crossing, unlike
+    # generate_visualizations's non-continuous branch which does both.
 
     calibration = {
         "prior": float(prior),
@@ -295,7 +294,7 @@ def _requires_2018(df, dataset):
 
 def _process_dataset(df_ds, dataset, clinvar_release, population_type,
                       prior, output_dir, score_range_points, point_values,
-                      acmg_mapping_method, liberal_monotonicity, generate_viz):
+                      acmg_mapping_method, generate_viz):
     from src.assay_calibration.data_utils.dataset import Scoreset
 
     dataset_name = dataset if clinvar_release == "2026" else f"{dataset}_clinvar_{clinvar_release}"
@@ -314,7 +313,7 @@ def _process_dataset(df_ds, dataset, clinvar_release, population_type,
     for variant in variants:
         result = _fit_variant(
             scoreset, dataset_name, variant, prior, score_range_points,
-            point_values, acmg_mapping_method, liberal_monotonicity)
+            point_values, acmg_mapping_method)
         if result["status"] == "fit":
             _save_variant_result(result, scoreset, output_dir, generate_viz)
             # Don't carry the (large, non-JSON-serializable) calibration/fit
@@ -340,9 +339,6 @@ def main():
     parser.add_argument("--acmg-mapping-method", default="tavtigian",
                        choices=["tavtigian", "piecewise", "strict_additive"])
     parser.add_argument("--score-range-points", type=int, default=2000)
-    parser.add_argument("--conservative-monotonicity", action="store_true",
-                       help="Conservative enforcement of monotonicity on evidence "
-                            "thresholds (default: liberal, matching run_pipeline.py)")
     parser.add_argument("--no-viz", action="store_true",
                        help="Skip generating <name>_<variant>_visualization.png "
                             "(calibration/lr_values/variants are always written)")
@@ -368,7 +364,6 @@ def main():
             score_range_points=args.score_range_points,
             point_values=point_values,
             acmg_mapping_method=args.acmg_mapping_method,
-            liberal_monotonicity=not args.conservative_monotonicity,
             generate_viz=not args.no_viz,
         )
         for ds in datasets

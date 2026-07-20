@@ -590,25 +590,29 @@ class Fit:
         sample_assignments = sample_assignments[include]
 
         # ── Overlap check: reduce dimensions if assays don't co-occur enough ──
+        verbose_overlap = kwargs.get("verbose_overlap", True)
+        log_prefix = kwargs.get("log_prefix", "")
         calibrated_dims = list(range(observations.shape[1])) if mv else None
         if mv:
             min_overlap = kwargs.get("min_overlap_rows", 30)
             calibrated_dims = Fit._select_calibration_dims(observations, min_overlap)
             if len(calibrated_dims) == 0:
-                print(
-                    f"[OVERLAP] No assay pair has ≥{min_overlap} shared observations. "
-                    f"Cannot run multivariate calibration — fall back to per-assay "
-                    f"1D calibrations."
-                )
+                if verbose_overlap:
+                    print(
+                        f"{log_prefix}[OVERLAP] No assay pair has ≥{min_overlap} shared "
+                        f"observations. Cannot run multivariate calibration — fall back "
+                        f"to per-assay 1D calibrations."
+                    )
                 return []
             elif len(calibrated_dims) < observations.shape[1]:
                 excluded = sorted(set(range(observations.shape[1])) - set(calibrated_dims))
-                print(
-                    f"[OVERLAP] Assay dim(s) {excluded} lack ≥{min_overlap} shared rows "
-                    f"with the rest. Running {len(calibrated_dims)}D calibration on "
-                    f"dims {calibrated_dims}; use existing 1D calibrations for dim(s) "
-                    f"{excluded}."
-                )
+                if verbose_overlap:
+                    print(
+                        f"{log_prefix}[OVERLAP] Assay dim(s) {excluded} lack ≥{min_overlap} "
+                        f"shared rows with the rest. Running {len(calibrated_dims)}D "
+                        f"calibration on dims {calibrated_dims}; use existing 1D "
+                        f"calibrations for dim(s) {excluded}."
+                    )
                 observations = observations[:, calibrated_dims]
                 valid = (
                     ~np.all(np.isnan(observations), axis=1)

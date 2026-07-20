@@ -116,6 +116,7 @@ def _get_variant_is_vus(scoreset) -> Optional[List[bool]]:
 def _compute_bootstrap_lr_percentiles(
     scores: np.ndarray,
     calibration: Dict,
+    percentile: float = 5.0,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
            Optional[np.ndarray], Optional[np.ndarray]]:
     """Interpolate per-bootstrap LR+ curves at each variant score and return
@@ -147,8 +148,8 @@ def _compute_bootstrap_lr_percentiles(
         for i in range(log_lr.shape[0])
     ])
 
-    lr_5 = np.exp(np.nanpercentile(log_lr_at_scores, 5, axis=0))
-    lr_95 = np.exp(np.nanpercentile(log_lr_at_scores, 95, axis=0))
+    lr_5 = np.exp(np.nanpercentile(log_lr_at_scores, percentile, axis=0))
+    lr_95 = np.exp(np.nanpercentile(log_lr_at_scores, 100 - percentile, axis=0))
 
     def _posterior(lr_arr: np.ndarray) -> np.ndarray:
         out = np.full_like(lr_arr, np.nan)
@@ -159,18 +160,19 @@ def _compute_bootstrap_lr_percentiles(
     return lr_5, lr_95, _posterior(lr_5), _posterior(lr_95)
 
 
-def _build_standard_table(scoreset, calibration: Dict) -> pd.DataFrame:
+def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0) -> pd.DataFrame:
     """Assign every variant its evidence points from the global calibration.
 
     Always includes standard_points.  Also includes lr_plus_5th, lr_plus_95th,
     posterior_5th, posterior_95th when bootstrap LR+ curves are present in the
-    calibration dict.
+    calibration dict. Column names stay fixed regardless of `percentile` (schema
+    stability) -- only the percentile value used to populate them changes.
     """
     flat = _flatten_point_ranges(calibration["point_ranges"])
     ids = _get_variant_ids(scoreset)
 
     scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
-    lr_5, lr_95, post_5, post_95 = _compute_bootstrap_lr_percentiles(scores, calibration)
+    lr_5, lr_95, post_5, post_95 = _compute_bootstrap_lr_percentiles(scores, calibration, percentile)
     has_percentiles = lr_5 is not None
     auth_labels = getattr(scoreset, "auth_labels", None)
     is_vus = _get_variant_is_vus(scoreset)
@@ -412,6 +414,7 @@ def _process_variant_oob(
     liberal: bool,
     min_samples: int = 1,
     acmg_mapping_method: str = "tavtigian",
+    percentile: float = 5.0,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
@@ -462,8 +465,8 @@ def _process_variant_oob(
     try:
         # Step 5: calculate_score_ranges (same as in-bag median_prior branch)
         pr_p, pr_b, C = calculate_score_ranges(
-            np.nanpercentile(vlr, 5, axis=0),
-            np.nanpercentile(vlr, 95, axis=0),
+            np.nanpercentile(vlr, percentile, axis=0),
+            np.nanpercentile(vlr, 100 - percentile, axis=0),
             prior, vsr, point_values, acmg_mapping_method=acmg_mapping_method,
         )
         pr = {**pr_p, **pr_b}
@@ -529,6 +532,7 @@ def _compute_oob_evidence(
             config.point_values, flipped, liberal,
             config.oob_min_samples,
             oob_acmg_mapping_method,
+            getattr(config, "pathogenic_percentile", 5.0),
         )
         for vidx, oob_idx in oob_map.items()
     )
@@ -599,7 +603,7 @@ def compute_variant_table(
     if acmg_mapping_method == "continuous":
         df = _build_continuous_table(scoreset, calibration, config)
     else:
-        df = _build_standard_table(scoreset, calibration)
+        df = _build_standard_table(scoreset, calibration, getattr(config, "pathogenic_percentile", 5.0))
     log(f"  Standard evidence assigned to {len(df)} variants "
         f"(acmg_mapping_method={acmg_mapping_method})")
 

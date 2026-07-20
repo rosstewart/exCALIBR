@@ -12,17 +12,26 @@ Methods
 acmgscaler   : github.com/badonyi/acmgscaler (Badonyi & Marsh 2025) -- run
                live via Rscript against each dataset's P/LP + B/LB scores.
                Implemented below.
-gmm_baseline : slurm/simple_gmm_baseline.py's 2-component Gaussian mixture
-               baseline -- run separately (not part of this pipeline).
-               load_gmm_baseline_points() reads its output JSON once you've
-               run it; see analysis.config.GMM_BASELINE_JSON.
+gmm_baseline : simple 2-component GMM baseline, two pooling variants
+               ("plp_blb", "plp_blb_synon"), prior=0.1. Its output tree is
+               shaped exactly like ExCALIBR's own pipeline output (same
+               {dataset}/{dataset}_{comp}_variants.csv layout, just
+               comp="plp_blb"/"plp_blb_synon" instead of an (n_c,
+               benign_method) token) -- load_comparison_variants() reads it
+               generically, and the resulting variants.csv has the same
+               sample/standard_points columns ExCALIBR's own does, so
+               analysis.confusion.build_confusion_matrix works on it
+               completely unchanged. See analysis.config.GMM_BASELINE_OUTPUT_DIR.
+               load_gmm_baseline_points() is a fallback for the older,
+               leaner bare-JSON-only output format (no variants.csv) --
+               prefer load_comparison_variants when GMM_BASELINE_OUTPUT_DIR
+               is populated.
 force_gaussian : the canonical ExCALIBR pipeline rerun with
-               force_gaussian=True. Not implemented yet -- calibrations for
-               this don't exist yet. Once they do, this should be a normal
-               *_calibration.json/*_variants.csv output tree (just under a
-               different output_dir / dataset-name suffix), loadable via
-               analysis.discovery like any other pipeline run rather than
-               needing its own loader here.
+               force_gaussian=True (results to come). Once populated, this
+               is a normal ExCALIBR output_dir with standard (n_c,
+               benign_method) comp naming -- load it via
+               analysis.discovery/analysis.confusion like any other pipeline
+               run, not via anything in this module.
 """
 from __future__ import annotations
 
@@ -63,6 +72,87 @@ ACMGSCALER_EVIDENCE_TO_POINTS = {
 }
 
 
+def _find_pvst(prior: float) -> int:
+    """Python port of acmgscaler's find_pvst() (R/add_evidence_levels.R) --
+    the "very strong" pathogenicity LR threshold for a given prior. Only used
+    to derive threshold-line positions for make_acmgscaler_figure; the actual
+    per-variant classification always comes from the live R call (run_acmgscaler),
+    never from this port -- so a divergence here would only mis-draw a
+    reference line, not mis-classify a variant. Verified directly against a
+    live `Rscript -e 'source(...); find_pvst(0.1)'` call: both give 350, and
+    thresholds_from_pvst(350) matches the R output to displayed precision on
+    all 8 tiers (do not confuse this with ExCALIBR's own unrelated Tavtigian
+    constant from get_tavtigian_constant, which is a different formula that
+    happens to also be an integer -- they are not the same number).
+
+    Ported line-for-line from R, including its `- 1` at the end -- not
+    obviously an off-by-one in the R source (find_pvst's own comment: "13 out
+    of 14 criteria met"), so reproduced exactly as written rather than
+    "corrected".
+    """
+    if prior <= 0.01:
+        return 8573
+    if prior > 0.97:
+        return 1
+
+    for pvst in range(1, 8574):
+        su = pvst ** 0.125
+        mo = pvst ** 0.25
+        st = pvst ** 0.5
+        class_lr = np.array([
+            mo * pvst, mo * st, su**2 * st, mo**3, su**2 * mo**2, su**4 * mo,
+            st * pvst, mo**2 * pvst, su * mo * pvst, su**2 * pvst, st**2,
+            mo**3 * st, su**2 * mo**2 * st, su**4 * mo * st,
+        ])
+        post_path = (class_lr * prior) / ((class_lr - 1) * prior + 1)
+        n_met = int((post_path[:6] >= 0.9).sum()) + int((post_path[6:] >= 0.99).sum())
+        if n_met == 13:
+            return pvst - 1
+    raise ValueError(f"find_pvst: no pvst in [1, 8573] satisfies 13/14 criteria for prior={prior}")
+
+
+def _thresholds_from_pvst(pvst: float) -> dict:
+    """Python port of acmgscaler's thresholds_from_pvst() -- LR value at each
+    of the 8 evidence-tier boundaries, for the given Pvst (see _find_pvst)."""
+    return {
+        "Benign-VeryStrong": 1 / pvst,
+        "Benign-Strong": 1 / pvst**0.5,
+        "Benign-Moderate": 1 / pvst**0.25,
+        "Benign-Supporting": 1 / pvst**0.125,
+        "Pathogenic-Supporting": pvst**0.125,
+        "Pathogenic-Moderate": pvst**0.25,
+        "Pathogenic-Strong": pvst**0.5,
+        "Pathogenic-VeryStrong": pvst,
+    }
+
+
+def build_variants_df_from_scoreset(scoreset) -> pd.DataFrame:
+    """variant_id/score/sample DataFrame straight from a freshly-built
+    Scoreset -- no calibration/pipeline output needed. `sample` is the same
+    pipe-separated multi-label string _build_standard_table writes to
+    *_variants.csv (see src/assay_calibration/pipeline/variant_evidence.py);
+    reused here so run_acmgscaler/make_acmgscaler_figure work identically
+    whether df_variants came from a saved *_variants.csv or was built fresh
+    from the master dataframe like run_igvf_batch.py/slurm/simple_gmm_baseline.py do.
+    """
+    from src.assay_calibration.pipeline.variant_evidence import _get_variant_ids
+
+    ids = _get_variant_ids(scoreset)
+    rows = []
+    for idx in range(len(scoreset.scores)):
+        matched = [
+            scoreset.sample_names[s_idx]
+            for s_idx in range(len(scoreset.sample_names))
+            if scoreset._sample_assignments[idx, s_idx]
+        ]
+        rows.append({
+            "variant_id": ids[idx] if idx < len(ids) else f"variant_{idx}",
+            "score": float(scoreset.scores[idx]),
+            "sample": "|".join(matched) if matched else "Unknown",
+        })
+    return pd.DataFrame(rows)
+
+
 def run_acmgscaler(
     df_variants: pd.DataFrame,
     prior: float = 0.1,
@@ -91,8 +181,14 @@ def run_acmgscaler(
     the 8 tier-boundary LRs) as a second return value, for
     make_acmgscaler_figure.
 
-    Requires Rscript on PATH; raises RuntimeError with the R stderr if the
-    call fails.
+    Requires Rscript on PATH. Raises ValueError up front (no R subprocess
+    call at all) if there are fewer than 10 P/LP or fewer than 10 B/LB
+    variants -- acmgscaler's own check_input() would reject this dataset
+    with the same 10-per-class minimum anyway, but only after a full R
+    startup + the noisy multi-line "Calls: calibrate -> check_input /
+    Execution halted" stderr dump; checking here first means a caller doing
+    `except Exception: print(f"SKIP: {e}")` gets one clean line instead.
+    Any other R failure still raises RuntimeError with the R stderr, as before.
     """
     acmgscaler_dir = acmgscaler_dir or cfg.ACMGSCALER_DIR
     if not Path(acmgscaler_dir).is_dir():
@@ -100,6 +196,12 @@ def run_acmgscaler(
 
     is_plp = sample_matches(df_variants, "Pathogenic/Likely Pathogenic")
     is_blb = sample_matches(df_variants, "Benign/Likely Benign")
+    n_plp, n_blb = int(is_plp.sum()), int(is_blb.sum())
+    if n_plp < 10 or n_blb < 10:
+        raise ValueError(
+            f"insufficient P/B controls for acmgscaler (needs >=10 each): "
+            f"n_P={n_plp}, n_B={n_blb}"
+        )
     class_col = np.where(is_plp, "P", np.where(is_blb, "B", ""))
 
     r_input = pd.DataFrame({
@@ -167,6 +269,46 @@ def build_acmgscaler_confusion_matrix(
     )
 
 
+def acmgscaler_variants_path(dataset: str, output_dir) -> Path:
+    """Path convention for the per-dataset acmgscaler CSV run_acmgscaler_all.py
+    writes -- {output_dir}/{dataset}/{dataset}_acmgscaler_variants.csv,
+    mirroring ExCALIBR's own {dataset}/{dataset}_{comp}_variants.csv layout.
+    """
+    return Path(output_dir) / dataset / f"{dataset}_acmgscaler_variants.csv"
+
+
+def load_acmgscaler_variants(dataset: str, output_dir) -> Optional[pd.DataFrame]:
+    """Load a previously-saved {dataset}_acmgscaler_variants.csv (from
+    run_acmgscaler_all.py) if it exists -- has the same acmgscaler_lr/
+    acmgscaler_evidence/acmgscaler_points columns run_acmgscaler() itself
+    returns, so build_acmgscaler_confusion_matrix works on it directly with
+    no R subprocess call needed. Returns None if no such file exists (caller
+    should fall back to run_acmgscaler() for a live computation).
+    """
+    path = acmgscaler_variants_path(dataset, output_dir)
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
+def load_comparison_variants(dataset: str, comp: str, output_dir) -> Optional[pd.DataFrame]:
+    """Generic loader for any comparison method whose output is shaped like
+    ExCALIBR's own pipeline output -- {output_dir}/{dataset}/{dataset}_{comp}_variants.csv
+    -- with the same sample/standard_points columns, so
+    analysis.confusion.build_confusion_matrix works on the result completely
+    unchanged. Used for the GMM baseline (comp="plp_blb"/"plp_blb_synon",
+    see analysis.config.GMM_BASELINE_VARIANTS) and would work identically for
+    any future comparison method saved in this same shape.
+
+    Returns None if no such file exists (e.g. that dataset/comp combo was
+    skipped -- too few controls, same as ExCALIBR's own calibration would be).
+    """
+    path = Path(output_dir) / dataset / f"{dataset}_{comp}_variants.csv"
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
 def load_gmm_baseline_points(json_path: Optional[str] = None) -> dict:
     """Load slurm/simple_gmm_baseline.py's output JSON (once you've run it --
     see analysis.config.GMM_BASELINE_JSON) into a lookup:
@@ -202,76 +344,180 @@ def load_gmm_baseline_points(json_path: Optional[str] = None) -> dict:
 
 # Sample colors matching the rest of this codebase's convention (see e.g.
 # plot_scoreset_best_config's sample_colors / _SAMPLE_COLORS in
-# analysis/calibration_plots.py) -- P/LP red, B/LB blue.
-_SAMPLE_HIST_COLORS = {"Pathogenic/Likely Pathogenic": "#CA7682", "Benign/Likely Benign": "#1D7AAB"}
+# analysis/calibration_plots.py) -- P/LP red, B/LB blue, gnomAD gray,
+# Synonymous green.
+_SAMPLE_HIST_COLORS = {
+    "Pathogenic/Likely Pathogenic": "#CA7682",
+    "Benign/Likely Benign": "#1D7AAB",
+    "population": "#A0A0A0",
+    "gnomAD": "#A0A0A0",
+    "Synonymous": "#6BAA75",
+}
+
+# Fixed row order score_thresholds is always written in (see
+# acmgscaler's build_threshold_df) -- boundary i is between tier_order[i]
+# and tier_order[i+1] with "indeterminate" spliced in at index 4.
+_ACMGSCALER_TIER_ORDER = [
+    "Benign-VeryStrong", "Benign-Strong", "Benign-Moderate", "Benign-Supporting",
+    "indeterminate",
+    "Pathogenic-Supporting", "Pathogenic-Moderate", "Pathogenic-Strong", "Pathogenic-VeryStrong",
+]
+
+
+def _point_ranges_from_acmgscaler_thresholds(thresholds: pd.DataFrame) -> dict:
+    """Convert acmgscaler's 8-row score_thresholds table (boundary score
+    between each pair of adjacent evidence tiers, in the fixed semantic order
+    _ACMGSCALER_TIER_ORDER) into the same {point_value: [[lo, hi]]} shape
+    ExCALIBR's own point_ranges use -- so the exact "Point Assignments" band
+    renderer from plot_scoreset_best_config (src/assay_calibration/plot_utils/
+    utils.py) can be reused verbatim.
+
+    Direction-agnostic: the 8 boundary values may increase or decrease along
+    _ACMGSCALER_TIER_ORDER depending on whether higher scores are more or
+    less pathogenic for this dataset -- inferred by comparing the first and
+    last boundary rather than assumed.
+    """
+    boundary_vals = thresholds["value"].tolist()
+    increasing = boundary_vals[0] < boundary_vals[-1]
+    edges = ([-np.inf] if increasing else [np.inf]) + boundary_vals + ([np.inf] if increasing else [-np.inf])
+
+    point_ranges = {}
+    for i, tier in enumerate(_ACMGSCALER_TIER_ORDER):
+        points = ACMGSCALER_EVIDENCE_TO_POINTS[tier]
+        if points == 0:
+            continue
+        lo, hi = edges[i], edges[i + 1]
+        lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+        point_ranges[points] = [[lo, hi]]
+    return point_ranges
 
 
 def make_acmgscaler_figure(dataset: str, df_variants: pd.DataFrame, figure_dir: Path,
-                            prior: float = 0.1, score_col: str = "score"):
-    """Per-dataset acmgscaler figure, analogous to run_igvf_batch.py's
-    per-selected-config `{dataset}_{comp}_visualization.png` -- one PNG per
-    dataset, saved as `{dataset}_acmgscaler_visualization.png` in the same
-    output_dir/{dataset}/ layout ExCALIBR's own visualizations use.
+                            prior: float = 0.1, score_col: str = "score",
+                            acmgscaler_dir: Optional[str] = None,
+                            precomputed: Optional[tuple] = None):
+    """Per-dataset acmgscaler figure, laid out like
+    src.assay_calibration.plot_utils.utils.plot_scoreset_best_config (the
+    same figure run_igvf_batch.py/run_pipeline.py save as
+    `{dataset}_{comp}_visualization.png`) rather than an ad hoc format --
+    saved as `{dataset}_acmgscaler_visualization.png` under a `{dataset}/`
+    subdirectory of `figure_dir` (figure_dir itself can be any destination,
+    not necessarily the pipeline's own output_dir).
 
-    Two panels:
-      left  : P/LP (red) / B/LB (blue) score histograms, with acmgscaler's
-              own score_thresholds marked as vertical dashed lines (one per
-              evidence-tier boundary).
-      right : per-variant acmgscaler LR (log scale) vs score, sorted by
-              score, with horizontal dashed lines at each evidence
-              tier's LR threshold -- the acmgscaler analogue of ExCALIBR's
-              own "Log LR+" panel in plot_scoreset_best_config.
+    Three rows, reusing that figure's exact styling where the underlying
+    data lets it:
+      Row 0 : per-sample score histograms (same P/LP-red, B/LB-blue,
+              gnomAD-gray, Synonymous-green convention). No fitted mixture
+              component overlay curves -- acmgscaler is a density-ratio/KDE
+              method, not a parametric mixture fit, so there's no per-
+              component curve to draw here the way ExCALIBR's own figure does.
+      Row 1 : "Point Assignments" -- the exact horizontal-band renderer from
+              plot_scoreset_best_config, fed acmgscaler's own evidence-tier
+              score boundaries (converted to ExCALIBR's point_ranges shape by
+              _point_ranges_from_acmgscaler_thresholds).
+      Row 2 : "Log LR+" -- acmgscaler's own per-variant LR estimate (black
+              line) with its 95% CI (gray band), plus the same dashed
+              red/blue reference lines plot_scoreset_best_config draws
+              (add_thresholds), computed from acmgscaler's own Pvst
+              (_find_pvst/_thresholds_from_pvst -- verified against a live R
+              call, see their docstrings) rather than ExCALIBR's Tavtigian
+              constant, since these are two close-but-not-identical numbers
+              (348 vs 350 at prior=0.1) and this figure should show what
+              acmgscaler itself actually used.
+
+    `precomputed`, if given, is the (df_acmg, thresholds) tuple already
+    returned by a prior run_acmgscaler(..., return_thresholds=True) call --
+    pass this when the caller already ran acmgscaler itself (e.g. to also
+    save a *_acmgscaler_variants.csv), so this function doesn't invoke the R
+    subprocess a second time for the same dataset.
 
     Returns the Path the figure was saved to, or None if acmgscaler couldn't
     be run for this dataset (e.g. <20 non-NA scores -- see build_grid).
     """
+    from src.assay_calibration.plot_utils.utils import add_thresholds
+
     Path(figure_dir).mkdir(parents=True, exist_ok=True)
 
-    df_acmg, thresholds = run_acmgscaler(
-        df_variants, prior=prior, score_col=score_col, return_thresholds=True,
-    )
+    if precomputed is not None:
+        df_acmg, thresholds = precomputed
+    else:
+        df_acmg, thresholds = run_acmgscaler(
+            df_variants, prior=prior, score_col=score_col, return_thresholds=True,
+            acmgscaler_dir=acmgscaler_dir,
+        )
     if df_acmg["acmgscaler_evidence"].isna().all():
         print(f"  SKIP acmgscaler figure for {dataset}: acmgscaler returned no evidence calls "
               f"(likely <20 P/B-labeled variants)")
         return None
 
-    fig, (ax_hist, ax_lr) = plt.subplots(1, 2, figsize=(14, 6))
+    present_samples = [
+        name for name in ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "population", "Synonymous"]
+        if sample_matches(df_variants, name).any()
+    ]
+    # "population" and "gnomAD" share one color/column -- don't double-count.
+    n_cols = max(len(present_samples), 1)
 
-    for sample_name, color in _SAMPLE_HIST_COLORS.items():
-        mask = sample_matches(df_variants, sample_name)
-        if mask.any():
-            ax_hist.hist(df_variants.loc[mask, score_col], bins=40, density=True,
-                         alpha=0.5, color=color, label=sample_name)
-    for _, row in thresholds.iterrows():
-        if pd.notna(row["value"]):
-            ax_hist.axvline(row["value"], color="gray", linestyle="--", alpha=0.6, linewidth=1)
-    ax_hist.set_xlabel(score_col)
-    ax_hist.set_ylabel("Density")
-    ax_hist.set_title(f"{dataset}: score distributions + acmgscaler thresholds")
-    ax_hist.legend(fontsize=9)
+    fig, ax = plt.subplots(3, n_cols, figsize=(6 * n_cols, 14), squeeze=False,
+                            gridspec_kw={"hspace": 0.35, "wspace": 0.3})
+
+    xlim = (df_variants[score_col].min(), df_variants[score_col].max())
+    point_ranges_dict = _point_ranges_from_acmgscaler_thresholds(thresholds)
+    point_ranges = sorted(point_ranges_dict.items())
+    point_values = [pr[0] for pr in point_ranges]
 
     plotted = df_acmg.dropna(subset=["acmgscaler_lr"]).sort_values(score_col)
-    ax_lr.fill_between(plotted[score_col], plotted["acmgscaler_lr_lower"], plotted["acmgscaler_lr_upper"],
-                        color="gray", alpha=0.25, label="95% CI")
-    ax_lr.plot(plotted[score_col], plotted["acmgscaler_lr"], color="black", linewidth=1, alpha=0.6, zorder=2)
-    # Color points by their assigned evidence tier -- more robust than trying
-    # to reconstruct exact horizontal threshold lines from score_thresholds
-    # (that requires matching a score-space boundary back to an LR-space
-    # value via nearest-score lookup, which is only approximate).
-    n_tiers = len(ACMGSCALER_EVIDENCE_TO_POINTS)
-    cmap = plt.cm.RdBu_r
-    for label, points in ACMGSCALER_EVIDENCE_TO_POINTS.items():
-        sub = plotted[plotted["acmgscaler_evidence"] == label]
-        if sub.empty:
-            continue
-        color = cmap(0.5 + points / 16) if points != 0 else "gray"
-        ax_lr.scatter(sub[score_col], sub["acmgscaler_lr"], color=color, s=10, zorder=3, label=label)
-    ax_lr.legend(fontsize=7, loc="best", ncol=2)
-    ax_lr.set_yscale("log")
-    ax_lr.set_xlabel(score_col)
-    ax_lr.set_ylabel("acmgscaler LR (log scale)")
-    ax_lr.set_title(f"{dataset}: acmgscaler LR curve (prior={prior})")
 
+    for col, sample_name in enumerate(present_samples):
+        # Row 0: score histogram for this sample.
+        ax_hist = ax[0, col]
+        mask = sample_matches(df_variants, sample_name)
+        ax_hist.hist(df_variants.loc[mask, score_col], bins=40, density=True,
+                     alpha=0.6, color=_SAMPLE_HIST_COLORS[sample_name])
+        ax_hist.set_title(f"{sample_name}\n(n={int(mask.sum()):,d})", fontsize=11)
+        ax_hist.set_xlabel(score_col)
+        ax_hist.set_ylabel("Density")
+        ax_hist.set_xlim(xlim)
+
+        # Row 1: Point Assignments -- verbatim rendering logic from
+        # plot_scoreset_best_config's Row 1 (see that function for the
+        # original), just fed acmgscaler-derived point_ranges.
+        ax_points = ax[1, col]
+        for pointIdx, (pointVal, scoreRanges) in enumerate(point_ranges):
+            for sr in scoreRanges:
+                x0 = xlim[0] if np.isneginf(sr[0]) else max(sr[0], xlim[0])
+                x1 = xlim[1] if np.isposinf(sr[1]) else min(sr[1], xlim[1])
+                ax_points.plot([x0, x1], [pointIdx, pointIdx],
+                              color="red" if pointVal > 0 else "blue",
+                              linestyle="-", alpha=0.7, linewidth=2)
+        ax_points.set_ylim(-1, len(point_values))
+        ax_points.set_yticks(range(len(point_values)),
+                             labels=[f"{v:+d}" if v != 0 else "0" for v in point_values])
+        ax_points.set_xlabel(score_col)
+        ax_points.set_ylabel("Points")
+        ax_points.set_title("Point Assignments", fontsize=11)
+        ax_points.set_xlim(xlim)
+        ax_points.grid(linewidth=0.5, alpha=0.3)
+
+        # Row 2: Log LR+ -- acmgscaler's own per-variant LR + CI, with
+        # add_thresholds' dashed reference lines at acmgscaler's own tiers.
+        ax_lr = ax[2, col]
+        ax_lr.fill_between(plotted[score_col], np.log(plotted["acmgscaler_lr_lower"]),
+                           np.log(plotted["acmgscaler_lr_upper"]), color="gray", alpha=0.3)
+        ax_lr.plot(plotted[score_col], np.log(plotted["acmgscaler_lr"]), color="black", alpha=0.7)
+
+        pvst = _find_pvst(prior)
+        tau = _thresholds_from_pvst(pvst)
+        tauP = np.log([tau["Pathogenic-Supporting"], tau["Pathogenic-Moderate"],
+                       tau["Pathogenic-Strong"], tau["Pathogenic-VeryStrong"]])
+        tauB = np.log([tau["Benign-Supporting"], tau["Benign-Moderate"],
+                       tau["Benign-Strong"], tau["Benign-VeryStrong"]])
+        add_thresholds(tauP, tauB, ax_lr)
+        ax_lr.set_xlabel(score_col)
+        ax_lr.set_ylabel("Log LR (acmgscaler)")
+        ax_lr.set_xlim(xlim)
+        ax_lr.set_title(f"prior={prior}, Pvst={pvst}", fontsize=11)
+
+    fig.suptitle(f"{dataset}: acmgscaler", fontsize=14, fontweight="bold")
     fig.tight_layout()
     out_dir = Path(figure_dir) / dataset
     out_dir.mkdir(parents=True, exist_ok=True)

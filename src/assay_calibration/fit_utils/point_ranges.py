@@ -190,8 +190,268 @@ def prior_equation_2c(w_p, w_b, w_g):
 def prior_invalid(prior):
     return prior <= 0 or prior >= 1
 
+
+def _get_benign_reference_weights(weights, benign_method, benign_idx, synonymous_idx):
+    """Effective benign/synonymous mixture weight vector per `benign_method`.
+
+    Shared by compute_lr_filtered_pathogenic_mask and get_fit_prior so the
+    benign_method blend logic (benign-only / synonymous-only / avg-of-both)
+    lives in exactly one place.
+    """
+    if benign_method == 'synonymous' and synonymous_idx is not None:
+        return weights[synonymous_idx]
+    if benign_method == 'avg' and benign_idx is not None and synonymous_idx is not None:
+        return (np.array(weights[benign_idx]) + np.array(weights[synonymous_idx])) / 2
+    return weights[synonymous_idx if benign_idx is None else benign_idx]
+
+
+def estimate_prior_from_class_densities(
+    f1, f2, mode,
+    max_em_steps=10000, tolerance=1e-6,
+    no_signal_prior=0.1, floor_low=0.01, discard_high=0.99,
+):
+    """Numeric core of prior estimation, shared by get_fit_prior (below) and
+    the multivariate analysis harness (test/analyze_mv_results.py), so both
+    pipelines run the exact same math instead of maintaining independent
+    copies.
+
+    `f1`, `f2` are 1-D linear-space density arrays evaluated at the same
+    population/gnomAD points (already filtered to whatever entries the
+    caller considers valid). Their meaning depends on `mode`:
+
+        mode == 'standard' (both a pathogenic- and a benign/synonymous-
+        labeled sample exist): f1 = pathogenic density, f2 = benign density.
+        Runs the iterative joint-EM loop and returns the RAW prior estimate,
+        UNBOUNDED -- the caller is responsible for its own discard/fallback
+        policy on the returned value (this intentionally differs across
+        existing call sites -- see each call site for why).
+
+        mode in ('positive_unlabeled', 'negative_unlabeled'): f1 = the
+        labeled class's density (pathogenic for PU, benign for NU), f2 =
+        the population's own raw mixture density. Runs the boundary/
+        unmixing estimator (Blanchard, Lee & Scott 2010; Scott 2015) and
+        DOES apply floor/discard here, since that policy is already
+        identical across every current call site.
+
+    Returns a float, or np.nan for the PU/NU branch when the boundary
+    estimate is too close to 1 to trust (see `discard_high`).
+    """
+    if mode == 'standard':
+        prior_estimate = 0.5
+        converged = False
+        em_steps = 0
+        while not converged and em_steps < max_em_steps:
+            em_steps += 1
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
+                posteriors = 1 / (
+                    1 + (1 - prior_estimate) / prior_estimate * f2 / f1
+                )
+            new_prior = np.nanmean(posteriors)
+            if abs(new_prior - prior_estimate) < tolerance:
+                converged = True
+            prior_estimate = new_prior
+            if prior_estimate < 0 or prior_estimate > 1:
+                break
+        return prior_estimate
+
+    # PU/NU boundary/unmixing estimator.
+    valid = f1 > 0
+    if not np.any(valid):
+        return no_signal_prior
+    boundary = float(np.min(f2[valid] / f1[valid]))
+    prior_raw = boundary if mode == 'positive_unlabeled' else (1.0 - boundary)
+    if prior_raw >= discard_high:
+        return np.nan
+    return float(max(prior_raw, floor_low))
+
+
+def compute_lr_filtered_pathogenic_mask(
+    fits, scores, sample_assignments, benign_method,
+    pathogenic_idx, benign_idx, synonymous_idx, gnomad_idx=None,
+    percentile=5.0, n_jobs=-1,
+):
+    """
+    For every pathogenic-labeled row, evaluate each bootstrap fit's log-likelihood-
+    ratio-like statistic directly at that row's own score (using the frozen fitted
+    mixture curves, same primitive as _compute_log_fp_only). Take the
+    `percentile`-th percentile across bootstraps per row, and keep rows where
+    that conservative statistic is > 0.
+
+    When a benign or synonymous sample exists, this is the real log_lr_plus =
+    log_fp - log_fb (LR+ > 1 at the conservative bound).
+
+    When neither exists (PU-only datasets), there is no fb curve to compute a
+    true LR+ against. Using the prior to unmix an fb curve here would be
+    circular (the prior is exactly what filtering is meant to improve) and
+    compounds whatever separation problem caused the unfiltered PU prior
+    estimate to be unreliable in the first place. Instead this falls back to
+    log_fp - log_f_population (requires gnomad_idx): a single-pass, prior-free
+    statistic that keeps only pathogenic-labeled rows whose fitted pathogenic
+    density exceeds the raw (mixed) population density at their own score --
+    directly excluding the poorly-separated rows that dilute the PU mean-
+    matching denominator (E_labeled[fp]) and inflate the estimated prior. This
+    is NOT literal LR+ (no fb involved) -- it is a PU-specific separation
+    criterion with the same >0 threshold semantics.
+
+    Returns (mask, n_labeled, n_kept):
+      mask       : bool array, shape (len(scores),), True for kept pathogenic rows
+                   (global indexing, aligned to `scores`/`sample_assignments`)
+      n_labeled  : total pathogenic-labeled rows before filtering
+      n_kept     : rows kept after filtering
+    """
+    lab_mask = sample_assignments[:, pathogenic_idx].astype(bool)
+    labeled_scores = scores[lab_mask]
+    n_labeled = len(labeled_scores)
+    if n_labeled == 0:
+        return np.zeros(len(scores), dtype=bool), 0, 0
+
+    is_pu = benign_idx is None and synonymous_idx is None
+
+    def _per_fit(fit):
+        params = fit['fit']['component_params']
+        weights = fit['fit']['weights']
+        log_fp = density_utils.mixture_pdf(labeled_scores, params, weights[pathogenic_idx])
+        if is_pu:
+            log_ref = density_utils.mixture_pdf(labeled_scores, params, weights[gnomad_idx])
+        else:
+            w_b = _get_benign_reference_weights(weights, benign_method, benign_idx, synonymous_idx)
+            log_ref = density_utils.mixture_pdf(labeled_scores, params, w_b)
+        stat = log_fp - log_ref
+        # Bootstrap fits don't all span the same score range; evaluating a fit's
+        # mixture curves at a score outside its fitted xlims is extrapolation, not
+        # interpolation, and can swing wildly (see the same guard in
+        # get_bootstrap_score_ranges). Mask those out so nanpercentile below isn't
+        # contaminated by a handful of unstable extrapolated fits.
+        xmin, xmax = fit['fit']['xlims']
+        in_range = (labeled_scores >= xmin) & (labeled_scores <= xmax)
+        stat = np.where(in_range, stat, np.nan)
+        return stat
+
+    log_lr = np.array(Parallel(n_jobs=min(len(fits), max(n_jobs, 1)), verbose=0)(
+        delayed(_per_fit)(fit) for fit in fits
+    ))  # shape (n_fits, n_labeled)
+
+    lr_percentile = np.nanpercentile(log_lr, percentile, axis=0)  # conservative per-row
+    keep = lr_percentile > 0
+
+    mask = np.zeros(len(scores), dtype=bool)
+    mask[np.where(lab_mask)[0][keep]] = True
+    return mask, n_labeled, int(keep.sum())
+
+
+def compute_pathomechanism_pathogenic_density(
+    labeled_scores, population, params, w_P_raw, w_N,
+    gamma_init=0.5, max_em_steps=10000, tolerance=1e-8,
+    multivariate=False,
+):
+    """
+    EXPERIMENTAL. Estimates the pathogenic-labeled sample's "assay
+    mechanistic coverage" fraction gamma in
+
+        f_pathogenic_labeled(x) = gamma * f_D(x) + (1 - gamma) * f_N(x)
+
+    and returns the resulting "assay-relevant" pathogenic density f_D
+    evaluated at `population` (the gnomAD/population points used elsewhere
+    in get_fit_prior), for use in place of the raw pathogenic density.
+
+    `w_N` is the fixed anchor density's weight vector -- the caller decides
+    what it represents. For PN/standard-mode datasets it's the benign/
+    synonymous reference (get_fit_prior's `w_b`). For PU-only datasets
+    (no benign/synonymous sample) it's the raw, UNPURIFIED gnomAD/
+    population weights (`weights[gnomad_idx]`) -- the same anchor
+    compute_lr_filtered_pathogenic_mask's PU fallback already uses
+    (log_fp - log_f_population), just formalized as a proper generative
+    mixture instead of a hard per-row threshold. No attempt is made to
+    unmix gnomAD's own (typically small) real-disease-variant content
+    first: writing f_gnomAD = pi*f_D + (1-pi)*f_N, the excess construction
+    below is provably invariant to pi -- (w_P_raw - w_gnomAD) = (gamma-pi)*
+    (w_D-w_N), and gamma > pi always holds (a curated pathogenic-labeled
+    sample is by construction more disease-enriched than the general
+    population), so renormalizing after max(0, ...) cancels the (gamma-pi)
+    scale factor regardless of its value. The one place pi's absence from
+    a pure reference does matter is gamma_hat itself, which becomes a mildly
+    conservative (downward-biased) estimate of true mechanistic coverage:
+    gamma_hat = 1 - (1-gamma_true)/(1-pi) <= gamma_true, with zero bias when
+    pi ~ 0 (empirically confirmed on TARDBP_Bolognesi_Faure_2019, where
+    gnomAD carries ~no disease-relevant mass: gamma_hat's median matched the
+    LR-filter's independently-computed kept-row fraction almost exactly).
+
+    f_D is built directly from the per-component EXCESS of the raw
+    pathogenic-labeled weights over the anchor weights:
+
+        w_D[k] = max(0, w_P_raw[k] - w_N[k]),  renormalized to sum to 1
+
+    This is a fixed, non-tautological density (it does not depend on
+    gamma), constructed independently of any gamma value -- unlike an
+    earlier version of this estimator that solved for gamma via
+    w_D(gamma) = (w_P_raw - (1-gamma)*w_N)/gamma, which reconstructs
+    f_pathogenic_labeled EXACTLY for every gamma and therefore carries zero
+    likelihood information about gamma (a proven tautology -- only the
+    non-negativity boundary constraint identified anything in that
+    framework). Building w_D directly from the excess breaks that
+    tautology, at the cost of a known, deliberate asymmetry: on any shared
+    component where both D and N have real weight (i.e. the two densities
+    genuinely overlap), this construction credits ALL of that component's
+    weight to N first and only assigns D whatever excess remains -- N gets
+    priority on ambiguous/overlapping mass, D only gets credit for
+    clearly-exceeding it. This is an appropriately conservative choice for
+    an evidence-assignment pipeline (a variant should only look
+    "assay-relevant damaging" once it clearly exceeds what the benign
+    reference alone explains) and is treated as fixed/accepted, not a bug
+    to fix. It also naturally handles more than one "benign-like" component
+    without any hardcoded component classification.
+
+    Because f_D (via w_D) and f_N (via w_N) are now both FIXED densities,
+    estimating gamma from the pathogenic-labeled sample's own scores is a
+    classic two-known-densities mixture-proportion EM -- the same update
+    rule as the standard-mode joint prior EM below, just applied here
+    against the pathogenic-labeled sample instead of the population sample.
+    This is provably well-behaved (a concave problem in the single scalar
+    gamma) and was confirmed empirically init-robust to ~1e-10 across
+    gamma_init in [0.01, 0.99] on real data -- unlike the free-weight-vector
+    EM this replaced, which was strongly initialization-dependent (median
+    gamma shifted from ~0.91 to ~0.81 across gamma_init=0.9 vs 0.1).
+
+    Returns (pathogenic_density_at_population_points, gamma_hat). Returns
+    (None, np.nan) when w_P_raw <= w_N on every component (no assay-relevant
+    excess signal at all -- degenerate). get_fit_prior discards this
+    individual bootstrap fit from prior estimation rather than falling back
+    to the raw pathogenic density for it: that raw density is itself the
+    degenerate case this correction exists to move away from (e.g. a fit
+    that collapses w_P_raw onto the same component as the anchor, so the two
+    densities are identical and any downstream prior EM is a trivial fixed
+    point). process_component_fits falls back to raw-density prior
+    estimation only if every bootstrap fit for the combo is degenerate this
+    way.
+    """
+    excess = np.maximum(np.asarray(w_P_raw, dtype=float) - np.asarray(w_N, dtype=float), 0.0)
+    total = float(excess.sum())
+    if total <= 0.0:
+        return None, np.nan
+    w_D = excess / total
+
+    log_fD = density_utils.mixture_pdf(labeled_scores, params, w_D, multivariate=multivariate)
+    log_fN = density_utils.mixture_pdf(labeled_scores, params, w_N, multivariate=multivariate)
+    gamma = float(gamma_init)
+    for _ in range(max_em_steps):
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            posteriors = 1.0 / (1.0 + (1.0 - gamma) / gamma * np.exp(log_fN - log_fD))
+        new_gamma = float(np.nanmean(posteriors))
+        if abs(new_gamma - gamma) < tolerance:
+            gamma = new_gamma
+            break
+        gamma = new_gamma
+        if not np.isfinite(gamma) or gamma <= 0.0 or gamma >= 1.0:
+            break
+
+    pathogenic_density = density_utils.joint_densities(
+        population, params, w_D, multivariate=multivariate
+    ).sum(axis=0)
+    return pathogenic_density, gamma
+
+
 def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, benign_idx=1, gnomad_idx=2, synonymous_idx=3,
-                  sample_assignments=None, **kwargs):
+                  sample_assignments=None, pathogenic_row_mask=None, **kwargs):
     if benign_idx is None:
         benign_idx = synonymous_idx
     if synonymous_idx is None:
@@ -212,6 +472,49 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
         scores = scoreset_or_scores.scores
         sa = scoreset_or_scores.sample_assignments
 
+    # LR-filtered "effective pathogenic sample": recompute this fit's pathogenic
+    # mixture weights restricted to just the rows in pathogenic_row_mask (a fixed
+    # subset of pathogenic-labeled rows selected by compute_lr_filtered_pathogenic_mask
+    # as reliably separated from the benign/synonymous/population reference). This is
+    # the same single M-step (frozen component_params, current weights as the E-step
+    # prior) that originally produced weights[pathogenic_idx] from the full labeled
+    # sample -- see get_sample_weights/get_sample_weights_and_ll in
+    # fit_utils/cfusn/update_steps.py -- just re-run on fewer rows. Components mostly
+    # explained by excluded ("looks normal") rows naturally end up with near-zero
+    # weight; everywhere below that reads weights[pathogenic_idx] then sees this
+    # cleaned vector instead of the raw one, so the ordinary standard-EM/PU/NU
+    # dispatch below runs unmodified on an "effective pathogenic" reference density
+    # that excludes mass overlapping the negative class.
+    if pathogenic_row_mask is not None and pathogenic_idx is not None:
+        filtered_scores = scores[pathogenic_row_mask]
+        if len(filtered_scores) > 0:
+            posts = density_utils.component_posteriors(
+                filtered_scores, params, weights[pathogenic_idx]
+            )
+            weights = list(weights)
+            weights[pathogenic_idx] = posts.mean(1)
+
+    # EXPERIMENTAL, opt-in alternative to the LR-filtered pathogenic_row_mask
+    # above: an excess-weight-based estimate of the pathogenic-labeled
+    # sample's mechanistic-coverage fraction (see
+    # compute_pathomechanism_pathogenic_density above), in place of an ad-hoc
+    # row filter. Needs a pathogenic-labeled sample; anchors against the
+    # benign/synonymous density when present (PN/standard mode) or, for
+    # PU-only datasets, against the raw gnomAD/population density directly
+    # (mirrors compute_lr_filtered_pathogenic_mask's own PU fallback -- see
+    # compute_pathomechanism_pathogenic_density's docstring). Mutually
+    # exclusive with pathogenic_row_mask.
+    pathomechanism_prior = kwargs.get("pathomechanism_prior", False)
+    gamma_hat = np.nan
+    pathomechanism_no_pu_support = False
+    if pathomechanism_prior and pathogenic_idx is not None and pathogenic_row_mask is not None:
+        raise ValueError(
+            "pathomechanism_prior and filter_pathogenic_sample_by_lr are "
+            "mutually exclusive pathogenic-sample-cleaning strategies -- "
+            "enable only one (pass --no-filter-pathogenic-sample-by-lr "
+            "alongside --pathomechanism-prior)."
+        )
+
     population = scores[sa[:, gnomad_idx]]
     # print(f"population: {len(population)} samples")
     
@@ -230,18 +533,54 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
     # Compute benign density if available
     benign_density = []
     if benign_idx is not None and synonymous_idx is not None:
-        if benign_method != 'avg':
-            benign_density = density_utils.joint_densities(
-                population, params, weights[benign_idx]
-            ).sum(axis=0)
-        else:
-            bs_weights = (np.array(weights[benign_idx]) + np.array(weights[synonymous_idx])) / 2
-            benign_density = density_utils.joint_densities(
-                population, params, bs_weights
-            ).sum(axis=0)
+        w_b = _get_benign_reference_weights(weights, benign_method, benign_idx, synonymous_idx)
+        benign_density = density_utils.joint_densities(
+            population, params, w_b
+        ).sum(axis=0)
         assert len(benign_density) == len(population)
     # print(f"benign_density: {benign_density}")
-    
+
+    if pathomechanism_prior and pathogenic_idx is not None and len(pathogenic_density) != 0:
+        is_pu = len(benign_density) == 0
+        w_N_anchor = weights[gnomad_idx] if is_pu else w_b
+        labeled_scores = scores[sa[:, pathogenic_idx].astype(bool)]
+        corrected, gamma_hat = compute_pathomechanism_pathogenic_density(
+            labeled_scores, population, params, weights[pathogenic_idx], w_N_anchor,
+            gamma_init=kwargs.get("pathomechanism_gamma_init", 0.5),
+            max_em_steps=kwargs.get("pathomechanism_max_em_steps", 10000),
+            tolerance=kwargs.get("pathomechanism_tolerance", 1e-8),
+        )
+        if corrected is None:
+            # No assay-relevant excess anywhere (w_P_raw <= w_N on every
+            # component) -- this bootstrap fit's own raw pathogenic density
+            # IS the degenerate reference pathomechanism_prior exists to move
+            # away from (e.g. a fit that collapses the pathogenic-labeled
+            # sample onto the same component as the benign/gnomAD anchor,
+            # making the two densities identical and any prior EM built on
+            # them a trivial fixed point at its own initialization --
+            # observed on SCN5A_Glazer_2020's 2c fits). Silently falling
+            # back to that raw density here would just reproduce the
+            # degeneracy under a different name, so discard this fit from
+            # prior estimation instead of using it. If every fit for this
+            # combo is degenerate this way, process_component_fits falls
+            # back to raw-density prior estimation for the whole combo.
+            return np.nan, np.nan
+        pathogenic_density = corrected
+        if is_pu:
+            # With a typically small gnomAD sample, "zero density
+            # everywhere the population lands" means f_D's isolated
+            # disease-relevant component(s) have no detectable trace in
+            # gnomAD -- itself the boundary estimator's floor signal
+            # (pi -> 0), not an absence of information. Confirmed on
+            # TARDBP_Bolognesi_Faure_2019 (68 gnomAD points): treating
+            # this as "no info" and discarding/defaulting to 0.1 (the
+            # generic PU fallback below) reproduced a selection-biased
+            # median over only the fits with fortuitous population
+            # overlap; flooring instead used ~2x as many bootstrap fits
+            # and gave a prior consistent with the assay's actual
+            # (near-zero) detectable disease signal in this population.
+            pathomechanism_no_pu_support = not np.any(pathogenic_density > 1e-300)
+
     if len(pathogenic_density) != 0 and len(benign_density) != 0:
         mode = 'standard'  # Both labeled classes available
         prior_estimate = 0.5
@@ -263,59 +602,49 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
     #         return default_prior
     
     if mode == 'standard':
-        # Standard EM
-        converged = False
-        em_steps = 0
-        max_em_steps = kwargs.get("max_em_steps", 10000)
-        tolerance = kwargs.get("tolerance", 1e-6)
-        while not converged and em_steps < max_em_steps:
-            em_steps += 1
-            with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
-                posteriors = 1 / (
-                    1 + (1 - prior_estimate) / prior_estimate
-                    * benign_density / pathogenic_density
-                )
-            new_prior = np.nanmean(posteriors)
-            if abs(new_prior - prior_estimate) < tolerance:
-                converged = True
-            prior_estimate = new_prior
-            if prior_estimate < 0 or prior_estimate > 1:
-                break
-    else:
-        # Mean-matching estimator:
-        #   NU: α = 1 - E_{gnomAD}[fb] / E_{benign}[fb]
-        #   PU: α = E_{gnomAD}[fp] / E_{path}[fp]
-        # Requires only that pathogenic (benign) variants have low benign (path) density.
-        # More robust than Blanchard-Recht: does not assume fpop/fbenign ≥ 1-α pointwise,
-        # which breaks when fitted model weights don't satisfy the mixture decomposition.
-        if mode == 'negative_unlabeled':
-            if benign_method == 'synonymous' and synonymous_idx is not None:
-                lab_mask = sa[:, synonymous_idx].astype(bool)
-            elif benign_method == 'avg' and synonymous_idx is not None:
-                lab_mask = sa[:, benign_idx].astype(bool) | sa[:, synonymous_idx].astype(bool)
-            else:
-                lab_mask = sa[:, benign_idx].astype(bool)
-            labeled = scores[lab_mask]
-            labeled_density = density_utils.joint_densities(
-                labeled, params, weights[benign_idx] if benign_method != 'avg'
-                else (np.array(weights[benign_idx]) + np.array(weights[synonymous_idx])) / 2
-            ).sum(axis=0)
-            mean_pop = float(np.nanmean(benign_density))
-            mean_lab = float(np.nanmean(labeled_density))
-            prior_estimate = float(np.clip(1.0 - mean_pop / mean_lab, 0.001, 0.999)) if mean_lab > 0 else 0.1
-        else:  # positive_unlabeled
-            labeled = scores[sa[:, pathogenic_idx]]
-            labeled_density = density_utils.joint_densities(
-                labeled, params, weights[pathogenic_idx]
-            ).sum(axis=0)
-            mean_pop = float(np.nanmean(pathogenic_density))
-            mean_lab = float(np.nanmean(labeled_density))
-            prior_estimate = float(np.clip(mean_pop / mean_lab, 0.001, 0.999)) if mean_lab > 0 else 0.1
+        # Standard EM -- see estimate_prior_from_class_densities for the shared
+        # implementation (also used by test/analyze_mv_results.py).
+        prior_estimate = estimate_prior_from_class_densities(
+            pathogenic_density, benign_density, mode='standard',
+            max_em_steps=kwargs.get("max_em_steps", 10000),
+            tolerance=kwargs.get("tolerance", 1e-6),
+        )
+        # Joint EM is the well-behaved estimator (uses both fp and fb) -- it
+        # doesn't suffer the saturation pathology PU/NU unmixing does, and
+        # floor-instead-of-discard here only ends up changing which bootstrap
+        # fits' curves feed the final LR+ plot for datasets that never had a
+        # saturation problem to begin with. Keep the original behavior.
+        if prior_estimate <= 0.001 or prior_estimate >= 0.999:
+            return np.nan, gamma_hat
+        return prior_estimate, gamma_hat
 
-    if prior_estimate <= 0.001 or prior_estimate >= 0.999:
-        return np.nan
+    # Boundary/"unmixing" estimator (Blanchard, Lee & Scott 2010; Scott 2015),
+    # evaluated at the gnomAD/population sample points (pop_density,
+    # pathogenic_density, benign_density are already computed there above):
+    #   f_pop(x) = alpha*f_labeled(x) + (1-alpha)*f_other(x), f_other(x) >= 0
+    #   everywhere requires alpha <= f_pop(x)/f_labeled(x) pointwise, so the
+    #   tightest identifiable alpha is inf_x [f_pop(x) / f_labeled(x)].
+    # More intuitive than mean-matching for PU/NU (formerly used here):
+    # mean-matching's ratio of *averages* collapses toward 0 whenever
+    # there's little population mass near the labeled class -- a
+    # data-sparsity artifact, not evidence of a low prior -- whereas
+    # unmixing asks "what's the largest alpha consistent with a
+    # non-negative residual population density everywhere", the direct
+    # generalization of the standard PN joint-EM logic (above) to the
+    # one-labeled-class case. Floor/discard (0.01 / >=0.99) is applied inside
+    # estimate_prior_from_class_densities -- identical policy shared with MV.
+    if mode == 'negative_unlabeled':
+        return estimate_prior_from_class_densities(
+            benign_density, pop_density, mode='negative_unlabeled'), gamma_hat
 
-    return prior_estimate
+    # positive_unlabeled. See pathomechanism_no_pu_support comment above:
+    # distinguish "pathomechanism correction found no population support at
+    # all" (a real floor signal, no_signal_prior=0.01) from the generic
+    # no-signal fallback used everywhere else (no_signal_prior=0.1).
+    no_signal_prior = 0.01 if pathomechanism_no_pu_support else 0.1
+    return estimate_prior_from_class_densities(
+        pathogenic_density, pop_density, mode='positive_unlabeled',
+        no_signal_prior=no_signal_prior), gamma_hat
 
 def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, point_values,
                                 acmg_mapping_method="tavtigian"):

@@ -92,6 +92,13 @@ def save_results(
         # 1. Compact calibration JSON (matches example/BRCA1_Findlay_2018.json)
         calibration_compact = {
             'prior': calibration['prior'],
+            'prior_unstable': calibration.get('prior_unstable', False),
+            'PLP_frac_pathomechanism_measured': calibration.get(
+                'PLP_frac_pathomechanism_measured', None),
+            'PLP_frac_pathomechanism_measured_unstable': calibration.get(
+                'PLP_frac_pathomechanism_measured_unstable', False),
+            'pct_bootstraps_kept': calibration.get('pct_bootstraps_kept', None),
+            'pct_pathogenic_rows_kept': calibration.get('pct_pathogenic_rows_kept', None),
             'point_ranges': calibration['point_ranges'],
             'dataset': config.dataset_name,
             'relax': True,

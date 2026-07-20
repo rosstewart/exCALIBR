@@ -19,6 +19,7 @@ from ..fit_utils.point_ranges import (
     prior_equation_2c,
     prior_invalid,
     get_fit_prior,
+    compute_lr_filtered_pathogenic_mask,
     get_bootstrap_score_ranges,
     remove_insufficient_bootstrap_converage_points,
     check_thresholds_reached,
@@ -34,10 +35,15 @@ _logging.getLogger("matplotlib.font_manager").setLevel(_logging.ERROR)
 import matplotlib as _mpl
 _mpl.use('Agg')
 import matplotlib.pyplot as plt
-from ..plot_utils.utils import plot_scoreset_best_config, sample_density, add_thresholds
+from ..plot_utils.utils import (
+    plot_scoreset_best_config, sample_density, add_thresholds, log_thresholds_with_ylim_pad,
+)
 
 from .config import PipelineConfig
 from .utils import load_dataset_from_df
+
+_precomputed_fits_cache: Dict[str, Dict] = {}
+
 
 def load_precomputed_fits(fits_path: str, dataset_name: str) -> Dict:
     """
@@ -49,11 +55,19 @@ def load_precomputed_fits(fits_path: str, dataset_name: str) -> Dict:
 
     Each fit entry has ``fit``, ``val_ll``, etc.
     Returns the inner dict: ``{bootstrap_key: {"2c": fit, "3c": fit}}``.
+
+    The full decompressed JSON (every dataset, not just `dataset_name`) is
+    cached in-process keyed by `fits_path` -- callers that fetch several
+    datasets from the same fits file in one session (e.g. an analysis
+    notebook building more than one Scoreset off the same PRECOMPUTED_FITS)
+    would otherwise re-decompress and re-parse the whole file on every call.
     """
     import gzip
 
-    with gzip.open(fits_path, 'rt', encoding='utf-8') as f:
-        all_results = json.load(f)
+    if fits_path not in _precomputed_fits_cache:
+        with gzip.open(fits_path, 'rt', encoding='utf-8') as f:
+            _precomputed_fits_cache[fits_path] = json.load(f)
+    all_results = _precomputed_fits_cache[fits_path]
 
     # Two supported formats:
     #   (a) {dataset_name: {seed: {"2c": ..., "3c": ...}}}
@@ -289,22 +303,98 @@ def process_component_fits(
         logger.info(f"    isinstance(BasicScoreset): {isinstance(scoreset, BasicScoreset)}")
         logger.info(f"    benign_method: {config.benign_method}")
 
+    filter_flag = getattr(config, "filter_pathogenic_sample_by_lr", False)
+    if filter_flag:
+        if config.use_2c_equation and n_c == 2:
+            raise ValueError(
+                "filter_pathogenic_sample_by_lr is not supported with use_2c_equation "
+                "(n_c=2 equation path never calls get_fit_prior, so the filtered "
+                "pathogenic weights it computes would have no effect)."
+            )
+        if pathogenic_idx is None:
+            logger.warning("  filter_pathogenic_sample_by_lr has no effect (no pathogenic "
+                            "sample for this dataset/combo); computing prior normally")
+            filter_flag = False
+        if config.manual_prior is not None:
+            logger.warning("  filter_pathogenic_sample_by_lr is ignored because manual_prior is set")
+
+    # EXPERIMENTAL, opt-in alternative to filter_flag: excess-weight
+    # pathomechanism estimate (see get_fit_prior /
+    # compute_pathomechanism_pathogenic_density in fit_utils/point_ranges.py).
+    # Needs a pathogenic-labeled sample; anchors against benign/synonymous
+    # when present (PN/standard mode) or raw gnomAD directly (PU-only mode).
+    # Mutually exclusive with filter_flag (already enforced at
+    # PipelineConfig construction, re-checked here for callers that mutate
+    # config post-construction).
+    gamma_flag = getattr(config, "pathomechanism_prior", False)
+    if gamma_flag:
+        if filter_flag:
+            raise ValueError(
+                "pathomechanism_prior and filter_pathogenic_sample_by_lr are mutually "
+                "exclusive -- disable one."
+            )
+        if config.use_2c_equation and n_c == 2:
+            raise ValueError(
+                "pathomechanism_prior is not supported with use_2c_equation "
+                "(n_c=2 equation path never calls get_fit_prior)."
+            )
+        if pathogenic_idx is None:
+            logger.warning("  pathomechanism_prior has no effect (no pathogenic-labeled "
+                            "sample for this dataset/combo); computing prior normally")
+            gamma_flag = False
+        if config.manual_prior is not None:
+            logger.warning("  pathomechanism_prior is ignored because manual_prior is set")
+
+    # True unmixing (PU/NU) mode, per get_fit_prior's own mode selection --
+    # pathogenic XOR benign/synonymous present. Used below to flag prior
+    # instability specific to that estimator (its saturation floor).
+    unmixing_mode = not (
+        pathogenic_idx is not None and (benign_idx is not None or synonymous_idx is not None)
+    )
+    prior_unstable = False
+    gamma_hat = np.nan
+    gamma_unstable = False
+    pct_pathogenic_rows_kept = None  # LR-filter row-level retention (filter_flag only)
+    pct_bootstraps_kept = None  # fraction of bootstrap fits used for LR+/prior computation
+
     if config.manual_prior is not None:
         # Use manually specified prior — skip estimation
         prior = config.manual_prior
         fit_priors = np.full(len(fits), prior)
+        fit_gammas = np.full(len(fits), np.nan)
         valid_bootstrap_seeds = bootstrap_seeds  # no filtering
         valid_mask = np.ones(len(fits), dtype=bool)
+        pct_bootstraps_kept = 1.0
         logger.info(f"  Using manual prior: {prior:.6f}")
     else:
+        # Pre-extract arrays so loky memory-maps them rather than pickling
+        # the full Scoreset object once per task.
+        scores_arr = np.asarray(scoreset.scores)
+        sa_arr = np.asarray(scoreset.sample_assignments)
+        n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
+
+        pathogenic_row_mask = None
+        if filter_flag:
+            pathogenic_row_mask, n_labeled, n_kept = compute_lr_filtered_pathogenic_mask(
+                all_fits_prefilter, scores_arr, sa_arr,
+                config.benign_method, pathogenic_idx, benign_idx, synonymous_idx,
+                gnomad_idx=gnomad_idx,
+                percentile=config.pathogenic_percentile,
+                n_jobs=n_cores,
+            )
+            logger.info(f"  filter_pathogenic_sample_by_lr: kept {n_kept}/{n_labeled} "
+                        f"pathogenic-labeled variants (percentile={config.pathogenic_percentile})")
+            pct_pathogenic_rows_kept = (n_kept / n_labeled) if n_labeled > 0 else None
+            if n_kept == 0:
+                logger.warning("  filter_pathogenic_sample_by_lr: 0 variants survived filtering; "
+                                "falling back to unfiltered pathogenic sample for this combo")
+                pathogenic_row_mask = None
+                prior_unstable = True
+
         # Compute priors - PASS ALL INDICES
-        if not config.use_2c_equation or n_c != 2:
-            # Pre-extract arrays so loky memory-maps them rather than pickling
-            # the full Scoreset object once per task.
-            scores_arr = np.asarray(scoreset.scores)
-            sa_arr = np.asarray(scoreset.sample_assignments)
-            n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
-            fit_priors = np.array(Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+        used_get_fit_prior = not config.use_2c_equation or n_c != 2
+        if used_get_fit_prior:
+            prior_gamma_results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
                 delayed(get_fit_prior)(
                     fit, scores_arr, config.benign_method,
                     pathogenic_idx=pathogenic_idx,
@@ -312,9 +402,45 @@ def process_component_fits(
                     gnomad_idx=gnomad_idx,
                     synonymous_idx=synonymous_idx,
                     sample_assignments=sa_arr,
+                    pathogenic_row_mask=pathogenic_row_mask,
+                    pathomechanism_prior=gamma_flag,
                 )
                 for fit in fits
-            ))
+            )
+            fit_priors = np.array([r[0] for r in prior_gamma_results])
+            fit_gammas = np.array([r[1] for r in prior_gamma_results])
+
+            # pathomechanism_prior discards (rather than silently falls back
+            # on) any individual bootstrap fit whose excess is degenerate
+            # everywhere (w_P_raw <= w_N on every component -- see
+            # compute_pathomechanism_pathogenic_density). If that wipes out
+            # every fit for this combo, there's no correction to apply at
+            # all; fall back to raw-density prior estimation for the whole
+            # combo rather than discarding it outright.
+            if gamma_flag and not np.any(np.isfinite(fit_priors)):
+                logger.warning(
+                    "  pathomechanism_prior: 0/%d fits had any assay-relevant excess "
+                    "(w_P_raw <= w_N everywhere on every fit); falling back to raw "
+                    "pathogenic density for prior estimation on this combo",
+                    n_fits_prefilter,
+                )
+                prior_gamma_results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+                    delayed(get_fit_prior)(
+                        fit, scores_arr, config.benign_method,
+                        pathogenic_idx=pathogenic_idx,
+                        benign_idx=benign_idx,
+                        gnomad_idx=gnomad_idx,
+                        synonymous_idx=synonymous_idx,
+                        sample_assignments=sa_arr,
+                        pathogenic_row_mask=None,
+                        pathomechanism_prior=False,
+                    )
+                    for fit in fits
+                )
+                fit_priors = np.array([r[0] for r in prior_gamma_results])
+                fit_gammas = np.array([r[1] for r in prior_gamma_results])
+                prior_unstable = True
+                gamma_unstable = True
         else:
             # Use 2c equation
             fit_priors = []
@@ -342,16 +468,21 @@ def process_component_fits(
                     fit_priors.append(prior_equation_2c(w_p, w_bs, w_g))
                 else:
                     fit_priors.append(prior_equation_2c(w_p, w_b, w_g))
-            
+
             fit_priors = np.array(fit_priors)
-        
+            fit_gammas = np.full(len(fits), np.nan)
+
         # Filter invalid priors
         valid_mask = ~(np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1))
         fit_priors = fit_priors[valid_mask]
+        fit_gammas = fit_gammas[valid_mask]
         fits = np.array(fits)[valid_mask].tolist()
         valid_bootstrap_seeds = bootstrap_seeds[valid_mask] if bootstrap_seeds is not None else np.array([])
         
         logger.info(f"  Valid priors: {len(fit_priors)}")
+        pct_bootstraps_kept = (len(fit_priors) / n_fits_prefilter) if n_fits_prefilter > 0 else None
+        logger.info(f"  pct_bootstraps_kept (for LR+/prior computation): {pct_bootstraps_kept:.4f}"
+                    if pct_bootstraps_kept is not None else "  pct_bootstraps_kept: n/a (0 fits)")
 
         if len(fits) == 0:
             logger.warning(f"  No valid priors; skipping {component_key}")
@@ -360,6 +491,32 @@ def process_component_fits(
         # Compute prior
         prior = np.nanmedian(fit_priors)
         logger.info(f"  Prior: {prior:.6f}")
+
+        # PU/NU unmixing floors saturating-low fits at 0.01 (get_fit_prior)
+        # rather than discarding them (see its mode-gated saturation handling).
+        # If the median itself lands exactly on that floor, the majority of
+        # bootstrap fits saturated -- the estimate is a floor artifact, not a
+        # real prior.
+        if used_get_fit_prior and unmixing_mode and np.isclose(prior, 0.01):
+            prior_unstable = True
+
+        # gamma_hat: median assay-mechanistic-coverage estimate across bootstrap
+        # fits (mirrors how `prior` itself is a nanmedian over fit_priors).
+        # Unstable when no bootstrap fit produced a finite gamma at all -- no
+        # arbitrary threshold here, just "did the EM produce anything usable".
+        if gamma_flag:
+            finite_gammas = fit_gammas[np.isfinite(fit_gammas)]
+            if len(finite_gammas) > 0:
+                gamma_hat = float(np.nanmedian(finite_gammas))
+                logger.info(
+                    f"  PLP_frac_pathomechanism_measured: {gamma_hat:.6f} (estimated "
+                    "fraction of PLP-labeled variants with the disease mechanism this "
+                    "assay measures)"
+                )
+            else:
+                gamma_unstable = True
+                logger.warning("  PLP_frac_pathomechanism_measured: no finite gamma "
+                               "estimates across bootstrap fits")
 
     # Indices into all_fits_prefilter that survived prior filtering
     valid_original_indices = np.where(valid_mask)[0]
@@ -443,7 +600,10 @@ def process_component_fits(
     # Compute C range (piecewise mapping returns C=None — skip those)
     Cs_valid = [c for c in Cs if isinstance(c, (int, float)) and not (isinstance(c, float) and np.isnan(c))]
     if Cs_valid:
-        C = np.array([np.nanpercentile(Cs_valid, 5), np.nanpercentile(Cs_valid, 95)])
+        C = np.array([
+            np.nanpercentile(Cs_valid, config.pathogenic_percentile),
+            np.nanpercentile(Cs_valid, 100 - config.pathogenic_percentile),
+        ])
     else:
         C = np.array([np.nan, np.nan])
     
@@ -502,8 +662,8 @@ def process_component_fits(
         if acmg_mapping_method == "continuous":
             from ..fit_utils.fit import calculate_classification_ranges
             cls_p, cls_b, lr_thresholds = calculate_classification_ranges(
-                np.nanpercentile(log_lr_plus[:, range_subset], 5, axis=0),
-                np.nanpercentile(log_lr_plus[:, range_subset], 95, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], config.pathogenic_percentile, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
                 prior,
                 score_range[range_subset],
             )
@@ -514,8 +674,8 @@ def process_component_fits(
             C = lr_thresholds  # dict of LR+ thresholds, not an integer C*
         else:
             point_ranges_pathogenic, point_ranges_benign, C = calculate_score_ranges(
-                np.nanpercentile(log_lr_plus[:, range_subset], 5, axis=0),
-                np.nanpercentile(log_lr_plus[:, range_subset], 95, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], config.pathogenic_percentile, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
                 prior,
                 score_range[range_subset],
                 config.point_values,
@@ -526,10 +686,14 @@ def process_component_fits(
                 for point in point_ranges:
                     point_ranges[point] = []
     else:
-        # Use 5th percentile conservative thresholds
-        logger.info("  Using 5th percentile conservative thresholds")
-        p_xaxis_5percentile_conservative = 5 if not scoreset_flipped else 95
-        b_xaxis_5percentile_conservative = 95 if not scoreset_flipped else 5
+        # Use pathogenic_percentile-th conservative thresholds
+        logger.info(f"  Using {config.pathogenic_percentile:g}th percentile conservative thresholds")
+        p_xaxis_5percentile_conservative = (
+            config.pathogenic_percentile if not scoreset_flipped else 100 - config.pathogenic_percentile
+        )
+        b_xaxis_5percentile_conservative = (
+            100 - config.pathogenic_percentile if not scoreset_flipped else config.pathogenic_percentile
+        )
         
         p_max = max if not scoreset_flipped else min
         b_min = min if not scoreset_flipped else max
@@ -663,7 +827,19 @@ def process_component_fits(
     # Serialize and return
     result = {
         'prior': prior,
+        'prior_unstable': bool(prior_unstable),
+        # PLP_frac_pathomechanism_measured (a.k.a. gamma_hat): estimated fraction
+        # of PLP-labeled variants whose disease mechanism this assay actually
+        # measures (a 0-1 fraction, median over bootstrap fits).
+        'PLP_frac_pathomechanism_measured': gamma_hat,
+        'PLP_frac_pathomechanism_measured_description': (
+            'estimated fraction (0-1) of PLP-labeled variants with the disease '
+            'mechanism this assay measures'),
+        'PLP_frac_pathomechanism_measured_unstable': bool(gamma_unstable),
+        'PLP_frac_pathomechanism_measured_per_fit': fit_gammas,
         'priors': fit_priors,
+        'pct_bootstraps_kept': pct_bootstraps_kept,
+        'pct_pathogenic_rows_kept': pct_pathogenic_rows_kept,
         'valid_bootstrap_seeds': valid_bootstrap_seeds,
         'valid_mask': valid_mask,
         'point_ranges': point_ranges,
@@ -953,9 +1129,9 @@ def plot_all_configs_comparison(
             pt_vals = sorted({abs(int(k)) for k in calib["point_ranges"]})
             if 0 < prior < 1 and pt_vals:
                 try:
-                    tauP, tauB, _ = list(map(np.log, thresholds_from_prior(prior, pt_vals + [10])))
-                    add_thresholds(tauP[:-1], tauB[:-1], ax_lr)
-                    ax_lr.set_ylim([tauB[-1], tauP[-1]])
+                    tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(prior, pt_vals)
+                    add_thresholds(tauP, tauB, ax_lr)
+                    ax_lr.set_ylim([ylim_bottom, ylim_top])
                 except Exception:
                     pass
             if "priors_pct" in calib:

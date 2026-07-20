@@ -22,7 +22,7 @@ def _env(name: str, default: str) -> str:
 # *_calibration.json, *_lr_values.json.gz written by run_igvf_batch.py.
 OUTPUT_DIR = _env(
     "EXCALIBR_OUTPUT_DIR",
-    "/data/ross/assay_calibration/explorer_jobs_pp_revisions_calib",
+    "/data/ross/assay_calibration/explorer_jobs_pp_revisions_calib_contam",
 )
 
 # Master integrated variant-effect dataframe (all datasets, one row per
@@ -125,13 +125,89 @@ ASSAY_METHOD_MAP_CSV = _env(
 # R/*.R files directly from here rather than requiring `install.packages`.
 ACMGSCALER_DIR = _env("EXCALIBR_ACMGSCALER_DIR", "/data/tools/acmgscaler")
 
-# Simple 2-component GMM baseline (slurm/simple_gmm_baseline.py output) --
-# run separately/manually; None until you've run it.
+# Where analysis/run_acmgscaler_all.py writes its per-dataset
+# {dataset}_acmgscaler_variants.csv + visualization.png (see
+# analysis.comparison_methods.load_acmgscaler_variants) -- run that script
+# once, point this at its --output-dir, and the notebook loads results
+# instead of calling Rscript again on every run. None until you've run it.
+ACMGSCALER_OUTPUT_DIR = _env("EXCALIBR_ACMGSCALER_OUTPUT_DIR", "/data/ross/assay_calibration/acmgscaler_out")
+
+# Simple 2-component GMM baseline -- a full ExCALIBR-pipeline-shaped output
+# tree (same {dataset}/{dataset}_{comp}_variants.csv/calibration.json/
+# lr_values.json.gz/visualization.png layout as run_igvf_batch.py's own
+# output, just with "comp" = "plp_blb" (P/LP + B/LB pool) or "plp_blb_synon"
+# (P/LP + [B/LB union Synonymous] pool) instead of an (n_c, benign_method)
+# token -- see analysis.comparison_methods.load_comparison_variants and
+# GMM_BASELINE_VARIANTS below. Assumes prior=0.1 for both variants.
+GMM_BASELINE_OUTPUT_DIR = _env(
+    "EXCALIBR_GMM_BASELINE_OUTPUT_DIR", "/data/ross/assay_calibration/simple_gmm_baseline"
+)
+GMM_BASELINE_VARIANTS = ("plp_blb", "plp_blb_synon")
+
+# Older bare-JSON output (slurm/simple_gmm_baseline.py run standalone,
+# without the wrapper that produces the full GMM_BASELINE_OUTPUT_DIR tree
+# above) -- per_sample_weights only, no point_ranges/variants.csv. Kept as a
+# fallback loader (analysis.comparison_methods.load_gmm_baseline_points) for
+# that leaner format; prefer GMM_BASELINE_OUTPUT_DIR when it's populated.
 GMM_BASELINE_JSON = _env("EXCALIBR_GMM_BASELINE_JSON", None)
 
-# "Canonical" ExCALIBR fits rerun with force_gaussian=True -- a future
-# comparison method; output_dir not yet known, filled in once available.
+# "Skew-zeroed" ExCALIBR -- the canonical pipeline rerun with
+# force_gaussian=True (results to come). Once populated, this is a normal
+# ExCALIBR output_dir (same (n_c, benign_method) comp naming as
+# EXCALIBR_OUTPUT_DIR) -- load it with analysis.discovery like any other
+# pipeline run, not with load_comparison_variants.
 FORCE_GAUSSIAN_OUTPUT_DIR = _env("EXCALIBR_FORCE_GAUSSIAN_OUTPUT_DIR", None)
+
+# Robustness analysis (analysis.robustness) -- ExCALIBR calibration
+# sensitivity to control-count downsampling / label discordance, compared
+# against a fixed reference (unperturbed) dataset. See analysis/robustness.py
+# module docstring for the on-disk condition-directory naming convention
+# ({base_dataset}_ds{N}_s{seed} / {base_dataset}_disc{pct:.2f}_s{seed}).
+ROBUSTNESS_OUTPUT_DIR = _env(
+    "EXCALIBR_ROBUSTNESS_OUTPUT_DIR", "/data/ross/assay_calibration/robustness/calib"
+)
+
+# Full per-bootstrap component fits (component_params/weights, ~1000
+# bootstraps x every condition, same {condition_dirname: {seed: {"2c"/"3c":
+# fit}}} format as PRECOMPUTED_FITS above, keyed by the condition directory
+# name itself e.g. "BRCA2_Sahu_2025_SGE_ds16_s0") -- produced by the same
+# slurm/aggregate_results.py run that made the ROBUSTNESS_OUTPUT_DIR tree.
+# Needed for the density-overlay row of plot_robustness_config_summary.
+ROBUSTNESS_BOOTSTRAP_RESULTS = _env(
+    "EXCALIBR_ROBUSTNESS_BOOTSTRAP_RESULTS",
+    "/data/ross/assay_calibration/robustness/bootstrap_results.json.gz",
+)
+
+# "Skew-locked" ExCALIBR -- canonical pipeline rerun with each component's
+# skew parameter fixed (not freely fit). Same ExCALIBR-shaped output tree as
+# OUTPUT_DIR above (per-dataset {dataset}_{comp}_variants.csv/
+# calibration.json/lr_values.json.gz), so it's discovered/loaded exactly like
+# a normal pipeline run via analysis.discovery -- not analysis.comparison_methods.
+SKEW_LOCKED_OUTPUT_DIR = _env(
+    "EXCALIBR_SKEW_LOCKED_OUTPUT_DIR", "/data/ross/assay_calibration/skew_locked_gmm/calib"
+)
+
+# Full per-bootstrap component fits for the skew-locked run (same
+# {dataset: {seed: {"2c"/"3c": {"fit": ..., "val_ll": float}}}} format as
+# PRECOMPUTED_FITS above) -- used only to compare each dataset's selected
+# component's per-bootstrap validation log-likelihood (val_ll) against the
+# regular (unlocked) run's own val_ll for the same bootstrap seed.
+SKEW_LOCKED_BOOTSTRAP_RESULTS = _env(
+    "EXCALIBR_SKEW_LOCKED_BOOTSTRAP_RESULTS",
+    "/data/ross/assay_calibration/skew_locked_gmm/bootstrap_results.json.gz",
+)
+
+# Reconstructed excalibr_datasets.csv -- calibration ranges + sample counts +
+# metadata + per-dataset Yang-distance goodness-of-fit (yang_dist_plp/blb/
+# gnomad/synonymous columns), built by
+# analysis/run_build_excalibr_datasets_table.py --with-yang. Yang distance
+# itself is slow (~1-3 min/dataset at full bootstrap resolution -- see
+# analysis/yang_distance.py), so the notebook reads this precomputed table
+# rather than recomputing it live; rerun that script (with --with-yang) to
+# refresh it if pipeline output changes.
+EXCALIBR_DATASETS_TABLE_CSV = _env(
+    "EXCALIBR_DATASETS_TABLE_CSV", "/data/ross/assay_calibration/dataframe/excalibr_datasets.csv"
+)
 
 
 def warn_if_missing(path: str, what: str) -> bool:

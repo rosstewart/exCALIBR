@@ -28,6 +28,7 @@ import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 
 from analysis.acmg_evidence_codes import classify_acmg
+from analysis.discovery import load_master_df
 from analysis.plot_common import effective_points, save_and_show
 
 # Functional-assay ACMG codes stripped before reclassifying — keeping these
@@ -69,6 +70,9 @@ def build_clingen_confusion(
     dataset_list: List[str],
     use_oob: bool = True,
     verbose_recode: bool = False,
+    tree: Optional[Dict] = None,
+    model_selections: Optional[Dict] = None,
+    calibrations: Optional[Dict] = None,
 ) -> Tuple[Dict[str, np.ndarray], Set[str]]:
     """Build ExCALIBR-vs-ClinGen and Author-vs-ClinGen 3x2 confusion matrices.
 
@@ -77,7 +81,24 @@ def build_clingen_confusion(
 
     df_variants must already have variant_id/dataset/standard_points[/oob_points]
     [/auth_label] columns (i.e. analysis.discovery.load_all_variants +
-    analysis.author_labels.attach_author_labels output).
+    analysis.author_labels.attach_author_labels output) -- reused directly
+    for every dataset except the `_clinvar_2018`-suffixed ones (see below).
+
+    `_clinvar_2018` datasets (BRCA1/MSH2/PTEN/TP53) get their variant/points
+    table rebuilt fresh via analysis.discovery.build_variants_from_scoreset
+    instead of being looked up in df_variants: their on-disk *_variants.csv
+    was, for some runs, written before fixes that corrected `sample`/`is_vus`
+    export for exactly these clinvar_2018-mode datasets (see
+    analysis/patch_variants_csv.py's module docstring -- e.g. it verified
+    MSH2_Jia_2021_clinvar_2018 undercounted VUS as 0/1376 instead of the true
+    421), and ClinGen's own labels are not restricted to whatever P/LP/B/LB/
+    VUS scope that stale file happened to carry. Rebuilding recovers every
+    kept variant (VUS included) straight from the Scoreset + this dataset's
+    resolved calibration.json, so ClinGen-labeled variants outside
+    df_variants's narrower scope still get matched. Needs `tree`/
+    `model_selections`/`calibrations` (pass in section 1's own globals) to
+    resolve the calibration.json path; clinvar_2018 datasets missing from
+    `tree` fall back to the plain df_variants lookup like any other dataset.
 
     `verbose_recode`, if True, prints every evidence-code recode
     (old_classification --> filtered/updated_classification) as the legacy
@@ -88,6 +109,7 @@ def build_clingen_confusion(
     from src.assay_calibration.pipeline.utils import load_dataset_from_df
     from src.assay_calibration.pipeline.variant_evidence import _get_variant_ids
     from analysis.author_labels import load_name_mapping
+    from analysis.discovery import build_variants_from_scoreset, resolve_component
 
     confusion = {
         "auth": np.zeros((3, 2), dtype=int),
@@ -97,20 +119,46 @@ def build_clingen_confusion(
     seen_genes: Set[str] = set()
 
     sep = "\t" if str(dataset_tsv).endswith((".tsv", ".tsv.gz")) else ","
-    df_full = pd.read_csv(dataset_tsv, sep=sep, low_memory=False)
-    old_to_new, _ = load_name_mapping(str(dataset_tsv))
-
     evidence_col = "Applied Evidence Codes (Met)_ClinGen_repo"
-    if evidence_col not in df_full.columns:
+
+    # Cheap header-only read first -- avoids paying for a full (multi-MB,
+    # gzipped, ~89-dataset) master TSV parse just to discover this dataset_tsv
+    # doesn't even have the ClinGen evidence column.
+    header_cols = pd.read_csv(dataset_tsv, sep=sep, nrows=0).columns
+    if evidence_col not in header_cols:
         print(f"  SKIP ClinGen confusion: '{evidence_col}' not found in {dataset_tsv}")
         return confusion, seen_genes
 
+    df_full = load_master_df(dataset_tsv)
+    old_to_new, _ = load_name_mapping(str(dataset_tsv))
+
     for dataset in dataset_list:
         df_m = df_variants[df_variants["dataset"] == dataset]
+
+        if "_clinvar_2018" in dataset and tree is not None and dataset in tree:
+            comp = resolve_component(dataset, list(tree[dataset].keys()), model_selections or {}, None)
+            cal_path = (calibrations or {}).get(dataset, {}).get("default", {}).get(comp)
+            if cal_path is not None:
+                try:
+                    df_m = build_variants_from_scoreset(dataset, cal_path, dataset_tsv)
+                    df_m["dataset"] = dataset
+                    if use_oob and "oob_points" not in df_m.columns:
+                        use_oob_this = False
+                    else:
+                        use_oob_this = use_oob
+                except Exception as e:
+                    print(f"  WARNING: full reload failed for {dataset} ({e}); "
+                          f"falling back to df_variants's own scope")
+                    use_oob_this = use_oob
+            else:
+                use_oob_this = use_oob
+        else:
+            use_oob_this = use_oob
+
         if df_m.empty:
             continue
 
-        pts = effective_points(df_m, use_oob, label=dataset, context="clingen").values
+        pts = effective_points(df_m, use_oob_this, label=dataset, context="clingen").values
         danz_by_vid = dict(zip(df_m["variant_id"], pts))
         auth_by_vid = (
             dict(zip(df_m["variant_id"], df_m["auth_label"]))

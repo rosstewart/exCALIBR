@@ -11,7 +11,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Optional
 
-from src.assay_calibration.pipeline.config import PipelineConfig
+from src.assay_calibration.pipeline.config import PipelineConfig, resolve_prior_mode
 from src.assay_calibration.pipeline.fit_bootstrap import BootstrapRunner
 from src.assay_calibration.pipeline.model_selection import bootstrap_paired_test
 from src.assay_calibration.pipeline.visualize import (
@@ -99,6 +99,42 @@ Examples:
                        help="Enable debug logging (component params, weights, flip detection, point ranges)")
     parser.add_argument("--viz-only", action="store_true",
                        help="Regenerate visualizations only — skip variant tables and calibration JSON save")
+    parser.add_argument("--pathogenic-percentile", type=float, default=5.0,
+                       help="Conservative percentile (paired with 100-p as the upper bound) used for "
+                            "all bootstrap LR+/threshold percentile calculations (conservative "
+                            "thresholds, C-range, OOB LR percentiles, per-variant LR percentiles). "
+                            "Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
+    # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
+    # experimentation only -- the pathomechanism prior (below) is the default and
+    # the two are mutually exclusive. Parses with default=None; resolve_prior_mode
+    # reconciles it against --pathomechanism-prior after parsing.
+    parser.add_argument("--filter-pathogenic-sample-by-lr",
+                       dest="filter_pathogenic_sample_by_lr", action="store_true", default=None,
+                       help=argparse.SUPPRESS)
+    parser.add_argument("--no-filter-pathogenic-sample-by-lr",
+                       dest="filter_pathogenic_sample_by_lr", action="store_false", default=None,
+                       help=argparse.SUPPRESS)
+    parser.add_argument("--pathomechanism-prior",
+                       dest="pathomechanism_prior", action="store_true", default=None,
+                       help="[PN/standard-mode only] Estimate the scalar prior from the "
+                            "'pathomechanism' component of the pathogenic-labeled sample. "
+                            "Decomposes that sample's score density into "
+                            "gamma*f_D(x) + (1-gamma)*f_N(x), where f_N is FIXED to the "
+                            "already-fitted benign/synonymous density (anchored, no "
+                            "label-switching), gamma is the estimated fraction of PLP-labeled "
+                            "variants whose disease mechanism this assay actually measures, and "
+                            "f_D ('assay-relevant pathogenic' density) feeds the standard "
+                            "joint-EM prior estimator in place of the raw pathogenic sample. "
+                            "PLP_frac_pathomechanism_measured (this gamma estimate) and an "
+                            "unstable flag are reported in the calibration JSON. Only affects "
+                            "the scalar prior -- the LR+ curve used for "
+                            "per-variant evidence keeps using the raw pathogenic density. No "
+                            "effect on PU/NU-only datasets. This is the DEFAULT (on); pass "
+                            "--no-pathomechanism-prior to disable it.")
+    parser.add_argument("--no-pathomechanism-prior",
+                       dest="pathomechanism_prior", action="store_false", default=None,
+                       help="Disable --pathomechanism-prior (use the full, unfiltered "
+                            "pathogenic sample for prior estimation).")
 
     # OOB evidence
     parser.add_argument("--oob", action="store_true",
@@ -169,6 +205,12 @@ Examples:
 
     args = parser.parse_args()
 
+    # Reconcile the mutually-exclusive prior-cleaning flags (defaults to the
+    # pathomechanism prior when neither is given).
+    args.filter_pathogenic_sample_by_lr, args.pathomechanism_prior = resolve_prior_mode(
+        args.filter_pathogenic_sample_by_lr, args.pathomechanism_prior
+    )
+
     # Parse scoreset_flipped_override
     flipped_override = None
     if args.scoreset_flipped_override is not None:
@@ -213,6 +255,9 @@ Examples:
         debug=args.debug,
         viz_only=args.viz_only,
         progress_file=args.progress_file,
+        pathogenic_percentile=args.pathogenic_percentile,
+        filter_pathogenic_sample_by_lr=args.filter_pathogenic_sample_by_lr,
+        pathomechanism_prior=args.pathomechanism_prior,
         acmg_mapping_method=(args.acmg_mapping_method
                               if args.acmg_mapping_method != "all" else "tavtigian"),
     )

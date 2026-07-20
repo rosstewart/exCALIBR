@@ -81,14 +81,16 @@ def _parse_calibration_stem(stem: str) -> Optional[Tuple[str, str, str]]:
     return _parse_stem(stem, "_calibration")
 
 
-def _recompute_points_from_calibration(
+def recompute_points_from_calibration(
     df: pd.DataFrame,
     calibration_path: Path,
 ) -> pd.DataFrame:
     """Recompute standard_points from score + calibration JSON point_ranges.
 
     Used when no method-specific variants CSV exists but the calibration JSON
-    and a shared (default) variants CSV do.
+    and a shared (default) variants CSV do. Also reused by
+    analysis.robustness to apply a robustness condition's point_ranges to the
+    reference (unperturbed) dataset's own variant scores.
     """
     from src.assay_calibration.plot_utils.utils import flatten_point_ranges, assign_points
 
@@ -107,6 +109,11 @@ def _recompute_points_from_calibration(
         df = df.drop(columns=["oob_points", "oob_n_boots", "oob_prior"],
                      errors="ignore")
     return df
+
+
+# Old private name, kept as an alias so existing call sites in this module
+# (and any external code importing it) don't need touching.
+_recompute_points_from_calibration = recompute_points_from_calibration
 
 
 def discover_outputs(
@@ -208,6 +215,123 @@ def resolve_component(
     return sorted(available_comps)[0]
 
 
+_master_df_cache: Dict[str, pd.DataFrame] = {}
+
+
+def load_master_df(dataset_tsv: str) -> pd.DataFrame:
+    """Read the master integrated-variant-effect TSV/CSV once per process and
+    cache it, keyed by path -- several independent call sites (legacy_fits'
+    load_scoreset_and_fits, clingen's build_clingen_confusion, this module's
+    own scoreset-rebuild fallbacks) each used to `pd.read_csv(dataset_tsv,
+    ...)` fresh on every call, so a single notebook session calling more than
+    one of them (e.g. the MSH2 example figure calling load_scoreset_and_fits
+    twice, then the Yang-distance diagnostic a third time, all for the same
+    dataset) re-read and re-parsed the same multi-MB gzipped file over and
+    over. Callers that slice this down to one dataset's rows must still
+    `.copy()` before mutating (see _filter_dataset_df) -- the cached frame
+    itself is shared and must not be mutated in place."""
+    dataset_tsv = str(dataset_tsv)
+    if dataset_tsv not in _master_df_cache:
+        sep = "\t" if dataset_tsv.endswith((".tsv", ".tsv.gz")) else ","
+        _master_df_cache[dataset_tsv] = pd.read_csv(dataset_tsv, sep=sep, low_memory=False)
+    return _master_df_cache[dataset_tsv]
+
+
+def _filter_dataset_df(df_full: pd.DataFrame, dataset: str, dataset_tsv: str) -> pd.DataFrame:
+    """Slice the (large, all-datasets) master dataframe down to one dataset's
+    rows. Kept separate from scoreset construction so callers that need to
+    build several datasets' scoresets (e.g. the parallel fallback in
+    load_all_variants) can do this filtering once in the parent process and
+    hand each worker only its own small slice -- never the full master frame."""
+    csv_name = dataset.replace("_clinvar_2018", "")
+    df_ds = df_full[df_full["Dataset"] == csv_name].copy()
+    if df_ds.empty:
+        from analysis.author_labels import load_name_mapping
+        old_to_new, _ = load_name_mapping(str(dataset_tsv))
+        alt = old_to_new.get(csv_name)
+        if alt:
+            df_ds = df_full[df_full["Dataset"] == alt].copy()
+    if df_ds.empty:
+        raise ValueError(f"Dataset '{csv_name}' not found in {dataset_tsv}")
+    df_ds["Dataset"] = dataset
+    return df_ds
+
+
+def _resolve_n_jobs(n_requested: int) -> int:
+    """CPU-affinity-aware worker count -- same idea as slurm/prepare.py's
+    _resolve_n_jobs (cgroup-visible core count, not raw os.cpu_count())."""
+    import os as _os
+    if n_requested != -1:
+        return n_requested
+    try:
+        return max(1, len(_os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, _os.cpu_count() or 1)
+
+
+def _run_scoreset_job(dataset: str, method: str, comp: str, cal_path: Path, df_ds: pd.DataFrame):
+    """Module-level (not a closure) so joblib/cloudpickle only ever pickles
+    the *one* dataset slice passed in as `df_ds` for this call, matching
+    slurm/prepare.py's `partitions[ds]` pattern -- a nested/closure-based
+    worker here would instead capture and re-serialize every dataset's slice
+    on every single task, which is what made an earlier version of this
+    silently thrash (huge duplicated payloads) instead of running in
+    parallel."""
+    try:
+        df = _build_variant_table_for_scoreset(dataset, df_ds, cal_path)
+        return dataset, method, comp, df, None
+    except Exception as e:
+        return dataset, method, comp, None, e
+
+
+def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_path: Path) -> pd.DataFrame:
+    """Worker-safe: builds one dataset's scoreset + variant table from an
+    already-filtered, single-dataset slice of the master dataframe (small --
+    safe to pickle to a joblib worker process) plus one calibration JSON.
+    Never touches the full master dataframe itself.
+
+    Reuses `compute_variant_table` (the same function run_igvf_batch.py's
+    normal single-config path calls) with `compute_oob=False`, since OOB
+    needs `dataset_splits` that only exist mid-pipeline-run -- this only
+    recovers the standard (non-OOB) `standard_points` column.
+    """
+    from src.assay_calibration.pipeline.config import PipelineConfig
+    from src.assay_calibration.pipeline.utils import load_dataset_from_df
+    from src.assay_calibration.pipeline.variant_evidence import compute_variant_table
+
+    with open(cal_path) as f:
+        calibration = json.load(f)
+
+    clinvar_release = "2018" if calibration.get("clinvar_2018") else "2026"
+    pcfg = PipelineConfig(
+        dataset_csv="", dataset_name=dataset, output_dir="/tmp",
+        clinvar_release=clinvar_release,
+    )
+    scoreset = load_dataset_from_df(df_ds, pcfg)
+    return compute_variant_table(scoreset=scoreset, calibration=calibration, config=pcfg)
+
+
+def build_variants_from_scoreset(
+    dataset: str,
+    cal_path: Path,
+    dataset_tsv: str,
+) -> pd.DataFrame:
+    """Single-dataset convenience wrapper around _build_variant_table_for_scoreset
+    for datasets that have no *_variants.csv on disk at all (e.g. runs made
+    with `run_igvf_batch.py --all-configs`, which only ever writes
+    *_calibration.json / *_lr_values.json.gz -- see
+    run_all_configs_for_dataset's docstring: "No visualization is generated
+    here" -- and, less obviously, no variant table either).
+
+    Reads the full master TSV itself, so for loading many datasets prefer
+    load_all_variants (which reads it once and parallelizes across datasets)
+    over calling this in a loop.
+    """
+    df_full = load_master_df(dataset_tsv)
+    df_ds = _filter_dataset_df(df_full, dataset, dataset_tsv)
+    return _build_variant_table_for_scoreset(dataset, df_ds, cal_path)
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -222,6 +346,7 @@ def load_all_variants(
     calibrations: Optional[Dict] = None,
     include_all: bool = False,
     recompute_points: bool = False,
+    dataset_tsv: Optional[str] = None,
 ) -> pd.DataFrame:
     """Load all variants CSVs into a single long-format DataFrame.
 
@@ -233,6 +358,12 @@ def load_all_variants(
     alongside a shared (default/no-method) variants CSV, standard_points are
     recomputed from scores + calibration point_ranges so no regeneration is needed.
 
+    When NO variants CSV exists anywhere for a dataset (e.g. output produced by
+    `run_igvf_batch.py --all-configs`, which only writes calibration.json /
+    lr_values.json.gz -- see build_variants_from_scoreset), the variant table is
+    instead built live from the scoreset (`dataset_tsv`, default
+    analysis.config.DATASET_TSV) + the resolved calibration JSON's point_ranges.
+
     recompute_points : if True, standard_points is always recomputed from
         score + the resolved (dataset, method, comp) calibration JSON, even when
         a method-specific variants CSV exists on disk.
@@ -242,6 +373,8 @@ def load_all_variants(
     skipped too.
     """
     frames = []
+    pending = []  # [(dataset, method, comp, df_or_None)] -- df is None for scoreset_jobs entries below
+    scoreset_jobs = []  # [(dataset, method, comp, cal_path)] resolved in parallel after the main loop
     for dataset, comp_dict in sorted(tree.items()):
         if datasets_filter and dataset not in datasets_filter:
             continue
@@ -278,6 +411,7 @@ def load_all_variants(
                 except Exception as e:
                     print(f"  WARNING: could not read {path}: {e}")
                     continue
+                pending.append((dataset, method, comp, df))
             elif path is not None and recompute_points:
                 cal_path = (calibrations or {}).get(dataset, {}).get(method, {}).get(comp)
                 if cal_path is None:
@@ -294,33 +428,92 @@ def load_all_variants(
                     except Exception as e:
                         print(f"  WARNING: recomputation failed for {dataset} / {method}: {e}")
                         continue
+                pending.append((dataset, method, comp, df))
             else:
                 cal_path = (calibrations or {}).get(dataset, {}).get(method, {}).get(comp)
-                if cal_path is None or default_csv is None:
+                if cal_path is None:
                     print(f"  SKIP {dataset} / {method}: no variants CSV and no calibration fallback")
                     continue
+                if default_csv is None:
+                    # No *_variants.csv anywhere for this dataset (e.g.
+                    # --all-configs output) -- build the table live from the
+                    # scoreset. Deferred to the parallel batch below instead
+                    # of built here, so the master TSV is read/filtered once
+                    # per dataset rather than once per (dataset, method).
+                    scoreset_jobs.append((dataset, method, comp, cal_path))
+                else:
+                    try:
+                        base_df = pd.read_csv(default_csv)
+                        df = _recompute_points_from_calibration(base_df, cal_path)
+                        print(f"  Recomputed standard_points for {dataset} / {method} from {cal_path.name}")
+                    except Exception as e:
+                        print(f"  WARNING: recomputation failed for {dataset} / {method}: {e}")
+                        continue
+                    pending.append((dataset, method, comp, df))
+
+    if scoreset_jobs:
+        from analysis import config as _cfg
+        dataset_tsv = dataset_tsv or _cfg.DATASET_TSV
+        df_full = load_master_df(dataset_tsv)
+
+        # Filter to each dataset's own (small) slice once, in this process,
+        # *before* dispatching to workers -- so joblib only ever pickles a
+        # per-dataset slice to each worker, never the full ~89-dataset master
+        # frame (which would otherwise get serialized once per job).
+        df_ds_by_dataset = {}
+        for dataset, _method, _comp, _cal_path in scoreset_jobs:
+            if dataset not in df_ds_by_dataset:
                 try:
-                    base_df = pd.read_csv(default_csv)
-                    df = _recompute_points_from_calibration(base_df, cal_path)
-                    print(f"  Recomputed standard_points for {dataset} / {method} from {cal_path.name}")
+                    df_ds_by_dataset[dataset] = _filter_dataset_df(df_full, dataset, dataset_tsv)
                 except Exception as e:
-                    print(f"  WARNING: recomputation failed for {dataset} / {method}: {e}")
-                    continue
+                    df_ds_by_dataset[dataset] = e
+        del df_full
 
-            from analysis.plot_common import sample_matches
-            n_controls = (
-                sample_matches(df, "Pathogenic/Likely Pathogenic").sum()
-                + sample_matches(df, "Benign/Likely Benign").sum()
-            )
-            if n_controls < min_controls:
-                print(f"  SKIP {dataset} / {method}: only {n_controls} controls "
-                      f"(< min_controls {min_controls})")
+        # Split out slices that failed to filter -- report immediately and
+        # don't hand them to workers at all.
+        good_jobs = []
+        for dataset, method, comp, cal_path in scoreset_jobs:
+            df_ds = df_ds_by_dataset[dataset]
+            if isinstance(df_ds, Exception):
+                print(f"  WARNING: scoreset fallback failed for {dataset} / {method}: {df_ds}")
                 continue
+            good_jobs.append((dataset, method, comp, cal_path, df_ds))
 
-            df["dataset"] = dataset
-            df["method"] = method
-            df["component"] = comp
-            frames.append(df)
+        if good_jobs:
+            from joblib import Parallel, delayed
+            n_jobs = _resolve_n_jobs(-1)
+            print(f"  Building {len(good_jobs)} variant table(s) from scoreset "
+                  f"across {n_jobs} worker(s)...")
+            # Each `delayed(...)` call below is passed *only* that job's own
+            # (small) df_ds as a positional argument -- joblib pickles each
+            # call's arguments independently, so every worker receives just
+            # its one dataset's slice, never the other datasets' data.
+            results = Parallel(n_jobs=n_jobs, verbose=5)(
+                delayed(_run_scoreset_job)(dataset, method, comp, cal_path, df_ds)
+                for dataset, method, comp, cal_path, df_ds in good_jobs
+            )
+            for dataset, method, comp, df, err in results:
+                if err is not None:
+                    print(f"  WARNING: scoreset fallback failed for {dataset} / {method}: {err}")
+                    continue
+                print(f"  Built variant table for {dataset} / {method} from scoreset")
+                pending.append((dataset, method, comp, df))
+
+    from analysis.plot_common import sample_matches
+    for dataset, method, comp, df in pending:
+        n_controls = (
+            sample_matches(df, "Pathogenic/Likely Pathogenic").sum()
+            + sample_matches(df, "Benign/Likely Benign").sum()
+        )
+        if n_controls < min_controls:
+            print(f"  SKIP {dataset} / {method}: only {n_controls} controls "
+                  f"(< min_controls {min_controls})")
+            continue
+
+        df["dataset"] = dataset
+        df["method"] = method
+        df["component"] = comp
+        frames.append(df)
 
     if not frames:
         return pd.DataFrame()

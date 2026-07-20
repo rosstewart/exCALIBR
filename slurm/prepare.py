@@ -675,7 +675,12 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
         for nc in component_range:
             for constrained in constrained_flags:
                 mode_key = f"jobs_{nc}c_{'con' if constrained else 'unc'}"
-                fit_kwargs = {"latent_q": latent_q, "init_strategy": init_strategy}
+                fit_kwargs = {
+                    "latent_q": latent_q, "init_strategy": init_strategy,
+                    "log_prefix": f"  {gene_label}: ",
+                    "verbose_overlap": bs == 0 and nc == component_range[0]
+                                       and constrained == constrained_flags[0],
+                }
                 if NUM_FITS is not None:
                     fit_kwargs["num_fits"] = NUM_FITS
                 try:
@@ -727,6 +732,10 @@ def run_multivariate(args):
                 print(f"  Warning: gene '{req}' not found in multi-assay groups")
         gene_groups = filtered
 
+    if args.exclude_genes:
+        excluded = {g.upper() for g in args.exclude_genes}
+        gene_groups = {g: v for g, v in gene_groups.items() if g.upper() not in excluded}
+
     print(f"\nFound {len(gene_groups)} gene groups:")
     for g, ds in sorted(gene_groups.items()):
         print(f"  {g} ({len(ds)} assays): {ds}")
@@ -738,8 +747,8 @@ def run_multivariate(args):
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
 
     N_BOOTSTRAPS = args.n_bootstraps
-    NUM_FITS = args.num_fits   # may be None (dynamic)
-    component_range = args.components or [2, 3]
+    NUM_FITS = args.num_fits
+    component_range = args.components
     constraint_modes = _resolve_constraints(args.constraints)
     latent_q = 2
     genes_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}
@@ -792,13 +801,16 @@ def run_predictor_mv(args):
     N_BOOTSTRAPS = args.n_bootstraps
     NUM_FITS = args.num_fits
     output_dir = args.output_dir
-    component_range = args.components or [2, 3]
+    component_range = args.components
     constraint_modes = _resolve_constraints(args.constraints)
     latent_q = 2
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
 
     print(f"Loading predictor CSVs from {args.data_dir}...")
     by_gene = load_predictor_data(args.data_dir, genes=args.genes)
+    if args.exclude_genes:
+        excluded = {g.upper() for g in args.exclude_genes}
+        by_gene = {g: v for g, v in by_gene.items() if g.upper() not in excluded}
     if not by_gene:
         print("No predictor data found. Exiting.")
         return
@@ -829,6 +841,9 @@ def run_predictor_mv(args):
                         "latent_q": latent_q,
                         "init_strategy": args.init_strategy,
                         "sample_balance_beta": args.sample_balance_beta,
+                        "log_prefix": f"  {predictor_dataset_label(gene)}: ",
+                        "verbose_overlap": bs == 0 and nc == component_range[0]
+                                           and constrained == constrained_flags[0],
                     }
                     if NUM_FITS is not None:
                         fit_kwargs["num_fits"] = NUM_FITS
@@ -971,19 +986,21 @@ def main():
     p_multi.add_argument("--dataframe", default=None)
     p_multi.add_argument("--genes", nargs="+", default=None,
                          help="Specific genes to process (default: all multi-assay)")
-    p_multi.add_argument("--components", nargs="+", type=int, default=None,
-                         help="Component counts (default: 2 3)")
+    p_multi.add_argument("--exclude-genes", nargs="+", default=None,
+                         help="Genes to drop from the run")
+    p_multi.add_argument("--components", nargs="+", type=int, default=[4],
+                         help="Component counts (default: 4)")
     p_multi.add_argument("--constraints", nargs="+",
-                         choices=["con", "unc", "both"], default=["both"],
-                         help="Constraint modes (default: both)")
+                         choices=["con", "unc", "both"], default=["unc"],
+                         help="Constraint modes (default: unc)")
     p_multi.add_argument("--init-strategy", default="kmeans",
                          choices=["kmeans", "anchored"])
     p_multi.add_argument("--max-dimensions", type=int, default=None,
                          help="Skip genes with more datasets than this")
     p_multi.add_argument("--population-type", default=None)
-    p_multi.add_argument("--n-bootstraps", type=int, default=200)
-    p_multi.add_argument("--num-fits", type=int, default=None,
-                         help="Override dynamic NUM_FITS (default: min(4^K,100))")
+    p_multi.add_argument("--n-bootstraps", type=int, default=1000)
+    p_multi.add_argument("--num-fits", type=int, default=100,
+                         help="Override dynamic NUM_FITS (default: 100)")
     p_multi.add_argument("--list-only", action="store_true",
                          help="Print gene groups and exit")
     p_multi.set_defaults(func=run_multivariate)
@@ -994,15 +1011,17 @@ def main():
     p_pred.add_argument("--data-dir", required=True,
                         help="Directory containing {gene}/{gene}_{predictor}.csv.gz")
     p_pred.add_argument("--genes", nargs="+", default=None)
-    p_pred.add_argument("--components", nargs="+", type=int, default=None)
+    p_pred.add_argument("--exclude-genes", nargs="+", default=None,
+                        help="Genes to drop from the run")
+    p_pred.add_argument("--components", nargs="+", type=int, default=[4])
     p_pred.add_argument("--constraints", nargs="+",
-                        choices=["con", "unc", "both"], default=["both"])
-    p_pred.add_argument("--init-strategy", default="anchored",
+                        choices=["con", "unc", "both"], default=["unc"])
+    p_pred.add_argument("--init-strategy", default="kmeans",
                         choices=["anchored", "kmeans"])
-    p_pred.add_argument("--n-bootstraps", type=int, default=200)
-    p_pred.add_argument("--num-fits", type=int, default=None)
-    p_pred.add_argument("--sample-balance-beta", type=float, default=0.5,
-                        help="Sample-balanced M-step β ∈ [0,1] (default: 0.5)")
+    p_pred.add_argument("--n-bootstraps", type=int, default=1000)
+    p_pred.add_argument("--num-fits", type=int, default=100)
+    p_pred.add_argument("--sample-balance-beta", type=float, default=0,
+                        help="Sample-balanced M-step β ∈ [0,1] (default: 0)")
     p_pred.set_defaults(func=run_predictor_mv)
 
     args = parser.parse_args()

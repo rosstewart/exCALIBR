@@ -3,11 +3,13 @@ Assay-level / dataset-level evidence statistics and the point-distribution
 heatmap — ported verbatim (plotting/statistics logic unchanged) from
 test/plot_author_calibration_confusion.py.
 
-All three functions here need `assay_method_map` (a DataFrame with columns
-dataset/vamp_sge/model_system/disease/IGVF_produced/gene) — see
-analysis/config.py's ASSAY_METHOD_MAP_CSV and the reconstruction pipeline in
-analysis/build_dataset_summary.py. Call sites should guard with
-analysis.config.warn_if_missing and skip if that file isn't available yet,
+The stats/heatmap functions here need an `assay_method_map` DataFrame. Pass the
+raw ASSAY_METHOD_MAP_CSV (var_effect_measurements_dataset.csv, columns
+Gene/Dataset/n_unique_IDs/SGE/Vamp/IGVF) directly — `normalize_assay_method_map`
+converts it to the internal dataset/vamp_sge/model_system/disease/
+IGVF_produced/gene schema, pulling model_system/disease from
+DATASET_DESCRIPTIONS_CSV (keyed on Dataset_tag). Call sites should guard with
+analysis.config.warn_if_missing and skip if the map file isn't available yet,
 same as other external-data-dependent figures.
 """
 from __future__ import annotations
@@ -21,6 +23,90 @@ from matplotlib.lines import Line2D
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
 from matplotlib.patches import Rectangle
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+
+
+# Model-system label normalization (mirrors analysis/gene_table.py).
+_MODEL_SYSTEM_MAP = {
+    'immortalized human cells': 'immortalized human cells',
+    'murine primary cells': 'murine primary cells',
+    'yeast': 'yeast',
+    'other': 'other',
+    'Not Applicable': 'not applicable',
+}
+
+
+def normalize_assay_method_map(assay_method_map, dataset_descriptions=None):
+    """Convert the raw assay-method-map CSV into the schema this module expects.
+
+    The on-disk map (``ASSAY_METHOD_MAP_CSV`` /
+    ``var_effect_measurements_dataset.csv``) has columns
+    ``Gene/Dataset/n_unique_IDs/SGE/Vamp/IGVF``. The stats and heatmap
+    functions here were written against an internal schema with lowercase
+    ``dataset/vamp_sge/model_system/disease/IGVF_produced/gene`` columns.
+
+    This helper bridges the two, deriving ``vamp_sge`` from the ``Vamp``/``SGE``
+    Yes/No columns (exactly like ``analysis/gene_table.py``) and pulling
+    ``model_system`` and ``disease`` from ``dataset_descriptions.csv`` (keyed on
+    ``Dataset_tag``). If ``dataset_descriptions`` is None it is loaded from
+    ``analysis.config.DATASET_DESCRIPTIONS_CSV`` when present.
+
+    ``vamp_sge`` is left empty ('') for datasets that are neither VAMP-seq nor
+    SGE so the downstream Meta-analysis/Other classification still fires.
+
+    A map already in the internal (lowercase ``dataset``) schema is returned
+    unchanged, so this is safe to call unconditionally and idempotently.
+    """
+    if assay_method_map is None or 'dataset' in assay_method_map.columns:
+        return assay_method_map
+
+    if dataset_descriptions is None:
+        from analysis import config as _cfg
+        if not _cfg.warn_if_missing(
+            _cfg.DATASET_DESCRIPTIONS_CSV,
+            "dataset descriptions (assay method map model_system/disease)",
+        ):
+            dataset_descriptions = pd.read_csv(
+                _cfg.DATASET_DESCRIPTIONS_CSV, low_memory=False,
+            )
+
+    desc_model, desc_disease = {}, {}
+    if dataset_descriptions is not None:
+        for _, r in dataset_descriptions.iterrows():
+            key = r.get('Dataset_tag')
+            if pd.isna(key):
+                continue
+            desc_model[key] = r.get('Model_system')
+            desc_disease[key] = r.get('Assay Disease Relevance')
+
+    rows = []
+    for _, row in assay_method_map.iterrows():
+        ds = row['Dataset']
+        if row.get('Vamp') == 'Yes':
+            vamp_sge = 'VAMP-seq'
+        elif row.get('SGE') == 'Yes':
+            vamp_sge = 'SGE'
+        else:
+            vamp_sge = ''
+
+        raw_model = desc_model.get(ds)
+        if raw_model is None or (isinstance(raw_model, float) and pd.isna(raw_model)):
+            model_system = None
+        else:
+            model_system = _MODEL_SYSTEM_MAP.get(raw_model, raw_model)
+
+        gene = row.get('Gene')
+        if gene is None or (isinstance(gene, float) and pd.isna(gene)):
+            gene = str(ds).split('_')[0]
+
+        rows.append({
+            'dataset': ds,
+            'gene': gene,
+            'vamp_sge': vamp_sge,
+            'model_system': model_system,
+            'disease': desc_disease.get(ds),
+            'IGVF_produced': row.get('IGVF') == 'Yes',
+        })
+    return pd.DataFrame(rows)
 
 
 def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
@@ -88,6 +174,8 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
     DISEASE_COLORS = {'C': '#D45F5F', 'V': '#5B8AC4', 'R': '#C5A87A', 'M': '#60B89F', 'O': '#9E9E9E'}
 
     vamp_sge_map, model_system_map, disease_map, igvf_map, gene_map = {}, {}, {}, {}, {}
+
+    assay_method_map = normalize_assay_method_map(assay_method_map)
 
     if assay_method_map is not None:
         for _, row in assay_method_map.iterrows():
@@ -424,6 +512,8 @@ def compute_assay_evidence_stats(dataset_info_df, all_danz_assignments, assay_me
         Keys are ('assay_type', 'model_system', 'disease'), values are
         DataFrames summarizing counts/percentages per group.
     """
+    assay_method_map = normalize_assay_method_map(assay_method_map)
+
     meta = {}
     for _, row in assay_method_map.iterrows():
         ds = row['dataset']

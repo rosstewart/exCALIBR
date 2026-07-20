@@ -178,16 +178,18 @@ def plot_scoreset_compare_point_assignments(dataset, scoresets, summary, scorese
                 ax_lr.plot(score_range, llr_curves[i], color=c, label=labels[i])
             
             point_values = sorted(list(set([abs(int(k)) for k in summary[(config, n_c)]['point_ranges'].keys()])))
-            tauP, tauB, _ = list(map(np.log, thresholds_from_prior(summary[(config, n_c)]['prior'], point_values + [10])))
+            tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(
+                summary[(config, n_c)]['prior'], point_values,
+            )
             priors = np.percentile(np.array(summary[(config, n_c)]['priors']),[5,50,95])
-            
+
             ax_lr.set_title(f"{st} LR+ {config}\nprior: {priors[1]:.3f} ({priors[0]:.3f}-{priors[2]:.3f}), C: {summary[(config, n_c)]['C']}", fontsize=10)
-            add_thresholds(tauP[:-1], tauB[:-1], ax_lr)
+            add_thresholds(tauP, tauB, ax_lr)
             ax_lr.set_xlabel("Score")
             ax_lr.set_ylabel("Log LR+")
             ax_lr.legend(fontsize=6, loc='best')
             ax_lr.set_xlim(xlim)
-            ax_lr.set_ylim([tauB[-1], tauP[-1]])  # Set y-limits based on ±10 thresholds
+            ax_lr.set_ylim([ylim_bottom, ylim_top])
             ax_lr.grid(linewidth=0.5, alpha=0.3)
         
         # Hide unused config columns in LR+ row
@@ -244,6 +246,29 @@ def add_thresholds(tauP, tauB, ax):
     for tp,tb in zip(tauP,tauB):
         ax.axhline(tp,color='red',linestyle='--',alpha=0.5)
         ax.axhline(tb,color='blue',linestyle='--',alpha=0.5)
+
+
+def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2):
+    """log(lrP)/log(lrB) tier thresholds for `point_values`, plus a y-axis
+    padding value extrapolated `pad_points` tiers beyond the highest one.
+
+    Do NOT compute the padding by calling thresholds_from_prior(prior,
+    point_values + [pad]) -- the Tavtigian formula is lrP = C**(pv/len(pv)),
+    so appending one dummy tier changes the *denominator* for every tier, not
+    just the new one, silently shrinking all the real thresholds (e.g. by a
+    factor of 8/9 when going from 8 to 9 tiers). That previously made the
+    dashed threshold lines drawn on "Log LR+" panels sit below the actual
+    thresholds used to compute point_ranges, making the LR+ curve appear to
+    cross a tier it never actually reached. Instead, extrapolate linearly
+    using the real per-tier step (log(C) / len(point_values)), which keeps
+    the drawn thresholds identical to the ones point_ranges was computed with.
+    """
+    lrP, lrB, C = thresholds_from_prior(prior, point_values)
+    tauP, tauB, log_c = np.log(lrP), np.log(lrB), np.log(C)
+    step = log_c / len(point_values)
+    ylim_top = tauP[-1] + pad_points * step
+    ylim_bottom = tauB[-1] - pad_points * step
+    return tauP, tauB, ylim_top, ylim_bottom
 
 
 def plot_summary(scoreset: Scoreset, fits: List[Dict], summary:Dict, score_range, log_fp, log_fb, use_median_prior,use_2c_equation, n_c, benign_method, C, dataset):
@@ -385,7 +410,9 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     
     # ===== Row 2: LR+ summaries (one per sample) =====
     point_values_all = sorted(list(set([abs(int(k)) for k in indv_summary['point_ranges'].keys()])))
-    tauP, tauB, _ = list(map(np.log, thresholds_from_prior(indv_summary['prior'], point_values_all + [10])))
+    tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(
+        indv_summary['prior'], point_values_all,
+    )
     priors = np.percentile(np.array(indv_summary['priors']),[5,50,95])
     
     # Identify which point values have insufficient evidence (empty ranges)
@@ -434,7 +461,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         lr_5th = llr_curves[0]
         max_5th_idx = np.nanargmax(lr_5th)
         max_5th = lr_5th[max_5th_idx]
-        exceeds_pathogenic = any(max_5th > tau for tau in tauP[:-1])
+        exceeds_pathogenic = any(max_5th > tau for tau in tauP)
         
         # Check if insufficient evidence causes cutoff
         insufficient_evidence_pathogenic_idx = None
@@ -458,7 +485,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         pathogenic_crossing_idx = None
         if exceeds_pathogenic:
             # Find the highest threshold exceeded
-            highest_tau_exceeded = max([tau for tau in tauP[:-1] if max_5th > tau])
+            highest_tau_exceeded = max([tau for tau in tauP if max_5th > tau])
             
             if not flipped:
                 # Normal: Use FIRST crossing (when going up towards max from the left)
@@ -487,7 +514,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         lr_95th = llr_curves[2]
         min_95th_idx = np.nanargmin(lr_95th)
         min_95th = lr_95th[min_95th_idx]
-        exceeds_benign = any(min_95th < tau for tau in tauB[:-1])
+        exceeds_benign = any(min_95th < tau for tau in tauB)
         
         # Check if insufficient evidence causes cutoff
         insufficient_evidence_benign_idx = None
@@ -511,7 +538,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         benign_crossing_idx = None
         if exceeds_benign:
             # Find the lowest threshold crossed
-            lowest_tau_crossed = min([tau for tau in tauB[:-1] if min_95th < tau])
+            lowest_tau_crossed = min([tau for tau in tauB if min_95th < tau])
             
             if not flipped:
                 # Normal: Use SECOND crossing (when coming back up from min to the right)
@@ -544,11 +571,11 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
             print(f"  5th percentile: max={max_5th:.3f} at idx={max_5th_idx}, exceeds_pathogenic={exceeds_pathogenic}")
             if exceeds_pathogenic:
                 print(f"    highest_tau_exceeded={highest_tau_exceeded:.3f}, crossing_idx={pathogenic_crossing_idx}, should_plot_dotted={should_plot_pathogenic_dotted}")
-            print(f"  tauP thresholds: {[f'{t:.3f}' for t in tauP[:-1]]}")
+            print(f"  tauP thresholds: {[f'{t:.3f}' for t in tauP]}")
             print(f"  95th percentile: min={min_95th:.3f} at idx={min_95th_idx}, exceeds_benign={exceeds_benign}")
             if exceeds_benign:
                 print(f"    lowest_tau_crossed={lowest_tau_crossed:.3f}, crossing_idx={benign_crossing_idx}, should_plot_dotted={should_plot_benign_dotted}")
-            print(f"  tauB thresholds: {[f'{t:.3f}' for t in tauB[:-1]]}")
+            print(f"  tauB thresholds: {[f'{t:.3f}' for t in tauB]}")
             print(f"  flipped={flipped}")
         
         # Plot curves
@@ -594,7 +621,13 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
                                  color=c, linestyle=':', alpha=0.8, linewidth=2)
                 else:
                     ax_lr.plot(score_range, curve, color=c, label=labels[i], linewidth=2)
-            
+
+            # Handle median (i=1) — plain curve, no dotted/crossing logic
+            elif i == 1:
+                ax_lr.plot(score_range, curve, color=c,
+                           label=labels[i] if len(log_lr_plus) != 1 else 'Single fit',
+                           linewidth=2)
+
             # Handle 95th percentile (i=2)
             elif i == 2:
                 # Handle insufficient evidence
@@ -637,12 +670,12 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
             
         
         ax_lr.set_title(f"Log LR+\nprior: {priors[1]:.3f}, C: {indv_summary['C']}", fontsize=11)
-        add_thresholds(tauP[:-1], tauB[:-1], ax_lr)
+        add_thresholds(tauP, tauB, ax_lr)
         ax_lr.set_xlabel("Score")
         ax_lr.set_ylabel("Log LR+")
         ax_lr.legend(fontsize=8, loc='best')
         ax_lr.set_xlim(xlim)
-        ax_lr.set_ylim([tauB[-1], tauP[-1]])
+        ax_lr.set_ylim([ylim_bottom, ylim_top])
         ax_lr.grid(linewidth=0.5, alpha=0.3)
     
     plt.tight_layout()

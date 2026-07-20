@@ -26,7 +26,7 @@ try:
 except ImportError:
     _HAS_SNS = False
 
-from src.assay_calibration.fit_utils.fit import thresholds_from_prior
+from src.assay_calibration.plot_utils.utils import log_thresholds_with_ylim_pad
 from analysis.plot_common import sample_matches
 
 
@@ -142,12 +142,13 @@ def make_log_lr_figure(
                 point_values = sorted({abs(int(k)) for k in pr_dict})
                 if point_values and prior > 0:
                     try:
-                        tauP, tauB, _ = list(map(np.log,
-                            thresholds_from_prior(prior, point_values + [10])))
-                        for tp in tauP[:-1]:
+                        tauP, tauB, _ylim_top, _ylim_bottom = log_thresholds_with_ylim_pad(
+                            prior, point_values,
+                        )
+                        for tp in tauP:
                             ax.axhline(tp, color="red", linestyle="--",
                                        linewidth=0.7, alpha=0.55)
-                        for tb in tauB[:-1]:
+                        for tb in tauB:
                             ax.axhline(tb, color="steelblue", linestyle="--",
                                        linewidth=0.7, alpha=0.55)
                     except Exception:
@@ -339,10 +340,10 @@ def make_calibration_figure(
                 pvs = sorted({abs(int(k)) for k in cal.get("point_ranges", {})})
                 if pvs and prior > 0:
                     try:
-                        tauP, tauB, _ = list(map(np.log, thresholds_from_prior(prior, pvs + [10])))
-                        for tp in tauP[:-1]:
+                        tauP, tauB, _ylim_top, _ylim_bottom = log_thresholds_with_ylim_pad(prior, pvs)
+                        for tp in tauP:
                             a.axhline(tp, color="red", linestyle="--", linewidth=0.7, alpha=0.5)
-                        for tb in tauB[:-1]:
+                        for tb in tauB:
                             a.axhline(tb, color="steelblue", linestyle="--", linewidth=0.7, alpha=0.5)
                     except Exception:
                         pass
