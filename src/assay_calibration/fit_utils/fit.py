@@ -853,6 +853,44 @@ def calculate_score_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores, point_v
     return pathogenic_ranges, benign_ranges, C
 
 
+def calculate_score_ranges_dual(log_lr_pathogenic, log_lr_benign, prior_pathogenic, prior_benign,
+                                 scores, point_values, acmg_mapping_method="tavtigian", **kwargs):
+    """Dual-prior sibling of calculate_score_ranges for the pathomechanism
+    two-LR/two-prior PS3/BS3 scheme: pathogenic-direction tier thresholds are
+    derived from prior_pathogenic (rho) alone, benign-direction thresholds
+    from prior_benign (pi) alone -- two independent calls to
+    thresholds_from_prior, each contributing only its own direction's half.
+
+    This is a deliberate deviation from strict Tavtigian-2018, where a single
+    constant C is jointly calibrated to satisfy ALL FOUR rule-combination
+    categories (pathogenic/likely-pathogenic/benign/likely-benign)
+    simultaneously under ONE prior (see get_tavtigian_constant). Here, C_p is
+    independently searched using only prior_pathogenic (and only its
+    pathogenic/likely-pathogenic halves are used, via lrP/tauP) and C_b is
+    independently searched using only prior_benign (only its
+    benign/likely-benign halves are used, via lrB/tauB). This is accepted as
+    the necessary cost of having two independently-meaningful priors for the
+    two evidence directions (see module-level pathomechanism plan/docs for
+    the rho vs pi derivation) -- PS3 and BS3 are separate ACMG evidence codes
+    with separately awarded points in this pipeline already, not combined
+    into one continuous score, so calibrating them under two different
+    constants does not break anything downstream that assumed a single C.
+
+    Returns (pathogenic_ranges, benign_ranges, C_pathogenic, C_benign).
+    """
+    lrP, _, C_p = thresholds_from_prior(
+        prior_pathogenic, point_values, acmg_mapping_method=acmg_mapping_method, **kwargs
+    )
+    _, lrB, C_b = thresholds_from_prior(
+        prior_benign, point_values, acmg_mapping_method=acmg_mapping_method, **kwargs
+    )
+    tauP = np.log(lrP)
+    tauB = np.log(lrB)
+    pathogenic_ranges = get_point_ranges(scores, log_lr_pathogenic, tauP, point_values, "pathogenic")
+    benign_ranges = get_point_ranges(scores, log_lr_benign, tauB, point_values, "benign")
+    return pathogenic_ranges, benign_ranges, C_p, C_b
+
+
 def calculate_classification_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores):
     """Continuous-method (Method B) analogue of calculate_score_ranges.
 

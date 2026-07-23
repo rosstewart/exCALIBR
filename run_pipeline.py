@@ -105,9 +105,8 @@ Examples:
                             "thresholds, C-range, OOB LR percentiles, per-variant LR percentiles). "
                             "Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
-    # experimentation only -- the pathomechanism prior (below) is the default and
-    # the two are mutually exclusive. Parses with default=None; resolve_prior_mode
-    # reconciles it against --pathomechanism-prior after parsing.
+    # experimentation only -- mutually exclusive with --pathomechanism-prior below.
+    # Parses with default=None; resolve_prior_mode reconciles it after parsing.
     parser.add_argument("--filter-pathogenic-sample-by-lr",
                        dest="filter_pathogenic_sample_by_lr", action="store_true", default=None,
                        help=argparse.SUPPRESS)
@@ -115,26 +114,36 @@ Examples:
                        dest="filter_pathogenic_sample_by_lr", action="store_false", default=None,
                        help=argparse.SUPPRESS)
     parser.add_argument("--pathomechanism-prior",
-                       dest="pathomechanism_prior", action="store_true", default=None,
-                       help="[PN/standard-mode only] Estimate the scalar prior from the "
-                            "'pathomechanism' component of the pathogenic-labeled sample. "
-                            "Decomposes that sample's score density into "
-                            "gamma*f_D(x) + (1-gamma)*f_N(x), where f_N is FIXED to the "
-                            "already-fitted benign/synonymous density (anchored, no "
-                            "label-switching), gamma is the estimated fraction of PLP-labeled "
-                            "variants whose disease mechanism this assay actually measures, and "
-                            "f_D ('assay-relevant pathogenic' density) feeds the standard "
-                            "joint-EM prior estimator in place of the raw pathogenic sample. "
-                            "PLP_frac_pathomechanism_measured (this gamma estimate) and an "
-                            "unstable flag are reported in the calibration JSON. Only affects "
-                            "the scalar prior -- the LR+ curve used for "
-                            "per-variant evidence keeps using the raw pathogenic density. No "
-                            "effect on PU/NU-only datasets. This is the DEFAULT (on); pass "
-                            "--no-pathomechanism-prior to disable it.")
+                       dest="pathomechanism_prior_enabled", action="store_true", default=None,
+                       help="[PN/PU mode only] Enable the dual LR+/prior pathomechanism "
+                            "approach: decompose the pathogenic-labeled sample's score "
+                            "density into gamma*f_D(x) + (1-gamma)*f_N(x), where f_N is FIXED to "
+                            "an anchor density (benign/synonymous blend in PN mode, raw gnomAD in "
+                            "PU mode -- anchored, no label-switching), gamma is the estimated "
+                            "fraction of PLP-labeled variants whose disease mechanism this assay "
+                            "actually measures, and f_D ('assay-relevant pathogenic' density) "
+                            "feeds a genuinely separate pathogenic-direction (PS3) prior+LR+ pair "
+                            "(reported as pathomechanism_prior, i.e. rho = P(pathogenic AND "
+                            "mechanism-detectable)) in the calibration JSON. The benign-direction "
+                            "(BS3) prior+LR+ pair (reported as prior, i.e. pi = P(pathogenic, any "
+                            "mechanism)) always stays raw/mechanism-agnostic. "
+                            "PLP_frac_pathomechanism_measured (the gamma estimate) and stability "
+                            "flags are reported in the calibration JSON. Mutually exclusive with "
+                            "--filter-pathogenic-sample-by-lr. Default: off (raw single LR+/prior).")
     parser.add_argument("--no-pathomechanism-prior",
-                       dest="pathomechanism_prior", action="store_false", default=None,
-                       help="Disable --pathomechanism-prior (use the full, unfiltered "
-                            "pathogenic sample for prior estimation).")
+                       dest="pathomechanism_prior_enabled", action="store_false", default=None,
+                       help=argparse.SUPPRESS)
+    # EXPERIMENTAL, hidden: which f_D construction --pathomechanism-prior uses.
+    # Only meaningful when --pathomechanism-prior is enabled; defaults to
+    # 'subtraction' (per-component excess max(0, w_P - w_N), renormalized) when
+    # unset. 'masking' keeps w_P wherever it exceeds w_N, zero elsewhere,
+    # renormalized -- more generous toward borderline components, less smooth
+    # at the w_P==w_N boundary. Kept hidden: an advanced tuning knob, not a
+    # top-level user-facing choice.
+    parser.add_argument("--pathomechanism-method",
+                       dest="pathomechanism_method", choices=["off", "subtraction", "masking"],
+                       default=None,
+                       help=argparse.SUPPRESS)
 
     # OOB evidence
     parser.add_argument("--oob", action="store_true",
@@ -205,10 +214,20 @@ Examples:
 
     args = parser.parse_args()
 
-    # Reconcile the mutually-exclusive prior-cleaning flags (defaults to the
-    # pathomechanism prior when neither is given).
-    args.filter_pathogenic_sample_by_lr, args.pathomechanism_prior = resolve_prior_mode(
-        args.filter_pathogenic_sample_by_lr, args.pathomechanism_prior
+    # Combine the visible --pathomechanism-prior on/off toggle with the hidden
+    # --pathomechanism-method sub-choice into the single value resolve_prior_mode
+    # expects, defaulting the sub-choice to "subtraction" when enabled.
+    if args.pathomechanism_prior_enabled:
+        pm_flag = args.pathomechanism_method or "subtraction"
+    elif args.pathomechanism_prior_enabled is False:
+        pm_flag = "off"
+    else:
+        pm_flag = args.pathomechanism_method  # None unless explicitly set
+
+    # Reconcile the mutually-exclusive prior-cleaning flags (defaults to off:
+    # raw single LR+/prior).
+    args.filter_pathogenic_sample_by_lr, args.pathomechanism_method = resolve_prior_mode(
+        args.filter_pathogenic_sample_by_lr, pm_flag
     )
 
     # Parse scoreset_flipped_override
@@ -257,7 +276,7 @@ Examples:
         progress_file=args.progress_file,
         pathogenic_percentile=args.pathogenic_percentile,
         filter_pathogenic_sample_by_lr=args.filter_pathogenic_sample_by_lr,
-        pathomechanism_prior=args.pathomechanism_prior,
+        pathomechanism_method=args.pathomechanism_method,
         acmg_mapping_method=(args.acmg_mapping_method
                               if args.acmg_mapping_method != "all" else "tavtigian"),
     )

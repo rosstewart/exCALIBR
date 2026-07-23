@@ -42,7 +42,7 @@ from src.assay_calibration.fit_utils.cfusn.density_utils import (
 )
 from src.assay_calibration.fit_utils.point_ranges import (
     estimate_prior_from_class_densities,
-    compute_pathomechanism_pathogenic_density,
+    apply_pathomechanism_correction,
     _get_benign_reference_weights,
 )
 
@@ -75,7 +75,7 @@ CONFIG_LABELS = {
 def _bootstrap_job(fit_raw, scores, sa,
                    p_idx, b_idx, g_idx, s_idx, benign_method,
                    partial_patterns, reestimate_marginal_weights,
-                   extra_p_indices=None, pathomechanism_prior=True):
+                   extra_p_indices=None, pathomechanism_method=None):
     """Process one bootstrap fit.  Standalone so joblib loky workers don't
     need to pickle the full MVCalibrationAnalysis object."""
     if fit_raw is None:
@@ -164,11 +164,12 @@ def _bootstrap_job(fit_raw, scores, sa,
             K = len(params)
             w_pop = weights[eff_g]
 
-            # ---- pathomechanism correction (default on; standard/PU only) ----
+            # ---- pathomechanism correction (default off; standard/PU only) ----
             # Replaces the raw pathogenic-labeled weight vector with a
             # corrected "assay-relevant" excess density before prior
-            # estimation, mirroring get_fit_prior's pathomechanism_prior
-            # (src/assay_calibration/fit_utils/point_ranges.py). Standard
+            # estimation, mirroring get_fit_prior's pathomechanism_method
+            # (src/assay_calibration/fit_utils/point_ranges.py) via the same
+            # shared apply_pathomechanism_correction dispatch. Standard
             # mode anchors against the UNRESTRICTED benign-method blend (no
             # per-pattern support-gating -- the correction characterizes the
             # pathogenic-labeled sample's overall mixture composition once,
@@ -183,11 +184,12 @@ def _bootstrap_job(fit_raw, scores, sa,
             # correction, but that's not implemented here).
             pathomechanism_no_pu_support = False
             f1_full = None
-            if pathomechanism_prior and eff_p is not None and not nu_mode:
+            if pathomechanism_method is not None and eff_p is not None and not nu_mode:
                 w_N_anchor = weights[eff_g] if pu_mode else _get_benign_reference_weights(
                     weights, benign_method, eff_b, eff_s)
                 labeled_scores = scores[sa[:, eff_p].astype(bool)]
-                corrected, _gamma_hat = compute_pathomechanism_pathogenic_density(
+                corrected, _gamma_hat = apply_pathomechanism_correction(
+                    pathomechanism_method,
                     labeled_scores, pop_scores, params, weights[eff_p], w_N_anchor,
                     multivariate=True,
                 )
@@ -603,7 +605,7 @@ class MVCalibrationAnalysis:
         self.ms = ms
         self.point_values = point_values or list(range(1, 9))
         self.benign_method = benign_method
-        self.pathomechanism_prior = True  # overridden by run()'s kwarg of the same name
+        self.pathomechanism_method = None  # overridden by run()'s kwarg of the same name
 
         # Map fixed role indices (0=path,1=ben,2=gnomad,3=syn) to effective indices
         # in ms.sample_assignments (public property, drops empty-sample columns).
@@ -782,17 +784,19 @@ class MVCalibrationAnalysis:
         w_pop = weights[self.g_idx]
 
         # ---- pathomechanism correction (see _bootstrap_job for full
-        # rationale) -- default on via self.pathomechanism_prior (set by
+        # rationale) -- default off via self.pathomechanism_method (set by
         # run()'s kwarg of the same name), standard/PU only, computed once
         # rather than per pattern group. ----
         pathomechanism_no_pu_support = False
         f1_full = None
-        if (getattr(self, "pathomechanism_prior", True) and self.p_idx is not None
+        pathomechanism_method = getattr(self, "pathomechanism_method", None)
+        if (pathomechanism_method is not None and self.p_idx is not None
                 and not self.nu_mode):
             w_N_anchor = weights[self.g_idx] if self.pu_mode else _get_benign_reference_weights(
                 weights, self.benign_method, self.b_idx, self.s_idx)
             labeled_scores = self.ms.scores[self.ms.sample_assignments[:, self.p_idx]]
-            corrected, _gamma_hat = compute_pathomechanism_pathogenic_density(
+            corrected, _gamma_hat = apply_pathomechanism_correction(
+                pathomechanism_method,
                 labeled_scores, pop_scores, params, weights[self.p_idx], w_N_anchor,
                 multivariate=True,
             )
@@ -1193,19 +1197,22 @@ class MVCalibrationAnalysis:
             reestimate_marginal_weights=True,
             enforce_marginal_monotonicity=True,
             liberal_marginal_monotonicity=True,
-            pathomechanism_prior=True,
+            pathomechanism_method=None,
             n_jobs=-1):
         """Run analysis for all configs.
 
-        pathomechanism_prior : bool, default True
-            Estimate the scalar prior from the pathomechanism-corrected
-            pathogenic density (excess over the benign/gnomAD anchor) rather
-            than the raw pathogenic-labeled density -- mirrors get_fit_prior's
-            pathomechanism_prior default in the univariate pipeline
-            (src/assay_calibration/fit_utils/point_ranges.py). Pass False to
-            reproduce this file's pre-pathomechanism behavior exactly.
+        pathomechanism_method : {None, "subtraction", "masking"}, default None
+            None (default): estimate the scalar prior from the raw
+            pathogenic-labeled density -- this file's original behavior.
+            "subtraction"/"masking": estimate the prior from the
+            pathomechanism-corrected pathogenic density (excess over the
+            benign/gnomAD anchor) instead -- mirrors
+            PipelineConfig.pathomechanism_method's opt-in dual-prior
+            correction in the univariate pipeline
+            (src/assay_calibration/fit_utils/point_ranges.py), dispatched
+            through the same shared apply_pathomechanism_correction helper.
         """
-        self.pathomechanism_prior = pathomechanism_prior
+        self.pathomechanism_method = pathomechanism_method
         ben_percentile = 100 - path_percentile
         _aux_path_pct = aux_path_percentile if aux_path_percentile is not None else path_percentile
         _aux_ben_pct  = aux_ben_percentile  if aux_ben_percentile  is not None else (100 - _aux_path_pct)
@@ -1257,7 +1264,7 @@ class MVCalibrationAnalysis:
                     self.benign_method, partial_patterns,
                     reestimate_marginal_weights,
                     extra_p_indices=aux_eff_indices,
-                    pathomechanism_prior=pathomechanism_prior,
+                    pathomechanism_method=pathomechanism_method,
                 )
                 for _, bd in boot_items
             )

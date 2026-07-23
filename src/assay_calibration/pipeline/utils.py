@@ -93,6 +93,15 @@ def save_results(
         calibration_compact = {
             'prior': calibration['prior'],
             'prior_unstable': calibration.get('prior_unstable', False),
+            # pathomechanism_prior (rho = P(pathogenic AND mechanism-detectable))
+            # is the pathogenic-direction/mechanism-specific prior, paired with
+            # the pathogenic-direction LR+ curve (log_lr_pathogenic). 'prior'
+            # above stays the benign-direction/mechanism-agnostic prior (pi),
+            # unchanged in meaning. Both None/False when pathomechanism_method
+            # is off for this run -- see PipelineConfig.pathomechanism_method.
+            'pathomechanism_prior': calibration.get('pathomechanism_prior', None),
+            'pathomechanism_prior_unstable': calibration.get('pathomechanism_prior_unstable', False),
+            'pathomechanism_method': calibration.get('pathomechanism_method', None),
             'PLP_frac_pathomechanism_measured': calibration.get(
                 'PLP_frac_pathomechanism_measured', None),
             'PLP_frac_pathomechanism_measured_unstable': calibration.get(
@@ -132,13 +141,32 @@ def save_results(
                 'dataset': config.dataset_name,
                 'n_c': component_key,
                 'score_range': calibration['score_range'],
+                # Legacy keys, always benign-direction/mechanism-agnostic
+                # (pi, LR_PB) for backward compatibility with existing
+                # consumers -- unchanged in meaning even when
+                # pathomechanism_method is active.
                 'log_lr_plus_p5': pct[0].tolist(),
                 'log_lr_plus_p50': pct[1].tolist(),
                 'log_lr_plus_p95': pct[2].tolist(),
                 'priors_pct': priors_pct,
                 'prior': calibration['prior'],
+                'log_lr_benign_p5': pct[0].tolist(),
+                'log_lr_benign_p50': pct[1].tolist(),
+                'log_lr_benign_p95': pct[2].tolist(),
+                'prior_benign_pct': priors_pct,
                 'scoreset_flipped': calibration.get('scoreset_flipped', False),
             }
+            # Pathogenic-direction (rho, LR_D) curve+prior percentiles, only
+            # when pathomechanism_method produced one for this combo.
+            if calibration.get('log_lr_pathogenic') is not None:
+                llr_p = _np.asarray(calibration['log_lr_pathogenic'])
+                pct_p = _np.nanpercentile(llr_p, [5, 50, 95], axis=0)
+                rho_arr = _np.asarray(calibration.get('priors_pathogenic', calibration.get('pathomechanism_prior')))
+                lr_data['log_lr_pathogenic_p5'] = pct_p[0].tolist()
+                lr_data['log_lr_pathogenic_p50'] = pct_p[1].tolist()
+                lr_data['log_lr_pathogenic_p95'] = pct_p[2].tolist()
+                lr_data['prior_pathogenic_pct'] = _np.nanpercentile(rho_arr, [5, 50, 95]).tolist()
+
             lr_file = output_dir / f"{config.dataset_name}_{component_key}_lr_values.json.gz"
             with gzip.open(lr_file, 'wt', encoding='utf-8') as f:
                 json.dump(serialize_dict(lr_data), f)

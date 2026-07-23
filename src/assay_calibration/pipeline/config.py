@@ -51,35 +51,43 @@ class PipelineConfig:
     # true LR+ against, so the row-selection criterion falls back to
     # log_fp - log_f_population > 0 -- a prior-free separation check (see
     # compute_lr_filtered_pathogenic_mask's docstring).
-    # EXPERIMENTAL / non-default: the pathomechanism prior (below) is the default
-    # pathogenic-sample-cleaning strategy. This LR filter is kept for experimentation
-    # only and is mutually exclusive with pathomechanism_prior.
+    # EXPERIMENTAL / non-default: kept for experimentation only. Mutually
+    # exclusive with pathomechanism_method (below), which is the supported
+    # opt-in alternative pathogenic-sample-cleaning strategy.
     filter_pathogenic_sample_by_lr: bool = False
 
     # EXPERIMENTAL, opt-in alternative to filter_pathogenic_sample_by_lr's
     # ad-hoc row filter, for any dataset with a pathogenic-labeled sample.
     # Decomposes the pathogenic-labeled sample's score density as
     #   f_pathogenic_labeled(x) = gamma * f_D(x) + (1 - gamma) * f_N(x)
-    # where f_D ("disease-mechanism-captured"/assay-relevant density) is
-    # built from the per-component excess of the raw pathogenic weights
-    # over the anchor weights (max(0, w_P - w_N), renormalized -- N gets
-    # priority on any overlap, D only gets credit for a clear excess, a
-    # deliberate conservative choice), f_N is FIXED to an anchor density
-    # (anchored -- no label-switching), and gamma is then estimated via a
-    # plain two-fixed-densities mixture-proportion EM (confirmed
-    # init-robust, unlike an earlier free-weight-vector version -- see
-    # compute_pathomechanism_pathogenic_density in fit_utils/point_ranges.py).
-    # gamma is the estimated fraction of PLP-labeled variants whose
-    # mechanism this assay captures (reported as
+    # where f_D ("disease-mechanism-captured"/assay-relevant density), f_N is
+    # FIXED to an anchor density (anchored -- no label-switching), and gamma
+    # is then estimated via a plain two-fixed-densities mixture-proportion EM
+    # (confirmed init-robust, unlike an earlier free-weight-vector version --
+    # see fit_utils/point_ranges.py). gamma is the estimated fraction of
+    # PLP-labeled variants whose mechanism this assay captures (reported as
     # PLP_frac_pathomechanism_measured in the output calibration JSON).
-    # f_D feeds the prior estimator in place of the raw pathogenic density.
+    #
+    # pathomechanism_method selects how f_D is built from the raw pathogenic
+    # weights w_P and the anchor weights w_N:
+    #   "subtraction" (default): max(0, w_P - w_N), renormalized -- N gets
+    #     priority on any overlap, D only gets credit for a clear excess, a
+    #     deliberate conservative choice. See
+    #     compute_pathomechanism_pathogenic_density.
+    #   "masking": keep w_P[k] wherever w_P[k] > w_N[k], zero elsewhere,
+    #     renormalized -- more generous toward borderline-overlapping
+    #     components than subtraction (keeps the FULL raw weight, not just
+    #     the excess), at the cost of a harder transition right at the
+    #     w_P==w_N boundary. See compute_pathomechanism_pathogenic_density_masked.
+    #   None: disabled -- no correction anywhere (raw baseline).
+    #
     # The anchor is the benign/synonymous density when a benign/synonymous
     # sample exists (PN/standard mode), or, for PU-only datasets, the raw
     # gnomAD/population density directly -- the same anchor
     # filter_pathogenic_sample_by_lr's own PU fallback already uses
     # (log_fp - log_f_population), just formalized as a generative mixture.
     # No unmixing of gnomAD's own (typically small) disease-variant content
-    # is attempted first: the excess construction is provably invariant to
+    # is attempted first: both f_D constructions are provably invariant to
     # it, at the cost of gamma_hat itself being a mildly conservative
     # (downward-biased) estimate of true mechanistic coverage when gnomAD
     # does carry real disease-relevant mass (see the docstring in
@@ -89,13 +97,25 @@ class PipelineConfig:
     # 0.01 rather than discarded -- with few gnomAD points, finding no trace
     # of the disease-relevant component there is itself evidence of a
     # near-zero prior, not an absence of information.
-    # Like filter_pathogenic_sample_by_lr, this substitution only affects
-    # the scalar prior -- the LR+ curve used for per-variant evidence
-    # assignment keeps using the raw pathogenic density. Mutually exclusive
-    # with filter_pathogenic_sample_by_lr. This is the default
-    # pathogenic-sample-cleaning strategy (ships on); pass
-    # pathomechanism_prior=False (CLI --no-pathomechanism-prior) to disable it.
-    pathomechanism_prior: bool = True
+    #
+    # Unlike filter_pathogenic_sample_by_lr's prior-only substitution, f_D
+    # ALSO drives a genuinely separate pathogenic-direction (PS3) LR+ curve
+    # now, paired with the pathomechanism-corrected prior (reported as
+    # pathomechanism_prior, i.e. rho = P(pathogenic AND mechanism-detectable)
+    # in the output calibration JSON). The benign-direction (BS3) LR+ curve
+    # and its prior (reported as prior, i.e. pi = P(pathogenic, any
+    # mechanism)) always stay raw/uncorrected, mechanism-agnostic -- this
+    # correctly discounts BS3 credit by phenocopy prevalence rather than
+    # overstating benign evidence for a variant that just has an unmeasured
+    # mechanism. See the pathomechanism plan doc for the full rho/pi
+    # derivation and why this pairing (not e.g. pi with the mechanism-
+    # specific curve) is the mathematically consistent one.
+    #
+    # Mutually exclusive with filter_pathogenic_sample_by_lr. None (disabled,
+    # raw single LR+/prior) is the default; pass pathomechanism_method=
+    # "subtraction" (CLI --pathomechanism-prior) to opt into the dual-prior
+    # correction, or "masking" for the alternative construction.
+    pathomechanism_method: Optional[Literal["subtraction", "masking"]] = None
 
     # Per-dataset overrides (used in IGVF batch mode)
     scoreset_flipped_override: Optional[bool] = None  # Force flip state
@@ -192,13 +212,21 @@ class PipelineConfig:
                 f"pathogenic_percentile must be in (0, 50), got {self.pathogenic_percentile}"
             )
 
-        # pathomechanism_prior and filter_pathogenic_sample_by_lr are mutually
-        # exclusive pathogenic-sample-cleaning strategies for prior estimation.
-        if self.pathomechanism_prior and self.filter_pathogenic_sample_by_lr:
+        # Validate pathomechanism_method
+        valid_pm_methods = {None, "subtraction", "masking"}
+        if self.pathomechanism_method not in valid_pm_methods:
             raise ValueError(
-                "pathomechanism_prior and filter_pathogenic_sample_by_lr are mutually "
-                "exclusive -- pass filter_pathogenic_sample_by_lr=False when enabling "
-                "pathomechanism_prior."
+                f"pathomechanism_method must be one of {valid_pm_methods}, "
+                f"got {self.pathomechanism_method!r}"
+            )
+
+        # pathomechanism_method and filter_pathogenic_sample_by_lr are mutually
+        # exclusive pathogenic-sample-cleaning strategies for prior estimation.
+        if self.pathomechanism_method is not None and self.filter_pathogenic_sample_by_lr:
+            raise ValueError(
+                "pathomechanism_method and filter_pathogenic_sample_by_lr are mutually "
+                "exclusive -- pass filter_pathogenic_sample_by_lr=False when setting "
+                "pathomechanism_method."
             )
         # Validate population_type
         valid_pop_types = {
@@ -214,23 +242,31 @@ class PipelineConfig:
             self.n_jobs = 30  # Reasonable default for job generation
 
 
-def resolve_prior_mode(filter_flag, pathomechanism_flag):
+def resolve_prior_mode(filter_flag, pathomechanism_method_flag):
     """Resolve the two mutually-exclusive pathogenic-sample-cleaning flags.
 
-    Both CLI flags parse with ``default=None`` (unset). The default mode is the
-    pathomechanism prior (LR filter off, pathomechanism on). Specifying just one
-    flag implicitly clears the other, so the experimental
+    ``filter_flag`` (bool|None) is the experimental LR-row-filter flag.
+    ``pathomechanism_method_flag`` (None|"off"|"subtraction"|"masking") is the
+    already-resolved pathomechanism-method selection (the caller combines its
+    own visible on/off toggle with the hidden subtraction/masking sub-choice
+    before calling this function -- see run_pipeline.py/run_igvf_batch.py),
+    where "off" means "explicitly disabled" (distinct from None, "unset").
+    The default mode is raw/off (LR filter off, pathomechanism off).
+    Specifying just one flag implicitly clears the other, so the experimental
     ``--filter-pathogenic-sample-by-lr`` can be used on its own without also
-    having to pass ``--no-pathomechanism-prior``. Setting both explicitly is left
-    to PipelineConfig's mutual-exclusion validation to reject.
+    having to pass pathomechanism="off". Setting both explicitly is left to
+    PipelineConfig's mutual-exclusion validation to reject.
 
-    Returns a ``(filter_pathogenic_sample_by_lr, pathomechanism_prior)`` tuple.
+    Returns a ``(filter_pathogenic_sample_by_lr, pathomechanism_method)`` tuple,
+    where pathomechanism_method is None|"subtraction"|"masking" (never the
+    string "off" -- that's resolved to None here).
     """
-    f, p = filter_flag, pathomechanism_flag
-    if f is None and p is None:
-        return False, True          # default: pathomechanism prior
-    if p is None:                    # only the LR filter was specified
-        return f, (False if f else True)
-    if f is None:                    # only the pathomechanism flag was specified
-        return False, p
-    return f, p                      # both explicit -> let PipelineConfig validate
+    f, m = filter_flag, pathomechanism_method_flag
+    if f is None and m is None:
+        return False, None               # default: raw, no pathomechanism correction
+    if m is None:                        # only the LR filter was specified
+        return f, None
+    m_resolved = None if m == "off" else m
+    if f is None:                        # only the pathomechanism method was specified
+        return False, m_resolved
+    return f, m_resolved                 # both explicit -> let PipelineConfig validate

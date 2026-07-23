@@ -12,7 +12,7 @@ from typing import Dict, Optional, Tuple, List
 from joblib import Parallel, delayed
 import logging
 
-from ..fit_utils.fit import calculate_score_ranges, thresholds_from_prior
+from ..fit_utils.fit import calculate_score_ranges, thresholds_from_prior, calculate_score_ranges_dual
 from ..fit_utils.cfusn import density_utils
 from ..fit_utils.point_ranges import (
     enforce_monotonicity_point_ranges,
@@ -21,10 +21,13 @@ from ..fit_utils.point_ranges import (
     get_fit_prior,
     compute_lr_filtered_pathogenic_mask,
     get_bootstrap_score_ranges,
+    get_bootstrap_score_ranges_dual,
     remove_insufficient_bootstrap_converage_points,
     check_thresholds_reached,
     extend_points_to_xlims,
     compute_single_fit_log_densities,
+    compute_pathomechanism_lr_curves,
+    resolve_pathomechanism_anchor,
     _compute_log_fp_only,
 )
 from ..data_utils.dataset import Scoreset, BasicScoreset
@@ -318,32 +321,46 @@ def process_component_fits(
         if config.manual_prior is not None:
             logger.warning("  filter_pathogenic_sample_by_lr is ignored because manual_prior is set")
 
-    # EXPERIMENTAL, opt-in alternative to filter_flag: excess-weight
-    # pathomechanism estimate (see get_fit_prior /
-    # compute_pathomechanism_pathogenic_density in fit_utils/point_ranges.py).
+    # EXPERIMENTAL, opt-in alternative to filter_flag: pathomechanism-corrected
+    # f_D (see get_fit_prior / compute_pathomechanism_pathogenic_density[_masked]
+    # in fit_utils/point_ranges.py) feeding a genuinely separate
+    # pathogenic-direction (PS3) prior+LR+ pair (rho, LR_D), paired with a
+    # mechanism-agnostic benign-direction (BS3) prior+LR+ pair (pi, LR_PB)
+    # that always stays raw/uncorrected -- see PipelineConfig.pathomechanism_method's
+    # docstring for the rho/pi derivation and why this pairing (not e.g. pi
+    # with the mechanism-specific curve) is the mathematically consistent one.
     # Needs a pathogenic-labeled sample; anchors against benign/synonymous
     # when present (PN/standard mode) or raw gnomAD directly (PU-only mode).
     # Mutually exclusive with filter_flag (already enforced at
     # PipelineConfig construction, re-checked here for callers that mutate
     # config post-construction).
-    gamma_flag = getattr(config, "pathomechanism_prior", False)
+    pathomechanism_method = getattr(config, "pathomechanism_method", None)
+    gamma_flag = pathomechanism_method is not None
     if gamma_flag:
         if filter_flag:
             raise ValueError(
-                "pathomechanism_prior and filter_pathogenic_sample_by_lr are mutually "
+                "pathomechanism_method and filter_pathogenic_sample_by_lr are mutually "
                 "exclusive -- disable one."
             )
         if config.use_2c_equation and n_c == 2:
             raise ValueError(
-                "pathomechanism_prior is not supported with use_2c_equation "
+                "pathomechanism_method is not supported with use_2c_equation "
                 "(n_c=2 equation path never calls get_fit_prior)."
             )
+        if getattr(config, "acmg_mapping_method", "tavtigian") == "continuous":
+            raise NotImplementedError(
+                "pathomechanism_method is not yet supported with "
+                "acmg_mapping_method='continuous' (no dual-prior sibling for "
+                "calculate_classification_ranges); use another acmg_mapping_method "
+                "or set pathomechanism_method=None."
+            )
         if pathogenic_idx is None:
-            logger.warning("  pathomechanism_prior has no effect (no pathogenic-labeled "
+            logger.warning("  pathomechanism_method has no effect (no pathogenic-labeled "
                             "sample for this dataset/combo); computing prior normally")
             gamma_flag = False
+            pathomechanism_method = None
         if config.manual_prior is not None:
-            logger.warning("  pathomechanism_prior is ignored because manual_prior is set")
+            logger.warning("  pathomechanism_method is ignored because manual_prior is set")
 
     # True unmixing (PU/NU) mode, per get_fit_prior's own mode selection --
     # pathogenic XOR benign/synonymous present. Used below to flag prior
@@ -352,15 +369,22 @@ def process_component_fits(
         pathogenic_idx is not None and (benign_idx is not None or synonymous_idx is not None)
     )
     prior_unstable = False
+    prior_pathogenic_unstable = False  # rho instability -- only meaningful when gamma_flag
     gamma_hat = np.nan
     gamma_unstable = False
     pct_pathogenic_rows_kept = None  # LR-filter row-level retention (filter_flag only)
     pct_bootstraps_kept = None  # fraction of bootstrap fits used for LR+/prior computation
 
     if config.manual_prior is not None:
-        # Use manually specified prior — skip estimation
+        # Use manually specified prior — skip estimation. Both directions
+        # collapse to the same manual value (dual pathomechanism curves never
+        # trigger below since gamma_flag stays whatever it resolved to above,
+        # but this whole branch bypasses get_fit_prior/curve-building
+        # entirely, so there's nothing for it to act on).
         prior = config.manual_prior
+        prior_pathogenic = config.manual_prior
         fit_priors = np.full(len(fits), prior)
+        fit_priors_pathogenic = fit_priors
         fit_gammas = np.full(len(fits), np.nan)
         valid_bootstrap_seeds = bootstrap_seeds  # no filtering
         valid_mask = np.ones(len(fits), dtype=bool)
@@ -394,37 +418,8 @@ def process_component_fits(
         # Compute priors - PASS ALL INDICES
         used_get_fit_prior = not config.use_2c_equation or n_c != 2
         if used_get_fit_prior:
-            prior_gamma_results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
-                delayed(get_fit_prior)(
-                    fit, scores_arr, config.benign_method,
-                    pathogenic_idx=pathogenic_idx,
-                    benign_idx=benign_idx,
-                    gnomad_idx=gnomad_idx,
-                    synonymous_idx=synonymous_idx,
-                    sample_assignments=sa_arr,
-                    pathogenic_row_mask=pathogenic_row_mask,
-                    pathomechanism_prior=gamma_flag,
-                )
-                for fit in fits
-            )
-            fit_priors = np.array([r[0] for r in prior_gamma_results])
-            fit_gammas = np.array([r[1] for r in prior_gamma_results])
-
-            # pathomechanism_prior discards (rather than silently falls back
-            # on) any individual bootstrap fit whose excess is degenerate
-            # everywhere (w_P_raw <= w_N on every component -- see
-            # compute_pathomechanism_pathogenic_density). If that wipes out
-            # every fit for this combo, there's no correction to apply at
-            # all; fall back to raw-density prior estimation for the whole
-            # combo rather than discarding it outright.
-            if gamma_flag and not np.any(np.isfinite(fit_priors)):
-                logger.warning(
-                    "  pathomechanism_prior: 0/%d fits had any assay-relevant excess "
-                    "(w_P_raw <= w_N everywhere on every fit); falling back to raw "
-                    "pathogenic density for prior estimation on this combo",
-                    n_fits_prefilter,
-                )
-                prior_gamma_results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+            def _run_get_fit_prior(method):
+                return Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
                     delayed(get_fit_prior)(
                         fit, scores_arr, config.benign_method,
                         pathogenic_idx=pathogenic_idx,
@@ -432,15 +427,54 @@ def process_component_fits(
                         gnomad_idx=gnomad_idx,
                         synonymous_idx=synonymous_idx,
                         sample_assignments=sa_arr,
-                        pathogenic_row_mask=None,
-                        pathomechanism_prior=False,
+                        pathogenic_row_mask=pathogenic_row_mask,
+                        pathomechanism_method=method,
                     )
                     for fit in fits
                 )
-                fit_priors = np.array([r[0] for r in prior_gamma_results])
-                fit_gammas = np.array([r[1] for r in prior_gamma_results])
-                prior_unstable = True
-                gamma_unstable = True
+
+            # Benign-direction / mechanism-agnostic prior (pi): always the raw,
+            # uncorrected estimate -- this is today's existing single-prior
+            # computation, unchanged in meaning regardless of pathomechanism_method
+            # (see PipelineConfig.pathomechanism_method's docstring).
+            prior_gamma_results_benign = _run_get_fit_prior(None)
+            fit_priors_benign = np.array([r[0] for r in prior_gamma_results_benign])
+            fit_gammas_benign = np.array([r[1] for r in prior_gamma_results_benign])  # always nan
+
+            if gamma_flag:
+                # Pathogenic-direction / mechanism-specific prior (rho).
+                prior_gamma_results_path = _run_get_fit_prior(pathomechanism_method)
+                fit_priors_pathogenic = np.array([r[0] for r in prior_gamma_results_path])
+                fit_gammas = np.array([r[1] for r in prior_gamma_results_path])
+
+                # pathomechanism_method discards (rather than silently falls back
+                # on) any individual bootstrap fit whose excess/mask is degenerate
+                # everywhere (see compute_pathomechanism_pathogenic_density[_masked]).
+                # If that wipes out every fit for this combo, there's no
+                # pathogenic-direction correction to apply at all -- fall back to
+                # the benign-direction's already-computed raw estimate for rho too
+                # (degrades both directions to the raw baseline for this combo)
+                # rather than discarding it outright.
+                if not np.any(np.isfinite(fit_priors_pathogenic)):
+                    logger.warning(
+                        "  pathomechanism_method: 0/%d fits had any assay-relevant "
+                        "excess/mask (degenerate on every fit); falling back to raw "
+                        "pathogenic density for the pathogenic-direction prior on "
+                        "this combo",
+                        n_fits_prefilter,
+                    )
+                    fit_priors_pathogenic = fit_priors_benign.copy()
+                    fit_gammas = fit_gammas_benign.copy()
+                    prior_unstable = True
+                    prior_pathogenic_unstable = True
+                    gamma_unstable = True
+            else:
+                fit_priors_pathogenic = fit_priors_benign
+                fit_gammas = fit_gammas_benign
+
+            # 'fit_priors'/'prior' stay benign-direction (pi) throughout this
+            # function for backward compatibility -- see PipelineConfig.pathomechanism_method.
+            fit_priors = fit_priors_benign
         else:
             # Use 2c equation
             fit_priors = []
@@ -471,14 +505,26 @@ def process_component_fits(
 
             fit_priors = np.array(fit_priors)
             fit_gammas = np.full(len(fits), np.nan)
+            fit_priors_pathogenic = fit_priors  # 2c-equation path never supports pathomechanism_method
 
-        # Filter invalid priors
-        valid_mask = ~(np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1))
+        # Filter invalid priors. A fit only contributes downstream if BOTH
+        # directions produced a valid prior for it (when gamma_flag is off,
+        # fit_priors_pathogenic is the exact same array as fit_priors, so this
+        # intersection reduces to the original single-array condition with no
+        # behavior change). Fits invalid in only one direction are dropped
+        # entirely rather than partially retained -- simpler and lower-risk
+        # than tracking two independently-filtered fit sets through the rest
+        # of this function, at the cost of a small, documented efficiency loss.
+        valid_mask = ~(
+            np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1) |
+            np.isnan(fit_priors_pathogenic) | (fit_priors_pathogenic <= 0) | (fit_priors_pathogenic >= 1)
+        )
         fit_priors = fit_priors[valid_mask]
+        fit_priors_pathogenic = fit_priors_pathogenic[valid_mask]
         fit_gammas = fit_gammas[valid_mask]
         fits = np.array(fits)[valid_mask].tolist()
         valid_bootstrap_seeds = bootstrap_seeds[valid_mask] if bootstrap_seeds is not None else np.array([])
-        
+
         logger.info(f"  Valid priors: {len(fit_priors)}")
         pct_bootstraps_kept = (len(fit_priors) / n_fits_prefilter) if n_fits_prefilter > 0 else None
         logger.info(f"  pct_bootstraps_kept (for LR+/prior computation): {pct_bootstraps_kept:.4f}"
@@ -488,9 +534,14 @@ def process_component_fits(
             logger.warning(f"  No valid priors; skipping {component_key}")
             return None
 
-        # Compute prior
+        # Compute prior(s). 'prior' (pi, benign-direction) is unchanged in
+        # meaning/name for backward compatibility; 'prior_pathogenic' (rho) is
+        # new, only meaningful when gamma_flag.
         prior = np.nanmedian(fit_priors)
-        logger.info(f"  Prior: {prior:.6f}")
+        prior_pathogenic = np.nanmedian(fit_priors_pathogenic) if gamma_flag else np.nan
+        logger.info(f"  Prior (benign-direction, pi): {prior:.6f}")
+        if gamma_flag:
+            logger.info(f"  Prior (pathogenic-direction, rho): {prior_pathogenic:.6f}")
 
         # PU/NU unmixing floors saturating-low fits at 0.01 (get_fit_prior)
         # rather than discarding them (see its mode-gated saturation handling).
@@ -499,6 +550,8 @@ def process_component_fits(
         # real prior.
         if used_get_fit_prior and unmixing_mode and np.isclose(prior, 0.01):
             prior_unstable = True
+        if used_get_fit_prior and unmixing_mode and gamma_flag and np.isclose(prior_pathogenic, 0.01):
+            prior_pathogenic_unstable = True
 
         # gamma_hat: median assay-mechanistic-coverage estimate across bootstrap
         # fits (mirrors how `prior` itself is a nanmedian over fit_priors).
@@ -545,52 +598,125 @@ def process_component_fits(
                 for fit in all_fits_prefilter
             ))
 
-    # Compute log likelihood ratios
-    results_fpfb = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
-        delayed(compute_single_fit_log_densities)(
-            fit, prior, score_range, config.benign_method,
-            pathogenic_idx=pathogenic_idx,
-            benign_idx=benign_idx,
-            gnomad_idx=gnomad_idx,
-            synonymous_idx=synonymous_idx,
-            precomputed_log_fp=(
-                log_fp_prefilter[valid_original_indices[j]]
-                if log_fp_prefilter is not None else None
-            ),
-        )
-        for j, (fit, prior) in enumerate(zip(fits, fit_priors))
-    )
-    
-    # Unpack results
-    _log_fp = np.array([r[0] if r[0] is not None else np.full(len(score_range), np.nan) 
-                        for r in results_fpfb])
-    _log_fb = np.array([r[1] if r[1] is not None else np.full(len(score_range), np.nan) 
-                        for r in results_fpfb])
-    
-    # Get bootstrap score ranges
     acmg_mapping_method = getattr(config, "acmg_mapping_method", "tavtigian")
-    results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
-        delayed(get_bootstrap_score_ranges)(
-            fitIdx, fit, fp, fb, score_range, fit_priors, config.point_values,
-            acmg_mapping_method=acmg_mapping_method,
+
+    log_lr_pathogenic = None  # set below only when gamma_flag; stays None otherwise
+    C_pathogenic = np.array([np.nan, np.nan])
+
+    if gamma_flag:
+        # Two-LR/two-prior pathomechanism scheme: pathogenic-direction (PS3)
+        # curves/ranges from (rho, LR_D = log_fD - log_fN_pathogenic);
+        # benign-direction (BS3) from (pi, LR_PB = log_fP_raw - log_fN_benign)
+        # -- see compute_pathomechanism_lr_curves, get_bootstrap_score_ranges_dual.
+        # PN mode: log_fN_benign == log_fN_pathogenic (no unmixing, one shared
+        # anchor). PU mode: population is a mixture itself, so each direction
+        # is unmixed separately against its own native (prior, density) pair
+        # (pi/f_P_raw for benign, rho/f_D for pathogenic) -- sharing one raw,
+        # unpurified anchor between both (this function's earlier behavior)
+        # understated both LRs; confirmed on PTEN_Mighell_2018_clinvar_2018.
+        anchors_is_pu = [
+            resolve_pathomechanism_anchor(
+                fit['fit']['weights'], config.benign_method, benign_idx, synonymous_idx, gnomad_idx
+            )
+            for fit in fits
+        ]
+        results_dual_curves = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+            delayed(compute_pathomechanism_lr_curves)(
+                fit, score_range, fit['fit']['weights'][pathogenic_idx], w_N_anchor,
+                pathomechanism_method, is_pu=is_pu,
+                prior_pathogenic=fit_priors_pathogenic[i], prior_benign=fit_priors_benign[i],
+            )
+            for i, (fit, (w_N_anchor, is_pu)) in enumerate(zip(fits, anchors_is_pu))
         )
-        for fitIdx, (fit, fp, fb) in enumerate(zip(fits, _log_fp, _log_fb))
-    )
-    
-    # Aggregate results
-    log_fp = np.full((len(fits), len(score_range)), np.nan)
-    log_fb = np.full((len(fits), len(score_range)), np.nan)
-    ranges_pathogenic, ranges_benign = [], []
-    Cs = []
-    
-    for fitIdx, log_fp_local, log_fb_local, ranges_p, ranges_b, C in results:
-        log_fp[fitIdx] = log_fp_local
-        log_fb[fitIdx] = log_fb_local
-        ranges_pathogenic.append({key: np.array(value).reshape(-1) for key, value in ranges_p.items()})
-        ranges_benign.append({key: np.array(value).reshape(-1) for key, value in ranges_b.items()})
-        Cs.append(C)
-    
-    log_lr_plus = log_fp - log_fb
+
+        results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+            delayed(get_bootstrap_score_ranges_dual)(
+                fitIdx, fit, log_fD, log_fN_benign, log_fP_raw, score_range,
+                fit_priors_pathogenic, fit_priors_benign, config.point_values,
+                acmg_mapping_method=acmg_mapping_method, log_fN_pathogenic=log_fN_pathogenic,
+            )
+            for fitIdx, (fit, (log_fD, log_fN_benign, log_fP_raw, log_fN_pathogenic))
+            in enumerate(zip(fits, results_dual_curves))
+        )
+
+        log_fD_arr = np.full((len(fits), len(score_range)), np.nan)
+        log_fN_arr = np.full((len(fits), len(score_range)), np.nan)
+        log_fN_pathogenic_arr = np.full((len(fits), len(score_range)), np.nan)
+        log_fPraw_arr = np.full((len(fits), len(score_range)), np.nan)
+        ranges_pathogenic, ranges_benign = [], []
+        Cs_pathogenic, Cs = [], []  # 'Cs' stays benign-direction for backward-compat aggregation below
+
+        for (fitIdx, log_fD_local, log_fN_local, log_fP_raw_local, ranges_p, ranges_b, C_p, C_b,
+             log_fN_pathogenic_local) in results:
+            log_fD_arr[fitIdx] = log_fD_local
+            log_fN_arr[fitIdx] = log_fN_local
+            log_fN_pathogenic_arr[fitIdx] = log_fN_pathogenic_local
+            log_fPraw_arr[fitIdx] = log_fP_raw_local
+            ranges_pathogenic.append({key: np.array(value).reshape(-1) for key, value in ranges_p.items()})
+            ranges_benign.append({key: np.array(value).reshape(-1) for key, value in ranges_b.items()})
+            Cs_pathogenic.append(C_p)
+            Cs.append(C_b)
+
+        log_lr_pathogenic = log_fD_arr - log_fN_pathogenic_arr
+        # Backward-compat aliases: 'log_fp'/'log_fb'/'log_lr_plus' (and the
+        # result dict's 'prior'/'C') always represent the benign-direction
+        # (pi, mechanism-agnostic) curve, matching 'prior'=pi.
+        log_fp = log_fPraw_arr
+        log_fb = log_fN_arr
+        log_lr_plus = log_fp - log_fb
+
+        Cs_valid_p = [c for c in Cs_pathogenic if isinstance(c, (int, float)) and not (isinstance(c, float) and np.isnan(c))]
+        if Cs_valid_p:
+            C_pathogenic = np.array([
+                np.nanpercentile(Cs_valid_p, config.pathogenic_percentile),
+                np.nanpercentile(Cs_valid_p, 100 - config.pathogenic_percentile),
+            ])
+    else:
+        # Legacy single-prior/single-LR path, unchanged.
+        results_fpfb = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+            delayed(compute_single_fit_log_densities)(
+                fit, prior, score_range, config.benign_method,
+                pathogenic_idx=pathogenic_idx,
+                benign_idx=benign_idx,
+                gnomad_idx=gnomad_idx,
+                synonymous_idx=synonymous_idx,
+                precomputed_log_fp=(
+                    log_fp_prefilter[valid_original_indices[j]]
+                    if log_fp_prefilter is not None else None
+                ),
+            )
+            for j, (fit, prior) in enumerate(zip(fits, fit_priors))
+        )
+
+        # Unpack results
+        _log_fp = np.array([r[0] if r[0] is not None else np.full(len(score_range), np.nan)
+                            for r in results_fpfb])
+        _log_fb = np.array([r[1] if r[1] is not None else np.full(len(score_range), np.nan)
+                            for r in results_fpfb])
+
+        # Get bootstrap score ranges
+        results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+            delayed(get_bootstrap_score_ranges)(
+                fitIdx, fit, fp, fb, score_range, fit_priors, config.point_values,
+                acmg_mapping_method=acmg_mapping_method,
+            )
+            for fitIdx, (fit, fp, fb) in enumerate(zip(fits, _log_fp, _log_fb))
+        )
+
+        # Aggregate results
+        log_fp = np.full((len(fits), len(score_range)), np.nan)
+        log_fb = np.full((len(fits), len(score_range)), np.nan)
+        ranges_pathogenic, ranges_benign = [], []
+        Cs = []
+
+        for fitIdx, log_fp_local, log_fb_local, ranges_p, ranges_b, C in results:
+            log_fp[fitIdx] = log_fp_local
+            log_fb[fitIdx] = log_fb_local
+            ranges_pathogenic.append({key: np.array(value).reshape(-1) for key, value in ranges_p.items()})
+            ranges_benign.append({key: np.array(value).reshape(-1) for key, value in ranges_b.items()})
+            Cs.append(C)
+
+        log_lr_plus = log_fp - log_fb
 
     if config.debug:
         logger.info(f"  [DEBUG] LR+ stats: shape={log_lr_plus.shape}")
@@ -606,7 +732,7 @@ def process_component_fits(
         ])
     else:
         C = np.array([np.nan, np.nan])
-    
+
     # Detect if scoreset is flipped - USE MEAN SCORES INSTEAD OF WEIGHTS
     scoreset_flipped = False
     
@@ -659,7 +785,29 @@ def process_component_fits(
     if config.use_median_prior:
         # Use median prior for unified thresholds
         logger.info(f"  Using median prior for unified thresholds (method={acmg_mapping_method})")
-        if acmg_mapping_method == "continuous":
+        if gamma_flag:
+            # acmg_mapping_method == "continuous" is already rejected together
+            # with gamma_flag at flag-validation time above (no dual-prior
+            # sibling for calculate_classification_ranges yet), so only the
+            # tavtigian/piecewise/strict_additive path is reachable here.
+            point_ranges_pathogenic, point_ranges_benign, C_p_dual, C_b_dual = calculate_score_ranges_dual(
+                np.nanpercentile(log_lr_pathogenic[:, range_subset], config.pathogenic_percentile, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
+                prior_pathogenic, prior,
+                score_range[range_subset],
+                config.point_values,
+                acmg_mapping_method=acmg_mapping_method,
+            )
+            point_ranges = {**point_ranges_pathogenic, **point_ranges_benign}
+            if not np.isfinite(prior_pathogenic) or prior_pathogenic <= 0 or prior_pathogenic >= 1:
+                for point in point_ranges_pathogenic:
+                    point_ranges[point] = []
+            if prior <= 0 or prior >= 1:
+                for point in point_ranges_benign:
+                    point_ranges[point] = []
+            C = C_b_dual  # backward-compat: 'C' stays benign-direction, matches 'prior'=pi
+            C_pathogenic = C_p_dual
+        elif acmg_mapping_method == "continuous":
             from ..fit_utils.fit import calculate_classification_ranges
             cls_p, cls_b, lr_thresholds = calculate_classification_ranges(
                 np.nanpercentile(log_lr_plus[:, range_subset], config.pathogenic_percentile, axis=0),
@@ -826,8 +974,16 @@ def process_component_fits(
     
     # Serialize and return
     result = {
+        # 'prior' (pi) and every legacy field below stay benign-direction /
+        # mechanism-agnostic for backward compatibility -- see
+        # PipelineConfig.pathomechanism_method's docstring. 'pathomechanism_prior'
+        # (rho) is the new pathogenic-direction/mechanism-specific prior,
+        # populated only when pathomechanism_method is active.
         'prior': prior,
         'prior_unstable': bool(prior_unstable),
+        'pathomechanism_prior': prior_pathogenic if gamma_flag else None,
+        'pathomechanism_prior_unstable': bool(prior_pathogenic_unstable) if gamma_flag else False,
+        'pathomechanism_method': pathomechanism_method,
         # PLP_frac_pathomechanism_measured (a.k.a. gamma_hat): estimated fraction
         # of PLP-labeled variants whose disease mechanism this assay actually
         # measures (a 0-1 fraction, median over bootstrap fits).
@@ -838,6 +994,7 @@ def process_component_fits(
         'PLP_frac_pathomechanism_measured_unstable': bool(gamma_unstable),
         'PLP_frac_pathomechanism_measured_per_fit': fit_gammas,
         'priors': fit_priors,
+        'priors_pathogenic': fit_priors_pathogenic if gamma_flag else None,
         'pct_bootstraps_kept': pct_bootstraps_kept,
         'pct_pathogenic_rows_kept': pct_pathogenic_rows_kept,
         'valid_bootstrap_seeds': valid_bootstrap_seeds,
@@ -845,9 +1002,13 @@ def process_component_fits(
         'point_ranges': point_ranges,
         'score_range': score_range[range_subset],
         'log_lr_plus': log_lr_plus[:, range_subset],
+        'log_lr_pathogenic': (
+            log_lr_pathogenic[:, range_subset] if log_lr_pathogenic is not None else None
+        ),
         'log_fp': log_fp[:, range_subset],
         'log_fb': log_fb[:, range_subset],
         'C': C,
+        'C_pathogenic': C_pathogenic,
         'scoreset_flipped': scoreset_flipped,
         'n_valid_fits': len(fits),
         'acmg_mapping_method': acmg_mapping_method,

@@ -71,8 +71,8 @@ def parse_dataset_config(
 
     "filter_pathogenic_sample_by_lr" is NOT a per-dataset override -- it is a global,
     batch-wide setting controlled only by the --filter-pathogenic-sample-by-lr CLI flag,
-    applied uniformly to every dataset in the run. Same for "pathomechanism_prior"
-    (controlled only by --pathomechanism-prior).
+    applied uniformly to every dataset in the run. Same for "pathomechanism_method"
+    (controlled only by --pathomechanism-method).
     """
     if isinstance(config_entry, dict):
         n_c = config_entry["n_c"]
@@ -154,7 +154,7 @@ def run_single_dataset(
             "pathogenic_percentile", getattr(args, "pathogenic_percentile", 5.0)
         ),
         filter_pathogenic_sample_by_lr=getattr(args, "filter_pathogenic_sample_by_lr", False),
-        pathomechanism_prior=getattr(args, "pathomechanism_prior", True),
+        pathomechanism_method=getattr(args, "pathomechanism_method", None),
         compute_oob=args.oob,
         oob_min_samples=args.oob_min_samples,
         n_jobs=args.n_jobs_inner,
@@ -416,7 +416,7 @@ def _run_one_combo(
     liberal_monotonicity: bool = True,
     pathogenic_percentile: float = 5.0,
     filter_pathogenic_sample_by_lr: bool = False,
-    pathomechanism_prior: bool = False,
+    pathomechanism_method: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[np.ndarray]]:
     """Run one (n_c, benign_method) calibration combo and save to disk.
 
@@ -450,7 +450,7 @@ def _run_one_combo(
         seed=getattr(args, "seed", None),
         pathogenic_percentile=pathogenic_percentile,
         filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
-        pathomechanism_prior=pathomechanism_prior,
+        pathomechanism_method=pathomechanism_method,
     )
 
     # Reload scoreset inside the worker (avoids large object serialization)
@@ -558,7 +558,7 @@ def run_all_configs_for_dataset(
         "pathogenic_percentile", getattr(args, "pathogenic_percentile", 5.0)
     )
     filter_pathogenic_sample_by_lr = getattr(args, "filter_pathogenic_sample_by_lr", False)
-    pathomechanism_prior = getattr(args, "pathomechanism_prior", True)
+    pathomechanism_method = getattr(args, "pathomechanism_method", None)
     for n_c_str, benign_methods in nc_groups.items():
         ordered = sorted(benign_methods, key=lambda m: 0 if m == "avg" else 1)
         both_needed = set(ordered) == {"avg", "benign"}
@@ -575,7 +575,7 @@ def run_all_configs_for_dataset(
                 liberal_monotonicity=liberal_mono,
                 pathogenic_percentile=pathogenic_percentile,
                 filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
-                pathomechanism_prior=pathomechanism_prior,
+                pathomechanism_method=pathomechanism_method,
             )
             if is_avg and returned_log_fp is not None:
                 log_fp_all = returned_log_fp
@@ -896,9 +896,9 @@ def main():
                             "Global default for datasets that don't set 'pathogenic_percentile' in "
                             "--dataset-configs. Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
-    # experimentation only -- the pathomechanism prior (below) is the default and
-    # the two are mutually exclusive. Parses with default=None; resolve_prior_mode
-    # reconciles it against --pathomechanism-prior after parsing. Global, batch-wide.
+    # experimentation only -- mutually exclusive with --pathomechanism-prior below.
+    # Parses with default=None; resolve_prior_mode reconciles it after parsing.
+    # Global, batch-wide.
     parser.add_argument("--filter-pathogenic-sample-by-lr",
                        dest="filter_pathogenic_sample_by_lr", action="store_true", default=None,
                        help=argparse.SUPPRESS)
@@ -906,28 +906,38 @@ def main():
                        dest="filter_pathogenic_sample_by_lr", action="store_false", default=None,
                        help=argparse.SUPPRESS)
     parser.add_argument("--pathomechanism-prior",
-                       dest="pathomechanism_prior", action="store_true", default=None,
-                       help="[PN/standard-mode only] Estimate the scalar prior from the "
-                            "'pathomechanism' component of the pathogenic-labeled sample. "
-                            "Decomposes that sample's score density into "
-                            "gamma*f_D(x) + (1-gamma)*f_N(x), where f_N is FIXED to the "
-                            "already-fitted benign/synonymous density (anchored, no "
-                            "label-switching), gamma is the estimated fraction of PLP-labeled "
-                            "variants whose disease mechanism this assay actually measures, and "
-                            "f_D ('assay-relevant pathogenic' density) feeds the standard "
-                            "joint-EM prior estimator in place of the raw pathogenic sample. "
-                            "PLP_frac_pathomechanism_measured (this gamma estimate) and an "
-                            "unstable flag are reported in the calibration JSON. Only affects "
-                            "the scalar prior -- the LR+ curve used for "
-                            "per-variant evidence keeps using the raw pathogenic density. No "
-                            "effect on PU/NU-only datasets. Global, batch-wide flag applied to "
+                       dest="pathomechanism_prior_enabled", action="store_true", default=None,
+                       help="[PN/PU mode only] Enable the dual LR+/prior pathomechanism "
+                            "approach: decompose the pathogenic-labeled sample's score "
+                            "density into gamma*f_D(x) + (1-gamma)*f_N(x), where f_N is FIXED to "
+                            "an anchor density (benign/synonymous blend in PN mode, raw gnomAD in "
+                            "PU mode -- anchored, no label-switching), gamma is the estimated "
+                            "fraction of PLP-labeled variants whose disease mechanism this assay "
+                            "actually measures, and f_D ('assay-relevant pathogenic' density) "
+                            "feeds a genuinely separate pathogenic-direction (PS3) prior+LR+ pair "
+                            "(reported as pathomechanism_prior, i.e. rho = P(pathogenic AND "
+                            "mechanism-detectable)) in the calibration JSON. The benign-direction "
+                            "(BS3) prior+LR+ pair (reported as prior, i.e. pi = P(pathogenic, any "
+                            "mechanism)) always stays raw/mechanism-agnostic. "
+                            "PLP_frac_pathomechanism_measured (the gamma estimate) and stability "
+                            "flags are reported in the calibration JSON. Mutually exclusive with "
+                            "--filter-pathogenic-sample-by-lr. Global, batch-wide flag applied to "
                             "every dataset in the run -- it cannot be set per-dataset via "
-                            "--dataset-configs. This is the DEFAULT (on); pass "
-                            "--no-pathomechanism-prior to disable it.")
+                            "--dataset-configs. Default: off (raw single LR+/prior).")
     parser.add_argument("--no-pathomechanism-prior",
-                       dest="pathomechanism_prior", action="store_false", default=None,
-                       help="Disable --pathomechanism-prior (use the full, unfiltered "
-                            "pathogenic sample for prior estimation).")
+                       dest="pathomechanism_prior_enabled", action="store_false", default=None,
+                       help=argparse.SUPPRESS)
+    # EXPERIMENTAL, hidden: which f_D construction --pathomechanism-prior uses.
+    # Only meaningful when --pathomechanism-prior is enabled; defaults to
+    # 'subtraction' (per-component excess max(0, w_P - w_N), renormalized) when
+    # unset. 'masking' keeps w_P wherever it exceeds w_N, zero elsewhere,
+    # renormalized -- more generous toward borderline components, less smooth
+    # at the w_P==w_N boundary. Kept hidden: an advanced tuning knob, not a
+    # top-level user-facing choice. Global, batch-wide.
+    parser.add_argument("--pathomechanism-method",
+                       dest="pathomechanism_method", choices=["off", "subtraction", "masking"],
+                       default=None,
+                       help=argparse.SUPPRESS)
     parser.add_argument("--viz-only", action="store_true",
                        help="Regenerate visualizations only — skip variant tables and calibration JSON save "
                             "(useful for rerunning after fixing a plot bug)")
@@ -949,10 +959,20 @@ def main():
 
     args = parser.parse_args()
 
-    # Reconcile the mutually-exclusive prior-cleaning flags (defaults to the
-    # pathomechanism prior when neither is given). Applies batch-wide.
-    args.filter_pathogenic_sample_by_lr, args.pathomechanism_prior = resolve_prior_mode(
-        args.filter_pathogenic_sample_by_lr, args.pathomechanism_prior
+    # Combine the visible --pathomechanism-prior on/off toggle with the hidden
+    # --pathomechanism-method sub-choice into the single value resolve_prior_mode
+    # expects, defaulting the sub-choice to "subtraction" when enabled.
+    if args.pathomechanism_prior_enabled:
+        pm_flag = args.pathomechanism_method or "subtraction"
+    elif args.pathomechanism_prior_enabled is False:
+        pm_flag = "off"
+    else:
+        pm_flag = args.pathomechanism_method  # None unless explicitly set
+
+    # Reconcile the mutually-exclusive prior-cleaning flags (defaults to off:
+    # raw single LR+/prior). Applies batch-wide.
+    args.filter_pathogenic_sample_by_lr, args.pathomechanism_method = resolve_prior_mode(
+        args.filter_pathogenic_sample_by_lr, pm_flag
     )
 
     print("=" * 80)

@@ -1,14 +1,15 @@
 {
-  "ASPA_Grønbæk-Thygesen_2024_abundance": {
+  "ASPA_Gr\u00f8nb\u00e6k-Thygesen_2024_abundance": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
-  "ASPA_Grønbæk-Thygesen_2024_toxicity": {
+  "ASPA_Gr\u00f8nb\u00e6k-Thygesen_2024_toxicity": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "BAP1_Waters_2024": {
-    "n_c": "3c",
+    "n_c": "2c",
     "benign_method": "avg"
   },
   "BARD1_IGVF": {
@@ -17,7 +18,7 @@
   },
   "BRCA1_Adamovich_2022_Cisplatin_Resistance_clinvar_2018": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "BRCA1_Adamovich_2022_HDR_clinvar_2018": {
     "n_c": "2c",
@@ -25,11 +26,11 @@
   },
   "BRCA1_Findlay_2018_clinvar_2018": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "BRCA2_Hu_2024": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "BRCA2_Huang_2026": {
     "n_c": "3c",
@@ -41,7 +42,7 @@
   },
   "BRCA2_Sahu_2023_exon13_Cisplatin_Resistance": {
     "n_c": "3c",
-    "benign_method": "avg"
+    "benign_method": "benign"
   },
   "BRCA2_Sahu_2023_exon13_Olaparib_Resistance": {
     "n_c": "3c",
@@ -60,7 +61,7 @@
     "benign_method": "avg"
   },
   "CALM1_CALM2_CALM3_Weile_2017": {
-    "n_c": "3c",
+    "n_c": "2c",
     "benign_method": "benign"
   },
   "CARD11_Meitlis_2020_SGE_Ibrutinib_GoF": {
@@ -72,8 +73,8 @@
     "benign_method": "avg"
   },
   "CBS_Sun_2020_high_B6": {
-    "n_c": "2c",
-    "benign_method": "benign"
+    "n_c": "3c",
+    "benign_method": "avg"
   },
   "CBS_Sun_2020_low_B6": {
     "n_c": "3c",
@@ -81,7 +82,7 @@
   },
   "CHEK2_Gebbia_2024": {
     "n_c": "2c",
-    "benign_method": "avg"
+    "benign_method": "benign"
   },
   "CHEK2_McCarthy_Leo_2024": {
     "n_c": "3c",
@@ -89,7 +90,7 @@
   },
   "CRX_Shepherdson_2024": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "CTCF_IGVF": {
     "n_c": "2c",
@@ -116,7 +117,7 @@
   },
   "F9_Popp_2025_light_chain": {
     "n_c": "2c",
-    "benign_method": "avg"
+    "benign_method": "benign"
   },
   "F9_Popp_2025_strep_2": {
     "n_c": "3c",
@@ -170,7 +171,7 @@
   },
   "KCNH2_Jiang_2022": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "KCNH2_Kozek_Glazer_2020": {
     "n_c": "3c",
@@ -182,11 +183,11 @@
   },
   "KCNQ4_Zheng_2022_current_homozygous": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "KCNQ4_Zheng_2022_v12_homozygous": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "LARGE1_Ma_2024": {
     "n_c": "3c",
@@ -194,7 +195,7 @@
   },
   "LDLR_Tabet_2025_LDLR_cell_surface_abundance": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "LDLR_Tabet_2025_LDL_uptake": {
     "n_c": "3c",
@@ -203,15 +204,16 @@
   },
   "MSH2_Jia_2021_clinvar_2018": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "NDUFAF6_Sung_2024": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "OTC_Lo_2023": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "PALB2_Boonen_2026": {
     "n_c": "3c",
@@ -223,39 +225,42 @@
   },
   "PAX6_McDonnell_2024_BLX_geneticin": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "PAX6_McDonnell_2024_BLX_no_geneticin": {
-    "n_c": "2c",
-    "benign_method": "benign"
+    "n_c": "3c",
+    "benign_method": "avg"
   },
   "PAX6_McDonnell_2024_LE9_geneticin": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "PAX6_McDonnell_2024_LE9_no_geneticin": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "PTEN_Matreyek_2018_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "benign",
+    "liberal_monotonicity": false
   },
   "PTEN_Mighell_2018_clinvar_2018": {
-    "n_c": "3c",
-    "benign_method": "benign"
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
-  "RAD51C_Olvera-León_2024": {
+  "RAD51C_Olvera-Le\u00f3n_2024": {
     "n_c": "3c",
     "benign_method": "avg"
   },
   "RAD51D_IGVF": {
-    "n_c": "2c",
+    "n_c": "3c",
     "benign_method": "avg"
   },
   "RHO_Wan_2019": {
-    "n_c": "2c",
-    "benign_method": "avg"
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "SCN5A_Glazer_2020": {
     "n_c": "3c",
@@ -263,7 +268,7 @@
   },
   "SCN5A_Ma_2024": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "SFPQ_IGVF": {
     "n_c": "2c",
@@ -275,11 +280,11 @@
   },
   "TARDBP_Bolognesi_Faure_2019": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Boettcher_2019_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign",
+    "benign_method": "avg",
     "liberal_monotonicity": false
   },
   "TP53_Fayer_2021_meta_clinvar_2018": {
@@ -288,7 +293,7 @@
   },
   "TP53_Fortuno_2021_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Funk_2025_clinvar_2018": {
     "n_c": "3c",
@@ -313,35 +318,35 @@
   },
   "TP53_Kato_2003_AIP1nWT_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Kato_2003_BAXnWT_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Kato_2003_GADD45nWT_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Kato_2003_MDM2nWT_clinvar_2018": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Kato_2003_NOXAnWT_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Kato_2003_P53R2nWT_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Kato_2003_WAF1nWT_clinvar_2018": {
     "n_c": "2c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TP53_Kato_2003_h1433snWT_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "TPK1_Weile_2017": {
     "n_c": "3c",
