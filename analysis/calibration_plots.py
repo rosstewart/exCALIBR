@@ -81,6 +81,8 @@ def load_lr_values(output_dir: Path, dataset_name: str, method: Optional[str], c
 
 _METHOD_COLORS = {
     "tavtigian": "#1f77b4",
+    "acmg_bayes": "#2ca02c",
+    # Legacy tags from runs predating the ACMG-Bayes consolidation.
     "piecewise": "#ff7f0e",
     "continuous": "#2ca02c",
     "strict_additive": "#9467bd",

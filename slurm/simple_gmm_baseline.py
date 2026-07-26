@@ -160,7 +160,7 @@ def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
     # No post-processing (no enforce_monotonicity_point_ranges, no
     # extend_points_to_xlims): point_ranges is the raw output of
     # calculate_score_ranges's per-score-point threshold crossing, unlike
-    # generate_visualizations's non-continuous branch which does both.
+    # generate_visualizations's non-acmg_bayes (point-based) branch which does both.
 
     calibration = {
         "prior": float(prior),

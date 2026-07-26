@@ -158,6 +158,96 @@ def piecewise_additive_log_lr(T: ArrayLike, prior: float) -> ArrayLike:
     return out
 
 
+def piecewise_display_points(log_lr: ArrayLike, prior: float,
+                              targets: Dict[str, float] = None,
+                              floor_at_neutral: bool = False) -> ArrayLike:
+    """Invert ``piecewise_log_lr``: log(LR+) -> a (generally fractional) point
+    label, for display purposes only.
+
+    This is the ACMG-Bayes display-point conversion: given an already-known
+    (possibly combined) log(LR+) value, locate which of the three segments
+    it falls in (or which side it extrapolates beyond) and linearly invert
+    that segment's slope to solve for T instead of log(LR+). Never use the
+    result as a combination operand -- combination must always be done on
+    log(LR+) directly (see ``piecewise_log_lr``/summing it across evidence
+    items); this function only recovers an ACMG-familiar Su/M/S/VS-equivalent
+    label at the current prior for reporting.
+
+    Parameters
+    ----------
+    targets : dict, optional
+        Override target posteriors (same keys/semantics as
+        ``continuous_classify``'s ``targets``, e.g. ``{"LB": 0.01, "B":
+        0.001}``); any key not given falls back to ``DEFAULT_TARGETS``. The
+        knot T positions (-7, -1, 6, 10) stay fixed -- only which posterior
+        each knot is calibrated to changes.
+    floor_at_neutral : bool, optional
+        If True, clamp targets via ``_floor_targets_at_prior`` and insert an
+        explicit T=0 knot pinned at log(LR+)=0 (in addition to the usual
+        B/LB/LP/P knots at T=-7,-1,6,10). Together these guarantee: (1)
+        log(LR+) >= 0 is required for ANY positive display point, and
+        log(LR+) <= 0 for any negative one -- not just at the +-1
+        thresholds a points-sign confusion matrix reads, but for every
+        fractional T; and (2) the positive-side points (T>0) depend only on
+        the LP/P targets, never on LB/B, so tightening LB/B (e.g. to make
+        benign classification stricter) can no longer make positive points
+        easier to reach -- see the design discussion this was built from.
+        The cost: whenever flooring is active (prior below/above a
+        benign/pathogenic-direction target), the floored knot at T=-1 (or
+        T=6) collapses to the same log(LR+)=0 value as the new T=0 anchor,
+        one full T-unit away -- so log(LR+) values on either side of 0
+        resolve to display points about a full point apart (e.g. -1.0 vs
+        0.0) despite representing near-identical evidence. This is a
+        display-only artifact; ``continuous_classify``'s P/LP/VUS/LB/B
+        labels have no such discontinuity.
+    """
+    log_lr_arr = np.atleast_1d(np.asarray(log_lr, dtype=float))
+    lpo = float(_log_prior_odds(prior))
+    if targets is None and not floor_at_neutral:
+        knot_T = _KNOT_T
+        knot_log_lr = _KNOT_LOG_POST_ODDS - lpo
+    elif floor_at_neutral:
+        merged = {**DEFAULT_TARGETS, **(targets or {})}
+        merged = _floor_targets_at_prior(merged, prior)
+        knot_T = np.array([-7.0, -1.0, 0.0, 6.0, 10.0])
+        knot_log_lr = np.array([
+            np.log(merged["B"] / (1.0 - merged["B"])) - lpo,
+            np.log(merged["LB"] / (1.0 - merged["LB"])) - lpo,
+            0.0,
+            np.log(merged["LP"] / (1.0 - merged["LP"])) - lpo,
+            np.log(merged["P"] / (1.0 - merged["P"])) - lpo,
+        ])
+    else:
+        merged = {**DEFAULT_TARGETS, **(targets or {})}
+        knot_T = _KNOT_T
+        knot_q = np.array([merged["B"], merged["LB"], merged["LP"], merged["P"]])
+        knot_log_lr = np.log(knot_q / (1.0 - knot_q)) - lpo
+
+    n_knots = len(knot_log_lr)
+    out = np.empty_like(log_lr_arr)
+    for i, y in enumerate(log_lr_arr):
+        if y <= knot_log_lr[0]:
+            lo, hi = 0, 1
+        elif y >= knot_log_lr[-1]:
+            lo, hi = n_knots - 2, n_knots - 1
+        else:
+            lo = int(np.searchsorted(knot_log_lr, y, side="right") - 1)
+            hi = lo + 1
+        if knot_log_lr[hi] == knot_log_lr[lo]:
+            # Degenerate segment: adjacent knots collapsed to the same value
+            # (e.g. B and LB both clamp to the prior itself at an extreme
+            # prior, or -- with floor_at_neutral -- a floored knot coincides
+            # with the T=0 anchor). Report the lower knot's T.
+            out[i] = knot_T[lo]
+            continue
+        slope = (knot_log_lr[hi] - knot_log_lr[lo]) / (knot_T[hi] - knot_T[lo])
+        out[i] = knot_T[lo] + (y - knot_log_lr[lo]) / slope
+
+    if np.ndim(log_lr) == 0:
+        return float(out[0])
+    return out
+
+
 def piecewise_lr_plus(T: ArrayLike, prior: float) -> ArrayLike:
     """LR+ at total points T for prior p under Method A."""
     return np.exp(piecewise_log_lr(T, prior))
@@ -277,21 +367,57 @@ def lp_anchored_posterior(T: ArrayLike, prior: float) -> ArrayLike:
 DEFAULT_TARGETS = {"B": 0.01, "LB": 0.10, "LP": 0.90, "P": 0.99}
 
 
+def _floor_targets_at_prior(targets: Dict[str, float], prior: float) -> Dict[str, float]:
+    """Clamp benign-direction targets (B, LB) to ``min(target, prior)`` and
+    pathogenic-direction targets (LP, P) to ``max(target, prior)``.
+
+    This is exactly equivalent to flooring the corresponding log(LR+)
+    threshold at 0 (verified: ``logit(min(target, prior)) - logit(prior) ==
+    min(logit(target) - logit(prior), 0)``, and symmetrically for max/LP/P).
+    Without this, whenever ``prior < target`` for a benign-direction target
+    (or ``prior > target`` for a pathogenic-direction one), the threshold
+    requires *evidence favoring the wrong direction* to be met -- e.g. at
+    prior=0.05 with the default LB target of 0.10, reaching "Likely Benign"
+    only requires log(LR+) <= +0.75, so evidence that actually favours
+    pathogenicity (LR+ up to ~2.1) still gets classified LB. Flooring
+    guarantees LB/B require log(LR+) <= 0 and LP/P require log(LR+) >= 0,
+    at the cost of collapsing those targets toward the prior itself when the
+    gene is rare (or common) enough that the nominal target is unreachable
+    without wrong-direction evidence.
+    """
+    return {
+        "B":  min(targets["B"],  prior),
+        "LB": min(targets["LB"], prior),
+        "LP": max(targets["LP"], prior),
+        "P":  max(targets["P"],  prior),
+    }
+
+
 def continuous_lr_thresholds(prior: float,
-                             targets: Dict[str, float] = None) -> Dict[str, float]:
+                             targets: Dict[str, float] = None,
+                             floor_at_neutral: bool = False) -> Dict[str, float]:
     """LR+ value at which posterior equals each target for the given prior.
 
     Analytical: LR+(q, p) = q(1-p) / (p(1-q)).
+
+    *targets* may be a partial override (e.g. ``{"LB": 0.01, "B": 0.001}``);
+    any key not given falls back to ``DEFAULT_TARGETS``.
+
+    *floor_at_neutral*: if True, clamp targets via ``_floor_targets_at_prior``
+    so no threshold ever requires evidence in the wrong direction -- see that
+    function's docstring.
     """
-    if targets is None:
-        targets = DEFAULT_TARGETS
+    merged = {**DEFAULT_TARGETS, **(targets or {})}
+    if floor_at_neutral:
+        merged = _floor_targets_at_prior(merged, prior)
     return {name: float(bayes_lr_for_posterior(q, prior))
-            for name, q in targets.items()}
+            for name, q in merged.items()}
 
 
 def continuous_classify(lr_plus: ArrayLike,
                         prior: float,
-                        targets: Dict[str, float] = None) -> Union[str, np.ndarray]:
+                        targets: Dict[str, float] = None,
+                        floor_at_neutral: bool = False) -> Union[str, np.ndarray]:
     """Direct posterior-based classification: 'P'/'LP'/'VUS'/'LB'/'B'.
 
     Boundary convention (matches ACMG):
@@ -300,9 +426,19 @@ def continuous_classify(lr_plus: ArrayLike,
         0.10 <= post < 0.90    -> 'VUS'   (also catches the 0.01–0.10 boundary
         0.01 <  post < 0.10    -> 'LB'     overlap; we treat the lower as LB)
         post <= 0.01           -> 'B'
+
+    *targets* may be a partial override (e.g. ``{"LB": 0.01, "B": 0.001}``);
+    any key not given falls back to ``DEFAULT_TARGETS``.
+
+    *floor_at_neutral*: if True, clamp targets via ``_floor_targets_at_prior``
+    so LB/B never trigger on evidence that actually favours pathogenicity
+    (and LP/P never trigger on evidence that actually favours benignity) --
+    see that function's docstring. Off by default to preserve the exact
+    ACMG posterior-target semantics.
     """
-    if targets is None:
-        targets = DEFAULT_TARGETS
+    targets = {**DEFAULT_TARGETS, **(targets or {})}
+    if floor_at_neutral:
+        targets = _floor_targets_at_prior(targets, prior)
     post = bayes_posterior_from_lr(lr_plus, prior)
     post = np.atleast_1d(np.asarray(post, dtype=float))
     out = np.empty(post.shape, dtype=object)

@@ -2,7 +2,7 @@
 Configuration for Assay Calibration Pipeline
 """
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 @dataclass
 class PipelineConfig:
@@ -167,17 +167,33 @@ class PipelineConfig:
 
     # ACMG-mapping method: how LR+ thresholds are derived from the prior.
     #   "tavtigian"  — legacy C*-based integer-point system (default).
-    #   "piecewise"  — prior-adaptive piecewise α; integer points preserved
-    #                  with exact posterior at the four ACMG knots.
-    #   "continuous" — posterior-based classification (B/LB/VUS/LP/P) directly
-    #                  from LR+; no integer points.
+    #   "acmg_bayes" — prior-adaptive: posterior-based classification
+    #                  (B/LB/VUS/LP/P) directly from LR+, exact at the four
+    #                  ACMG boundaries for every prior, plus a display-only
+    #                  ACMG point label (Su/M/S/VS-equivalent) derived from
+    #                  the same log(LR+) for reporting. Supersedes the
+    #                  former separate "piecewise"/"continuous"/
+    #                  "strict_additive" options, which were the same
+    #                  underlying method exercised through different code
+    #                  paths (single-item vs point-tier display).
     # "all" is handled at the orchestration layer (run_pipeline / run_igvf_batch)
     # by running the calibration step once per ACMG-mapping method.
-    #   "strict_additive" — prior-dependent LSQ-optimal α(p); strictly additive
-    #                      (1 VS = 2 St = 4 M = 8 Su in log-LR at each prior);
-    #                      exact posteriors at shifting classification boundaries.
-    acmg_mapping_method: Literal["tavtigian", "piecewise", "continuous",
-                                 "strict_additive"] = "tavtigian"
+    acmg_mapping_method: Literal["tavtigian", "acmg_bayes"] = "tavtigian"
+
+    # Optional override of the acmg_bayes target posteriors, e.g.
+    # {"LB": 0.01, "B": 0.001} for stricter benign-direction targets. Any key
+    # not given falls back to bayesian_thresholds.DEFAULT_TARGETS (P=0.99,
+    # LP=0.90, LB=0.10, B=0.01). Ignored when acmg_mapping_method="tavtigian".
+    acmg_bayes_targets: Optional[Dict[str, float]] = None
+
+    # If True, clamp LB/B/LP/P targets against the gene's own prior so no
+    # threshold ever requires evidence in the wrong direction (e.g. without
+    # this, a rare gene with prior=0.05 and the default LB=0.10 target can
+    # classify a variant as "Likely Benign" from log(LR+) up to +0.75 --
+    # evidence that actually favours pathogenicity). See
+    # bayesian_thresholds._floor_targets_at_prior. Ignored when
+    # acmg_mapping_method="tavtigian".
+    acmg_bayes_floor_at_neutral: bool = False
 
     # ClinVar parameters
     clinvar_release: str = "2025"

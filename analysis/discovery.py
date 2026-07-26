@@ -21,7 +21,10 @@ import pandas as pd
 # Constants
 # ---------------------------------------------------------------------------
 
-KNOWN_METHODS = {"tavtigian", "piecewise", "continuous", "strict_additive"}
+# "acmg_bayes" is the current method (supersedes the former separate
+# "piecewise"/"continuous"/"strict_additive" tags); the legacy names are kept
+# here so filenames from historical runs still parse correctly.
+KNOWN_METHODS = {"tavtigian", "acmg_bayes", "piecewise", "continuous", "strict_additive"}
 
 # Excluded by default from analysis unless include_all=True
 DEFAULT_EXCLUDED_DATASETS = {
@@ -33,6 +36,15 @@ DEFAULT_EXCLUDED_DATASETS = {
 # benign_method suffix attached directly after n_c in output filenames, e.g.
 # "..._3c_avg_calibration.json" — part of the component token ("3c_avg"), not the method.
 BENIGN_METHODS = {"avg", "benign", "synonymous"}
+
+# Dataset-name spellings that differ between the pipeline/dataset_configs
+# naming (used throughout output directory trees) and the master TSV's own
+# "Dataset" column, not covered by new_dataset_names.csv. Scoped to this
+# analysis module only -- deliberately not added to new_dataset_names.csv,
+# which is shared with the rest of the pipeline. pipeline name -> master TSV name.
+_DATASET_TSV_NAME_ALIASES = {
+    "CHEK2_McCarthy_Leo_2024": "CHEK2_McCarthy-Leo_2024",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +264,10 @@ def _filter_dataset_df(df_full: pd.DataFrame, dataset: str, dataset_tsv: str) ->
         if alt:
             df_ds = df_full[df_full["Dataset"] == alt].copy()
     if df_ds.empty:
+        alt = _DATASET_TSV_NAME_ALIASES.get(csv_name)
+        if alt:
+            df_ds = df_full[df_full["Dataset"] == alt].copy()
+    if df_ds.empty:
         raise ValueError(f"Dataset '{csv_name}' not found in {dataset_tsv}")
     df_ds["Dataset"] = dataset
     return df_ds
@@ -269,7 +285,35 @@ def _resolve_n_jobs(n_requested: int) -> int:
         return max(1, _os.cpu_count() or 1)
 
 
-def _run_scoreset_job(dataset: str, method: str, comp: str, cal_path: Path, df_ds: pd.DataFrame):
+def _merge_oob_columns(df: pd.DataFrame, oob_csv_path: Optional[Path]) -> pd.DataFrame:
+    """Left-merge oob_points/oob_n_boots/oob_prior from a saved *_variants.csv
+    onto a freshly-built (scoreset + calibration) variant table, by
+    variant_id.
+
+    This is the *only* thing the saved CSV is still trusted for -- OOB
+    evidence is expensive to recompute (needs dataset_splits that only exist
+    mid-pipeline-run) and isn't derivable from calibration.json alone. A
+    variant present in the fresh table but absent from the saved CSV (e.g.
+    matching failure, or the dataset's saved CSV predates a variant_id fix)
+    simply gets NaN oob_* columns here -- callers using effective_points'
+    OOB-with-in-bag-fallback convention then correctly fall back to the
+    freshly-computed in-bag standard_points/classification for it, rather
+    than to a value read from the CSV.
+    """
+    if oob_csv_path is None:
+        return df
+    try:
+        saved = pd.read_csv(oob_csv_path)
+    except Exception:
+        return df
+    oob_cols = [c for c in ("oob_points", "oob_n_boots", "oob_prior") if c in saved.columns]
+    if not oob_cols or "variant_id" not in saved.columns:
+        return df
+    return df.merge(saved[["variant_id"] + oob_cols], on="variant_id", how="left")
+
+
+def _run_scoreset_job(dataset: str, method: str, comp: str, cal_path: Path, df_ds: pd.DataFrame,
+                       oob_csv_path: Optional[Path] = None):
     """Module-level (not a closure) so joblib/cloudpickle only ever pickles
     the *one* dataset slice passed in as `df_ds` for this call, matching
     slurm/prepare.py's `partitions[ds]` pattern -- a nested/closure-based
@@ -278,13 +322,14 @@ def _run_scoreset_job(dataset: str, method: str, comp: str, cal_path: Path, df_d
     silently thrash (huge duplicated payloads) instead of running in
     parallel."""
     try:
-        df = _build_variant_table_for_scoreset(dataset, df_ds, cal_path)
+        df = _build_variant_table_for_scoreset(dataset, df_ds, cal_path, oob_csv_path)
         return dataset, method, comp, df, None
     except Exception as e:
         return dataset, method, comp, None, e
 
 
-def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_path: Path) -> pd.DataFrame:
+def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_path: Path,
+                                       oob_csv_path: Optional[Path] = None) -> pd.DataFrame:
     """Worker-safe: builds one dataset's scoreset + variant table from an
     already-filtered, single-dataset slice of the master dataframe (small --
     safe to pickle to a joblib worker process) plus one calibration JSON.
@@ -292,8 +337,10 @@ def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_pat
 
     Reuses `compute_variant_table` (the same function run_igvf_batch.py's
     normal single-config path calls) with `compute_oob=False`, since OOB
-    needs `dataset_splits` that only exist mid-pipeline-run -- this only
-    recovers the standard (non-OOB) `standard_points` column.
+    needs `dataset_splits` that only exist mid-pipeline-run -- this builds
+    the in-bag standard_points/classification, auth_label, and is_vus
+    columns fresh from the scoreset, then optionally merges in oob_* columns
+    from *oob_csv_path* via _merge_oob_columns.
     """
     from src.assay_calibration.pipeline.config import PipelineConfig
     from src.assay_calibration.pipeline.utils import load_dataset_from_df
@@ -308,13 +355,15 @@ def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_pat
         clinvar_release=clinvar_release,
     )
     scoreset = load_dataset_from_df(df_ds, pcfg)
-    return compute_variant_table(scoreset=scoreset, calibration=calibration, config=pcfg)
+    df = compute_variant_table(scoreset=scoreset, calibration=calibration, config=pcfg)
+    return _merge_oob_columns(df, oob_csv_path)
 
 
 def build_variants_from_scoreset(
     dataset: str,
     cal_path: Path,
     dataset_tsv: str,
+    oob_csv_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Single-dataset convenience wrapper around _build_variant_table_for_scoreset
     for datasets that have no *_variants.csv on disk at all (e.g. runs made
@@ -329,7 +378,7 @@ def build_variants_from_scoreset(
     """
     df_full = load_master_df(dataset_tsv)
     df_ds = _filter_dataset_df(df_full, dataset, dataset_tsv)
-    return _build_variant_table_for_scoreset(dataset, df_ds, cal_path)
+    return _build_variant_table_for_scoreset(dataset, df_ds, cal_path, oob_csv_path)
 
 
 # ---------------------------------------------------------------------------
@@ -348,33 +397,44 @@ def load_all_variants(
     recompute_points: bool = False,
     dataset_tsv: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Load all variants CSVs into a single long-format DataFrame.
+    """Load all variants into a single long-format DataFrame.
 
-    Columns: variant_id, score, sample, standard_points,
+    Columns: variant_id, score, sample, standard_points, auth_label, is_vus,
              dataset, method, component
-    (plus oob_* columns when present)
+    (plus oob_* columns when the saved *_variants.csv has them)
 
-    When a method-specific variants CSV is absent but a calibration JSON exists
-    alongside a shared (default/no-method) variants CSV, standard_points are
-    recomputed from scores + calibration point_ranges so no regeneration is needed.
+    The variant table (score, sample, standard_points/classification,
+    auth_label, is_vus) is always built fresh from a Scoreset + the resolved
+    calibration JSON's point_ranges (via compute_variant_table -- the same
+    function run_igvf_batch.py itself calls at write time), never trusted
+    from an already-saved *_variants.csv: variant_id/auth_label baked into a
+    CSV written by older pipeline code can be stale or lossy (see
+    _get_variant_ids's mavedb_variant_urn history) relative to rebuilding
+    from calibration.json + a freshly-constructed Scoreset, which reproduces
+    write-time behavior exactly. The saved *_variants.csv, when present, is
+    consulted for exactly the one thing that can't be cheaply recomputed
+    here -- oob_points/oob_n_boots/oob_prior (needs dataset_splits that only
+    exist mid-pipeline-run) -- merged in by variant_id via
+    _merge_oob_columns. A variant with no matching OOB row there (e.g. the
+    saved CSV predates a variant_id fix, or simply has no OOB computed)
+    keeps its freshly-computed in-bag standard_points/classification rather
+    than falling back to a possibly-stale value read from the CSV.
 
-    When NO variants CSV exists anywhere for a dataset (e.g. output produced by
-    `run_igvf_batch.py --all-configs`, which only writes calibration.json /
-    lr_values.json.gz -- see build_variants_from_scoreset), the variant table is
-    instead built live from the scoreset (`dataset_tsv`, default
-    analysis.config.DATASET_TSV) + the resolved calibration JSON's point_ranges.
+    Falls back to trusting the saved CSV outright only when no calibration
+    JSON exists at all for a (dataset, method, comp) -- there is nothing to
+    rebuild from in that case.
 
-    recompute_points : if True, standard_points is always recomputed from
-        score + the resolved (dataset, method, comp) calibration JSON, even when
-        a method-specific variants CSV exists on disk.
+    recompute_points : retained for backward-compatible call signatures; no
+        longer changes behavior, since the base table is now always
+        recomputed from calibration.json + Scoreset regardless.
 
     Unless include_all=True, datasets in DEFAULT_EXCLUDED_DATASETS are skipped, and
     (when dataset_configs is provided) any dataset absent from dataset_configs is
     skipped too.
     """
     frames = []
-    pending = []  # [(dataset, method, comp, df_or_None)] -- df is None for scoreset_jobs entries below
-    scoreset_jobs = []  # [(dataset, method, comp, cal_path)] resolved in parallel after the main loop
+    pending = []  # [(dataset, method, comp, df)]
+    scoreset_jobs = []  # [(dataset, method, comp, cal_path, oob_csv_path)] resolved in parallel below
     for dataset, comp_dict in sorted(tree.items()):
         if datasets_filter and dataset not in datasets_filter:
             continue
@@ -389,67 +449,32 @@ def load_all_variants(
         comp = resolve_component(dataset, list(comp_dict.keys()), model_selections, dataset_configs)
         method_dict = comp_dict[comp]
 
-        # Find the shared (no-method) variants CSV for fallback recomputation.
-        default_csv = method_dict.get("default")
-        if default_csv is None:
-            base_nc = comp.split("_", 1)[0]
-            other_csvs = [
-                (c, md["default"]) for c, md in comp_dict.items()
-                if c != comp and md.get("default") is not None
-            ]
-            other_csvs.sort(key=lambda cp: cp[0].split("_", 1)[0] != base_nc)
-            if other_csvs:
-                default_csv = other_csvs[0][1]
-
         for method, path in method_dict.items():
             if methods_filter and method not in methods_filter:
                 continue
 
-            if path is not None and not recompute_points:
+            cal_path = (calibrations or {}).get(dataset, {}).get(method, {}).get(comp)
+            if cal_path is None:
+                # No calibration to rebuild from -- best-effort fall back to
+                # trusting the saved CSV outright. Rare: only when a
+                # calibration JSON is genuinely missing alongside a
+                # variants CSV.
+                if path is None:
+                    print(f"  SKIP {dataset} / {method}: no variants CSV and no calibration")
+                    continue
                 try:
                     df = pd.read_csv(path)
                 except Exception as e:
                     print(f"  WARNING: could not read {path}: {e}")
                     continue
                 pending.append((dataset, method, comp, df))
-            elif path is not None and recompute_points:
-                cal_path = (calibrations or {}).get(dataset, {}).get(method, {}).get(comp)
-                if cal_path is None:
-                    try:
-                        df = pd.read_csv(path)
-                    except Exception as e:
-                        print(f"  WARNING: could not read {path}: {e}")
-                        continue
-                else:
-                    try:
-                        base_df = pd.read_csv(path)
-                        df = _recompute_points_from_calibration(base_df, cal_path)
-                        print(f"  Recomputed standard_points for {dataset} / {method} from {cal_path.name}")
-                    except Exception as e:
-                        print(f"  WARNING: recomputation failed for {dataset} / {method}: {e}")
-                        continue
-                pending.append((dataset, method, comp, df))
-            else:
-                cal_path = (calibrations or {}).get(dataset, {}).get(method, {}).get(comp)
-                if cal_path is None:
-                    print(f"  SKIP {dataset} / {method}: no variants CSV and no calibration fallback")
-                    continue
-                if default_csv is None:
-                    # No *_variants.csv anywhere for this dataset (e.g.
-                    # --all-configs output) -- build the table live from the
-                    # scoreset. Deferred to the parallel batch below instead
-                    # of built here, so the master TSV is read/filtered once
-                    # per dataset rather than once per (dataset, method).
-                    scoreset_jobs.append((dataset, method, comp, cal_path))
-                else:
-                    try:
-                        base_df = pd.read_csv(default_csv)
-                        df = _recompute_points_from_calibration(base_df, cal_path)
-                        print(f"  Recomputed standard_points for {dataset} / {method} from {cal_path.name}")
-                    except Exception as e:
-                        print(f"  WARNING: recomputation failed for {dataset} / {method}: {e}")
-                        continue
-                    pending.append((dataset, method, comp, df))
+                continue
+
+            # Build fresh from calibration.json + Scoreset. Deferred to the
+            # parallel batch below instead of built here, so the master TSV
+            # is read/filtered once per dataset rather than once per
+            # (dataset, method).
+            scoreset_jobs.append((dataset, method, comp, cal_path, path))
 
     if scoreset_jobs:
         from analysis import config as _cfg
@@ -461,7 +486,7 @@ def load_all_variants(
         # per-dataset slice to each worker, never the full ~89-dataset master
         # frame (which would otherwise get serialized once per job).
         df_ds_by_dataset = {}
-        for dataset, _method, _comp, _cal_path in scoreset_jobs:
+        for dataset, _method, _comp, _cal_path, _oob_path in scoreset_jobs:
             if dataset not in df_ds_by_dataset:
                 try:
                     df_ds_by_dataset[dataset] = _filter_dataset_df(df_full, dataset, dataset_tsv)
@@ -472,12 +497,12 @@ def load_all_variants(
         # Split out slices that failed to filter -- report immediately and
         # don't hand them to workers at all.
         good_jobs = []
-        for dataset, method, comp, cal_path in scoreset_jobs:
+        for dataset, method, comp, cal_path, oob_path in scoreset_jobs:
             df_ds = df_ds_by_dataset[dataset]
             if isinstance(df_ds, Exception):
-                print(f"  WARNING: scoreset fallback failed for {dataset} / {method}: {df_ds}")
+                print(f"  WARNING: scoreset build failed for {dataset} / {method}: {df_ds}")
                 continue
-            good_jobs.append((dataset, method, comp, cal_path, df_ds))
+            good_jobs.append((dataset, method, comp, cal_path, oob_path, df_ds))
 
         if good_jobs:
             from joblib import Parallel, delayed
@@ -489,12 +514,12 @@ def load_all_variants(
             # call's arguments independently, so every worker receives just
             # its one dataset's slice, never the other datasets' data.
             results = Parallel(n_jobs=n_jobs, verbose=5)(
-                delayed(_run_scoreset_job)(dataset, method, comp, cal_path, df_ds)
-                for dataset, method, comp, cal_path, df_ds in good_jobs
+                delayed(_run_scoreset_job)(dataset, method, comp, cal_path, df_ds, oob_path)
+                for dataset, method, comp, cal_path, oob_path, df_ds in good_jobs
             )
             for dataset, method, comp, df, err in results:
                 if err is not None:
-                    print(f"  WARNING: scoreset fallback failed for {dataset} / {method}: {err}")
+                    print(f"  WARNING: scoreset build failed for {dataset} / {method}: {err}")
                     continue
                 print(f"  Built variant table for {dataset} / {method} from scoreset")
                 pending.append((dataset, method, comp, df))
@@ -524,6 +549,9 @@ def load_all_variants(
 # Prior override helpers
 # ---------------------------------------------------------------------------
 
+# Point-based (discretizing) methods only -- "acmg_bayes" (like the legacy
+# "continuous" it superseded) uses calculate_classification_ranges, a
+# different mechanism, and is not supported here.
 _PRIOR_OVERRIDE_METHODS = {"tavtigian", "piecewise", "strict_additive"}
 
 
@@ -555,7 +583,8 @@ def recompute_points_with_prior_overrides(
       4. Clear oob_points (set to NaN) so downstream analysis uses the recomputed values.
 
     Only methods in _PRIOR_OVERRIDE_METHODS (tavtigian, piecewise, strict_additive) are
-    supported; continuous scoring uses a different mechanism.
+    supported; acmg_bayes (and the legacy "continuous" it superseded) uses a
+    different mechanism.
     """
     import numpy as np
     from src.assay_calibration.fit_utils.fit import calculate_score_ranges

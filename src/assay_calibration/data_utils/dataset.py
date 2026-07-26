@@ -1333,6 +1333,49 @@ class Scoreset:
 
 
 
+# Canonical ClinVar review-status string for each numeric star count, matching
+# Variant.eval_quality's zero/one/two/three_star_statuses sets. Used by
+# _normalize_clinvar_star to make numeric-star source files (see its
+# docstring) behave identically to review-status-string source files.
+_STAR_COUNT_TO_STATUS = {
+    0: "no assertion criteria provided",
+    1: "criteria provided, single submitter",
+    2: "criteria provided, multiple submitters, no conflicts",
+    3: "reviewed by expert panel",
+}
+
+
+def _normalize_clinvar_star(value):
+    """Normalize a clinvar_star_* value to the ClinVar review-status STRING
+    that Variant.eval_quality's zero/one/two/three_star_statuses sets expect
+    to compare against.
+
+    Some source TSVs (integrated_variant_effect_dataset_20260526/
+    20260615.tsv.gz, sge_variants.expanded, new_igvf_variants.expanded,
+    last_batch.expanded.tsv.gz, and some rows of merged_89datasets.tsv.gz --
+    itself a concatenation of rows from multiple source files without this
+    column normalized first) store a numeric star COUNT (float, or a numeric
+    string like "1.0") instead of the review-status text that
+    pp_final.tsv.gz / excalibr_reruns.expanded.tsv.gz use. A numeric value is
+    never `==` to any status string, so `x not in {status strings}` is always
+    True for it -- silently making min_clinvar_star's quality gate a
+    complete no-op for every row from a numeric-star source. Leaves already-
+    string, NaN, and None values untouched.
+    """
+    if value is None:
+        return value
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return value  # already a real status string
+    if isinstance(value, (int, float)):
+        if pd.isna(value):
+            return value
+        return _STAR_COUNT_TO_STATUS.get(int(value), value)
+    return value
+
+
 class Variant:
     def __init__(self, variant_info, min_clinvar_star: int, clinvar_release: str, score_col: str):
         self.min_clinvar_star = min_clinvar_star
@@ -1367,6 +1410,20 @@ class Variant:
         if "clinvar_star_2026" not in variant_info:
             self.clinvar_star_2026 = variant_info.get("clinvar_star_2025", self.clinvar_star)
             self.clinvar_sig_2026 = variant_info.get("clinvar_sig_2025", self.clinvar_sig)
+        # Some source TSVs (integrated_variant_effect_dataset_20260526/
+        # 20260615.tsv.gz, sge_variants.expanded, new_igvf_variants.expanded,
+        # last_batch.expanded.tsv.gz, and some rows of merged_89datasets.tsv.gz)
+        # store clinvar_star_* as a numeric star COUNT (float, or a numeric
+        # string like "1.0") instead of the ClinVar review-status text that
+        # eval_quality's zero/one/two/three_star_statuses sets compare
+        # against (as pp_final.tsv.gz/excalibr_reruns.expanded.tsv.gz do). A
+        # numeric value is never `==` to any status string, so it silently
+        # passes every "not in {status strings}" check -- making
+        # min_clinvar_star's quality gate a complete no-op for those rows.
+        # Normalize to the equivalent status string here so eval_quality
+        # behaves identically regardless of which source file a row came from.
+        self.clinvar_star = _normalize_clinvar_star(self.clinvar_star)
+        self.clinvar_star_2026 = _normalize_clinvar_star(self.clinvar_star_2026)
         self.parse_gnomAD_MAF()
         self.parse_clinvar_sig()
         self.parse_consequences()
@@ -1418,7 +1475,10 @@ class Variant:
         
 
     def parse_auth_class(self):
-        self.auth_label = self.standardize_class(getattr(self, "StandardizedClass", None))
+        standardized_class = getattr(self, "auth_reported_func_class_category", None)
+        if standardized_class is None:
+            standardized_class = getattr(self, "StandardizedClass", None)
+        self.auth_label = self.standardize_class(standardized_class)
         if self.auth_label is not None:
             return
     

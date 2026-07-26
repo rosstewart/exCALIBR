@@ -194,17 +194,24 @@ Examples:
     
     # ACMG-mapping method
     parser.add_argument("--acmg-mapping-method",
-                       choices=["tavtigian", "piecewise", "continuous",
-                                "strict_additive", "all"],
+                       choices=["tavtigian", "acmg_bayes", "all"],
                        default="tavtigian",
                        help="ACMG-mapping method (default: tavtigian). "
-                            "'piecewise' = prior-adaptive integer-point system with exact "
-                            "ACMG boundary posteriors; 'continuous' = posterior-based "
-                            "classification with no integer points; 'strict_additive' = "
-                            "strictly additive integer-point system with prior-dependent "
-                            "LSQ-optimal alpha, prior-aware LR+ thresholds, and exact "
-                            "posteriors at shifting classification boundaries; "
-                            "'all' = run all four and write per-method output files.")
+                            "'acmg_bayes' = prior-adaptive posterior-based classification, "
+                            "exact at the four ACMG boundaries for every prior, with a "
+                            "display-only ACMG point label derived from the same log(LR+) "
+                            "for reporting (supersedes the former separate 'piecewise'/"
+                            "'continuous'/'strict_additive' options); "
+                            "'all' = run both and write per-method output files.")
+    parser.add_argument("--acmg-bayes-targets", type=json.loads, default=None,
+                       help="Override acmg_bayes target posteriors as a JSON object, "
+                            "e.g. '{\"LB\": 0.01, \"B\": 0.001}'. Any key not given falls "
+                            "back to the standard targets (P=0.99, LP=0.90, LB=0.10, "
+                            "B=0.01). Ignored when acmg-mapping-method=tavtigian.")
+    parser.add_argument("--acmg-bayes-floor-at-neutral", action="store_true",
+                       help="Clamp LB/B/LP/P targets against the gene's own prior so no "
+                            "threshold ever requires evidence in the wrong direction. "
+                            "Ignored when acmg-mapping-method=tavtigian.")
 
     # Progress reporting (for web backend)
     parser.add_argument("--progress-file", default=None,
@@ -279,10 +286,12 @@ Examples:
         pathomechanism_method=args.pathomechanism_method,
         acmg_mapping_method=(args.acmg_mapping_method
                               if args.acmg_mapping_method != "all" else "tavtigian"),
+        acmg_bayes_targets=args.acmg_bayes_targets,
+        acmg_bayes_floor_at_neutral=args.acmg_bayes_floor_at_neutral,
     )
 
     # Resolve ACMG-mapping methods to run
-    acmg_mapping_methods = (["tavtigian", "piecewise", "continuous", "strict_additive"]
+    acmg_mapping_methods = (["tavtigian", "acmg_bayes"]
                              if args.acmg_mapping_method == "all"
                              else [args.acmg_mapping_method])
 

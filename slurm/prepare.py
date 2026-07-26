@@ -221,6 +221,22 @@ def _requires_2018(df: pd.DataFrame, dataset: str) -> bool:
     return df[df["Dataset"] == dataset]["Gene"].iloc[0] in genes_2018
 
 
+def _resolve_dataset_filter(args) -> "set[str] | None":
+    """Union of --datasets and --datasets-file, or None if neither was given
+    (meaning: no filter, process every dataset in --dataframe)."""
+    names: "set[str]" = set()
+    if getattr(args, "datasets", None):
+        names.update(args.datasets)
+    datasets_file = getattr(args, "datasets_file", None)
+    if datasets_file:
+        with open(datasets_file) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    names.add(line)
+    return names or None
+
+
 def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
     """Return {dataset_name → [component_ints]} from a config JSON."""
     if config_file is None:
@@ -236,18 +252,28 @@ def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
             if old is not None:
                 key = old + ("_clinvar_2018" if dataset_name.endswith("_clinvar_2018") else "")
                 entry = cfg.get(key)
-        return [int(entry[0][0])] if entry is not None else [2, 3]
+        if entry is None:
+            return [2, 3]
+        # Two config schemas in the wild: dict entries (current, e.g.
+        # dataset_configs_jul_2026.json: {"n_c": "2c", "benign_method": "avg"})
+        # and older list/tuple entries (e.g. ["3c", "avg", {...}]) where the
+        # n_c token is the first element. Same "n_c" extraction as
+        # analysis/discovery.py's _parse_dataset_config_entry.
+        n_c = str(entry.get("n_c", "3c")) if isinstance(entry, dict) else str(entry[0])
+        if n_c == "all":
+            return [2, 3]
+        return [int(n_c[0])]
 
     return lookup
 
 
 def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type,
-                              force_gaussian=False):
+                              force_gaussian=False, default_release="2026"):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
-    dataset_name = dataset if clinvar_release == "2026" else f"{dataset}_clinvar_{clinvar_release}"
+    dataset_name = dataset if clinvar_release == default_release else f"{dataset}_clinvar_{clinvar_release}"
     save_dir = os.path.join(output_dir, dataset_name)
 
     if selected_components is None:
@@ -365,6 +391,11 @@ def run_default(args):
     output_dir = args.output_dir
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
 
+    # "default" mode. "pillar_project" mode. (see main()) reuses this same
+    # function with clinvar_default_release="2025" instead -- every dataset
+    # that isn't forced to 2018 uses this release, rather than 2026.
+    default_release = getattr(args, "clinvar_default_release", "2026")
+
     df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
     df = pd.read_csv(df_path, sep=sep)
@@ -383,10 +414,25 @@ def run_default(args):
         print("Components: [2, 3] for all datasets (no --config-file or --components given)")
 
     datasets = df.Dataset.unique()
-    print(f"Datasets: {len(datasets)}")
+    dataset_filter = _resolve_dataset_filter(args)
+    if dataset_filter is not None:
+        # --datasets/--datasets-file entries may carry the "_clinvar_2018"
+        # suffix used for pipeline *output* naming (see _requires_2018
+        # below) -- the raw Dataset column itself never does, so strip it
+        # before matching.
+        normalized_filter = {name.removesuffix("_clinvar_2018") for name in dataset_filter}
+        missing = sorted(normalized_filter - set(datasets))
+        if missing:
+            print(f"  WARNING: {len(missing)} requested dataset(s) not found in "
+                  f"--dataframe's Dataset column: {missing}")
+        datasets = [ds for ds in datasets if ds in normalized_filter]
+        print(f"Datasets: {len(datasets)} (filtered via --datasets/--datasets-file "
+              f"from {len(dataset_filter)} requested)")
+    else:
+        print(f"Datasets: {len(datasets)}")
     for ds in sorted(datasets):
-        rel = "2018" if _requires_2018(df, ds) else "2026"
-        name = ds if rel == "2026" else f"{ds}_clinvar_{rel}"
+        rel = "2018" if _requires_2018(df, ds) else default_release
+        name = ds if rel == default_release else f"{ds}_clinvar_{rel}"
         print(f"  {name}: {_comp_for(name)}c")
 
     partitions = {ds: df[df["Dataset"] == ds] for ds in datasets}
@@ -395,7 +441,8 @@ def run_default(args):
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_default_dataset)(
             partitions[ds], ds, output_dir, N_BOOTSTRAPS, NUM_FITS,
-            clinvar_release="2018" if _requires_2018(df, ds) else "2026",
+            clinvar_release="2018" if _requires_2018(df, ds) else default_release,
+            default_release=default_release,
             selected_components=_comp_for(
                 ds if not _requires_2018(df, ds) else f"{ds}_clinvar_2018"
             ),
@@ -923,22 +970,45 @@ def main():
     )
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    # ── default ──────────────────────────────────────────────────────────────
-    p_def = sub.add_parser("default", help="Univariate Scoreset from integrated TSV")
-    _add_common_args(p_def)
-    p_def.add_argument("--dataframe", default=None,
+    # ── default / pillar_project ─────────────────────────────────────────────
+    def _add_default_mode_args(p):
+        _add_common_args(p)
+        p.add_argument("--dataframe", default=None,
                        help="Input TSV/CSV (default: integrated_variant_effect_dataset.tsv.gz)")
-    p_def.add_argument("--config-file", default=None,
+        p.add_argument("--config-file", default=None,
                        help="Dataset config JSON (default: dataset_configs_jan_2026.json)")
-    p_def.add_argument("--population-type", default=None)
-    p_def.add_argument("--components", nargs="+", type=int, default=None,
+        p.add_argument("--population-type", default=None)
+        p.add_argument("--components", nargs="+", type=int, default=None,
                        help="Override component counts (default: per-config)")
-    p_def.add_argument("--force-gaussian", action="store_true",
+        p.add_argument("--force-gaussian", action="store_true",
                        help="Ablation: lock skew=0 throughout init and every EM "
                             "M-step, collapsing skew-normal components to plain "
                             "Gaussians while keeping the rest of the pipeline "
                             "(bootstraps, fit counts, constraints) identical")
-    p_def.set_defaults(func=run_default)
+        p.add_argument("--datasets", nargs="+", default=None,
+                       help="Only generate jobs for these Dataset name(s) (as they "
+                            "appear in --dataframe's Dataset column), instead of "
+                            "every unique dataset found there. Combinable with "
+                            "--datasets-file (union of both).")
+        p.add_argument("--datasets-file", default=None,
+                       help="Path to a text file with one Dataset name per line "
+                            "(blank lines and '#'-prefixed comments ignored) to "
+                            "restrict job generation to, instead of every unique "
+                            "dataset in --dataframe. Combinable with --datasets "
+                            "(union of both).")
+        return p
+
+    p_def = sub.add_parser("default", help="Univariate Scoreset from integrated TSV")
+    _add_default_mode_args(p_def)
+    p_def.set_defaults(func=run_default, clinvar_default_release="2026")
+
+    p_pillar = sub.add_parser(
+        "pillar_project",
+        help="Same as 'default', but ClinVar 2025 in place of ClinVar 2026 "
+             "everywhere (datasets forced to 2018 are unaffected)",
+    )
+    _add_default_mode_args(p_pillar)
+    p_pillar.set_defaults(func=run_default, clinvar_default_release="2025")
 
     # ── mavedb ───────────────────────────────────────────────────────────────
     p_mv = sub.add_parser("mavedb", help="Univariate Scoreset.from_mavedb")

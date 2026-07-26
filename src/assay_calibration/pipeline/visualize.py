@@ -347,10 +347,10 @@ def process_component_fits(
                 "pathomechanism_method is not supported with use_2c_equation "
                 "(n_c=2 equation path never calls get_fit_prior)."
             )
-        if getattr(config, "acmg_mapping_method", "tavtigian") == "continuous":
+        if getattr(config, "acmg_mapping_method", "tavtigian") == "acmg_bayes":
             raise NotImplementedError(
                 "pathomechanism_method is not yet supported with "
-                "acmg_mapping_method='continuous' (no dual-prior sibling for "
+                "acmg_mapping_method='acmg_bayes' (no dual-prior sibling for "
                 "calculate_classification_ranges); use another acmg_mapping_method "
                 "or set pathomechanism_method=None."
             )
@@ -699,6 +699,9 @@ def process_component_fits(
             delayed(get_bootstrap_score_ranges)(
                 fitIdx, fit, fp, fb, score_range, fit_priors, config.point_values,
                 acmg_mapping_method=acmg_mapping_method,
+                acmg_bayes_targets=getattr(config, "acmg_bayes_targets", None),
+                acmg_bayes_floor_at_neutral=getattr(
+                    config, "acmg_bayes_floor_at_neutral", False),
             )
             for fitIdx, (fit, fp, fb) in enumerate(zip(fits, _log_fp, _log_fb))
         )
@@ -786,10 +789,10 @@ def process_component_fits(
         # Use median prior for unified thresholds
         logger.info(f"  Using median prior for unified thresholds (method={acmg_mapping_method})")
         if gamma_flag:
-            # acmg_mapping_method == "continuous" is already rejected together
+            # acmg_mapping_method == "acmg_bayes" is already rejected together
             # with gamma_flag at flag-validation time above (no dual-prior
             # sibling for calculate_classification_ranges yet), so only the
-            # tavtigian/piecewise/strict_additive path is reachable here.
+            # tavtigian path is reachable here.
             point_ranges_pathogenic, point_ranges_benign, C_p_dual, C_b_dual = calculate_score_ranges_dual(
                 np.nanpercentile(log_lr_pathogenic[:, range_subset], config.pathogenic_percentile, axis=0),
                 np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
@@ -807,13 +810,15 @@ def process_component_fits(
                     point_ranges[point] = []
             C = C_b_dual  # backward-compat: 'C' stays benign-direction, matches 'prior'=pi
             C_pathogenic = C_p_dual
-        elif acmg_mapping_method == "continuous":
+        elif acmg_mapping_method == "acmg_bayes":
             from ..fit_utils.fit import calculate_classification_ranges
             cls_p, cls_b, lr_thresholds = calculate_classification_ranges(
                 np.nanpercentile(log_lr_plus[:, range_subset], config.pathogenic_percentile, axis=0),
                 np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
                 prior,
                 score_range[range_subset],
+                targets=getattr(config, "acmg_bayes_targets", None),
+                floor_at_neutral=getattr(config, "acmg_bayes_floor_at_neutral", False),
             )
             point_ranges = {**cls_p, **cls_b}
             if prior <= 0 or prior >= 1:
@@ -899,7 +904,7 @@ def process_component_fits(
     # Monotonicity enforcement and extend-to-xlims are integer-point-specific.
     # Continuous uses string-keyed ranges but still needs the outermost P and B
     # ranges extended to ±inf so scores beyond the observed range are classified.
-    if acmg_mapping_method == "continuous":
+    if acmg_mapping_method == "acmg_bayes":
         # Extend outermost pathogenic range (P, or LP if P is empty) to ±inf.
         for label in ("P", "LP"):
             ranges = point_ranges.get(label)

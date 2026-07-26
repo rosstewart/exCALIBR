@@ -57,9 +57,11 @@ def is_notebook() -> bool:
 def pretty_method(method: str) -> str:
     return {
         "tavtigian": "Tavtigian",
-        "piecewise": "Piecewise",
-        "continuous": "Continuous",
-        "strict_additive": "Strict Additive",
+        "acmg_bayes": "ACMG-Bayes",
+        # Legacy tags from runs predating the ACMG-Bayes consolidation.
+        "piecewise": "Piecewise [legacy]",
+        "continuous": "Continuous [legacy]",
+        "strict_additive": "Strict Additive [legacy]",
         "default": "ExCALIBR",
     }.get(method, method.replace("_", " ").title())
 

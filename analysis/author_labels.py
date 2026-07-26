@@ -107,35 +107,36 @@ def attach_author_labels(
     """Ensure df has an 'auth_label' column, rebuilding via Scoreset only
     where needed.
 
-    As of the pipeline's compute_variant_table writing auth_label directly
-    into *_variants.csv (when the Scoreset used to score a dataset actually
-    has labels — see variant_evidence.py::_build_standard_table /
-    _build_continuous_table), most datasets loaded via
-    analysis.discovery.load_all_variants already carry real auth_label
-    values straight from disk — no Scoreset rebuild required for those.
-
-    Only datasets with zero non-null auth_label values in `df` (older output
-    predating that pipeline change, or genuinely no author labels available)
-    fall back to rebuilding a Scoreset per dataset from the master dataframe,
-    which is the slow path this function used to always take for everything.
+    analysis.discovery.load_all_variants now always builds its variant table
+    fresh from a Scoreset + calibration.json (never trusting an already-saved
+    *_variants.csv for anything but oob_points -- see its docstring), and
+    that same Scoreset construction populates auth_label directly. So every
+    dataset loaded via load_all_variants already carries real auth_label
+    values by the time this function runs -- this is now effectively a
+    validating no-op for that path, not a second, independent Scoreset
+    reload. The slow per-dataset Scoreset-rebuild branch below only exists
+    as a safety net for callers that hand this function a `df` built some
+    other way (e.g. a raw pd.read_csv of an old *_variants.csv, which can
+    predate auth_label export entirely).
     """
     df = df.copy()
     if "auth_label" not in df.columns:
         df["auth_label"] = np.nan
 
-    has_label_from_csv = df.groupby("dataset")["auth_label"].transform(lambda s: s.notna().any())
-    datasets_needing_rebuild = sorted(df.loc[~has_label_from_csv, "dataset"].unique())
+    has_label = df.groupby("dataset")["auth_label"].transform(lambda s: s.notna().any())
+    datasets_needing_rebuild = sorted(df.loc[~has_label, "dataset"].unique())
 
-    n_from_csv = int((has_label_from_csv & df["auth_label"].notna()).sum())
-    print(f"\nAuthor labels: {n_from_csv}/{len(df)} variants already carried "
-          f"auth_label from the pipeline's own *_variants.csv output.")
+    n_already_labeled = int((has_label & df["auth_label"].notna()).sum())
+    print(f"\nAuthor labels: {n_already_labeled}/{len(df)} variants already carried "
+          f"auth_label (normally from load_all_variants' scoreset+calibration rebuild; "
+          f"from the saved *_variants.csv only for a df built some other way).")
 
     if not datasets_needing_rebuild:
         print("  No datasets need Scoreset rebuild — done.")
         return df
 
     print(f"  Rebuilding Scoresets for {len(datasets_needing_rebuild)} dataset(s) "
-          f"without auth_label in their variants CSV: {datasets_needing_rebuild}")
+          f"without auth_label: {datasets_needing_rebuild}")
     sep = "\t" if dataset_tsv.endswith((".tsv", ".tsv.gz")) else ","
     df_full = pd.read_csv(dataset_tsv, sep=sep, low_memory=False)
 

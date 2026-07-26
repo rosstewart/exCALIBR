@@ -183,7 +183,7 @@ def extend_points_to_xlims(point_ranges, point_values, score_range, scoreset_fli
             point_ranges[neg] = []
             print(neg,'extends the whole score range, removing...')
 
-        
+
 def prior_equation_2c(w_p, w_b, w_g):
     return (w_g[1] - w_b[1]) / (w_p[1] - w_b[1])
 
@@ -857,7 +857,8 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
         no_signal_prior=no_signal_prior), gamma_hat
 
 def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, point_values,
-                                acmg_mapping_method="tavtigian"):
+                                acmg_mapping_method="tavtigian", acmg_bayes_targets=None,
+                                acmg_bayes_floor_at_neutral=False):
     fit_xmin, fit_xmax = fit['fit']['xlims']
     mask = (score_range >= fit_xmin) & (score_range <= fit_xmax)# & ((fp > -7.0) | (fb > -7.0)) # add min density check
 
@@ -874,12 +875,13 @@ def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, poi
     lrP = log_fp_local[mask] - log_fb_local[mask]
     s = score_range[mask]
 
-    if acmg_mapping_method == "continuous":
+    if acmg_mapping_method == "acmg_bayes":
         from .fit import calculate_classification_ranges
         ranges_p, ranges_b, thresholds = calculate_classification_ranges(
-            lrP, lrP, fit_priors[fitIdx], s
+            lrP, lrP, fit_priors[fitIdx], s, targets=acmg_bayes_targets,
+            floor_at_neutral=acmg_bayes_floor_at_neutral,
         )
-        # For continuous, "C" slot carries the LR+ threshold dict (not an int).
+        # For acmg_bayes, "C" slot carries the LR+ threshold dict (not an int).
         C = thresholds
     else:
         ranges_p, ranges_b, C = calculate_score_ranges(
@@ -887,7 +889,7 @@ def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, poi
             acmg_mapping_method=acmg_mapping_method,
         )
         if C is not None:
-            C = int(C)  # tavtigian path returns int; piecewise returns None
+            C = int(C)  # tavtigian path returns int
 
     if prior_invalid(fit_priors[fitIdx]):
         log_fp_local = np.full_like(fp, np.nan, dtype=float)
@@ -925,16 +927,16 @@ def get_bootstrap_score_ranges_dual(fitIdx, fit, log_fD, log_fN_benign, log_fP_r
     invalid, while the benign-direction ranges (which don't depend on log_fD)
     are still computed normally.
 
-    acmg_mapping_method == "continuous" is not supported here (no dual-prior
+    acmg_mapping_method == "acmg_bayes" is not supported here (no dual-prior
     sibling for calculate_classification_ranges yet) -- raises
     NotImplementedError rather than silently using the wrong thresholds.
     """
-    if acmg_mapping_method == "continuous":
+    if acmg_mapping_method == "acmg_bayes":
         raise NotImplementedError(
-            "acmg_mapping_method='continuous' is not yet supported together "
+            "acmg_mapping_method='acmg_bayes' is not yet supported together "
             "with pathomechanism_method (no dual-prior sibling for "
-            "calculate_classification_ranges); use 'tavtigian', 'piecewise', "
-            "or 'strict_additive', or set pathomechanism_method=None."
+            "calculate_classification_ranges); use 'tavtigian', "
+            "or set pathomechanism_method=None."
         )
     if log_fN_pathogenic is None:
         log_fN_pathogenic = log_fN_benign
@@ -1663,7 +1665,7 @@ def compute_oob_variant_evidence_multi_method(
     Parameters
     ----------
     acmg_mapping_methods : sequence of str
-        Methods to evaluate (e.g. ``["tavtigian", "piecewise"]``).  Each name
+        Methods to evaluate (e.g. ``["tavtigian", "acmg_bayes"]``).  Each name
         must be understood by ``calculate_score_ranges`` / ``thresholds_from_prior``.
 
     Returns

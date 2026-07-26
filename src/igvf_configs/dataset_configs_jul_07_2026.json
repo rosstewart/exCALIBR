@@ -8,7 +8,7 @@
     "benign_method": "avg"
   },
   "BAP1_Waters_2024": {
-    "n_c": "2c",
+    "n_c": "3c",
     "benign_method": "avg"
   },
   "BARD1_IGVF": {
@@ -41,7 +41,7 @@
   },
   "BRCA2_Sahu_2023_exon13_Cisplatin_Resistance": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "avg"
   },
   "BRCA2_Sahu_2023_exon13_Olaparib_Resistance": {
     "n_c": "3c",
@@ -84,10 +84,6 @@
     "benign_method": "avg"
   },
   "CHEK2_McCarthy_Leo_2024": {
-    "n_c": "3c",
-    "benign_method": "avg"
-  },
-  "CHEK2_McCarthy-Leo_2024": {
     "n_c": "3c",
     "benign_method": "avg"
   },
@@ -198,7 +194,7 @@
   },
   "LDLR_Tabet_2025_LDLR_cell_surface_abundance": {
     "n_c": "3c",
-    "benign_method": "avg"
+    "benign_method": "benign"
   },
   "LDLR_Tabet_2025_LDL_uptake": {
     "n_c": "3c",
@@ -215,8 +211,7 @@
   },
   "OTC_Lo_2023": {
     "n_c": "3c",
-    "benign_method": "avg",
-    "liberal_monotonicity": false
+    "benign_method": "avg"
   },
   "PALB2_Boonen_2026": {
     "n_c": "3c",
@@ -244,20 +239,18 @@
   },
   "PTEN_Matreyek_2018_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "benign",
-    "liberal_monotonicity": false
+    "benign_method": "benign"
   },
   "PTEN_Mighell_2018_clinvar_2018": {
-    "n_c": "2c",
-    "benign_method": "avg",
-    "liberal_monotonicity": false
+    "n_c": "3c",
+    "benign_method": "benign"
   },
   "RAD51C_Olvera-León_2024": {
     "n_c": "3c",
     "benign_method": "avg"
   },
   "RAD51D_IGVF": {
-    "n_c": "3c",
+    "n_c": "2c",
     "benign_method": "avg"
   },
   "RHO_Wan_2019": {
@@ -286,7 +279,7 @@
   },
   "TP53_Boettcher_2019_clinvar_2018": {
     "n_c": "3c",
-    "benign_method": "avg",
+    "benign_method": "benign",
     "liberal_monotonicity": false
   },
   "TP53_Fayer_2021_meta_clinvar_2018": {

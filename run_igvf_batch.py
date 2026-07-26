@@ -147,6 +147,7 @@ def run_single_dataset(
         components=component_list,
         use_median_prior=True,
         use_2c_equation=False,
+        manual_prior=getattr(args, "manual_prior", None),
         liberal_monotonicity=overrides.get("liberal_monotonicity", True),
         benign_method=benign_method,
         scoreset_flipped_override=overrides.get("scoreset_flipped_override", None),
@@ -166,6 +167,12 @@ def run_single_dataset(
         sample_names=args.sample_names if hasattr(args, "sample_names") else None,
         debug=args.debug if hasattr(args, "debug") else False,
         acmg_mapping_method=acmg_mapping_method,
+        acmg_bayes_targets=overrides.get(
+            "acmg_bayes_targets", getattr(args, "acmg_bayes_targets", None)
+        ),
+        acmg_bayes_floor_at_neutral=overrides.get(
+            "acmg_bayes_floor_at_neutral", getattr(args, "acmg_bayes_floor_at_neutral", False)
+        ),
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         seed=getattr(args, "seed", None),
     )
@@ -438,6 +445,7 @@ def _run_one_combo(
         components=[n_c_int],
         use_median_prior=True,
         use_2c_equation=False,
+        manual_prior=getattr(args, "manual_prior", None),
         liberal_monotonicity=liberal_monotonicity,
         benign_method=benign_method,
         clinvar_release=clinvar_release,
@@ -447,6 +455,8 @@ def _run_one_combo(
         n_jobs=n_bootstrap_jobs,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         acmg_mapping_method=getattr(args, "acmg_mapping_method", "tavtigian"),
+        acmg_bayes_targets=getattr(args, "acmg_bayes_targets", None),
+        acmg_bayes_floor_at_neutral=getattr(args, "acmg_bayes_floor_at_neutral", False),
         seed=getattr(args, "seed", None),
         pathogenic_percentile=pathogenic_percentile,
         filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
@@ -684,6 +694,7 @@ def generate_all_configs_viz(
         components=[2],
         use_median_prior=True,
         use_2c_equation=False,
+        manual_prior=getattr(args, "manual_prior", None),
         liberal_monotonicity=(overrides or {}).get("liberal_monotonicity", True),
         benign_method="avg",
         clinvar_release=clinvar_release,
@@ -865,6 +876,12 @@ def main():
                        choices=["all_variants", "all_nsSNV", "all_missense_nsSNV",
                                 "gnomAD", "gnomAD_nsSNV", "gnomAD_missense_nsSNV"])
 
+    # Manual prior override (batch-wide -- applies to every dataset in this run)
+    parser.add_argument("--manual-prior", type=float, default=None,
+                       help="Manually set the prior probability (0-1) for every dataset in "
+                            "this batch, skipping empirical prior estimation entirely. "
+                            "Omit for the default per-dataset estimated prior.")
+
     # Skip already-completed datasets
     parser.add_argument("--skip-existing", action="store_true",
                        help="Skip datasets whose calibration JSON output already exists "
@@ -950,12 +967,26 @@ def main():
                        help="Write a config template JSON (all datasets with n_c/benign_method=null) "
                             "and exit. Preserves override fields from --dataset-configs if provided.")
     parser.add_argument("--acmg-mapping-method",
-                       choices=["tavtigian", "piecewise", "continuous",
-                                "strict_additive", "all"],
+                       choices=["tavtigian", "acmg_bayes", "all"],
                        default="tavtigian",
                        help="ACMG-mapping method (default: tavtigian). "
-                            "'all' runs tavtigian and piecewise and writes per-method "
-                            "output files for comparison.")
+                            "'acmg_bayes' = prior-adaptive posterior-based classification, "
+                            "exact at every ACMG boundary for every prior, with a "
+                            "display-only ACMG point label for reporting (supersedes the "
+                            "former separate 'piecewise'/'continuous'/'strict_additive' "
+                            "options); 'all' runs tavtigian and acmg_bayes and writes "
+                            "per-method output files for comparison.")
+    parser.add_argument("--acmg-bayes-targets", type=json.loads, default=None,
+                       help="Override acmg_bayes target posteriors as a JSON object, "
+                            "e.g. '{\"LB\": 0.01, \"B\": 0.001}'. Any key not given falls "
+                            "back to the standard targets (P=0.99, LP=0.90, LB=0.10, "
+                            "B=0.01). Ignored when acmg-mapping-method=tavtigian.")
+    parser.add_argument("--acmg-bayes-floor-at-neutral", action="store_true",
+                       help="Clamp LB/B/LP/P targets against the gene's own prior so no "
+                            "threshold ever requires evidence in the wrong direction (e.g. "
+                            "without this, a rare gene can classify a variant 'Likely "
+                            "Benign' from evidence that actually favours pathogenicity). "
+                            "Ignored when acmg-mapping-method=tavtigian.")
 
     args = parser.parse_args()
 
@@ -1022,10 +1053,13 @@ def main():
         base = dataset_name.replace("_clinvar_2018", "")
         return base.split("_")[0]
 
-    # Drive iteration from CSV datasets; configs are optional per-dataset overrides
+    # Drive iteration from CSV datasets; configs are optional per-dataset overrides.
+    # --datasets is matched below against the *effective* (ClinVar-2018-suffixed)
+    # name as well as the bare CSV name, since dataset_configs and this batch's
+    # own output/config keys use the suffixed form (e.g. "..._clinvar_2018") for
+    # BRCA1/MSH2/PTEN/TP53 datasets, while df["Dataset"] never carries it.
     csv_datasets = sorted(df["Dataset"].unique())
-    if args.datasets:
-        csv_datasets = [d for d in csv_datasets if d in set(args.datasets)]
+    requested_datasets = set(args.datasets) if args.datasets else None
 
     # --generate-config-template: emit a blank config and exit
     if getattr(args, "generate_config_template", None):
@@ -1035,6 +1069,8 @@ def main():
                 eff = f"{dataset_name}_clinvar_2018"
             else:
                 eff = dataset_name
+            if requested_datasets and eff not in requested_datasets and dataset_name not in requested_datasets:
+                continue
             if eff not in all_bootstrap_results and dataset_name not in all_bootstrap_results:
                 continue
             existing = (dataset_configs.get(eff) or dataset_configs.get(dataset_name) or [])
@@ -1066,6 +1102,11 @@ def main():
             clinvar_mode = "default"
             effective_dataset_name = dataset_name
             bootstrap_key = dataset_name
+
+        if (requested_datasets
+                and effective_dataset_name not in requested_datasets
+                and dataset_name not in requested_datasets):
+            continue
 
         if bootstrap_key not in all_bootstrap_results:
             print(f"  SKIP {dataset_name}: not in precomputed fits "
@@ -1181,7 +1222,7 @@ def main():
         print(f"\n{'='*80}\nALL-CONFIGS COMPLETE\n{'='*80}")
         return
 
-    acmg_mapping_methods = (["tavtigian", "piecewise"]
+    acmg_mapping_methods = (["tavtigian", "acmg_bayes"]
                              if args.acmg_mapping_method == "all"
                              else [args.acmg_mapping_method])
     suffix = (lambda m: "" if (len(acmg_mapping_methods) == 1 and m == "tavtigian")

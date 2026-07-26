@@ -62,16 +62,30 @@ def _assign_points(score: float, flat_ranges: Dict) -> int:
 
 
 def _get_variant_ids(scoreset) -> List[str]:
-    """Best-effort variant ID extraction; falls back to integer index."""
+    """Best-effort variant ID extraction; falls back to integer index.
+
+    *key* here is exactly get_variants_by_id's own grouping key
+    (mavedb_variant_urn when the variant has one, else variant.ID) -- use it
+    directly rather than re-deriving an id from v.ID, which is a different,
+    typically-unset attribute (renders as the literal string "None" in every
+    exported id otherwise). Two variants that are genomically identical
+    (same Gene/Chrom/hgvs_c) but are distinct MaveDB library entries with
+    independently measured scores -- e.g. different barcoded/codon-level
+    designs collapsing to the same net single-nucleotide cDNA change -- are
+    correctly kept as separate groups by get_variants_by_id (grouped by
+    mavedb_variant_urn), but previously collided into one exported
+    variant_id string once v.ID (None for both) made the distinguishing
+    field disappear. Using *key* preserves that distinction end to end.
+    """
     ids = []
     if hasattr(scoreset, "get_variants_by_id") and hasattr(scoreset, "_keep_mask"):
         variants_by_id = scoreset.get_variants_by_id()
         kept = 0
-        for all_idx, (_, variants) in enumerate(variants_by_id.items()):
+        for all_idx, (key, variants) in enumerate(variants_by_id.items()):
             if scoreset._keep_mask[all_idx]:
                 v = variants[0]
                 if hasattr(v, "ID"):
-                    ids.append(f"{v.ID}_{v.Gene}_{v.Chrom}_{v.hgvs_c}")
+                    ids.append(f"{key}_{v.Gene}_{v.Chrom}_{v.hgvs_c}")
                 else:
                     ids.append(f"variant_{kept}")
                 kept += 1
@@ -220,51 +234,96 @@ def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0) 
 
 
 def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame:
-    """Continuous (Method B) per-variant table.
+    """ACMG-Bayes per-variant table.
 
-    Interpolates LR+ from the calibration's median bootstrap LR+ curve,
-    computes posterior at the calibration's prior, and assigns a label
-    ('P'/'LP'/'VUS'/'LB'/'B') via direct posterior comparison.
+    Never classifies from a single median/point-estimate log(LR+) curve.
+    Instead, mirrors point_ranges.py's discrete OOB evidence-assignment rule
+    (5th percentile of the bootstrap log(LR+) distribution for
+    pathogenic-direction evidence, 95th percentile for benign-direction
+    evidence -- the same conservative bounds _build_standard_table already
+    uses for Tavtigian's standard_points via
+    _compute_bootstrap_lr_percentiles), generalized to the continuous
+    posterior/classification/display-point representation:
+
+      - Evaluate the pathogenic candidate from the 5th-percentile bound and
+        the benign candidate from the 95th-percentile bound independently.
+      - A candidate is only used if it actually leaves VUS under
+        continuous_classify at the gene's prior/targets -- NOT if its
+        log(LR+) is merely positive/negative. A hardcoded log(LR+)=0 cutoff
+        is only correct when the real LP/LB decision boundary happens to
+        sit at neutral evidence; it doesn't in general (e.g. prior below the
+        LB target with floor_at_neutral off, where the real LB boundary
+        sits at a *positive* log(LR+) -- exactly the miscalibration this
+        method exists to fix).
+      - If both candidates leave VUS (shouldn't normally happen), keep
+        whichever is farther from neutral. If neither does, the variant is
+        VUS by construction, and the milder (closer-to-neutral) bound is
+        reported as lr_plus/posterior for display only.
     """
     import sys, os
     _SRC = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if _SRC not in sys.path:
         sys.path.insert(0, _SRC)
     from assay_calibration.fit_utils.bayesian_thresholds import (
-        bayes_posterior_from_lr, continuous_classify,
+        bayes_posterior_from_lr, continuous_classify, piecewise_display_points,
     )
 
-    score_range = np.asarray(calibration["score_range"], dtype=float)
-    log_lr = np.asarray(calibration["log_lr_plus"], dtype=float)
-    # Aggregate bootstrap LR+ curves to a single median curve (use median to
-    # be robust; this matches the spirit of the median-prior path).
-    if log_lr.ndim == 2:
-        log_lr_curve = np.nanmedian(log_lr, axis=0)
-    else:
-        log_lr_curve = log_lr
-
     prior = float(calibration["prior"])
+    targets = getattr(config, "acmg_bayes_targets", None)
+    floor_at_neutral = getattr(config, "acmg_bayes_floor_at_neutral", False)
+    percentile = getattr(config, "pathogenic_percentile", 5.0)
     ids = _get_variant_ids(scoreset)
     auth_labels = getattr(scoreset, "auth_labels", None)
     is_vus = _get_variant_is_vus(scoreset)
 
-    # Interpolate LR+ at each variant's score
-    def _interp_log_lr(s):
-        if s is None or np.isnan(s):
-            return np.nan
-        return float(np.interp(s, score_range, log_lr_curve,
-                               left=np.nan, right=np.nan))
+    scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
+    lr_5, lr_95, _, _ = _compute_bootstrap_lr_percentiles(scores, calibration, percentile)
+    if lr_5 is None:
+        raise ValueError(
+            "_build_continuous_table (ACMG-Bayes) requires bootstrap log(LR+) curves "
+            "(calibration['log_lr_plus'] as a per-bootstrap matrix, or log_fp/log_fb) "
+            "to compute the 5th/95th percentile bounds -- ACMG-Bayes never classifies "
+            "from a single median/point-estimate curve."
+        )
+    log_lr_5 = np.log(lr_5)
+    log_lr_95 = np.log(lr_95)
 
     rows = []
     for idx in range(len(scoreset.scores)):
-        score = float(scoreset.scores[idx])
-        log_lr_i = _interp_log_lr(score)
-        if np.isnan(log_lr_i):
-            lr_i = np.nan; post_i = np.nan; label = "Unknown"
+        score = scores[idx]
+        l5, l95 = log_lr_5[idx], log_lr_95[idx]
+
+        if np.isnan(l5) and np.isnan(l95):
+            lr_i = np.nan; post_i = np.nan; label = "Unknown"; display_pts = np.nan
         else:
-            lr_i = float(np.exp(log_lr_i))
-            post_i = float(bayes_posterior_from_lr(lr_i, prior))
-            label = str(continuous_classify(lr_i, prior))
+            cat_p5 = (str(continuous_classify(np.exp(l5), prior, targets, floor_at_neutral))
+                      if not np.isnan(l5) else "Unknown")
+            cat_p95 = (str(continuous_classify(np.exp(l95), prior, targets, floor_at_neutral))
+                       if not np.isnan(l95) else "Unknown")
+            path_ok = cat_p5 in ("LP", "P")
+            ben_ok = cat_p95 in ("LB", "B")
+
+            if path_ok and ben_ok:
+                use_path = abs(l5) >= abs(l95)
+            elif path_ok:
+                use_path = True
+            elif ben_ok:
+                use_path = False
+            else:
+                use_path = None
+
+            if use_path is None:
+                l_rep = l5 if (not np.isnan(l5) and (np.isnan(l95) or abs(l5) <= abs(l95))) else l95
+                lr_i = float(np.exp(l_rep))
+                post_i = float(bayes_posterior_from_lr(lr_i, prior))
+                label = "VUS"
+                display_pts = 0.0
+            else:
+                l_use = l5 if use_path else l95
+                lr_i = float(np.exp(l_use))
+                post_i = float(bayes_posterior_from_lr(lr_i, prior))
+                label = cat_p5 if use_path else cat_p95
+                display_pts = float(piecewise_display_points(l_use, prior, targets, floor_at_neutral))
 
         # See _build_standard_table's identical logic — sample_assignments is
         # multi-label; keep every matching category, pipe-separated.
@@ -282,6 +341,7 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
             "lr_plus": lr_i,
             "posterior": post_i,
             "classification": label,
+            "display_points": display_pts,
         }
         if auth_labels is not None:
             row["auth_label"] = auth_labels[idx]
@@ -600,7 +660,7 @@ def compute_variant_table(
         "acmg_mapping_method",
         getattr(config, "acmg_mapping_method", "tavtigian"),
     )
-    if acmg_mapping_method == "continuous":
+    if acmg_mapping_method == "acmg_bayes":
         df = _build_continuous_table(scoreset, calibration, config)
     else:
         df = _build_standard_table(scoreset, calibration, getattr(config, "pathogenic_percentile", 5.0))
@@ -608,8 +668,8 @@ def compute_variant_table(
         f"(acmg_mapping_method={acmg_mapping_method})")
 
     # --- OOB assignment (optional) ---
-    if config.compute_oob and acmg_mapping_method == "continuous":
-        log("  Note: OOB evidence not supported for continuous acmg_mapping_method; skipping")
+    if config.compute_oob and acmg_mapping_method == "acmg_bayes":
+        log("  Note: OOB evidence not supported for acmg_bayes acmg_mapping_method; skipping")
     elif config.compute_oob:
         if dataset_splits is None:
             log("  WARNING: OOB requested but no dataset_splits provided; skipping")

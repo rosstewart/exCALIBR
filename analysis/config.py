@@ -22,14 +22,14 @@ def _env(name: str, default: str) -> str:
 # *_calibration.json, *_lr_values.json.gz written by run_igvf_batch.py.
 OUTPUT_DIR = _env(
     "EXCALIBR_OUTPUT_DIR",
-    "/data/ross/assay_calibration/explorer_jobs_pp_revisions_calib_contam",
+    "/data/ross/assay_calibration/explorer_jobs_pp_revisions_calib",
 )
 
 # Master integrated variant-effect dataframe (all datasets, one row per
 # variant measurement) — the --dataset input to run_igvf_batch.py.
 DATASET_TSV = _env(
     "EXCALIBR_DATASET_TSV",
-    "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_merged_89datasets.tsv.gz",
+    "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz",
 )
 
 # Dataset -> (n_c, benign_method[, overrides]) config JSON, same file passed
@@ -93,7 +93,7 @@ YURIY_OR_CSV = _env(
 # computed fresh from pipeline output regardless of whether this file exists.
 OP_EVIDENCE_CODES_CSV = _env(
     "EXCALIBR_OP_EVIDENCE_CODES_CSV",
-    "/data/ross/assay_calibration/dataframe/OP_clinvar18_25_122325.csv",
+    "/data/ross/assay_calibration/dataframe/OddsPath_calibrations.csv",
 )
 
 EVIDENCE_COUNTS_DIR = _env(

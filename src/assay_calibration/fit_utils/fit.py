@@ -891,12 +891,30 @@ def calculate_score_ranges_dual(log_lr_pathogenic, log_lr_benign, prior_pathogen
     return pathogenic_ranges, benign_ranges, C_p, C_b
 
 
-def calculate_classification_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores):
+def calculate_classification_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores,
+                                     targets=None, floor_at_neutral=False):
     """Continuous-method (Method B) analogue of calculate_score_ranges.
 
     Returns score intervals keyed by classification label rather than by
     integer points.  Boundaries are exact: a score falls in label "P" iff
     the posterior from its LR+ is >= 0.99 at the given prior, etc.
+
+    Parameters
+    ----------
+    targets : dict, optional
+        Override target posteriors, e.g. ``{"LB": 0.01, "B": 0.001}``.
+        Any key not given falls back to
+        ``bayesian_thresholds.DEFAULT_TARGETS`` (P=0.99, LP=0.90, LB=0.10,
+        B=0.01). LP/P are rarely changed; LB/B are the common override for
+        stricter benign-direction targets.
+    floor_at_neutral : bool, optional
+        If True, clamp targets so LB/B never trigger on evidence that
+        actually favours pathogenicity (and LP/P never trigger on evidence
+        favouring benignity) -- see
+        ``bayesian_thresholds._floor_targets_at_prior``. Otherwise a target
+        below (resp. above) the prior can be satisfied by wrong-direction
+        evidence, since reaching that posterior doesn't require overcoming
+        the prior in that direction.
 
     Returns
     -------
@@ -904,8 +922,10 @@ def calculate_classification_ranges(log_lrPlusLow, log_lrPlusHigh, prior, scores
     benign_ranges     : {"B": [[lo,hi], ...], "LB": [...]}
     thresholds        : dict label -> LR+ threshold (continuous)
     """
-    from .bayesian_thresholds import continuous_lr_thresholds
-    thresholds = continuous_lr_thresholds(prior)
+    from .bayesian_thresholds import continuous_lr_thresholds, DEFAULT_TARGETS
+    merged_targets = {**DEFAULT_TARGETS, **(targets or {})}
+    thresholds = continuous_lr_thresholds(prior, merged_targets,
+                                          floor_at_neutral=floor_at_neutral)
 
     def _ranges(log_lr_arr, labels_in_order, lr_thresholds, scores):
         # labels_in_order: ascending in LR+ stringency, e.g. ["LP", "P"] for path
