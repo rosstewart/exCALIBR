@@ -3,10 +3,15 @@
 ExCALIBR bootstrap fit worker — runs one SLURM array task.
 
 Usage:
-    python slurm/run_array_task.py <output_dir> <array_idx>
+    python slurm/run_array_task.py <output_dir> <array_idx> [--device {cpu,gpu}]
 
 Loads <output_dir>/jobs/array_<NNNN>.pkl, runs the fits it describes,
 and writes per-bootstrap results to <output_dir>/<dataset_name>/.
+
+--device gpu batches jobs sharing (dataset, num_components, multivariate)
+through src/assay_calibration/fit_utils/jax_batch (see its module docstring)
+instead of the default per-job ProcessPoolExecutor path. Untested on GPU as
+of authoring — validate with tests/test_batch_em_parity.py first.
 
 Resume safety
 -------------
@@ -23,6 +28,7 @@ line, # comments allowed) are silently skipped.
 import sys
 import os
 import pickle
+import argparse
 import concurrent.futures
 from collections import defaultdict
 from pathlib import Path
@@ -71,7 +77,7 @@ def _load_skip_datasets(output_dir: Path) -> set:
     return skip
 
 
-def run_array_task(output_dir: str, array_idx: int) -> None:
+def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None:
     output_dir = Path(output_dir).resolve()
     jobs_dir = output_dir / "jobs"
     array_file = jobs_dir / f"array_{array_idx:04d}.pkl"
@@ -138,65 +144,76 @@ def run_array_task(output_dir: str, array_idx: int) -> None:
         print("All fits already completed — nothing to do.")
         return
 
-    print(f"Submitting {len(fit_specs)} fits across {len(fits_per_bootstrap)} bootstrap(s)")
+    print(f"Submitting {len(fit_specs)} fits across {len(fits_per_bootstrap)} bootstrap(s) "
+          f"(device={device})")
 
-    # ── Run fits in parallel, track best per (bootstrap, label, save_dir) ──
-    # ProcessPoolExecutor + as_completed() yields results in OS-scheduling
-    # order, not submission order, so the tie-break key below includes
-    # fit_idx (smaller wins on an exact val_ll tie) — this keeps the best-fit
-    # selection deterministic and independent of which worker finishes first,
+    # ── Run fits, track best per (bootstrap, label, save_dir) ──
+    # Result order isn't guaranteed (ProcessPoolExecutor.as_completed() is
+    # OS-scheduling order; the GPU path batches/reorders by group), so the
+    # tie-break key below includes fit_idx (smaller wins on an exact val_ll
+    # tie) — keeps best-fit selection deterministic regardless of order,
     # matching the joblib.Parallel-based pipeline path (which preserves
     # submission order).
     best: dict = {}                              # key → (val_ll, -fit_idx, result)
     remaining = dict(fits_per_bootstrap)
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
-        futures = [ex.submit(_run_one_fit, spec) for spec in fit_specs]
-
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                bs_seed, label, save_dir, fit_idx, result = fut.result()
-            except Exception as e:
-                print(f"  Future raised: {e}")
-                continue
-
-            val_ll = (result.get("val_ll", -np.inf) if result else -np.inf)
-            sort_key = (val_ll, -(fit_idx if fit_idx is not None else 0))
-            key = (bs_seed, label, save_dir)
-            if sort_key > best.get(key, (-np.inf, None, None))[:2]:
-                best[key] = (val_ll, -(fit_idx if fit_idx is not None else 0), result)
-
-            bs_key = (bs_seed, save_dir)
-            remaining[bs_key] -= 1
-
-            # ── Save as soon as all fits for this bootstrap are done ──
-            if remaining[bs_key] == 0:
-                save_path = Path(save_dir) / f"bootstrap_{bs_seed}_best_fits.pkl"
-                new_results = {
-                    lbl: res
-                    for (b, lbl, sd), (_, _, res) in best.items()
-                    if b == bs_seed and sd == save_dir
-                }
-                # Merge with pre-existing (preserves already-complete components)
-                existing = {}
-                if save_path.exists():
+    if device == "gpu":
+        from src.assay_calibration.fit_utils.jax_batch.interop import run_gpu
+        results_iter = run_gpu(fit_specs)
+    else:
+        def _cpu_results():
+            with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
+                futures = [ex.submit(_run_one_fit, spec) for spec in fit_specs]
+                for fut in concurrent.futures.as_completed(futures):
                     try:
-                        with open(save_path, "rb") as f:
-                            existing = pickle.load(f)
-                    except Exception:
-                        existing = {}
-                existing.update(new_results)
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(save_path, "wb") as f:
-                    pickle.dump(existing, f)
-                components = sorted(existing.keys())
-                print(f"  ✓ bootstrap {bs_seed} → {save_path.parent.name}  [{', '.join(components)}]")
+                        yield fut.result()
+                    except Exception as e:
+                        print(f"  Future raised: {e}")
+        results_iter = _cpu_results()
+
+    for bs_seed, label, save_dir, fit_idx, result in results_iter:
+        val_ll = (result.get("val_ll", -np.inf) if result else -np.inf)
+        sort_key = (val_ll, -(fit_idx if fit_idx is not None else 0))
+        key = (bs_seed, label, save_dir)
+        if sort_key > best.get(key, (-np.inf, None, None))[:2]:
+            best[key] = (val_ll, -(fit_idx if fit_idx is not None else 0), result)
+
+        bs_key = (bs_seed, save_dir)
+        remaining[bs_key] -= 1
+
+        # ── Save as soon as all fits for this bootstrap are done ──
+        if remaining[bs_key] == 0:
+            save_path = Path(save_dir) / f"bootstrap_{bs_seed}_best_fits.pkl"
+            new_results = {
+                lbl: res
+                for (b, lbl, sd), (_, _, res) in best.items()
+                if b == bs_seed and sd == save_dir
+            }
+            # Merge with pre-existing (preserves already-complete components)
+            existing = {}
+            if save_path.exists():
+                try:
+                    with open(save_path, "rb") as f:
+                        existing = pickle.load(f)
+                except Exception:
+                    existing = {}
+            existing.update(new_results)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(save_path, "wb") as f:
+                pickle.dump(existing, f)
+            components = sorted(existing.keys())
+            print(f"  ✓ bootstrap {bs_seed} → {save_path.parent.name}  [{', '.join(components)}]")
 
 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python run_array_task.py <output_dir> <array_idx>")
-        sys.exit(1)
-    run_array_task(sys.argv[1], int(sys.argv[2]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output_dir")
+    parser.add_argument("array_idx", type=int)
+    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
+                        help="cpu (default): existing per-job ProcessPoolExecutor path. "
+                             "gpu: batch jobs through jax_batch and run on GPU "
+                             "(see slurm/submit_array_gpu.sh).")
+    args = parser.parse_args()
+    run_array_task(args.output_dir, args.array_idx, device=args.device)

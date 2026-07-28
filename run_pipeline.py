@@ -166,6 +166,12 @@ Examples:
                        default="parallel", help="Execution mode (default: parallel)")
     parser.add_argument("--n-jobs", type=int, default=-1,
                        help="Number of parallel jobs (-1 = all CPUs, default: -1)")
+    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
+                       help="cpu (default): existing per-job joblib path (--mode parallel/single). "
+                            "gpu: batch fits through src/assay_calibration/fit_utils/jax_batch and "
+                            "run on GPU instead (only affects --mode parallel/single, not slurm). "
+                            "Untested on GPU as of authoring -- validate with "
+                            "tests/test_batch_em_parity.py first.")
 
     # SLURM options
     slurm = parser.add_argument_group("SLURM options")
@@ -264,6 +270,7 @@ Examples:
         oob_min_samples=args.oob_min_samples,
         execution_mode=args.mode,
         n_jobs=args.n_jobs,
+        device=args.device,
         slurm_account=args.slurm_account,
         slurm_partition=args.slurm_partition,
         slurm_time_hours=args.slurm_time,

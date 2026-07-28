@@ -99,14 +99,17 @@ class BootstrapRunner:
             for minimal_job in job_data['jobs']
         ]
 
-        # Run all fits; return_as="generator" is joblib >=1.2.0 only so we
-        # collect as a plain list and accept that per-fit progress is coarser.
-        flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=0)(
-            delayed(BootstrapRunner._execute_single_fit)(
-                minimal_job, shared_data, self.config.dataset_name
+        if getattr(self.config, "device", "cpu") == "gpu":
+            flat_results = self._execute_flat_tasks_gpu(flat_tasks)
+        else:
+            # Run all fits; return_as="generator" is joblib >=1.2.0 only so we
+            # collect as a plain list and accept that per-fit progress is coarser.
+            flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=0)(
+                delayed(BootstrapRunner._execute_single_fit)(
+                    minimal_job, shared_data, self.config.dataset_name
+                )
+                for _, _, minimal_job, shared_data in flat_tasks
             )
-            for _, _, minimal_job, shared_data in flat_tasks
-        )
         if self.reporter is not None:
             # reporter.track is a no-op here but keeps the interface intact
             flat_results = list(self.reporter.track(iter(flat_results), total=len(flat_tasks)))
@@ -130,6 +133,33 @@ class BootstrapRunner:
             aggregated[bootstrap_idx] = entry
 
         return aggregated, dataset_splits
+
+    def _execute_flat_tasks_gpu(self, flat_tasks: List[Tuple]) -> List[Optional[Dict]]:
+        """GPU counterpart of the joblib dispatch above: batches flat_tasks
+        through jax_batch.interop.run_gpu (grouped by num_components/
+        multivariate) instead of one job per CPU worker.
+
+        run_gpu doesn't preserve flat_tasks' order (it groups/batches jobs),
+        so results are re-keyed by (bootstrap_seed, component_key, fit_idx)
+        and reassembled in the caller's original order — the aggregation
+        loop in _run_parallel does a positional `zip(flat_tasks, flat_results)`
+        and would silently misattribute results if this weren't re-sorted.
+        """
+        from ..fit_utils.jax_batch.interop import run_gpu
+
+        fit_specs = [
+            ({**minimal_job, **shared_data, 'dataset_name': self.config.dataset_name},
+             bootstrap_seed, component_key, "")
+            for bootstrap_seed, component_key, minimal_job, shared_data in flat_tasks
+        ]
+        by_key = {
+            (bs_seed, label, fit_idx): result
+            for bs_seed, label, _save_dir, fit_idx, result in run_gpu(fit_specs)
+        }
+        return [
+            by_key.get((bootstrap_seed, component_key, minimal_job['fit_idx']))
+            for bootstrap_seed, component_key, minimal_job, _shared_data in flat_tasks
+        ]
 
     @staticmethod
     def _execute_single_fit(minimal_job: Dict, shared_data: Dict, dataset_name: str) -> Optional[Dict]:
@@ -282,6 +312,7 @@ class BootstrapRunner:
                         'constrained': job['constrained'],
                         'init_method': job['init_method'],
                         'init_constraint_adjustment': job['init_constraint_adjustment'],
+                        'multivariate': job.get('multivariate', False),
                         'kwargs': job['kwargs']
                     }
                     minimal_jobs.append(minimal_job)

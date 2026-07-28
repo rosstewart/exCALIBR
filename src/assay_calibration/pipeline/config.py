@@ -144,6 +144,7 @@ class PipelineConfig:
     # Execution parameters
     execution_mode: Literal["slurm", "parallel", "single"] = "parallel"
     n_jobs: int = -1  # -1 uses all available CPUs
+    device: Literal["cpu", "gpu"] = "cpu"  # "gpu" batches fits through jax_batch (see BootstrapRunner)
 
     # SLURM parameters (only used if execution_mode="slurm")
     slurm_account: str = "default"
