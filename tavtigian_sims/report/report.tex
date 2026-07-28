@@ -18,8 +18,7 @@
 \newcommand{\postp}{P(Y{=}1\mid E{=}e)}
 \newcommand{\lrp}{\mathrm{LR}^{+}}
 
-\title{\textbf{Prior-adaptive evidence thresholds for clinical variant classification:\\
-       limitations of the Tavtigian framework and a piecewise Bayesian solution}}
+\title{\textbf{Prior-adaptive evidence thresholds for ACMG/AMP variant classification}}
 \author{}
 \date{}
 
@@ -28,124 +27,111 @@
 
 \begin{abstract}
 \noindent
-Evidence-based variant classification under the ACMG/AMP guidelines requires
-mapping continuous likelihood-ratio scores to discrete evidence strengths using
-thresholds that satisfy specified posterior probability targets.
-The Tavtigian et al.\ framework provides such thresholds through a single
-constant $C^*$ calibrated to a canonical prior of $p = 0.10$, but the
-mapping is exact only at that prior and degrades systematically at all others.
-We characterise the failure modes of this approach in detail:
-pathogenic thresholds drift from their targets at priors above ${\sim}0.20$,
-while benign thresholds are severely miscalibrated across the entire
-biologically relevant range---at $p = 0.01$, the LB boundary posterior is
-$0.003$ instead of $0.10$, causing benign evidence to be withheld from the
-vast majority of variants that should receive it.
-We prove that no additive scoring system with prior-independent thresholds can
-simultaneously produce exact posteriors at all classification boundaries for all
-priors, and we show that a piecewise-linear Bayesian solution achieves exact
-boundary posteriors at every prior while preserving the ACMG/AMP point system.
-We demonstrate that the threshold difference is practically large: at $p=0.01$,
-the piecewise LB threshold (LR$^+{<}11$) is 42$\times$ more permissive than
-the Tavtigian threshold (LR$^+{<}0.26$), directly reducing false-negative
-benign evidence assignments in assay calibration pipelines.
+Clinical variant classification under the ACMG/AMP guidelines converts a
+piece of evidence (for example, a functional assay result) into an evidence
+strength (Supporting, Moderate, Strong, Very Strong) by comparing it against
+a threshold. The most widely used thresholds, from Tavtigian and colleagues,
+were derived using a single reference prior probability of pathogenicity
+($p=0.10$) and are then applied unchanged to genes with very different
+priors. We show that this produces systematically wrong evidence
+assignments away from that one reference point, especially for benign
+evidence at low priors, where the standard thresholds are far too strict
+and quietly discard real benign signal. We describe an alternative,
+ACMG-Bayes, that recomputes the correct threshold for the gene's actual
+prior rather than reusing a single fixed value, and prove that this is the
+only way to get exact results at every prior. We further show that even the
+standard posterior targets used to define "Likely Benign" and "Benign"
+(10\% and 1\%) are themselves poorly matched to a low prior: at the
+reference prior of 0.10, the Likely Benign target requires no evidence at
+all to trigger. Shifting these targets to 1\% and 0.1\% is better justified
+and, on 89 real calibrated functional assay datasets, nearly doubles
+pathogenic sensitivity (89.8\%$\to$97.0\%) and reduces dangerous
+false-negative benign calls by 47\%, at matched overall coverage and
+comparable specificity.
 \end{abstract}
 
-% ------------------------------------------------------------------
+% ==================================================================
 \section*{Introduction}
-% ------------------------------------------------------------------
+% ==================================================================
 
-The ACMG/AMP guidelines~\cite{richards2015standards} classify genetic variants
-into five categories according to their posterior probability of pathogenicity:
-pathogenic ($\geq$99\%), likely pathogenic (LP; $\geq$90\%), uncertain
-significance (10--90\%), likely benign (LB; $\leq$10\%), and benign
-($\leq$1\%).
-Classification combines independent lines of evidence, each characterised by
-a direction (pathogenic or benign) and strength (supporting, moderate, strong,
-or very strong), according to fixed combination rules~\cite{richards2015standards}.
-Tavtigian et al.~\cite{tavtigian2018modeling, Tavtigian2020} formalised this as
-a Bayesian point system in which each evidence strength carries an integer
-point value ($\pm1$, $\pm2$, $\pm4$, $\pm8$) proportional to $\log(\lrp)$ (the natural
-logarithm of the likelihood ratio), so that the combined $\lrp$ for total points $T$ is
-$\lrp(T) = C^{T/8}$ for a single constant $C = O_{\mathrm{PVSt}}$.
+The ACMG/AMP guidelines~\cite{richards2015standards} classify a genetic
+variant into one of five categories based on how likely it is to be
+disease-causing: Pathogenic ($\geq$99\% probability), Likely Pathogenic
+(LP; $\geq$90\%), Uncertain Significance (VUS; in between), Likely Benign
+(LB; $\leq$10\%), and Benign ($\leq$1\%). Reaching one of these categories
+requires combining independent pieces of evidence -- population data,
+computational predictions, functional assays, segregation in families, and
+so on -- each of which is assigned a strength (Supporting, Moderate, Strong,
+or Very Strong, in either the pathogenic or benign direction) according to
+fixed combination rules~\cite{richards2015standards}.
 
-Evidence calibration pipelines---including our own
-\excalibr~\cite{igvf_pp}---convert continuous assay scores to evidence points by
-comparing the variant's score-specific $\lrp$ to the thresholds
-$C^{k/8}$ for each evidence strength $k \in \{1,2,4,8\}$.
-Supporting evidence requires $\lrp(s) \geq C^{1/8}$; moderate requires
-$\lrp(s) \geq C^{1/4}$; and so on~\cite{pejaver2022calibration}.
-These thresholds are correct only if the posterior probability at each
-boundary satisfies the ACMG target---that is, only if the correct $C$ is used
-for the gene-specific prior.
-However, $C^*$ in the Tavtigian framework is a single integer determined by
-grid search at the canonical prior $p = 0.10$, and applying it at other priors
-yields thresholds that map assay scores to incorrect posterior probabilities.
+Tavtigian and colleagues~\cite{tavtigian2018modeling, Tavtigian2020} showed
+that this scheme can be put on a rigorous statistical footing: each evidence
+strength corresponds to a specific likelihood ratio (how many times more
+likely the evidence is if the variant is pathogenic than if it is benign),
+and the strengths were assigned point values ($\pm1, \pm2, \pm4, \pm8$) so
+that adding points together corresponds to multiplying likelihood ratios.
+The point-to-likelihood-ratio conversion, however, was fixed once, using a
+single reference gene-level prior probability of pathogenicity,
+$p = 0.10$. Modern calibration pipelines -- including our own
+\excalibr~\cite{igvf_pp} -- estimate a different prior for every gene from
+population frequency data, and apply the same, unchanged
+Tavtigian thresholds regardless of what that prior turns out to be.
 
-Harrison et al.~\cite{Harrison2019} observed that variants classified as LP
-in ClinVar often carry posterior probabilities well below the nominal 90\%,
-and that reclassification data reveal systematic inconsistency in posterior
-calibration across genes.
-A key source of this inconsistency is the prior-dependence of the correct
-classification threshold: a variant whose $\lrp$ just reaches the LP threshold
-at $p = 0.10$ would yield a posterior of only 0.45 at $p = 0.01$---squarely
-in the VUS range---while the same threshold yields 0.96 at $p = 0.25$.
-Functional assay calibration pipelines that apply Tavtigian thresholds without
-prior-adaptation therefore produce evidence assignments whose implied posteriors
-depend on the gene-specific prior in an uncontrolled way.
-This is not a limitation of the underlying assay or calibration model, but of
-the threshold mapping from $\lrp$ to evidence strength.
+This matters because the correct evidence threshold genuinely depends on
+the prior: the same functional assay result that reaches Likely Pathogenic
+at $p=0.10$ would leave a variant squarely in the uncertain range at
+$p=0.01$ and would be far too weak a bar at $p=0.25$. Harrison and
+Rehm~\cite{Harrison2019} observed exactly this kind of problem in practice:
+variants classified Likely Pathogenic in ClinVar often turn out, on
+reanalysis, to carry nowhere near the intended 90\% confidence. Reusing a
+single set of thresholds across genes with different priors is a plausible
+mechanistic explanation for that inconsistency.
 
-Here, we characterise the calibration errors introduced by prior-fixed Tavtigian
-thresholds, prove that this limitation is unavoidable for any additive system
-with prior-independent thresholds, and describe a piecewise-linear Bayesian
-solution that achieves exact boundary posteriors at every prior.
-We provide quantitative comparisons of evidence threshold accuracy across the
-biologically relevant prior range and discuss the implications for assay
-calibration pipelines such as \excalibr~\cite{igvf_pp},
-OddsPath~\cite{brnich2020recommendations}, and PP3/BP4
-calibration~\cite{pejaver2022calibration}.
+In this paper we (1) quantify how badly the standard, prior-fixed
+thresholds miscalibrate evidence assignments away from $p=0.10$; (2) show,
+with a short mathematical argument (details in Methods), that no scheme
+that adds fixed integer points together can give exact results at every
+prior -- some form of prior-adaptation is unavoidable; (3) describe
+ACMG-Bayes, a straightforward fix that recomputes the correct
+likelihood-ratio threshold for each gene's own prior, while still
+producing an ACMG-familiar point label for reporting; (4) show that the
+standard Likely-Benign/Benign posterior targets are themselves poorly
+chosen relative to a typical prior, and propose a better-justified
+alternative; and (5) validate that alternative on 89 real calibrated
+functional assay datasets.
 
-% ------------------------------------------------------------------
-\section*{The Tavtigian Framework and Its Prior-Dependent Failures}
-% ------------------------------------------------------------------
+% ==================================================================
+\section*{Results}
+% ==================================================================
 
-\subsection*{Construction and calibration at the canonical prior}
+\subsection*{Standard thresholds are only correct at the one prior they were calibrated to}
+\label{sec:results-tav}
 
-Given a prior $p$ and a combined $\lrp = C^{T/8}$, the posterior probability of
-pathogenicity is
-\begin{equation}
-  \postp =
-  \frac{C^{T/8}\, p}{\bigl(C^{T/8} - 1\bigr)p + 1}.
-  \label{eq:bayes}
-\end{equation}
-The constant $C$ (the ``OddsPath'' $O_{\mathrm{PVSt}}$) is determined from the
-2020 derivation~\cite{Tavtigian2020}: five of the six LP combination rules
-each require odds equivalent to six pieces of supporting evidence, fixing
-$O_{\mathrm{PSu}}^6 = 81$, hence
-$C^* = O_{\mathrm{PSu}}^8 = 81^{4/3} \approx 350$ at $p = 0.10$.
-To resolve two originally inconsistent ACMG rules, we follow the modification of
-Tavtigian et al.~\cite{tavtigian2018modeling}: the combination 2S is moved to the
-LP classification (8 points, Post\_P $\approx$ 0.975) and VS+M is moved to the
-P classification (10 points, Post\_P $\approx$ 0.994); all remaining rules are internally
-consistent at $p = 0.10$ with $C^* = 350$.
-
-\subsection*{Threshold accuracy degrades away from $p = 0.10$}
+Table~\ref{tab:boundary} shows, at five representative priors, what
+posterior probability a variant actually has when it just reaches each of
+the four ACMG boundaries under the standard (Tavtigian) thresholds, compared
+to the boundary the ACMG guidelines intend (90\%, 99\%, 10\%, 1\%). At the
+reference prior, $p=0.10$, the two agree closely, by construction. Away from
+it, they diverge substantially, and the pathogenic and benign directions
+fail differently.
 
 \begin{table}[t]
 \centering
-\caption{Tavtigian boundary posteriors vs.\ piecewise targets at five
-         representative priors.
-         Piecewise values are exact at each target by construction.
-         $C^*$ is from the integer grid search.}
+\caption{What posterior probability a variant actually has when it just
+         reaches each ACMG boundary, standard (Tavtigian) thresholds vs.\
+         the intended target, at five representative priors. ``AB'' columns
+         are ACMG-Bayes, which is exact at every target by construction (see
+         Results below and Methods).}
 \label{tab:boundary}
 \begin{tabular}{rr @{\hspace{1em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr}
 \toprule
 $p$ & $C^*$
-  & \multicolumn{2}{c}{LP (6 pts, tgt 0.90)}
-  & \multicolumn{2}{c}{P (10 pts, tgt 0.99)}
-  & \multicolumn{2}{c}{LB ($-$1 pts, tgt 0.10)}
-  & \multicolumn{2}{c}{B ($-$7 pts, tgt 0.01)} \\
-& & Tav & PW & Tav & PW & Tav & PW & Tav & PW \\
+  & \multicolumn{2}{c}{LP (target 0.90)}
+  & \multicolumn{2}{c}{P (target 0.99)}
+  & \multicolumn{2}{c}{LB (target 0.10)}
+  & \multicolumn{2}{c}{B (target 0.01)} \\
+& & Tav & AB & Tav & AB & Tav & AB & Tav & AB \\
 \midrule
 0.01 & 8511  & \textbf{.900} & .900 & .999 & \textbf{.990} & .003 & \textbf{.100} & .000 & \textbf{.010} \\
 0.05 &  950  & \textbf{.900} & .900 & .996 & \textbf{.990} & .022 & \textbf{.100} & .000 & \textbf{.010} \\
@@ -156,63 +142,263 @@ $p$ & $C^*$
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:boundary} and Figure~\ref{fig:boundary_posteriors} show the
-posteriors produced by Tavtigian thresholds at the four ACMG classification
-boundaries across the prior range.
-Three distinct failure modes are evident.
+The pathogenic (LP/P) boundaries stay reasonably close to their intended
+targets for priors between roughly 0.01 and 0.25. Above that, the standard
+approach becomes over-confident: at $p=0.45$ a variant reaching the LP
+boundary actually has a 99.7\% posterior, not 90\%. The benign (LB)
+boundary fails everywhere shown except by coincidence near $p=0.25$: at
+$p=0.01$, a variant that just reaches the LB boundary under the standard
+thresholds actually has only a 0.3\% chance of being pathogenic -- far
+below the intended 10\% cutoff. In practical terms, at $p=0.01$ the
+standard likelihood-ratio threshold for Likely Benign evidence is 42-fold
+stricter than it needs to be to hit the intended 10\% target (a likelihood
+ratio below 0.26 is required, versus the 11 that would actually suffice).
+Every variant whose evidence falls in that gap is being denied benign
+evidence it has genuinely earned. Figures~\ref{fig:lr_thresholds}
+and~\ref{fig:boundary_posteriors} show this across the full prior range.
 
-\paragraph{Pathogenic classification ranges: accurate near $p = 0.10$, drifting elsewhere.}
-The LP points cutoff (6 points) posterior is within 1\% of the 0.90 target for priors
-between 0.01 and 0.25, because the LP constraint is the binding one in the
-grid search at low priors and $C^*$ approximately tracks the LP-optimal value.
-Above $p \approx 0.25$, however, benign combination rules become binding and
-drive $C^*$ to anomalously large values: at $p = 0.45$, the grid search
-returns $C^* = 2876$, causing the LP and P points cutoffs to reach posteriors of
-0.997 and $\approx$1.000, respectively---variants are classified with far
-greater confidence than warranted.
-The P points cutoff is persistently below its 0.99 target across all priors,
-ranging from 0.990 to 0.999.
+\subsection*{No fixed set of thresholds can be exact at every prior}
+\label{sec:results-trilemma}
 
-\paragraph{Benign classification ranges: severely miscalibrated across the full range.}
-The LB points cutoff ($-$1 points, target: posterior $\leq$0.10) fails at every prior
-in Table~\ref{tab:boundary} except $p = 0.25$.
-At $p = 0.01$, the LB points cutoff posterior is 0.003---the Tavtigian LR⁺ threshold
-is 33$\times$ more stringent than necessary.
-A gene with prior $p = 0.01$ would require a variant's $\lrp$ to fall
-below 0.26 to receive Supporting Benign evidence, when the correct LR⁺ threshold
-(achieving the target posterior of 0.10) is $\lrp < 11$.
-Equivalently, every variant with $0.26 < \lrp < 11$ that should be
-classified as LB is instead returned as VUS.
-At $p = 0.25$, the failure inverts: the LB posterior is 0.159, so variants
-are classified LB when their true posterior is still 15.9\%, above the
-intended threshold.
+This is not a matter of picking a better reference prior. We show formally
+(Methods) that any classification scheme built from fixed evidence-strength
+tiers (Supporting/Moderate/Strong/Very Strong, in a fixed 1:2:4:8 point
+ratio) that are simply added together, using a single fixed set of
+combination thresholds, \emph{cannot} give exact posterior probabilities at
+every prior -- it can be exact at one prior, or a small number of them, but
+not all. Something has to give: either the thresholds have to move with the
+prior, or the points have to stop being the thing that gets added together.
+The Tavtigian system keeps fixed thresholds and fixed additive points, at
+the cost of exactness (Table~\ref{tab:boundary}). ACMG-Bayes, described
+next, keeps fixed evidence combination rules and exact posteriors, at the
+cost of letting the point-to-evidence conversion vary with the prior --
+which turns out to be the only part of the system that needs to.
 
-\paragraph{The implication for assay calibration.}
-When a calibration pipeline (e.g., \excalibr, OddsPath, PP3/BP4) uses
-$C^{k/8}$ to assign evidence strengths, the resulting assignments
-imply the ACMG posterior targets only at $p = 0.10$.
-For any other prior---including the gnomAD-estimated priors that \excalibr
-computes per gene~\cite{igvf_pp}---the evidence strengths carry the wrong
-implied posteriors.
-Benign evidence is particularly affected: at low priors (gene-level rarity),
-the Tavtigian LB threshold is far too stringent, suppressing benign evidence
-assignments for variants that genuinely meet the LB posterior criterion.
-This provides a mechanistic explanation for the observation that LP classifications
-in ClinVar frequently carry posteriors well below 90\%~\cite{Harrison2019}.
+\subsection*{ACMG-Bayes: recompute the threshold for the gene's actual prior}
+\label{sec:results-acmgbayes}
 
-% ------------------------------------------------------------------
-\section*{A Mathematical Trilemma}
-% ------------------------------------------------------------------
+ACMG-Bayes addresses the problem directly: instead of reusing one
+likelihood-ratio threshold for every gene, it computes, from Bayes' theorem,
+the exact likelihood ratio needed to reach each ACMG boundary (90\%, 99\%,
+10\%, 1\%) at whatever prior the gene actually has (derivation in Methods).
+This guarantees the four boundary posteriors are correct by construction, at
+every prior -- the "AB" columns in Table~\ref{tab:boundary} are exact, not
+approximate. Figure~\ref{fig:slope_geometry} shows the geometric picture:
+where the standard approach is a single straight line that only touches all
+four correct answers when $p=0.10$, ACMG-Bayes is a line that shifts to
+always pass through the four correct answers, whatever the prior is.
 
-The miscalibration above is not a limitation of $C^*$ estimation but a
-provable consequence of requiring three mutually incompatible properties.
+When more than one piece of evidence needs to be combined, ACMG-Bayes
+combines the underlying likelihood ratios directly (equivalently, adds their
+logarithms) rather than rounding each piece of evidence to an integer point
+value first and adding those. This is exact Bayesian evidence combination
+regardless of prior, and it is the only way to combine evidence that is
+consistent with also having exact, prior-specific thresholds. A final
+combined value can still be converted back into a familiar ACMG point label
+for reporting (e.g. "moderate-equivalent") -- but that label is computed
+\emph{after} combination, for display only, and its exact numeric meaning is
+specific to the gene's own prior, so it cannot be read off a single table
+shared across genes with different priors (Methods).
+
+\subsection*{The standard Likely Benign and Benign targets are themselves miscalibrated}
+\label{sec:results-targets}
+
+Table~\ref{tab:boundary} shows what happens when the standard 90\%/99\%/
+10\%/1\% \emph{targets} are pursued using the wrong threshold. A separate
+question is whether those four targets are even well-chosen relative to a
+realistic prior, independent of any threshold-calibration issue.
+
+They are not, for the two benign-direction targets. The four ACMG targets
+(1\%, 10\%, 90\%, 99\%) are symmetric around 50-50 odds: LP and LB are each
+"10 points from the extreme," P and B are each "1 point from the extreme."
+That symmetry is only evidence-neutral if the reference prior is itself
+50\%. It is not -- the reference prior used throughout this paper (and in
+the original Tavtigian calibration) is 10\%. At exactly that prior, the
+amount of evidence required to reach the Likely Benign target works out to
+\emph{zero}: a likelihood ratio of 1, i.e.\ no data at all, is already
+enough (derivation in Methods, Table~\ref{tab:target_symmetry}). More
+generally, for any gene with a prior below 10\% -- which is most of them --
+the standard Likely Benign target requires either no evidence or, worse,
+evidence that actually leans pathogenic. The Likely Pathogenic and
+Pathogenic targets are not affected the same way; the problem is specific
+to the benign-direction targets.
+
+\begin{table}[h]
+\centering
+\caption{Likelihood ratio required to reach each target, at the reference
+         prior $p=0.10$. A likelihood ratio of exactly 1 means the target is
+         reached with no evidence at all; a ratio below 1 means genuinely
+         benign-leaning evidence is required; a ratio above 1 means
+         pathogenic-leaning evidence would (wrongly) be required.}
+\label{tab:target_symmetry}
+\begin{tabular}{lrr}
+\toprule
+Tier & Target posterior & Likelihood ratio required \\
+\midrule
+LP (unchanged)                    & 0.90    & 81.0 \\
+LB, standard ACMG                 & 0.10    & 1.00 \emph{(no evidence needed)} \\
+LB, shifted target (evaluated below) & 0.01 & 0.091 \\
+P (unchanged)                     & 0.99    & 891 \\
+B, standard ACMG                  & 0.01    & 0.091 \\
+B, shifted target (evaluated below) & 0.001 & 0.0090 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A better-justified pair of targets is LB$=1\%$ and B$=0.1\%$ -- an order of
+magnitude stricter than the current standard, and, unlike the current
+standard, one that actually requires real benign-leaning evidence to
+trigger. (A value that mirrors LP/P exactly in the amount of evidence
+required would be closer to 0.14\%/0.01\%; 1\%/0.1\% is a practical,
+round-number compromise that is already a large improvement -- Methods.)
+
+\subsection*{Validation on 89 real calibrated functional assay datasets}
+\label{sec:results-validation}
+
+We tested the shifted targets (LB$=1\%$, B$=0.1\%$) against the standard
+targets on 89 real deep mutational scanning / multiplexed assay of variant
+effect datasets, using the same underlying assay calibrations and the same
+gene-specific priors for both, so that any difference reflects the
+evidence-threshold choice alone. Ground truth came from each variant's own
+clinical curation label (Pathogenic/Likely Pathogenic or Benign/Likely
+Benign); variants without one of those two labels were excluded from the
+comparison, leaving 23{,}717 control variants (9{,}441 pathogenic, 14{,}276
+benign) across 72 evaluated dataset components.
+
+\begin{table}[h]
+\centering
+\caption{How true pathogenic and benign controls were classified (LP-or-P
+         vs.\ VUS/indeterminate vs.\ LB-or-B), standard targets vs.\ shifted
+         targets (LB$=1\%$, B$=0.1\%$), same 89 datasets and priors.}
+\label{tab:target_confusion}
+\begin{tabular}{lrrr}
+\toprule
+\multicolumn{4}{c}{\textbf{Standard targets (LB=10\%, B=1\%)}} \\
+\midrule
+True control & LP or P & VUS & LB or B \\
+\midrule
+Pathogenic ($n=9{,}441$) & 2{,}049 & 7{,}160 & 232 \\
+Benign ($n=14{,}276$)    & 15      & 3{,}591 & 10{,}670 \\
+\midrule
+\multicolumn{4}{c}{\textbf{Shifted targets (LB=1\%, B=0.1\%)}} \\
+\midrule
+True control & LP or P & VUS & LB or B \\
+\midrule
+Pathogenic ($n=9{,}441$) & 3{,}885 & 5{,}434 & 122 \\
+Benign ($n=14{,}276$)    & 40      & 6{,}025 & 8{,}211 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Derived classification metrics from Table~\ref{tab:target_confusion}
+         (determinate calls only, i.e.\ excluding VUS).}
+\label{tab:target_metrics}
+\begin{tabular}{lrr}
+\toprule
+Metric & Standard targets & Shifted targets \\
+\midrule
+Coverage (determinate)                          & 54.7\% & 51.7\% \\
+Sensitivity (path.\ controls resolved LP/P)      & 89.8\% & \textbf{97.0\%} \\
+Specificity (benign controls resolved LB/B)      & \textbf{99.86\%} & 99.52\% \\
+Accuracy                                         & 98.1\% & \textbf{98.7\%} \\
+MCC                                              & 0.933 & \textbf{0.970} \\
+Dangerous false negatives (path.\ called LB/B)   & 232 (2.46\%) & \textbf{122 (1.29\%)} \\
+Dangerous false positives (benign called LP/P)   & \textbf{15 (0.11\%)} & 40 (0.28\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At essentially matched overall coverage, shifting the LB/B targets nearly
+doubles pathogenic sensitivity (89.8\%$\to$97.0\%) and cuts dangerous
+false negatives -- real pathogenic variants wrongly called benign -- by
+47\% (232$\to$122), while specificity drops only marginally
+(99.86\%$\to$99.52\%, both very high) and the dangerous false-positive
+count, while roughly tripling in relative terms, stays small in absolute
+terms (40 of 14{,}276 true benign controls, 0.28\%). This matches what
+Table~\ref{tab:target_symmetry} predicts: the standard Likely Benign target
+gives away a benign call for evidence ranging from neutral all the way down
+to only mildly benign-leaning, and pathogenic controls are disproportionately
+the ones whose evidence happens to fall in that zone.
+
+% ==================================================================
+\section*{Discussion}
+% ==================================================================
+
+Two independent sources of error compound in current assay calibration
+pipelines that use fixed, Tavtigian-style thresholds. First, the threshold
+itself is only correct at the one prior it was calibrated to, and drifts --
+sometimes by orders of magnitude in likelihood-ratio terms -- at every other
+prior, with the largest practical impact on benign evidence at low priors,
+which is precisely the regime most relevant to rare disease genes. Second,
+independent of that, the standard Likely Benign and Benign targets
+themselves are calibrated as if the reference prior were 50\%, when it is
+actually 10\%, making the Likely Benign bar in particular too easy to clear.
+
+ACMG-Bayes resolves the first problem by computing the correct threshold
+directly from the gene's own prior rather than reusing a fixed constant, and
+makes the second problem a simple configuration choice rather than a
+structural limitation: because thresholds are derived from targets rather
+than baked into a fixed point table, adopting better-justified targets (for
+example, 1\%/0.1\% instead of 10\%/1\% for LB/B) requires no change to the
+underlying method.
+
+For calibration pipelines such as \excalibr~\cite{igvf_pp}, OddsPath
+~\cite{brnich2020recommendations}, and PP3/BP4
+calibration~\cite{pejaver2022calibration} that already estimate a
+gene-specific prior, the practical recommendation is straightforward:
+retain the underlying likelihood ratio (or its logarithm) as the working
+representation of evidence, convert to an ACMG-familiar point label only at
+the final reporting step, and derive the conversion thresholds from the
+gene's own prior rather than from a single shared table. This directly
+addresses the kind of miscalibration reported by Harrison and
+Rehm~\cite{Harrison2019}, where Likely Pathogenic calls in ClinVar often
+carry less confidence than the label implies.
+
+A caveat is worth stating plainly: because the point-to-evidence conversion
+is prior-specific under ACMG-Bayes, a displayed point value (e.g.\
+"Moderate-equivalent") is not directly comparable across two genes with
+different priors, even if the underlying evidence is numerically identical.
+This is intentional -- it is the same underlying fact that makes fixed
+thresholds wrong in the first place -- but it does mean point labels must be
+recomputed per gene rather than read off one shared table.
+
+% ==================================================================
+\section*{Methods}
+% ==================================================================
+
+\subsection*{The Tavtigian point system}
+
+Given a prior $p$ and a combined likelihood ratio $\lrp = C^{T/8}$ for total
+evidence points $T$, the posterior probability of pathogenicity is
+\begin{equation}
+  \postp =
+  \frac{C^{T/8}\, p}{\bigl(C^{T/8} - 1\bigr)p + 1}.
+  \label{eq:bayes}
+\end{equation}
+The constant $C$ (the "OddsPath" $O_{\mathrm{PVSt}}$) is determined by the
+2020 derivation~\cite{Tavtigian2020}: five of the six LP combination rules
+each require odds equivalent to six pieces of Supporting evidence, fixing
+$O_{\mathrm{PSu}}^6 = 81$, hence
+$C^* = O_{\mathrm{PSu}}^8 = 81^{4/3} \approx 350$ at $p = 0.10$. We follow
+the modification of Tavtigian et al.~\cite{tavtigian2018modeling} that
+resolves two originally inconsistent ACMG rules by moving the combination 2S
+to the LP classification (8 points, Post\_P $\approx$ 0.975) and VS+M to the
+P classification (10 points, Post\_P $\approx$ 0.994); all remaining rules
+are internally consistent at $p=0.10$ with $C^*=350$. Table~\ref{tab:boundary}
+was produced by re-deriving $C^*$ at each listed prior by the same grid
+search and evaluating Equation~\ref{eq:bayes} at each ACMG boundary's point
+total ($T\in\{6,10,-1,-7\}$).
+
+\subsection*{Proof that no fixed, additive point system is exact at every prior}
 
 \begin{theorem}
 \label{thm:main}
 No scoring system satisfying fixed combination thresholds \textup{(R1)},
-the $1{:}2{:}4{:}8$ tier ratio \textup{(R2)}, and additive evidence combination
-\textup{(R3)} can simultaneously achieve exact classification boundary posteriors
-at all priors \textup{(R4)}.
+the $1{:}2{:}4{:}8$ tier ratio \textup{(R2)}, and additive evidence
+combination \textup{(R3)} can simultaneously achieve exact classification
+boundary posteriors at all priors \textup{(R4)}.
 \end{theorem}
 
 \begin{proof}
@@ -228,20 +414,27 @@ The same argument applies to all four classification boundaries, and any
 rescaling of the tier weights preserves the contradiction.
 \end{corollary}
 
-The trilemma---Table~\ref{tab:trilemma}---leaves three design choices.
-Tavtigian~\cite{tavtigian2018modeling} satisfies R1--R3 (additive, fixed
-thresholds) at the cost of R4 (posteriors drift with prior).
-A ``floating threshold'' approach satisfies R3--R4 but breaks R1, since the
-same evidence combination would cross different classification boundaries at
-different priors---unacceptable when rule-based evidence sources already
-incorporate the prior independently.
-The piecewise method (below) satisfies R1, R2, and R4 exactly, sacrificing
-only strict additivity (R3) in a quantifiable way.
+Table~\ref{tab:trilemma} lays out the trade-off: Tavtigian satisfies R1--R3
+at the cost of R4 (posteriors drift with prior, Table~\ref{tab:boundary}).
+A hypothetical "floating threshold" scheme could satisfy R3--R4 but breaks
+R1, since identical evidence combinations would then cross different
+classification boundaries at different priors -- unworkable when other,
+non-prior-adaptive evidence sources (segregation, population data) are
+combined alongside it. ACMG-Bayes escapes the trade-off by relaxing R2 from
+a combination constraint to a \emph{display-only} one: it never sums
+integer tiers -- evidence is combined by summing $\log(\lrp)$ directly --
+but any combined $\log(\lrp)$ value can still be converted back into a
+Su/M/S/VS-equivalent label at the prior in use. Because R2 no longer
+constrains the combination arithmetic, Theorem~\ref{thm:main}'s proof
+(which requires R2 and R3 together) does not apply, and R1, R3, and R4 all
+hold exactly and simultaneously.
 
 \begin{table}[h]
 \centering
-\caption{The trilemma: any two of R1, R3, R4 can be satisfied exactly,
-         but not all three.}
+\caption{Any two of R1, R3, R4 can be satisfied exactly, but not all three
+         under R2 (integer, fixed-ratio tiers used as the combination
+         operand). ACMG-Bayes escapes this by relaxing R2 to a
+         display-only constraint rather than dropping it outright.}
 \label{tab:trilemma}
 \begin{tabular}{lcccc}
 \toprule
@@ -249,244 +442,151 @@ Method & R1 (fixed thresh.) & R2 (1:2:4:8) & R3 (additive) & R4 (exact post.) \\
 \midrule
 Tavtigian~\cite{tavtigian2018modeling} & \checkmark & \checkmark & \checkmark & $\times$ \\
 Floating threshold  & $\times$   & \checkmark & \checkmark & \checkmark \\
-\textbf{Piecewise}  & \checkmark & \checkmark & $\approx$  & \checkmark \\
+\textbf{ACMG-Bayes}  & \checkmark & $\approx^\dagger$ & \checkmark & \checkmark \\
 \bottomrule
 \end{tabular}
+
+\vspace{0.3em}
+\footnotesize
+$^\dagger$R2 holds as a derived \emph{display} label (Su/M/S/VS-equivalent,
+computed from the combined $\log(\lrp)$ at the current prior), not as the
+combination operand.
 \end{table}
 
-% ------------------------------------------------------------------
-\section*{A Piecewise Bayesian Solution}
-% ------------------------------------------------------------------
-
-\subsection*{Construction and exact boundary posteriors}
+\subsection*{ACMG-Bayes construction}
+\label{sec:acmgbayes}
 
 At each prior $p$, the four Bayesian target $\lrp$ values are computed
 analytically~\cite{Glas2003}:
 \begin{equation}
-  \lrp^*_q(p) = \frac{q(1-p)}{p(1-q)},
+  {\lrp}^*_q(p) = \frac{q(1-p)}{p(1-q)},
   \qquad q \in \{0.99,\, 0.90,\, 0.10,\, 0.01\},
 \end{equation}
-yielding $\postp = q$ exactly.
-These are anchored to the ACMG classification boundaries
+yielding $\postp = q$ exactly. These are anchored to the ACMG boundaries
 $T \in \{10, 6, -1, -7\}$ to define four knots of a piecewise-linear
-function $L_p(T) = \log(\lrp(T))$ (the natural logarithm of the likelihood ratio),
-with linear interpolation within each of the
-three segments and extrapolation beyond the outermost knots using the
-adjacent segment's slope.
-The posterior is then given by the logistic function applied to $L_p(T)$ plus the log-prior-odds:
-$\postp = \sigma\!\bigl(L_p(T) + \log\frac{p}{1-p}\bigr)$,
-where $\sigma$ is the logistic function and $\log\frac{p}{1-p}$ is the log-prior-odds.
-By construction, $\postp = q$ exactly at each of the four points cutoff values for every prior $p \in (0,1)$.
+function $L_p(T) = \log(\lrp(T))$, with linear interpolation within each of
+the three segments and extrapolation beyond the outermost knots using the
+adjacent segment's slope. The posterior at a single code (or point total)
+$T$ is then $\postp = \sigma\!\bigl(L_p(T) + \log\frac{p}{1-p}\bigr)$, where
+$\sigma$ is the logistic function. By construction, $\postp = q$ exactly at
+each of the four boundary values, for every prior $p \in (0,1)$. The
+segment slopes ($\log(11)/6$, $\log(81)/7$, $\log(11)/4$ per point) are
+prior-independent; only the vertical position of the line shifts with
+prior (Figure~\ref{fig:slope_geometry}).
 
-A key property is that the slopes of $\log(\lrp)$ vs.\ $T$ in each segment are
-prior-independent:
-$\alpha_{\mathrm{B\text{--}LB}} = \log(11)/6 \approx 0.385$ per point,
-$\alpha_{\mathrm{LB\text{--}LP}} = \log(81)/7 \approx 0.586$ per point, and
-$\alpha_{\mathrm{LP\text{--}P}} = \log(11)/4 \approx 0.614$ per point.
-Only the vertical position (intercept) of the $\log(\lrp)$ line shifts with prior, ensuring
-the correct anchor $\lrp$ (the threshold LR$^+$ value) at every classification boundary.
-Figure~\ref{fig:slope_geometry} illustrates this geometry: as $p$ changes,
-the piecewise line translates vertically through all four Bayesian target dots,
-while the Tavtigian straight line rotates and misses the dots at priors away
-from 0.10.
+When combining evidence from more than one code, ACMG-Bayes sums the
+per-code $\log(\lrp)$ values directly (equivalently, multiplies the
+underlying likelihood ratios), which is exact Bayesian evidence aggregation
+regardless of prior:
+$\log(\lrp_A \cdot \lrp_B) = \log(\lrp_A) + \log(\lrp_B)$. Classification
+into P/LP/VUS/LB/B is then applied once, to the final combined
+$\log(\lrp)$, using the same exact analytical thresholds derived above.
 
-\subsection*{Evidence thresholds are substantially different from Tavtigian at non-canonical priors}
+To recover an ACMG-familiar point label for reporting, the four boundary
+$\log(\lrp)$ values at the gene's current prior are used to invert a
+combined $\log(\lrp)$ value back into a (generally fractional) point count:
+locate which segment the value falls in, then linearly invert that
+segment's own slope to solve for $T$. Because the boundary $\log(\lrp)$
+values are prior-specific, the same numeric $\log(\lrp)$ maps to a
+different point count at different priors -- this is expected, not an
+error, and follows directly from Theorem~\ref{thm:main}.
 
-The practical consequence of piecewise calibration is most visible in the
-evidence thresholds themselves.
-At the LP points cutoff (6 points), both methods agree by construction at $p = 0.10$:
-$\lrp^* = 81$.
-But for the LB points cutoff ($-$1 points):
+ACMG-Bayes requires access to a continuous $\log(\lrp)$ per evidence item,
+already available in pipelines like \excalibr that fit assay-score-to-LR$^+$
+calibration curves directly~\cite{igvf_pp}. For evidence sources only ever
+available as a discrete ACMG code (e.g.\ PM1, with no underlying continuous
+score), the code's canonical $\log(\lrp)$ (its Tavtigian point value scaled
+by $\log(C^*)/8$ at $p=0.10$, or the ACMG-Bayes-anchored equivalent at
+another prior) can be added into the same running total without
+approximation.
+
+\subsection*{Evidence-symmetric correction to the LB/B targets}
+\label{sec:target_symmetry}
+
+Writing $\mathrm{logit}(x) = \log\bigl(x/(1-x)\bigr)$, the exact evidence
+required to reach a target posterior $q$ from prior $p$ is
 \begin{equation}
-  \lrp^*_{\mathrm{PW}}(-1, p) = \frac{0.10(1-p)}{p \cdot 0.90},
-  \qquad
-  \lrp^*_{\mathrm{Tav}}(-1, p) = C^*(p)^{-1/8},
+  \log\lrp_{\mathrm{req}}(q, p) = \mathrm{logit}(q) - \mathrm{logit}(p).
+  \label{eq:req_evidence}
 \end{equation}
-and these diverge sharply.
-At $p = 0.01$: $\lrp^*_{\mathrm{PW}} = 11.0$, $\lrp^*_{\mathrm{Tav}} = 0.26$.
-Any variant with $0.26 < \lrp < 11.0$---a 42-fold range in $\lrp$ (or equivalently $\log(11.0/0.26) \approx 1.62$
-in $\log(\lrp)$)---receives benign evidence under piecewise but not under Tavtigian.
-For the LP points cutoff at $p = 0.45$: $\lrp^*_{\mathrm{PW}} = 9.2$,
-$\lrp^*_{\mathrm{Tav}} = 2876^{0.75} \approx 477$---Tavtigian
-requires 52$\times$ more evidence to reach LP classification than necessary.
+The standard ACMG targets satisfy
+$\mathrm{logit}(0.99) = +4.595$,
+$\mathrm{logit}(0.90) = +2.197$,
+$\mathrm{logit}(0.10) = -2.197$,
+$\mathrm{logit}(0.01) = -4.595$ -- exactly symmetric about
+$\mathrm{logit}=0$, i.e.\ posterior $=0.5$. By Equation~\ref{eq:req_evidence},
+this design is evidence-neutral (LB and LP requiring equal and opposite
+amounts of evidence) only if $\mathrm{logit}(p)=0$, i.e.\ the reference
+prior is itself $0.5$. The reference prior used throughout this paper is
+$p=0.10$, giving, for the LB target,
+\begin{equation}
+  \log\lrp_{\mathrm{req}}(0.10,\ 0.10) = \mathrm{logit}(0.10) - \mathrm{logit}(0.10) = 0
+  \qquad(\lrp = 1),
+  \label{eq:lb_degenerate}
+\end{equation}
+i.e.\ the standard LB target requires no evidence at all when the prior
+equals the reference prior. More generally,
+$\log{\lrp}_{\mathrm{req}}^{\mathrm{LB}}(p) = \mathrm{logit}(0.10) - \mathrm{logit}(p)$,
+which is positive (requiring pathogenic-leaning evidence for a benign call)
+whenever $p<0.10$, zero at $p=0.10$, and only correctly negative when
+$p>0.10$. LP/P are not affected the same way:
+$\mathrm{logit}(0.90) - \mathrm{logit}(p)$ stays comfortably positive down
+to very low priors.
 
-These threshold differences translate directly into evidence assignment errors
-in calibration pipelines.
-A calibration tool that estimates a variant's $\lrp$ correctly but maps it
-to evidence strengths using Tavtigian thresholds will under-assign benign
-evidence at low priors and over-assign pathogenic evidence at high priors.
+The evidence-symmetric correction mirrors LB/B to LP/P about the prior
+itself rather than about 50-50 odds:
+\begin{equation}
+  \mathrm{logit}(q_{\mathrm{LB}}) = 2\,\mathrm{logit}(p) - \mathrm{logit}(q_{\mathrm{LP}}).
+  \label{eq:symmetric_target}
+\end{equation}
+At $p=0.10$, Equation~\ref{eq:symmetric_target} gives
+$q_{\mathrm{LB}} \approx 0.137\%$ (mirroring LP's 0.90) and, applying the
+same relation to $q_{\mathrm{P}}=0.99$, $q_{\mathrm{B}} \approx 0.0125\%$
+(mirroring P). The shifted targets evaluated in Results (LB$=1\%$,
+B$=0.1\%$) are a round-number compromise between the broken status quo and
+this exact value -- an order of magnitude looser, but already sufficient to
+require genuine benign-leaning evidence rather than none
+(Table~\ref{tab:target_symmetry}). As with $C^*$ itself, this correction is
+stated at the reference prior; a fully general treatment would make the
+LB/B targets a function of the prior via Equation~\ref{eq:symmetric_target}
+rather than a second pair of fixed constants, which we do not pursue here.
 
-% ------------------------------------------------------------------
-\section*{Combination Errors: a Secondary Consideration}
-% ------------------------------------------------------------------
+\subsection*{Empirical validation}
 
-When two pieces of evidence are combined by summing points, the combined
-$\lrp$ should equal the product of individual $\lrp$ values.
-Tavtigian satisfies this exactly by construction ($C^{a+b} = C^a \cdot C^b$),
-but its per-code LR$^+$ thresholds are miscalibrated away from $p = 0.10$.
-The piecewise method has exact single-assay boundary posteriors but incurs
-combination errors when evidence sums cross a segment boundary (Figure~\ref{fig:additivity_by_type}).
+We compared the standard targets (LB=10\%, B=1\%) against the shifted
+targets (LB=1\%, B=0.1\%) using \excalibr\ bootstrap calibration fits for 89
+real deep mutational scanning / multiplexed assay of variant effect
+datasets, applying identical assay-score-to-$\lrp$ calibrations and
+identical gene-specific priors to both, so that any difference in outcome
+is attributable only to the evidence-threshold targets. Ground truth was
+taken from each variant's curated ClinVar sample label: a variant was
+treated as a pathogenic control if "Pathogenic/Likely Pathogenic" was one of
+its labels, a benign control if "Benign/Likely Benign" was one of its
+labels (synonymous-only variants were not counted as benign controls), and
+excluded from the comparison otherwise (e.g.\ plain population-frequency
+rows). Datasets and components were selected to match one evaluated
+component per dataset (preferring the 3-class over 2-class fit where both
+were available), giving 72 evaluated components and 23{,}717 total control
+variants. Classification metrics (sensitivity, specificity, accuracy, and
+Matthews correlation coefficient) were computed on the resulting 2$\times$3
+confusion matrix (true Pathogenic/Benign controls vs.\ predicted
+LP-or-P/VUS/LB-or-B), restricted to determinate (non-VUS) calls.
 
-Piecewise combination errors arise from the fact that the
-$\log(\lrp)$ function is anchored at the LB points cutoff ($-$1 points), not at the
-origin (0 points), so the piecewise segments have the form $L_p(T) = L_p(-1) + \alpha(T - (-1))$
-rather than $\alpha T$.
-Within a single segment, this produces a constant offset error in $\log(\lrp)$ per combined pair.
-The 6$\cdot$11$\cdot$6 additive variant of Tavtigian~\cite{Tavtigian2020} is
-specifically designed to eliminate within-segment errors by moving the LB points cutoff
-to 0 points.
-
-We measure combination errors using the absolute log-odds metric
-$|\mathrm{logit}(\hat{p}) - \mathrm{logit}(p_{\mathrm{ref}})|$,
-where $p_{\mathrm{ref}}$ is the Bayesian posterior from the piecewise per-code LR$^+$ product.
-This metric is scale-invariant and treats errors near 0 and 1 appropriately---a posterior shift
-from 0.990 to 0.999 is as significant as one from 0.010 to 0.019, both corresponding to roughly
-0.9 log-odds units.
-
-Table~\ref{tab:combo_errors_priors} shows median log-odds errors across the full prior range.
-For mixed combinations, piecewise wins consistently and significantly at every prior
-($p < 0.01$, Wilcoxon signed-rank; Table~\ref{tab:wilcoxon}).
-For within-segment pathogenic pairs, piecewise also wins at all priors,
-reaching significance only at $p = 0.45$ where Tavtigian's $C^*$ severely degrades.
-The one consistent exception is cross-segment evidence:
-Tavtigian wins at $p \leq 0.25$ due to its exact additivity by construction,
-though piecewise reverses this at $p = 0.45$.
-
-The primary advantage of piecewise is therefore in single-assay LR$^+$ threshold correctness,
-not combination accuracy, which is the property that directly impacts assay calibration pipelines.
-
-\begin{table}[p]
-\centering
-\small
-\caption{Median absolute log-odds combination error by type across key priors (lower is better, bolded).
-         Errors measured as $|\mathrm{logit}(\hat{p}) - \mathrm{logit}(p_{\mathrm{ref}})|$.}
-\label{tab:combo_errors_priors}
-\begin{tabular}{l @{\hspace{0.5em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr}
-\toprule
-\textbf{Type} & \multicolumn{2}{c}{\textbf{$p=0.01$}} & \multicolumn{2}{c}{\textbf{$p=0.05$}}
-              & \multicolumn{2}{c}{\textbf{$p=0.10$}} & \multicolumn{2}{c}{\textbf{$p=0.25$}}
-              & \multicolumn{2}{c}{\textbf{$p=0.45$}} \\
-& \textbf{PW} & \textbf{Tav} & \textbf{PW} & \textbf{Tav} & \textbf{PW} & \textbf{Tav} & \textbf{PW} & \textbf{Tav} & \textbf{PW} & \textbf{Tav} \\
-\midrule
-Within-seg (path) & \textbf{3.03} & 3.28 & \textbf{1.38} & 1.49 & \textbf{0.628} & 0.681 & \textbf{0.471} & 0.598 & \textbf{1.37} & 4.76 \\
-Cross-seg (path)  & 3.11 & \textbf{1.04} & 1.46 & \textbf{0.487} & 0.713 & \textbf{0.235} & 0.386 & \textbf{0.359} & \textbf{1.28} & 6.42 \\[0.3em]
-Within-seg (ben)  & \textbf{2.80} & 8.52 & \textbf{1.15} & 4.12 & \textbf{0.400} & 2.13 & \textbf{0.699} & 0.736 & 1.60 & \textbf{0.810} \\
-Cross-seg (ben)   & \textbf{2.80} & 12.9 & \textbf{1.15} & 6.87 & \textbf{0.400} & 4.13 & 0.699 & \textbf{0.258} & 1.60 & \textbf{2.77} \\[0.3em]
-Mixed (path+ben)  & \textbf{3.25} & 6.51 & \textbf{1.60} & 3.09 & \textbf{0.856} & 1.54 & \textbf{0.243} & 0.503 & \textbf{1.14} & 2.33 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[p]
-\centering
-\small
-\caption{Wilcoxon signed-rank test on per-combination log-odds error differences
-         (PW $-$ Tav). Null hypothesis: median difference $= 0$.
-         $W$ = test statistic; $p$ = two-sided $p$-value.
-         Bold $p$-values indicate significance at $\alpha = 0.05$.
-         Note: within/cross benign types have only 5 combinations; minimum attainable $p = 0.063$.}
-\label{tab:wilcoxon}
-\begin{tabular}{l @{\hspace{0.5em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr @{\hspace{1em}} rr}
-\toprule
-\textbf{Type}
-  & \multicolumn{2}{c}{\textbf{$p=0.01$}}
-  & \multicolumn{2}{c}{\textbf{$p=0.05$}}
-  & \multicolumn{2}{c}{\textbf{$p=0.10$}}
-  & \multicolumn{2}{c}{\textbf{$p=0.25$}}
-  & \multicolumn{2}{c}{\textbf{$p=0.45$}} \\
-& $W$ & $p$ & $W$ & $p$ & $W$ & $p$ & $W$ & $p$ & $W$ & $p$ \\
-\midrule
-Within-seg (path) & 30 & 0.52 & 36 & 0.85 & 30 & 0.52 & 23 & 0.23 & 0 & \textbf{0.001} \\
-Cross-seg (path)  & 0 & \textbf{$<$0.001} & 0 & \textbf{$<$0.001} & 0 & \textbf{$<$0.001} & 68 & \textbf{0.018} & 0 & \textbf{$<$0.001} \\[0.3em]
-Within-seg (ben)  & 0 & 0.063 & 0 & 0.063 & 0 & 0.063 & 6 & 0.81 & 2 & 0.19 \\
-Cross-seg (ben)   & 0 & 0.063 & 0 & 0.063 & 0 & 0.063 & 3 & 0.31 & 1 & 0.13 \\[0.3em]
-Mixed (path+ben)  & 2 & \textbf{$<$0.001} & 3 & \textbf{$<$0.001} & 2 & \textbf{$<$0.001} & 23 & \textbf{0.018} & 4 & \textbf{$<$0.001} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% ------------------------------------------------------------------
-\section*{Discussion}
-% ------------------------------------------------------------------
-
-\subsection*{Prior-adaptive thresholds are necessary for accurate evidence assignment}
-
-Assay calibration pipelines estimate the variant-level positive likelihood
-ratio from data; the quality of this estimation is the primary driver of
-calibration accuracy~\cite{igvf_pp, pejaver2022calibration}.
-However, once $\lrp(s)$ is estimated, the mapping to evidence strengths
-introduces a second source of error: the use of prior-fixed thresholds.
-Our results show that this error is largest in the benign direction at low
-priors, which is precisely the regime most clinically relevant for rare
-disease panels where gene-level priors can be well below 0.05.
-The piecewise method eliminates this second source of error entirely by
-constructing prior-adaptive thresholds that guarantee the ACMG posterior
-targets at every prior.
-
-\subsection*{Implications for assay calibration with gene-specific priors}
-
-\excalibr~\cite{igvf_pp} and related methods estimate the gene-specific prior
-from gnomAD population frequencies, which vary substantially across genes.
-When these priors are used to determine $C^*$ via the Tavtigian formula, the
-pathogenic LP and P thresholds are approximately correct (within $\sim$1\%
-for LP at priors below 0.25), but the benign LB and B thresholds can be
-orders of magnitude too stringent.
-Replacing $C^{k/8}$ thresholds with piecewise $\lrp$ thresholds in these
-pipelines would recover the correct ACMG boundary posteriors and substantially
-increase benign evidence assignment rates at low priors.
-At $p = 0.01$---representative of high-throughput panels screening many genes
-simultaneously---every variant with $0.26 < \lrp < 11$ would gain Supporting
-Benign evidence under piecewise; at Supporting Benign, the posterior
-probability is by construction $\leq 0.10$.
-
-\subsection*{Combination errors and multi-assay integration}
-
-For applications combining multiple independent assays or combining assay
-evidence with other evidence types (computational, segregation, population),
-the additivity property of the evidence combination is relevant.
-Tavtigian's exact additivity ($C^{a+b} = C^a \cdot C^b$) is convenient but
-does not compensate for the threshold miscalibration shown above; a correctly
-additive system with the wrong thresholds still produces wrong posteriors.
-Piecewise errors of $\sim$0.005--0.06 in posterior probability at the
-cross-segment or within-segment level are small relative to the 42-fold
-difference in LB LR⁺ threshold at $p = 0.01$.
-When multiple assay results are combined with other lines of evidence, the
-combination errors of the piecewise method are bounded by the maximum
-log-slope discontinuity across segment boundaries, which is a fixed geometric
-property independent of prior.
-
-\subsection*{Conclusion}
-
-We prove that the Tavtigian framework's threshold miscalibration at
-non-canonical priors is an unavoidable mathematical consequence of requiring
-additive evidence combination with fixed, prior-independent thresholds.
-The piecewise solution resolves this by sacrificing strict additivity
-in exchange for exact boundary posteriors at every prior, preserving the
-ACMG combination rules and point system.
-The practical impact is largest for benign evidence at low priors, where
-Tavtigian thresholds are far too stringent and cause widespread under-assignment
-of benign evidence.
-We recommend that assay calibration pipelines that estimate gene-specific priors
-use prior-adaptive (piecewise) thresholds in the LR$^+$-to-evidence-strength
-mapping step.
-
-% ------------------------------------------------------------------
+% ==================================================================
 % Figures
-% ------------------------------------------------------------------
+% ==================================================================
 
 \begin{figure}[p]
   \centering
   \includegraphics[width=0.92\textwidth]{figures/lr_thresholds.pdf}
-  \caption{LR$^+$ thresholds for evidence codes 1, 2, 4, 8 (Su, M, S, VS)
-           vs.\ gene-specific prior.
-           Tavtigian (solid): follows $C^{*T/8}$; shows a non-monotone
-           artefact near $p \approx 0.25$ where $C^*$ passes through its
-           minimum, and a large spike at $p = 0.45$ where benign combination
-           rules drive $C^*$ to 2876.
-           Piecewise (dashed): varies smoothly; thresholds are prior-adaptive
-           and produce exact posteriors at each evidence boundary.
-           Dotted lines: analytical Bayesian thresholds (continuous ground truth).
-           Warm colours = pathogenic codes; cool colours = benign codes.}
+  \caption{Likelihood-ratio thresholds for evidence codes 1, 2, 4, 8 (Su, M,
+           S, VS) vs.\ gene-specific prior. Standard (Tavtigian, solid):
+           follows a single fixed relationship; shows a non-monotone
+           artefact near $p \approx 0.25$ and a large spike at $p=0.45$
+           where benign combination rules drive $C^*$ to 2876. ACMG-Bayes
+           (dashed): varies smoothly with the prior and produces exact
+           posteriors at each evidence boundary. Warm colours = pathogenic
+           codes; cool colours = benign codes.}
   \label{fig:lr_thresholds}
 \end{figure}
 
@@ -494,63 +594,32 @@ mapping step.
   \centering
   \includegraphics[width=0.92\textwidth]{figures/boundary_posteriors.pdf}
   \caption{Posterior probability at each method's classification boundary
-           $T$ value vs.\ gene-specific prior.
-           Piecewise (dashed): flat at all four targets by construction.
-           Tavtigian (solid): well-calibrated for LP at priors $\leq 0.25$
-           but severely miscalibrated for LB and B boundaries across the
-           full prior range; anomalous over-calibration at $p \approx 0.45$.}
+           vs.\ gene-specific prior. ACMG-Bayes (dashed): flat at all four
+           targets by construction. Standard (Tavtigian, solid):
+           well-calibrated for LP at priors $\leq 0.25$ but severely
+           miscalibrated for LB and B across the full prior range, with
+           anomalous over-calibration near $p \approx 0.45$.}
   \label{fig:boundary_posteriors}
 \end{figure}
 
 \begin{figure}[p]
   \centering
   \includegraphics[width=0.95\textwidth]{figures/slope_geometry.pdf}
-  \caption{$\log\lrp$ vs.\ total evidence points $T$ at three prior values.
-           Coloured dots indicate the exact Bayesian target $\log\lrp$
-           at each of the four classification boundaries.
-           Tavtigian (red): a single straight line that passes through all
-           four dots only at $p = 0.10$.
-           Piecewise (blue): a kinked line that passes through all four dots
-           at every prior by translating vertically.
-           Lower panels: the corresponding posterior probability curves;
-           piecewise reaches each ACMG boundary exactly, Tavtigian drifts.}
+  \caption{$\log(\lrp)$ vs.\ total evidence points at three prior values.
+           Coloured dots mark the exact Bayesian target at each of the four
+           classification boundaries. Standard (Tavtigian, red): a single
+           straight line that passes through all four dots only at
+           $p=0.10$. ACMG-Bayes (blue): a line that passes through all four
+           dots at every prior by shifting vertically. Lower panels: the
+           corresponding posterior probability curves.}
   \label{fig:slope_geometry}
 \end{figure}
 
-\begin{figure}[p]
-  \centering
-  \includegraphics[width=0.98\textwidth]{figures/additivity_by_type.pdf}
-  \caption{Evidence combination errors stratified by type.
-           \emph{Top row}: single-assay boundary posteriors showing
-           Tavtigian drift and piecewise exactness.
-           \emph{Bottom left}: representative per-type errors at $p = 0.10$;
-           both methods measured against the same Bayesian ground truth.
-           \emph{Bottom middle}: median per-type combination errors
-           vs.\ prior (piecewise dashed, Tavtigian solid).
-           \emph{Bottom right}: error advantage (piecewise $-$ Tavtigian);
-           positive = piecewise more accurate.}
-  \label{fig:additivity_by_type}
-\end{figure}
-
-\begin{figure}[p]
-  \centering
-  \includegraphics[width=0.95\textwidth]{figures/error_comparison.pdf}
-  \caption{Single-assay boundary errors for both methods using two error
-           metrics: MAE in posterior probability (solid) and absolute
-           log-odds error $|\mathrm{logit}(\hat{p}) - \mathrm{logit}(\mathrm{target})|$
-           (dashed).
-           Piecewise = 0 at all boundaries by construction.
-           The log-odds metric reveals the true severity of Tavtigian's
-           benign-boundary miscalibration at low priors, which MAE
-           substantially understates.}
-  \label{fig:error_comparison}
-\end{figure}
-
-% ------------------------------------------------------------------
+% ==================================================================
 \clearpage
 \appendix
 
-\section*{Supplementary: evidence tier point system and combination rules}
+\section*{Supplement: evidence tier point system and combination rules}
 
 \begin{table}[h]
 \centering
@@ -560,8 +629,8 @@ mapping step.
          Su$_B$\,=\,$-1$, S$_B$\,=\,$-4$ (standard ACMG benign tiers only).
          $^\dagger$Modified rule: original ACMG classifies VS+M as LP and
          2S as P; both are internally inconsistent at $p=0.10$, so following
-         Tavtigian et al.\ they are swapped.
-         All calculations use the modified (swapped) rules.}
+         Tavtigian et al.\ they are swapped. All calculations use the
+         modified (swapped) rules.}
 \label{tab:rules}
 \begin{tabular}{lll}
 \toprule
@@ -588,22 +657,6 @@ B  & 2S$_B$                                            & $-8$ \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-\section*{Supplementary: combination error tables}
-\label{sec:supplement}
-
-The following tables list the posterior combination errors for all
-evidence pairs at priors $p \in \{0.01, 0.10, 0.25, 0.45\}$.
-PW = piecewise additivity error; Tav = Tavtigian posterior error, both
-measured against the Bayesian posterior from the piecewise per-code
-LR$^+$ product.
-Standard ACMG pathogenic tiers: Su$=1$, M$=2$, S$=4$, VS$=8$;
-codes 3,5,6,7 are intermediate strengths not corresponding to named tiers.
-Standard ACMG benign tiers: Su$_B=-1$, S$_B=-4$;
-M$_B$ ($-2$, $^\dagger$) and VS$_B$ ($-8$, $^\dagger$) are non-standard
-hypothetical extensions.
-
-\input{supplement_tables}
 
 % ------------------------------------------------------------------
 \bibliographystyle{unsrtnat}

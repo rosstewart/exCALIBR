@@ -1,5 +1,16 @@
 """
-Side-by-side comparison plots: Tavtigian vs Piecewise vs Continuous.
+Side-by-side comparison plots: Tavtigian vs ACMG-Bayes.
+
+ACMG-Bayes is the single merged method that replaced the earlier three-way
+split into "piecewise" (per-code/boundary thresholds), "continuous" (a
+single already-known LR+ mapped straight to a posterior), and "ledger"
+(summing per-code log-LR for multi-evidence combination): all three were the
+same underlying object, differing only in how many evidence items were being
+combined. `ACMGBayesSuite` reports the per-code/boundary thresholds;
+`ACMGBayesCombinationSuite` reports multi-evidence combination (zero error by
+construction). `PiecewiseAdditiveSuite`/`LPAnchoredSuite` remain available
+directly (not through `run_all_methods`) as historical reference variants,
+not part of the primary comparison.
 
 Quick-start
 -----------
@@ -8,15 +19,13 @@ Quick-start
         run_all_methods,
         plot_three_way_comparison,
         plot_boundary_posteriors_three_way,
-        plot_relative_stringency,
         plot_additivity_experiment,
         plot_combined_error_comparison,
     )
     priors = prior_grid("paper")
-    t, pw, pw_add, cont = run_all_methods(priors, n_jobs=10)
-    plot_three_way_comparison(t, pw, cont_df=cont)
-    plot_boundary_posteriors_three_way(t, pw)
-    plot_relative_stringency(t, pw, cont_df=cont)
+    t, acmg = run_all_methods(priors, n_jobs=10)
+    plot_three_way_comparison(t, acmg)
+    plot_boundary_posteriors_three_way(t, acmg)
     plot_additivity_experiment(priors, tav_df=t)
     plot_combined_error_comparison(priors, tav_df=t)
 """
@@ -32,7 +41,11 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 
 from .suite import SimulationSuite
-from .bayesian import PiecewiseSuite, PiecewiseAdditiveSuite, LPAnchoredSuite, ContinuousSuite
+from .bayesian import (
+    ACMGBayesSuite, ACMGBayesCombinationSuite,
+    PiecewiseAdditiveSuite, LPAnchoredSuite,
+    acmg_bayes_log_lr,
+)
 from .core import ACMG_TIER_CODES, CLASSIFICATION_BOUNDARIES, POSTERIOR_TARGETS
 from .analysis import boundary_validity
 
@@ -58,20 +71,22 @@ _BND_COLOR = {
     "B":  STRENGTH_COLOR[-8],
 }
 
-# Per-method line styles / labels
+# Per-method line styles / labels.  Only "tavtigian" and "acmg_bayes" are
+# part of the primary comparison; the historical variants keep their own
+# entries so ad-hoc plots against PiecewiseAdditiveSuite/LPAnchoredSuite
+# still render sensibly if called directly.
 _METHOD_STYLE = {
     "tavtigian":          {"ls": "-",   "lw": 2.0, "alpha": 0.95, "label": "Tavtigian (C*)"},
-    "piecewise":          {"ls": "--",  "lw": 2.0, "alpha": 0.85, "label": "Piecewise α (ACMG)"},
-    "piecewise_additive": {"ls": "-.",  "lw": 2.0, "alpha": 0.85, "label": "Piecewise-Add (6·11·6)"},
-    "lp_anchored":        {"ls": "-.",  "lw": 2.0, "alpha": 0.85, "label": "LP-Anchored (additive)"},
-    "continuous":         {"ls": ":",   "lw": 2.5, "alpha": 0.80, "label": "Continuous (Bayes)"},
+    "acmg_bayes":         {"ls": "--",  "lw": 2.0, "alpha": 0.85, "label": "ACMG-Bayes"},
+    "piecewise_additive": {"ls": "-.",  "lw": 2.0, "alpha": 0.85, "label": "Piecewise-Add (6·11·6) [historical]"},
+    "lp_anchored":        {"ls": "-.",  "lw": 2.0, "alpha": 0.85, "label": "LP-Anchored (additive) [historical]"},
 }
 
 # Classification boundary T values for each method.
 # Used to label plots and pull the right bnd_post_* columns.
 _METHOD_BND_T = {
     "tavtigian":          {"P": 10, "LP":  6, "LB": -1, "B": -7},
-    "piecewise":          {"P": 10, "LP":  6, "LB": -1, "B": -7},
+    "acmg_bayes":         {"P": 10, "LP":  6, "LB": -1, "B": -7},
     "piecewise_additive": {"P": 17, "LP": 11, "LB":  0, "B": -6},
     "lp_anchored":        {"P": 10, "LP":  6, "LB": -1, "B": -7},
 }
@@ -100,15 +115,15 @@ def abs_log_odds_error(posterior: np.ndarray, target: float) -> np.ndarray:
 
 
 def run_all_methods(priors: np.ndarray, n_jobs: int = -1) \
-        -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Run all five suites; return (tav_df, pw_df, pw_add_df, lp_anch_df, cont_df)."""
-    t_suite  = SimulationSuite(priors=priors, n_jobs=n_jobs).run()
-    p_suite  = PiecewiseSuite(priors=priors).run()
-    pa_suite = PiecewiseAdditiveSuite(priors=priors).run()
-    lpa_suite = LPAnchoredSuite(priors=priors).run()
-    c_suite  = ContinuousSuite(priors=priors).run()
-    return (t_suite.to_dataframe(), p_suite.to_dataframe(),
-            pa_suite.to_dataframe(), lpa_suite.to_dataframe(), c_suite.to_dataframe())
+        -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the two primary suites; return (tav_df, acmg_df).
+
+    Historical variants (PiecewiseAdditiveSuite, LPAnchoredSuite) are not
+    part of the primary comparison — instantiate them directly if needed.
+    """
+    t_suite = SimulationSuite(priors=priors, n_jobs=n_jobs).run()
+    a_suite = ACMGBayesSuite(priors=priors).run()
+    return t_suite.to_dataframe(), a_suite.to_dataframe()
 
 
 def _apply_xscale(ax, log_scale: bool):
@@ -122,11 +137,10 @@ def _apply_xscale(ax, log_scale: bool):
 
 def plot_three_way_comparison(
     tav_df:     Optional[pd.DataFrame] = None,
-    pw_df:      Optional[pd.DataFrame] = None,
+    acmg_df:    Optional[pd.DataFrame] = None,
     pw_add_df:  Optional[pd.DataFrame] = None,
     lpa_df:     Optional[pd.DataFrame] = None,
-    cont_df:    Optional[pd.DataFrame] = None,
-    methods: List[str] = ("tavtigian", "piecewise", "lp_anchored", "continuous"),
+    methods: List[str] = ("tavtigian", "acmg_bayes"),
     codes = "key",
     figsize  = (11, 6),
     log_scale: bool = False,
@@ -136,12 +150,10 @@ def plot_three_way_comparison(
     Parameters
     ----------
     methods : list of str
-        Any subset of
-        ``{"tavtigian", "piecewise", "piecewise_additive", "lp_anchored", "continuous"}``.
-        Pass a single-element list to plot only one method.
-        ``"continuous"`` is always drawn as thin black dotted reference lines
-        regardless of whether it appears in ``methods`` — pass ``cont_df=None``
-        to suppress it entirely.
+        Any subset of ``{"tavtigian", "acmg_bayes", "piecewise_additive",
+        "lp_anchored"}`` — the latter two are historical reference variants,
+        not part of the primary comparison (pass their DataFrames via
+        ``pw_add_df``/``lpa_df`` if you want them overlaid).
     codes : ``"all"`` | ``"key"`` | list of int
         ``"all"``  → codes 1–12 (all extended codes)
         ``"key"``  → codes 1, 2, 4, 8 only (ACMG tiers; default)
@@ -155,30 +167,15 @@ def plot_three_way_comparison(
     else:
         _codes = list(codes)
 
-    _DF = {"tavtigian": tav_df, "piecewise": pw_df,
+    _DF = {"tavtigian": tav_df, "acmg_bayes": acmg_df,
            "piecewise_additive": pw_add_df, "lp_anchored": lpa_df}
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    # Continuous ground-truth background: four thin black dotted lines
-    if cont_df is not None:
-        _cont_cols = {
-            "P":  ("log10_lr_P",  0.99),
-            "LP": ("log10_lr_LP", 0.90),
-            "LB": ("log10_lr_LB", 0.10),
-            "B":  ("log10_lr_B",  0.01),
-        }
-        for name, (col, target) in _cont_cols.items():
-            if col in cont_df.columns:
-                ax.plot(cont_df["prior"], cont_df[col],
-                        color="black", lw=1.2, ls=":", alpha=0.35,
-                        zorder=1,
-                        label=f"Bayes {name} (post={target})" if name == "P" else None)
-
-    # Per-method per-code lines
+    # Per-method per-code lines.  ACMG-Bayes's own per-code thresholds are
+    # already exact analytic Bayes targets at the four ACMG boundaries (by
+    # construction), so no separate "ground truth" reference line is needed.
     for method in methods:
-        if method == "continuous":
-            continue   # drawn above as background
         df = _DF.get(method)
         if df is None:
             continue
@@ -205,12 +202,7 @@ def plot_three_way_comparison(
 
     # Legend: one entry per method + colour gradient sentinels
     handles = []
-    if cont_df is not None:
-        handles.append(Line2D([0], [0], color="black", ls=":", lw=1.5,
-                               alpha=0.5, label="Bayesian ground truth"))
     for method in methods:
-        if method == "continuous":
-            continue
         df = _DF.get(method)
         if df is not None:
             s = _METHOD_STYLE[method]
@@ -223,8 +215,7 @@ def plot_three_way_comparison(
                           label=f"Code ±{_codes[0]} (weakest)"))
 
     ax.legend(handles=handles, fontsize=9, loc="best", framealpha=0.8)
-    _methods_shown = [m for m in methods if m != "continuous"]
-    _labels_shown  = [_METHOD_STYLE.get(m, {}).get("label", m) for m in _methods_shown]
+    _labels_shown = [_METHOD_STYLE.get(m, {}).get("label", m) for m in methods]
     ax.set_title(
         f"LR+ thresholds vs prior  [{', '.join(_labels_shown)}]"
         f"  (pathogenic above 0, benign below 0)",
@@ -234,34 +225,32 @@ def plot_three_way_comparison(
     return fig, ax
 
 
-# ── 2. Boundary posteriors: Tavtigian vs Piecewise ───────────────────────────
+# ── 2. Boundary posteriors: Tavtigian vs ACMG-Bayes ──────────────────────────
 
 def plot_boundary_posteriors_three_way(
     tav_df:    Optional[pd.DataFrame] = None,
-    pw_df:     Optional[pd.DataFrame] = None,
+    acmg_df:   Optional[pd.DataFrame] = None,
     pw_add_df: Optional[pd.DataFrame] = None,
-    lpa_df:    Optional[pd.DataFrame] = None,  # [DEPRECATED] kept for compatibility
-    cont_df:   Optional[pd.DataFrame] = None,   # accepted for backward compat, unused
-    methods: List[str] = ("tavtigian", "piecewise"),
+    lpa_df:    Optional[pd.DataFrame] = None,  # historical reference variant
+    methods: List[str] = ("tavtigian", "acmg_bayes"),
     figsize  = (12, 5),
     log_scale: bool = False,
 ) -> Tuple[plt.Figure, np.ndarray]:
     """Posterior at each method's own boundary T values vs prior.
 
     Each method is plotted at its OWN classification boundary T values:
-      - Tavtigian and piecewise: T ∈ {10, 6, −1, −7}
-      - Piecewise-Add (6·11·6): T ∈ {16, 10, −1, −7}
+      - Tavtigian and ACMG-Bayes: T ∈ {10, 6, −1, −7}
+      - Piecewise-Add (6·11·6) [historical]: T ∈ {16, 10, −1, −7}
 
-    Continuous is omitted (trivially flat by construction).
-    Piecewise variants should be flat at the targets for every prior.
+    ACMG-Bayes is flat at the targets for every prior, by construction.
     Tavtigian drifts away from the targets at priors far from 0.10.
     """
     # Guard: if methods is accidentally a DataFrame (old call: (t, a, b))
     if not isinstance(methods, (list, tuple)) or (
             len(methods) > 0 and not isinstance(methods[0], str)):
-        methods = ("tavtigian", "piecewise", "piecewise_additive")
+        methods = ("tavtigian", "acmg_bayes")
 
-    _DF = {"tavtigian": tav_df, "piecewise": pw_df,
+    _DF = {"tavtigian": tav_df, "acmg_bayes": acmg_df,
            "piecewise_additive": pw_add_df, "lp_anchored": lpa_df}
 
     # Each method's boundary T values for the four named boundaries
@@ -337,7 +326,7 @@ def plot_boundary_posteriors_three_way(
 
     fig.suptitle(
         "Boundary posteriors at each method's own boundary T\n"
-        "Piecewise variants: flat on targets · Tavtigian: drifts from p=0.10",
+        "ACMG-Bayes: flat on targets · Tavtigian: drifts from p=0.10",
         fontsize=11,
     )
     fig.tight_layout()
@@ -388,13 +377,13 @@ def plot_relative_stringency(
                     color=color, lw=2, ls="-",
                     label=f"Tavtigian (T={_METHOD_BND_T['tavtigian'].get(name, '?')})")
 
-        # Piecewise original
+        # ACMG-Bayes
         if pw_df is not None and f"bnd_lr_{bnd_name}" in pw_df.columns:
             pw_lr = pw_df[f"bnd_lr_{bnd_name}"].values
-            T_pw  = _METHOD_BND_T["piecewise"].get(name, "?")
+            T_pw  = _METHOD_BND_T["acmg_bayes"].get(name, "?")
             ax.plot(pw_df["prior"], np.log10(pw_lr / cont_lr),
                     color=color, lw=2, ls="--",
-                    label=f"Piecewise (T={T_pw})")
+                    label=f"ACMG-Bayes (T={T_pw})")
 
         # Piecewise additive
         if pw_add_df is not None and f"bnd_lr_{bnd_name}" in pw_add_df.columns:
@@ -413,7 +402,7 @@ def plot_relative_stringency(
     axes[0].set_ylabel("log₁₀(LR+_method / LR+_Bayesian)", fontsize=10)
     fig.suptitle(
         "Stringency vs the analytical Bayesian reference  (0 = exact match)\n"
-        "Piecewise variants: always 0 at their own boundary T · Tavtigian: drifts",
+        "ACMG-Bayes: always 0 at its own boundary T · Tavtigian: drifts",
         fontsize=11,
     )
     fig.tight_layout()
@@ -425,7 +414,7 @@ def plot_relative_stringency(
 def plot_log_lr_curves(
     priors=(0.05, 0.10, 0.25, 0.50),
     T_grid=None,
-    methods=("tavtigian", "piecewise", "continuous", "recanonical",
+    methods=("tavtigian", "acmg_bayes", "continuous", "recanonical",
              "lsq", "spline"),
     tav_df: Optional[pd.DataFrame] = None,
     figsize=None,
@@ -465,9 +454,9 @@ def plot_log_lr_curves(
             y = (math.log(C) / 8.0) * T_grid
             ax.plot(T_grid, y, lw=2, color="#d62728", ls="-",
                     label=f'Tavtigian (C={int(C)})')
-        if "piecewise" in methods:
+        if "acmg_bayes" in methods:
             y = piecewise_log_lr(T_grid, float(p))
-            ax.plot(T_grid, y, lw=2, color="#1f77b4", ls="--", label="Piecewise")
+            ax.plot(T_grid, y, lw=2, color="#1f77b4", ls="--", label="ACMG-Bayes")
         if "recanonical" in methods:
             y = recanonical_log_lr(T_grid, float(p))
             ax.plot(T_grid, y, lw=2, color="#9467bd", ls="-.", label="Recanonical")
@@ -501,7 +490,7 @@ def plot_log_lr_curves(
 
 def plot_boundary_posteriors_all(
     priors: np.ndarray,
-    methods=("tavtigian", "piecewise", "continuous", "recanonical"),
+    methods=("tavtigian", "acmg_bayes", "continuous", "recanonical"),
     tav_df: Optional[pd.DataFrame] = None,
     figsize=(13, 5),
     log_scale: bool = False,
@@ -542,7 +531,7 @@ def plot_boundary_posteriors_all(
                 if method == "tavtigian" and tav_C is not None:
                     lr = tav_C[i] ** (T_acmg / 8.0)
                     posts[i] = bayes_posterior_from_lr(lr, float(p))
-                elif method == "piecewise":
+                elif method == "acmg_bayes":
                     posts[i] = piecewise_posterior(T_acmg, float(p))
                 elif method == "continuous":
                     posts[i] = target
@@ -1068,6 +1057,184 @@ def plot_combined_error_comparison(
     )
     fig.tight_layout()
     return fig, axes
+
+
+def compute_acmg_bayes_combination_errors(
+    priors: np.ndarray = None,
+    combos: Optional[list] = None,
+) -> pd.DataFrame:
+    """ACMG-Bayes combination error vs the per-code LR+ product reference
+    used in `plot_combined_error_comparison`.
+
+    For each combo (k_A, k_B), ACMG-Bayes's combined posterior is
+    ``Bayes(exp(log_lr(k_A) + log_lr(k_B)), p)`` — i.e. exactly the same
+    quantity ``plot_combined_error_comparison`` already calls
+    ``post_true_pw`` (the shared reference both Tavtigian and the naive
+    point-sum variant are scored against). The "error" column is therefore
+    expected to be identically zero (to floating-point precision) at every
+    prior and combo — this function exists to confirm that numerically
+    rather than assume it, before it is cited in the paper.
+
+    Returns a DataFrame with columns: prior, combo, posterior_acmg_bayes,
+    posterior_reference, error.
+    """
+    from assay_calibration.fit_utils.bayesian_thresholds import (
+        piecewise_log_lr, bayes_posterior_from_lr,
+    )
+
+    if priors is None:
+        priors = np.logspace(-3, np.log10(0.80), 500)
+    if combos is None:
+        combos = [(4, 4), (2, 4), (2, 2), (6, 6)]
+
+    rows = []
+    for p in priors:
+        p = float(p)
+        for k_A, k_B in combos:
+            lr_A_pw = float(np.exp(piecewise_log_lr(k_A, p)))
+            lr_B_pw = float(np.exp(piecewise_log_lr(k_B, p)))
+            post_reference = float(bayes_posterior_from_lr(lr_A_pw * lr_B_pw, p))
+
+            log_lr_acmg = acmg_bayes_log_lr([k_A, k_B], p)
+            post_acmg = float(
+                bayes_posterior_from_lr(float(np.exp(log_lr_acmg)), p)
+            )
+
+            rows.append({
+                "prior": p,
+                "combo": (k_A, k_B),
+                "posterior_acmg_bayes": post_acmg,
+                "posterior_reference": post_reference,
+                "error": post_acmg - post_reference,
+            })
+    return pd.DataFrame(rows)
+
+
+# ── 9. Combination motivation: threshold error vs additivity error ──────────
+#
+# Two genuinely different failure modes were conflated in earlier drafts:
+#
+#  1. Threshold (baseline) error: a method's single-code LR+ threshold is
+#     simply wrong at a given prior. Tavtigian has this away from p=0.10;
+#     ACMG-Bayes never does (exact by construction at every prior).
+#
+#  2. Additivity (combination) error: a method's rule for combining two
+#     already-known per-code values doesn't preserve their product. Only the
+#     naive "sum points, then remap" variant has this — Tavtigian is exactly
+#     additive (C^(a+b) = C^a * C^b) and ACMG-Bayes is exactly additive
+#     (sum of logs = log of product), so both have zero additivity error
+#     regardless of whether their thresholds are individually correct.
+#
+# Conflating the two made Tavtigian look like it had "combination error" in
+# earlier tables — it doesn't; what it has is threshold error that survives
+# combination unchanged (because Tavtigian's combination rule is exact).
+# This figure isolates the two so the only real motivation for summing
+# log(LR+) instead of points is shown for what it is: eliminating the
+# genuine additivity failure of the naive point-sum variant, which is a
+# separate problem from Tavtigian's threshold drift.
+
+def plot_combination_motivation(
+    priors: np.ndarray = None,
+    tav_df: Optional[pd.DataFrame] = None,
+    combos: Optional[list] = None,
+    figsize: tuple = (12, 5),
+) -> Tuple[plt.Figure, np.ndarray]:
+    """Two panels: threshold error (left) vs pure additivity error (right).
+
+    Left: single-code boundary error vs prior. Tavtigian drifts away from
+    its p=0.10 calibration; ACMG-Bayes (and the naive point-sum variant,
+    which uses the same per-code thresholds) are exact by construction.
+
+    Right: *additivity-only* error vs prior for two-code combos — each
+    method's own combined posterior compared to the Bayesian product of its
+    OWN per-code values (not a cross-method reference). This isolates
+    whether combining breaks additivity, independent of whether the
+    per-code values were correct to begin with.
+      - Tavtigian: 0 (C^(a+b) = C^a * C^b, exactly, at every prior)
+      - ACMG-Bayes: 0 (log-LR sums exactly, by definition)
+      - Naive point-sum (sum points, then remap through the piecewise
+        function): nonzero — the only method with genuine additivity error.
+    """
+    import math
+    from assay_calibration.fit_utils.bayesian_thresholds import (
+        piecewise_log_lr, piecewise_posterior, bayes_posterior_from_lr,
+    )
+    from assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
+
+    if priors is None:
+        priors = np.logspace(-3, np.log10(0.80), 500)
+    if combos is None:
+        combos = [(4, 4), (2, 4), (2, 2), (6, 6)]
+
+    if tav_df is not None and "C_star" in tav_df.columns:
+        C_arr = np.array([
+            float(tav_df.loc[(tav_df["prior"] - float(p)).abs().idxmin(), "C_star"])
+            for p in priors
+        ])
+    else:
+        C_arr = np.array([float(get_tavtigian_constant(float(p))) for p in priors])
+
+    fig, (ax_thresh, ax_add) = plt.subplots(1, 2, figsize=figsize)
+
+    # ── Left: single-code boundary error (threshold accuracy) ──────────────
+    _BND_INFO = [
+        ("P",  10,  0.99, _BND_COLOR["P"]),
+        ("LP",  6,  0.90, _BND_COLOR["LP"]),
+        ("LB", -1,  0.10, _BND_COLOR["LB"]),
+        ("B",  -7,  0.01, _BND_COLOR["B"]),
+    ]
+    for name, T_bnd, target, color in _BND_INFO:
+        tav_posts = np.array([
+            bayes_posterior_from_lr(C_arr[i] ** (T_bnd / 8.0), float(p))
+            for i, p in enumerate(priors)
+        ])
+        ax_thresh.plot(priors, abs_log_odds_error(tav_posts, target),
+                       color=color, lw=2, ls="-", alpha=0.85,
+                       label=f"Tavtigian {name} (T={T_bnd})")
+    ax_thresh.axhline(0, color="grey", lw=1.2, ls=":", alpha=0.7,
+                       label="ACMG-Bayes = 0 (exact at every prior)")
+    ax_thresh.set_xlabel("Prior", fontsize=10)
+    ax_thresh.set_ylabel("Threshold error (abs. log-odds)", fontsize=10)
+    ax_thresh.set_title("Threshold (baseline) error\nWrong at a single code — not a combination issue",
+                         fontsize=10)
+    ax_thresh.legend(fontsize=7, loc="best")
+    ax_thresh.grid(True, alpha=0.3)
+
+    # ── Right: additivity-only error, each method vs its OWN product ───────
+    _COMBO_LS = ["-", "--", "-.", ":"]
+    _COMBO_COLS = [STRENGTH_COLOR[8], STRENGTH_COLOR[6],
+                   STRENGTH_COLOR[4], STRENGTH_COLOR[3]]
+    for (k_A, k_B), ls, color in zip(combos, _COMBO_LS, _COMBO_COLS):
+        k_tot = k_A + k_B
+        naive_add_err = np.empty(len(priors))
+        for i, p in enumerate(priors):
+            p = float(p)
+            lr_A = math.exp(float(piecewise_log_lr(k_A, p)))
+            lr_B = math.exp(float(piecewise_log_lr(k_B, p)))
+            own_product_post = float(bayes_posterior_from_lr(lr_A * lr_B, p))
+            naive_comb_post = float(piecewise_posterior(k_tot, p))
+            naive_add_err[i] = abs_log_odds_error(
+                np.array([naive_comb_post]), own_product_post
+            )[0]
+        ax_add.plot(priors, naive_add_err, color=color, lw=2, ls=ls,
+                    label=f"Naive point-sum k=({k_A},{k_B})")
+    ax_add.axhline(0, color="grey", lw=1.2, ls=":", alpha=0.7,
+                   label="Tavtigian = 0 & ACMG-Bayes = 0\n(both exactly additive)")
+    ax_add.set_xlabel("Prior", fontsize=10)
+    ax_add.set_ylabel("Additivity error (abs. log-odds)", fontsize=10)
+    ax_add.set_title("Additivity (combination) error\nOwn combined result vs own per-code product",
+                      fontsize=10)
+    ax_add.legend(fontsize=7, loc="best")
+    ax_add.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        "Why combine log(LR+), not points: isolating threshold error from additivity error\n"
+        "Tavtigian's error (left) is a threshold problem that combination does not worsen (right, =0)\n"
+        "Only rounding to points before summing (naive point-sum) introduces genuine additivity error",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    return fig, np.array([ax_thresh, ax_add])
 
 
 # ── 9. Additivity dilemma: clinical intuition ────────────────────────────────
@@ -1721,18 +1888,18 @@ def plot_slope_geometry(
     log_scale: bool = False,
     tav_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[plt.Figure, np.ndarray]:
-    """Show the log(LR+) vs T geometry: Tavtigian straight line vs Piecewise kinks.
+    """Show the log(LR+) vs T geometry: Tavtigian straight line vs ACMG-Bayes kinks.
 
     Visualizes the core additivity tradeoff:
     - Tavtigian: straight (additive) but misses Bayesian target dots at non-canonical priors
-    - Piecewise: kinked line that hits all four target dots exactly at every prior
+    - ACMG-Bayes: kinked line that hits all four target dots exactly at every prior
 
     Layout (2 rows × 3 columns, one column per prior)
     -----------------------------------------------
     Row 0 — log(LR+) vs T curves:
         Target dots show where Bayesian posterior equals 0.01, 0.10, 0.90, 0.99.
         Tavtigian = straight through all T, hits dots only at p=0.10.
-        Piecewise = kinked, hits dots exactly at every prior.
+        ACMG-Bayes = kinked, hits dots exactly at every prior.
     Row 1 — implied posterior vs T:
         Shows classification regions (P/LP/LB/B) and where each method lands.
     """
@@ -1773,10 +1940,10 @@ def plot_slope_geometry(
         ax_log.plot(T_grid, tav_slope * T_grid,
                     color="#d62728", lw=2.5, ls="-", label=f"Tavtigian (C={int(C)})")
 
-        # Piecewise (ACMG knots)
+        # ACMG-Bayes (ACMG knots)
         pw_log_lr = piecewise_log_lr(T_grid, float(p))
         ax_log.plot(T_grid, pw_log_lr,
-                    color="#1f77b4", lw=2.5, ls="--", label="Piecewise α (ACMG)")
+                    color="#1f77b4", lw=2.5, ls="--", label="ACMG-Bayes")
 
         # Bayesian target log(LR+) at each ACMG T: mark with dots
         for name, T_bnd in _ACMG_T.items():
@@ -1821,7 +1988,7 @@ def plot_slope_geometry(
         ax_post.plot(T_grid, tav_posts,
                      color="#d62728", lw=2.5, ls="-",  label="Tavtigian")
         ax_post.plot(T_grid, pw_posts,
-                     color="#1f77b4", lw=2.5, ls="--", label="Piecewise α")
+                     color="#1f77b4", lw=2.5, ls="--", label="ACMG-Bayes")
 
         # Classification region shading
         ax_post.axhspan(0.99, 1.01, color=_BND_COLOR["P"],  alpha=0.12)
@@ -1854,7 +2021,7 @@ def plot_slope_geometry(
         ax_post.set_ylabel("Posterior P(pathogenic)", fontsize=10)
         ax_post.set_title(
             f"Classification posterior  p = {p:.2f}\n"
-            "Piecewise hits ACMG boundaries exactly · "
+            "ACMG-Bayes hits ACMG boundaries exactly · "
             "Tavtigian misses at p ≠ 0.10",
             fontsize=9,
         )
@@ -1865,7 +2032,7 @@ def plot_slope_geometry(
     fig.suptitle(
         "Why the dilemma is unavoidable: a straight log(LR+) line "
         "cannot pass through all four Bayesian targets simultaneously\n"
-        "Piecewise connects the dots exactly (kinks); "
+        "ACMG-Bayes connects the dots exactly (kinks); "
         "Tavtigian stays straight (misses the dots at priors ≠ 0.10)",
         fontsize=12, y=1.01,
     )

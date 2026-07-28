@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[41]:
+# In[11]:
 
 
 import sys, os
@@ -17,84 +17,78 @@ from tavtigian_sims.compare import run_all_methods, plot_three_way_comparison, \
     plot_slope_geometry, plot_combination_paths
 
 
-# In[4]:
+# In[3]:
 
 
 priors = prior_grid("paper")
-t, pw, pw_add, lpa, cont = run_all_methods(priors, n_jobs=10)
+t, pw, pw_add, lpa, cont = run_all_methods(priors, n_jobs=64)
 
 
-# In[24]:
+# In[4]:
 
 
 cont
 
 
-# In[26]:
+# In[6]:
 
 
-plot_three_way_comparison(t, pw, pw_add_df=pw_add, cont_df=cont, log_scale=False, codes="key")
+plot_three_way_comparison(t, pw, cont_df=cont, log_scale=False)#, codes="all")
 
 
-# In[18]:
+# In[8]:
 
 
-plot_boundary_posteriors_three_way(t, pw, pw_add_df=pw_add, lpa_df=lpa, log_scale=False)  # 5 methods
+plot_boundary_posteriors_three_way(t, pw, log_scale=False)  # 4 methods
 
 
-# In[19]:
+# In[7]:
 
 
-fig, axes = plot_additivity_experiment(
-    priors=(0.05, 0.10, 0.25, 0.50),   # which priors to show in the slope panels (row 0)
-    tav_df=t,                            # reuses precomputed C* — avoids re-running grid search
-    pw_add_df=pw_add
-)
+# fig, axes = plot_additivity_experiment(
+#     priors=(0.05, 0.10, 0.25, 0.50),   # which priors to show in the slope panels (row 0)
+#     tav_df=t,                            # reuses precomputed C* — avoids re-running grid search
+#     pw_add_df=pw_add
+# )
 
 
 # In[20]:
 
 
-plot_combined_error_comparison(priors, tav_df=t, log_scale=False)
+# plot_combined_error_comparison(priors, tav_df=t, pw_add_df=pw_add, log_scale=False)
 
 
-# In[33]:
+# In[9]:
 
 
-fig, axes = plot_additivity_dilemma(priors, tav_df=t)
+# from tavtigian_sims import prior_grid
+# from tavtigian_sims.compare import (
+#     run_all_methods,
+#     plot_additivity_dilemma,
+#     plot_slope_geometry,
+# )
+
+# priors = prior_grid("paper")
+# t, pw, pw_add, cont = run_all_methods(priors, n_jobs=10)
+
+# fig, _ = plot_additivity_dilemma(priors, tav_df=t)
+# fig.savefig('figures/additivity_dilemma.pdf', bbox_inches='tight')
+
+# fig, _ = plot_slope_geometry(tav_df=t)
+# fig.savefig('figures/slope_geometry.pdf', bbox_inches='tight')
 
 
-# In[36]:
+# In[12]:
 
 
-from tavtigian_sims import prior_grid
-from tavtigian_sims.compare import (
-    run_all_methods,
-    plot_additivity_dilemma,
-    plot_slope_geometry,
-)
+fig, _ = plot_additivity_dilemma(priors, tav_df=t)#, lpa_df=lpa)
+# fig.savefig('figures/additivity_dilemma.pdf', bbox_inches='tight')
 
-priors = prior_grid("paper")
-t, pw, pw_add, cont = run_all_methods(priors, n_jobs=10)
-
-fig, _ = plot_additivity_dilemma(priors, tav_df=t)
-fig.savefig('figures/additivity_dilemma.pdf', bbox_inches='tight')
-
-fig, _ = plot_slope_geometry(tav_df=t)
-fig.savefig('figures/slope_geometry.pdf', bbox_inches='tight')
+fig, _ = plot_slope_geometry(tav_df=t)#, lpa_df=lpa)
+# fig.savefig('figures/slope_geometry.pdf', bbox_inches='tight')
 
 
-# In[40]:
-
-
-fig, _ = plot_additivity_dilemma(priors, tav_df=t)
-fig.savefig('figures/additivity_dilemma.pdf', bbox_inches='tight')
-
-fig, _ = plot_slope_geometry(tav_df=t)
-fig.savefig('figures/slope_geometry.pdf', bbox_inches='tight')
-
-
-# In[42]:
+# In[10]:
 
 
 fig, axes = plot_combination_paths(priors, tav_df=t)

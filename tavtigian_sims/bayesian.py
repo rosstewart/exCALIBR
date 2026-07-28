@@ -1,13 +1,25 @@
 """
-Simulation suites for the two Bayesian replacement methods.
+Simulation suites for the ACMG-Bayes replacement method.
 
-PiecewiseSuite  : Method A — prior-adaptive piecewise α (integer points
-                  preserved, exact boundary posteriors at every prior).
-ContinuousSuite : Method B — continuous LR+ (no discretisation, posterior-
-                  based classification).
+ACMGBayesSuite            : per-code / per-boundary LR+ thresholds, anchored
+                             to the exact analytic Bayes threshold at each of
+                             the four ACMG posterior targets, for every prior.
+ACMGBayesCombinationSuite : multi-evidence combination — per-code log(LR+)
+                             values are summed directly (never rounded to an
+                             integer point first), so combination error is
+                             zero by construction. Subsumes what earlier
+                             drafts called "Continuous" (the trivial
+                             single-item case: no code interpolation needed
+                             when you already have a continuous LR+) and
+                             "Ledger" (the multi-item log-LR summation).
 
-Both expose a DataFrame interface compatible with the plotting code in
-``plots.py`` so they can be overlaid on the legacy Tavtigian suite.
+Historical variants (`PiecewiseAdditiveSuite`, `LPAnchoredSuite`) are kept
+for reference but are not part of the primary Tavtigian-vs-ACMG-Bayes
+comparison — see compare.py.
+
+Both primary suites expose a DataFrame interface compatible with the
+plotting code in ``compare.py`` so they can be overlaid on the legacy
+Tavtigian suite.
 """
 
 from __future__ import annotations
@@ -26,6 +38,7 @@ if _SRC not in sys.path:
 
 from assay_calibration.fit_utils.bayesian_thresholds import (
     piecewise_lr_plus, piecewise_posterior, piecewise_tier_thresholds,
+    piecewise_log_lr,
     piecewise_additive_lr_plus, piecewise_additive_posterior,
     lp_anchored_lr_plus, lp_anchored_posterior,
     continuous_lr_thresholds, bayes_posterior_from_lr,
@@ -56,7 +69,7 @@ ADDITIVE_POSTERIOR_TARGETS: dict = {
 }
 
 
-# ── Generic piecewise base ────────────────────────────────────────────────────
+# ── Generic piecewise-anchored base ──────────────────────────────────────────
 
 @dataclass
 class PiecewiseResult:
@@ -72,14 +85,14 @@ class PiecewiseResult:
 
 
 class _PiecewiseSuiteBase:
-    """Shared machinery for piecewise-α suites."""
+    """Shared machinery for piecewise-anchored suites."""
 
     # Subclasses override these three:
     _lr_fn    = staticmethod(piecewise_lr_plus)
     _post_fn  = staticmethod(piecewise_posterior)
     _BOUNDARIES = CLASSIFICATION_BOUNDARIES
     _POST_TARGETS = POSTERIOR_TARGETS
-    _METHOD   = "piecewise"
+    _METHOD   = "acmg_bayes"
 
     def __init__(self, priors: np.ndarray):
         self.priors = np.asarray(priors)
@@ -125,29 +138,46 @@ class _PiecewiseSuiteBase:
         return pd.DataFrame(rows)
 
 
-# ── Method A: standard piecewise α ───────────────────────────────────────────
+# ── ACMG-Bayes: exact per-code/boundary thresholds ───────────────────────────
 
-class PiecewiseSuite(_PiecewiseSuiteBase):
-    """Method A sweep across priors.  Same interface as SimulationSuite."""
+class ACMGBayesSuite(_PiecewiseSuiteBase):
+    """Per-code and per-boundary LR+ thresholds, exact at every prior.
+
+    Same interface as the legacy Tavtigian suite (`SimulationSuite`), so the
+    two can be overlaid directly. Boundary posteriors are exact by
+    construction at every prior (unlike Tavtigian, which is exact only at
+    p=0.10). Combining multiple pieces of evidence with this suite's
+    per-code thresholds must be done by summing `log(LR+)` values directly —
+    see `ACMGBayesCombinationSuite` / `acmg_bayes_log_lr` below — never by
+    summing points and re-deriving a threshold at the summed total, which
+    reintroduces combination error (quantified in the report's Table 3/4 as
+    the cost of the "naive" points-then-remap approach).
+    """
     _lr_fn       = staticmethod(piecewise_lr_plus)
     _post_fn     = staticmethod(piecewise_posterior)
     _BOUNDARIES  = CLASSIFICATION_BOUNDARIES
     _POST_TARGETS = POSTERIOR_TARGETS
-    _METHOD      = "piecewise"
+    _METHOD      = "acmg_bayes"
 
 
-# ── Method A′: (6·11·6) additive piecewise ───────────────────────────────────
+# ── Historical variant: (6·11·6) additive piecewise ──────────────────────────
+# Kept for reference; not part of the primary Tavtigian-vs-ACMG-Bayes
+# comparison (see compare.py).
 
 class PiecewiseAdditiveSuite(_PiecewiseSuiteBase):
     """Piecewise-α with (6·11·6) gap-pattern knots at T = 17, 11, 0, −6.
 
-    Two conditions for near-perfect additivity:
+    Two conditions for near-perfect additivity under naive points-then-remap
+    combination:
       1. Equal slopes (gap pattern 6·11·6): cross-segment error < 0.07 %.
       2. T_LB = 0: log_lr(0, p=0.10) = 0, making same-segment combination
          exactly additive at the canonical prior.
 
     Posteriors at the four knot T values are exact for every prior.
     Classification boundaries: B=−6, LB=0, LP=11, P=17.
+    Superseded by ACMG-Bayes combination (log-LR summation), which has zero
+    combination error under the *standard* ACMG knots without needing a
+    special gap pattern.
     """
     _lr_fn        = staticmethod(piecewise_additive_lr_plus)
     _post_fn      = staticmethod(piecewise_additive_posterior)
@@ -156,30 +186,16 @@ class PiecewiseAdditiveSuite(_PiecewiseSuiteBase):
     _METHOD       = "piecewise_additive"
 
 
-# ── Method A″: LP-anchored additive (pathogenic direction only) ──────────────
+# ── Historical variant: LP-anchored additive (pathogenic direction only) ─────
 
 class LPAnchoredSuite(_PiecewiseSuiteBase):
     """[DEPRECATED] LP & LB anchored with separate prior-dependent slopes.
 
-    ⚠️  DEPRECATED: Fundamental three-way tradeoff makes this approach inferior
-    to Tavtigian and Piecewise. Keeping for reference only.
-
-    Two-slope approach: pathogenic (T≥0) anchored at LP, benign (T<0) at LB.
-    Each slope varies with prior to achieve exact posteriors at boundaries.
-
-    The Inescapable Tradeoff:
-    You can have any TWO of:
-      1. Strictly additive (constant slopes)
-      2. Exact posteriors at boundaries for all priors
-      3. Prior-independent slopes
-
-    - Tavtigian: (1) + (3) — additive, prior-independent, posteriors drift
-    - Piecewise: (2) + (3) — exact, prior-independent, has kinks
-    - LP-anchored: (1) + (2) — additive, exact, but slopes must vary with prior
-                              → "benign gets harder at low prior" artifact
-                              → no real advantage over Tavtigian + Piecewise
-
-    Use Tavtigian vs Piecewise for the substantive comparison.
+    ⚠️  DEPRECATED: superseded by ACMG-Bayes, which achieves additive
+    combination (via log-LR summation) AND exact boundary posteriors AND
+    prior-independent per-code thresholds simultaneously — the three-way
+    tradeoff this class was built to explore no longer applies once
+    combination is defined correctly. Kept for reference only.
     """
     _lr_fn        = staticmethod(lp_anchored_lr_plus)
     _post_fn      = staticmethod(lp_anchored_posterior)
@@ -188,46 +204,118 @@ class LPAnchoredSuite(_PiecewiseSuiteBase):
     _METHOD       = "lp_anchored"
 
 
-# ── Method C: continuous LR+ suite ───────────────────────────────────────────
+# ── ACMG-Bayes: multi-evidence combination via direct log-LR summation ──────
+#
+# Per-evidence-item log(LR+) values are summed directly (never rounded to an
+# integer point value first), then classified by posterior at the end. This
+# is exact Bayesian evidence combination — the "combination error" is zero by
+# construction for any set of per-code log-LR values, at every prior,
+# regardless of how many segment boundaries the running total would have
+# crossed under a points-then-remap scheme. When there is only a single
+# piece of evidence (already known as a continuous LR+, not a code), this
+# reduces to the trivial case of no summation at all — the "Continuous"
+# behaviour of earlier drafts is this suite's one-code special case.
+#
+# For a fixed set of named evidence codes we take each code's canonical
+# log(LR+) from the prior-adaptive anchor (`piecewise_log_lr`) — the same
+# per-code values ACMGBayesSuite reports — so combined posteriors are
+# directly comparable to the Tavtigian combination-error figures.
+
+def acmg_bayes_log_lr(codes: List[int], prior: float) -> float:
+    """Sum of per-code canonical log(LR+) at *prior* — the combination operand.
+
+    Combination is literal addition in log-LR space; no point-tier rounding
+    occurs at any stage. A single-item list reduces to that item's own
+    canonical log(LR+), i.e. the "continuous" single-assay case.
+    """
+    return float(sum(piecewise_log_lr(k, prior) for k in codes))
+
+
+def acmg_bayes_posterior(codes: List[int], prior: float) -> float:
+    """Posterior implied by summing *codes*' canonical log-LR at *prior*."""
+    lr_total = float(np.exp(acmg_bayes_log_lr(codes, prior)))
+    return float(bayes_posterior_from_lr(lr_total, prior))
+
+
+def acmg_bayes_display_points(log_lr: float, prior: float) -> float:
+    """Invert the piecewise knot geometry: log-LR -> fractional point label.
+
+    Display-only conversion, applied to an already-combined log-LR value,
+    never used as a combination operand itself. Uses the same four ACMG
+    knots as `piecewise_log_lr`, inverted within (or extrapolated beyond)
+    the enclosing segment.
+    """
+    knots_T  = [-7, -1, 6, 10]
+    knots_lr = [float(piecewise_log_lr(t, prior)) for t in knots_T]
+
+    if log_lr <= knots_lr[0]:
+        lo, hi = 0, 1
+    elif log_lr >= knots_lr[-1]:
+        lo, hi = 2, 3
+    else:
+        lo, hi = next(
+            (i, i + 1) for i in range(3)
+            if knots_lr[i] <= log_lr <= knots_lr[i + 1]
+        )
+
+    slope = (knots_lr[hi] - knots_lr[lo]) / (knots_T[hi] - knots_T[lo])
+    return knots_T[lo] + (log_lr - knots_lr[lo]) / slope
+
 
 @dataclass
-class ContinuousResult:
+class ACMGBayesCombinationResult:
     prior: float
-    # LR+ at each ACMG posterior target
-    lr_threshold: Dict[str, float] = field(default_factory=dict)
+    combo: tuple
+    log_lr_total: float = 0.0
+    posterior: float = 0.0
+    display_points: float = 0.0
 
 
-def _run_continuous(prior: float) -> ContinuousResult:
-    r = ContinuousResult(prior=prior)
-    r.lr_threshold = continuous_lr_thresholds(prior)
-    return r
+class ACMGBayesCombinationSuite:
+    """Multi-evidence combination sweep for ACMG-Bayes over a fixed set of
+    combos.
 
-
-class ContinuousSuite:
-    """Method B sweep across priors.
-
-    There are no integer codes in Method B — classification is by posterior
-    directly.  This suite just records the LR+ value corresponding to each
-    of the four posterior targets (P=0.99, LP=0.90, LB=0.10, B=0.01).
+    For interface parity with `_PiecewiseSuiteBase`, this sweeps the same
+    (k_A, k_B) evidence-code pairs used in the combination-error benchmarks
+    (see `compare.py`) and records the combined log-LR, posterior, and
+    display-point label at every prior. Combination error against the
+    per-code LR+ product reference is zero for every combo/prior by
+    construction — this suite is for recording/plotting that fact, not for
+    detecting it (see `compare.py::compute_ledger_combination_errors` for
+    the numerical verification).
     """
 
-    def __init__(self, priors: np.ndarray):
+    def __init__(self, priors: np.ndarray,
+                 combos: Optional[List[tuple]] = None):
         self.priors = np.asarray(priors)
-        self.results: List[ContinuousResult] = []
+        self.combos = combos or [(4, 4), (2, 4), (2, 2), (6, 6)]
+        self.results: List[ACMGBayesCombinationResult] = []
 
-    def run(self) -> "ContinuousSuite":
-        self.results = [_run_continuous(float(p)) for p in self.priors]
+    def run(self) -> "ACMGBayesCombinationSuite":
+        self.results = [
+            self._run_one(combo, float(p))
+            for p in self.priors
+            for combo in self.combos
+        ]
         return self
+
+    def _run_one(self, combo: tuple, prior: float) -> ACMGBayesCombinationResult:
+        log_lr = acmg_bayes_log_lr(list(combo), prior)
+        post   = float(bayes_posterior_from_lr(float(np.exp(log_lr)), prior))
+        pts    = acmg_bayes_display_points(log_lr, prior)
+        return ACMGBayesCombinationResult(prior=prior, combo=combo,
+                                           log_lr_total=log_lr,
+                                           posterior=post, display_points=pts)
 
     def to_dataframe(self) -> pd.DataFrame:
         rows = []
         for r in self.results:
-            row = {"prior": r.prior, "acmg_mapping_method": "continuous"}
-            for name, lr in r.lr_threshold.items():
-                row[f"lr_{name}"]       = lr
-                row[f"log10_lr_{name}"] = float(np.log10(lr)) if lr > 0 else float("-inf")
-                row[f"post_{name}"]     = float(
-                    bayes_posterior_from_lr(lr, r.prior)
-                )
-            rows.append(row)
+            rows.append({
+                "prior": r.prior,
+                "acmg_mapping_method": "acmg_bayes",
+                "combo": r.combo,
+                "log_lr_total": r.log_lr_total,
+                "posterior": r.posterior,
+                "display_points": r.display_points,
+            })
         return pd.DataFrame(rows)

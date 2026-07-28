@@ -38,7 +38,7 @@ def points_to_confusion(labels, points):
                         columns=['Benign', 'Indeterminate', 'Pathogenic'])
 
 
-def _accumulate_into(target, key, labels, pts, snv_pts, n_snv, n_ctrl):
+def _accumulate_into(target, key, config, labels, pts, snv_pts, n_snv, n_ctrl):
     cm = points_to_confusion(labels, pts)
     target[key]['TP']               += cm.iloc[1, 2]
     target[key]['TN']               += cm.iloc[0, 0]
@@ -68,7 +68,7 @@ def _safe(n, d):
 # ── Build aggregation ─────────────────────────────────────────────────────────
 
 def build_agg(results_df, gene_ms, percentile_analyses,
-              compute_assay_labels_zscore, gene_to_analysis_cons_b0,
+              compute_assay_labels_zscore, gene_to_analysis_cons_b0, config,
               non_nu_genes=None, assay_key="Assay"):
     """
     Aggregate confusion matrix counts across genes.
@@ -106,24 +106,25 @@ def build_agg(results_df, gene_ms, percentile_analyses,
 
         if compute_assay_labels_zscore is not None:
             assay_pts = compute_assay_labels_zscore(ms)
-            _accumulate_into(agg, assay_key,
+            _accumulate_into(agg, assay_key, config,
                              labels, assay_pts[eval_mask],
                              assay_pts[is_snv], n_snv, n_ctrl)
 
         for pctile, pdf in gdf.groupby("path_percentile"):
-            r = gene_to_analysis_cons_b0 if pctile == 25 else \
+            r = gene_to_analysis_cons_b0 if pctile == 5 else \
                 percentile_analyses.get(pctile, {})
             analysis = r.get(gene)
             if analysis is None:
                 continue
-            result = analysis.results.get("3c_unc")
+            result = analysis.results.get(config)
             if result is None:
                 continue
             pts = result["points"]
-            key = f"MV p{pctile} (3c_unc)"
-            _accumulate_into(agg, key,
+            key = f"MV p{pctile} ({config})"
+            _accumulate_into(agg, key, config,
                              labels, pts[eval_mask],
                              pts[is_snv], n_snv, n_ctrl)
+            # print(agg)
 
     return agg
 

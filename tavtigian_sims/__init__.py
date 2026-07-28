@@ -19,7 +19,10 @@ from .analysis import (
     summarize_suite,
 )
 from . import plots
-from .bayesian import PiecewiseSuite, PiecewiseAdditiveSuite, LPAnchoredSuite, ContinuousSuite
+from .bayesian import (
+    ACMGBayesSuite, ACMGBayesCombinationSuite,
+    PiecewiseAdditiveSuite, LPAnchoredSuite,
+)
 from . import compare
 from . import additivity
 
@@ -42,10 +45,10 @@ __all__ = [
     "lr_threshold_sensitivity",
     "summarize_suite",
     "plots",
-    "PiecewiseSuite",
+    "ACMGBayesSuite",
+    "ACMGBayesCombinationSuite",
     "PiecewiseAdditiveSuite",
     "LPAnchoredSuite",
-    "ContinuousSuite",
     "compare",
     "additivity",
 ]

@@ -56,6 +56,24 @@ def pick_component_from_config(dataset_dir: Path, entry: dict) -> Path | None:
     p_bare = dataset_dir / f"{dataset_dir.name}_{n_c}_calibration.json"
     if p_bare.exists():
         return p_bare
+
+    # Filename can lag behind content -- e.g. the pipeline silently overrides
+    # benign_method (avg -> benign) for datasets with no synonymous sample,
+    # but the *filename* still reflects whatever benign_method was originally
+    # requested when the file was saved. Fall back to checking every
+    # calibration JSON's own content against the requested (n_c, benign_method).
+    for candidate in sorted(dataset_dir.glob(f"{dataset_dir.name}_*_calibration.json")):
+        try:
+            data = json.loads(candidate.read_text())
+        except Exception:
+            continue
+        content_n_c = str(data.get("n_c", ""))
+        for suf in ("_avg", "_benign"):
+            if content_n_c.endswith(suf):
+                content_n_c = content_n_c[: -len(suf)]
+                break
+        if content_n_c == n_c and (benign_method is None or data.get("benign_method") == benign_method):
+            return candidate
     return None
 
 
