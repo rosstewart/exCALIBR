@@ -1,0 +1,25 @@
+name: excalibr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=2.0
+  - scipy>=1.14
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - numba
+  - joblib
+  - tqdm
+  - ipykernel
+  - jupyterlab
+  - fire
+  - ffmpeg
+  - adjusttext
+  - pip
+  - pip:
+    # JAX with CUDA 12 — bundles nvidia-* runtime libs, no module load cuda needed.
+    # For CPU-only installs use excalibr.yml instead.
+    - jax[cuda12]==0.10.2
+    - jaxlib==0.10.2
