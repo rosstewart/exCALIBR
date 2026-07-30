@@ -475,6 +475,7 @@ def _process_variant_oob(
     min_samples: int = 1,
     acmg_mapping_method: str = "tavtigian",
     percentile: float = 5.0,
+    postprocess: bool = True,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
@@ -536,14 +537,15 @@ def _process_variant_oob(
             for point in pr:
                 pr[point] = []
 
-        # Step 6: enforce monotonicity (first pass)
-        enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
+        if postprocess:
+            # Step 6: enforce monotonicity (first pass)
+            enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
-        # Step 7: extend to xlims
-        extend_points_to_xlims(pr, point_values, vsr, flipped, inf=True)
+            # Step 7: extend to xlims
+            extend_points_to_xlims(pr, point_values, vsr, flipped, inf=True)
 
-        # Step 8: enforce monotonicity (second pass)
-        enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
+            # Step 8: enforce monotonicity (second pass)
+            enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
         # Step 9: flatten and assign
         pts = _assign_points(score, _flatten_point_ranges(pr))
@@ -582,6 +584,7 @@ def _compute_oob_evidence(
     log(f"  OOB mapping built: {len(oob_map)} variants have OOB data")
 
     liberal = config.liberal_monotonicity
+    postprocess = getattr(config, "postprocess_point_ranges", True)
     n_cores = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
 
     oob_acmg_mapping_method = getattr(config, "acmg_mapping_method", "tavtigian")
@@ -593,6 +596,7 @@ def _compute_oob_evidence(
             config.oob_min_samples,
             oob_acmg_mapping_method,
             getattr(config, "pathogenic_percentile", 5.0),
+            postprocess,
         )
         for vidx, oob_idx in oob_map.items()
     )

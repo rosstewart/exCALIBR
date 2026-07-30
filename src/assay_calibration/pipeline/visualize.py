@@ -933,47 +933,50 @@ def process_component_fits(
             for k in sorted(point_ranges.keys(), key=lambda x: -x):
                 logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-        # Enforce monotonicity (first pass)
-        enforce_monotonicity_point_ranges(
-            point_ranges,
-            config.point_values,
-            score_range[range_subset],
-            scoreset_flipped=scoreset_flipped,
-            liberal=config.liberal_monotonicity
-        )
+        if getattr(config, "postprocess_point_ranges", True):
+            # Enforce monotonicity (first pass)
+            enforce_monotonicity_point_ranges(
+                point_ranges,
+                config.point_values,
+                score_range[range_subset],
+                scoreset_flipped=scoreset_flipped,
+                liberal=config.liberal_monotonicity
+            )
 
-        if config.debug:
-            logger.info("  [DEBUG] Point ranges AFTER first enforce_monotonicity:")
-            for k in sorted(point_ranges.keys(), key=lambda x: -x):
-                logger.info(f"    {k:+d}: {point_ranges[k]}")
+            if config.debug:
+                logger.info("  [DEBUG] Point ranges AFTER first enforce_monotonicity:")
+                for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                    logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-        # Extend to limits
-        extend_points_to_xlims(
-            point_ranges,
-            config.point_values,
-            score_range[range_subset],
-            scoreset_flipped,
-            inf=True
-        )
+            # Extend to limits
+            extend_points_to_xlims(
+                point_ranges,
+                config.point_values,
+                score_range[range_subset],
+                scoreset_flipped,
+                inf=True
+            )
 
-        if config.debug:
-            logger.info("  [DEBUG] Point ranges AFTER extend_points_to_xlims:")
-            for k in sorted(point_ranges.keys(), key=lambda x: -x):
-                logger.info(f"    {k:+d}: {point_ranges[k]}")
+            if config.debug:
+                logger.info("  [DEBUG] Point ranges AFTER extend_points_to_xlims:")
+                for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                    logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-        # Enforce monotonicity again after extending (matches assign_points.py)
-        enforce_monotonicity_point_ranges(
-            point_ranges,
-            config.point_values,
-            score_range[range_subset],
-            scoreset_flipped=scoreset_flipped,
-            liberal=config.liberal_monotonicity
-        )
+            # Enforce monotonicity again after extending (matches assign_points.py)
+            enforce_monotonicity_point_ranges(
+                point_ranges,
+                config.point_values,
+                score_range[range_subset],
+                scoreset_flipped=scoreset_flipped,
+                liberal=config.liberal_monotonicity
+            )
 
-        if config.debug:
-            logger.info("  [DEBUG] Point ranges AFTER second enforce_monotonicity (final):")
-            for k in sorted(point_ranges.keys(), key=lambda x: -x):
-                logger.info(f"    {k:+d}: {point_ranges[k]}")
+            if config.debug:
+                logger.info("  [DEBUG] Point ranges AFTER second enforce_monotonicity (final):")
+                for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                    logger.info(f"    {k:+d}: {point_ranges[k]}")
+        elif config.debug:
+            logger.info("  [DEBUG] --no-postprocess: skipping monotonicity enforcement and extend-to-xlims")
 
     logger.info(f"  Final ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
     

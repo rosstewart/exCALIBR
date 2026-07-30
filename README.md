@@ -1,326 +1,470 @@
-# Assay Calibration Pipeline
+# ExCALIBR
 
-A pipeline for calibrating functional assays using bootstrap skew normal mixture model fitting and Bayesian calibration.
+A pipeline for calibrating functional assays to clinical variant interpretation scales (ACMG/AMP evidence levels) using bootstrap skew-normal mixture model fitting and Bayesian calibration.
 
 ## Overview
 
-This pipeline takes variant effect scores from functional assays and calibrates them to clinical interpretation scales (ACMG/AMP evidence levels) using:
+ExCALIBR takes variant effect scores from functional assays and calibrates them using:
 
 - **Bootstrap mixture modeling** to estimate probability distributions for pathogenic, benign, population, and synonymous variants
-- **Bayesian calibration** to compute likelihood ratios and evidence thresholds
+- **Bayesian calibration** to compute likelihood ratios and ACMG evidence thresholds
 - **Statistical model selection** to choose optimal component counts (2c vs 3c)
 - **Flexible execution** via SLURM clusters, parallel processing, or single-CPU
 
 ## Installation
 
 ```bash
-# Clone repository
-git clone https://github.com/rosstewart/assay_calibration
-cd assay_calibration
+git clone https://github.com/rosstewart/exCALIBR
+cd exCALIBR
 
-# Install dependencies
-pip install -r requirements.txt
+# CPU-only environment (standard runs)
+conda env create -f excalibr.yml
+conda activate excalibr
+pip install -e .
 
-# Requires the assay_calibration package
+# GPU environment (JAX + CUDA 12, for GPU-accelerated fitting)
+conda env create -f excalibr-gpu.yml
+conda activate excalibr
 pip install -e .
 ```
 
 ## Quick Start
 
-### Basic Usage
+### Interactive (single dataset)
 
 ```bash
-# Run calibration with default settings (2c and 3c models, parallel execution)
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021
-
-# This will:
-# 1. Fit 1000 bootstrap iterations with 100 fits each
-# 2. Automatically select between 2c and 3c models
-# 3. Generate calibration thresholds and visualizations
-# 4. Save results to ./calibration_output/
+python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021
 ```
 
-### Input Data Format
+Defaults: 20 bootstrap iterations × 8 fits each. For production-quality results, use `--n-bootstraps 1000 --fits-per-bootstrap 100` (or the SLURM batch workflow below).
 
-Your CSV must contain these columns (or alternatively input a pre-formatted IGVF scoreset):
+### Production batch (many datasets)
 
-| Column | Description | Example |
-|--------|-------------|---------|
-| `score` | Variant effect score | 0.523 |
-| `sample` | Sample assignment index (can be multilabel) | "1,2" |
-| `Dataset` | Dataset name (optional) | "MyGene_MyLab_2025" |
+See the [Batch HPC Workflow](#batch-hpc-workflow) section below.
 
-**Required sample indices (these indices cannot be changed):**
-- `0: Pathogenic/Likely Pathogenic` - ClinVar P/LP variants
-- `1: Benign/Likely Benign` - ClinVar B/LB variants (optional)
-- `2: gnomAD` or `population` - Population variants
-- `3: Synonymous` - Synonymous variants (optional)
+## Input Data Formats
 
-Note: Must have either Benign or Synonymous samples. Variants can belong to multiple samples via separating each index with ",".
+Three formats are supported:
 
-## Execution Modes
+### 1. IGVF / PillarProject format (standard)
 
-### 1. Parallel Execution (Recommended)
-
-Fast and efficient for moderate datasets:
+Multi-sample variant score TSV with `score`, `sample`, and `Dataset` columns. ClinVar-labeled samples (P/LP, B/LB, gnomAD, synonymous) are auto-detected. This is the format produced by the IGVF Coding Variants Focus Group pipeline (Tejura et al. 2026, bioRxiv 2026.02.14.705848).
 
 ```bash
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --mode parallel \
-  --n-jobs -1  # Use all available CPUs
+python run_pipeline.py --dataset variants.tsv.gz --name MyGene_MyLab_2025
 ```
 
-### 2. SLURM Cluster
+Required columns: `score`, `sample` (integer index or comma-separated for multilabel), `Dataset`.
 
-For large-scale runs on HPC clusters:
+Sample indices:
+- `0`: Pathogenic/Likely Pathogenic (ClinVar P/LP)
+- `1`: Benign/Likely Benign (ClinVar B/LB, optional)
+- `2`: gnomAD / population
+- `3`: Synonymous (optional)
+
+At least one of Benign or Synonymous samples is required.
+
+### 2. BasicScoreset (bare-bones CSV)
+
+Minimal format: `score` column + `sample_assignments` integer column. No ClinVar required. Use `--sample-names` to label samples.
 
 ```bash
-# Generate SLURM job array (customize for your cluster environment)
 python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --mode slurm \
-  --slurm-account my_account \
-  --slurm-partition short \
-  --slurm-time 12 \
-  --slurm-conda-env my_conda_env \
-  --slurm-modules "module load anaconda3/2024.06"
-
-# This creates job files in ./calibration_output/slurm_jobs/
-# Review the generated submit.sh script and customize if needed:
-nano ./calibration_output/slurm_jobs/submit.sh
-
-# Then submit:
-cd ./calibration_output/slurm_jobs
-sbatch submit.sh
-
-# After jobs complete, collect results:
-python -c "
-from utils import collect_slurm_results
-from config import PipelineConfig
-from pathlib import Path
-
-config = PipelineConfig(
-    dataset_csv='example/MSH2_Jia_2021.csv',
-    dataset_name='MSH2_Jia_2021',
-    output_dir='./calibration_output'
-)
-
-results = collect_slurm_results(
-    Path('./calibration_output/slurm_jobs'),
-    config
-)
-
-# Continue with visualization...
-"
+    --dataset basic.csv --name MyGene \
+    --sample-names "Pathogenic/Likely Pathogenic" "Benign/Likely Benign" "gnomAD"
 ```
 
-### 3. Single-CPU (Debugging)
+### 3. MaveDB format
 
-Slowest but easiest to debug:
+MaveDB-style CSV with functional classification columns. Used for batch runs via `slurm/prepare.py mavedb`.
+
+Implementation: `src/assay_calibration/data_utils/dataset.py` — `BasicScoreset`, `Scoreset`, `MultiScoreset`, `BasicMultiScoreset`.
+
+## Batch HPC Workflow
+
+For calibrating many datasets, use the decoupled batch workflow: fitting runs on a compute cluster, then calibration runs from precomputed fits.
+
+### Step 1 — Generate job manifest
 
 ```bash
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --mode single
+python slurm/prepare.py default \
+    --output-dir /path/to/run \
+    --dataframe variants.tsv.gz
+
+# Other subcommands:
+#   pillar_project  — same as default, ClinVar 2025 default instead of 2026
+#   mavedb          — MaveDB-formatted CSV input
+#   basicscoreset   — bare-bones CSV with sample_assignments column
+#   multivariate    — multi-assay per-gene fitting (MultiScoreset)
+#   predictor-mv    — multi-assay from per-gene predictor CSV files
 ```
 
-## Model Selection
+Outputs `<output_dir>/jobs/job_index.json` and `jobs/array_NNNN.pkl` files.
 
-### Automatic Selection (Default)
+### Step 2 — Submit fits
 
-The pipeline automatically tests 2-component vs 3-component models:
-
+**SLURM CPU array:**
 ```bash
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --components 2 3  # Fit both models
+bash slurm/submit_array.sh /path/to/run
 ```
 
-**Conservative selection (default):** Uses 5th percentile test - selects 3c only if 95% of bootstrap samples show improvement.
+Key env-var overrides: `SLURM_ACCOUNT`, `SLURM_PARTITION` (default: `short`), `SLURM_TIME` (default: `23:59:00`), `SLURM_MEM` (default: `1G`), `SLURM_CPUS` (default: `8`), `PYTHON` (default: system python).
 
-**P-value selection:** Uses Wilcoxon signed-rank test at α=0.05:
-
+**SLURM GPU array:**
 ```bash
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --components 2 3 \
-  --no-conservative
+bash slurm/submit_array_gpu.sh /path/to/run
 ```
 
-### Manual Selection
+Additional overrides: `N_GPUS` (default: `32`), `CUDA_MODULE`, `CONDA_MODULE`.
 
-Fit only specific component count:
+**Local CPU:**
+```bash
+bash slurm/run_local_array.sh /path/to/run START END [concurrency]
+# Example: bash slurm/run_local_array.sh /path/to/run 0 999 8
+```
+
+**Local GPU:**
+```bash
+PYTHON=/path/to/envs/excalibr/bin/python \
+CUDA_VISIBLE_DEVICES=0 \
+bash slurm/run_local_array_gpu.sh /path/to/run START END
+```
+
+### Step 3 — Monitor progress
 
 ```bash
-# 2-component model only
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --components 2
+python slurm/count_bootstraps.py /path/to/run [--verbose]
+```
 
-# 3-component model only
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --components 3
+### Step 4 — Aggregate fit results
+
+```bash
+python slurm/aggregate_results.py /path/to/run
+# Writes /path/to/run/bootstrap_results.json.gz
+```
+
+### Step 5 — Calibrate all datasets
+
+```bash
+python run_igvf_batch.py \
+    --dataset variants.tsv.gz \
+    --precomputed-fits /path/to/run/bootstrap_results.json.gz \
+    --dataset-configs src/igvf_configs/my_configs.json \
+    --output-dir ./calibration_output
+```
+
+### Step 6 — Collect outputs
+
+```bash
+python src/collect_calibration_outputs.py ./calibration_output ./collected \
+    --dataset-configs src/igvf_configs/my_configs.json
+# Writes collected/json/ and collected/png/, then tars for download
+```
+
+## Script Reference
+
+### `run_pipeline.py` — Single-dataset interactive pipeline
+
+Fits, selects models, generates visualizations, and saves calibration JSON for one dataset.
+
+Key flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dataset` | (required) | Path to input CSV/TSV |
+| `--name` | (required) | Dataset name for output files |
+| `--n-bootstraps` | 20 | Bootstrap iterations (use 1000 for production) |
+| `--fits-per-bootstrap` | 8 | Fits per bootstrap (use 100 for production) |
+| `--components K [K ...]` | `2 3` | Component counts to fit (integers 2–10) |
+| `--mode` | `parallel` | `parallel`, `single`, or `slurm` |
+| `--device` | `cpu` | `cpu` or `gpu` (GPU: routes through JAX batch) |
+| `--precomputed-fits` | — | Skip fitting; load existing bootstrap fits JSON |
+| `--output-dir` | `./calibration_output` | Output directory |
+| `--no-postprocess` | off | Skip monotonicity enforcement and extend-to-limits on point ranges. Intended for bidirectional assays (e.g. LoF/GoF in one assay) where standard monotonicity assumptions do not hold. |
+| `--conservative-monotonicity` | off | Use stricter monotonicity enforcement (default is liberal) |
+| `--manual-prior` | — | Override prior probability (0–1); skip estimation |
+| `--benign-method` | `avg` | `avg`, `benign`, or `synonymous` |
+| `--oob` | off | Compute out-of-bag per-variant evidence |
+| `--seed` | — | Master seed for full reproducibility |
+| `--sample-names` | — | Override sample labels (order must match data columns) |
+
+---
+
+### `run_igvf_batch.py` — Batch calibration from precomputed fits
+
+Calibrates many datasets at once from a pre-aggregated bootstrap fits file. Does not run any fitting.
+
+Key flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dataset` | (required) | Integrated TSV with all datasets |
+| `--precomputed-fits` | (required) | Path to `bootstrap_results.json.gz` from `aggregate_results.py` |
+| `--dataset-configs` | — | JSON mapping dataset names to `[n_c, benign_method, {overrides}]` |
+| `--datasets` | all | Only process these dataset names |
+| `--output-dir` | `./igvf_output` | Output directory |
+| `--n-jobs` | 1 | Datasets in parallel (outer) |
+| `--n-jobs-inner` | -1 | Parallel jobs within each dataset |
+| `--skip-existing` | off | Resume a failed run (skip completed datasets) |
+| `--all-configs` | off | Run all 4 (2c/3c)×(avg/benign) combos per dataset with comparison plot |
+| `--no-postprocess` | off | Skip point-range postprocessing (same as `run_pipeline.py`) |
+| `--manual-prior` | — | Override prior for all datasets |
+| `--oob` | off | Compute OOB per-variant evidence |
+| `--generate-config-template` | — | Write a blank dataset config JSON and exit |
+
+---
+
+### `slurm/prepare.py` — Job manifest generation
+
+Generates array job files from a dataset dataframe. Must be run before submitting fits.
+
+```bash
+python slurm/prepare.py <subcommand> --output-dir /path/to/run [options]
+```
+
+Subcommands:
+- `default` — IGVF/PillarProject TSV, ClinVar 2026
+- `pillar_project` — same as `default`, ClinVar 2025 default
+- `mavedb` — MaveDB CSV with `--score-cols` and `--dataframe`
+- `basicscoreset` — bare-bones CSV or directory of CSVs
+- `multivariate` — multi-assay fitting; groups genes with >1 dataset
+- `predictor-mv` — multi-assay from per-gene predictor CSVs
+
+Common options: `--n-bootstraps` (default: 1000), `--components`, `--datasets`, `--target-array-size`, `--n-jobs`.
+
+---
+
+### `slurm/submit_array.sh` — SLURM CPU array submission
+
+```bash
+bash slurm/submit_array.sh /path/to/run
+```
+
+Env-var overrides (all optional):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SLURM_ACCOUNT` | `predrag` | SLURM account |
+| `SLURM_PARTITION` | `short` | Partition |
+| `SLURM_TIME` | `23:59:00` | Wall time |
+| `SLURM_MEM` | `1G` | Memory per task |
+| `SLURM_CPUS` | `8` | CPUs per task |
+| `MAX_CONCURRENT` | `50` | Max simultaneous array tasks |
+| `PYTHON` | system python | Python executable |
+
+---
+
+### `slurm/submit_array_gpu.sh` — SLURM GPU array submission
+
+```bash
+N_GPUS=32 bash slurm/submit_array_gpu.sh /path/to/run
+```
+
+Same overrides as `submit_array.sh` plus:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `N_GPUS` | `32` | Number of GPU jobs (each covers a consecutive range) |
+| `SLURM_GRES` | `gpu:1` | GPU resource request |
+| `CUDA_MODULE` | `cuda/12.1.1` | CUDA module to load |
+| `CONDA_MODULE` | `anaconda3/2024.06` | Conda module to load |
+
+---
+
+### `slurm/run_local_array.sh` — Local CPU execution
+
+```bash
+bash slurm/run_local_array.sh /path/to/run START END [concurrency]
+```
+
+Runs array tasks `START` to `END` locally using `xargs -P` for parallelism.
+
+---
+
+### `slurm/run_local_array_gpu.sh` — Local GPU execution
+
+```bash
+PYTHON=/path/to/envs/excalibr/bin/python \
+CUDA_VISIBLE_DEVICES=0 \
+bash slurm/run_local_array_gpu.sh /path/to/run START END [gpu_id]
+```
+
+Runs all tasks in one process to keep the JAX JIT cache alive across tasks.
+
+---
+
+### `slurm/run_array_task.py` — Array task worker
+
+Called by the submission scripts; not intended to be invoked directly.
+
+```
+python slurm/run_array_task.py <output_dir> <array_idx> [--end <end_idx>] [--device {cpu,gpu}]
+```
+
+---
+
+### `slurm/count_bootstraps.py` — Progress monitoring
+
+```bash
+python slurm/count_bootstraps.py /path/to/run [--verbose]
+```
+
+Prints a per-dataset table of completed vs. expected bootstrap iterations.
+
+---
+
+### `slurm/aggregate_results.py` — Aggregate fit results
+
+```bash
+python slurm/aggregate_results.py /path/to/run [output_file]
+```
+
+Merges all per-bootstrap `*.pkl` files into `bootstrap_results.json.gz`, which is the input for `run_igvf_batch.py --precomputed-fits`.
+
+---
+
+### `src/collect_calibration_outputs.py` — Collect batch outputs
+
+```bash
+python src/collect_calibration_outputs.py <input_dir> <output_dir> \
+    [--dataset-configs src/igvf_configs/my_configs.json]
+```
+
+Copies the selected-model calibration JSON and PNG for each dataset into flat `json/` and `png/` subdirectories, then tars the result for download.
+
+## Output Files
+
+For each run, `run_pipeline.py` and `run_igvf_batch.py` produce:
+
+| File | Description |
+|------|-------------|
+| `<name>_<Kc>_calibration.json` | Calibration thresholds, prior, point ranges, fit metadata |
+| `<name>_<Kc>_visualization.png` | Score distribution plot with calibrated thresholds |
+| `<name>_<Kc>_variants.csv` | Per-variant point assignment table |
+| `<name>_<Kc>_lr_values.json.gz` | Full LR+ curves over score range |
+| `<name>_model_selection.json` | 2c vs. 3c bootstrap test results |
+| `<name>_bootstrap_fits.json.gz` | Saved bootstrap fit results (when fitting fresh) |
+
+The `calibration.json` includes:
+```json
+{
+  "prior": 0.0034,
+  "point_ranges": {
+    "1": [[0.12, 0.45]],
+    "2": [[0.45, 0.78]],
+    "-1": [[-0.45, -0.12]],
+    "-2": [[-0.78, -0.45]]
+  },
+  "scoreset_flipped": true,
+  "n_valid_fits": 998,
+  "C_range": [3.17, 3.45]
+}
 ```
 
 ## Configuration Options
 
-### Bootstrap Parameters
+### Bootstrap parameters
 
 ```bash
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --n-bootstraps 500 \        # Default: 1000
-  --fits-per-bootstrap 50     # Default: 100
+# Interactive / exploratory (defaults)
+python run_pipeline.py --dataset my.csv --name MyGene
+# → 20 bootstraps × 8 fits
+
+# Production quality
+python run_pipeline.py --dataset my.csv --name MyGene \
+    --n-bootstraps 1000 --fits-per-bootstrap 100
 ```
 
-### Prior Estimation
+### Component selection
 
 ```bash
-# Use EM estimation (default)
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021
+# Default: fit both 2c and 3c, auto-select
+python run_pipeline.py --dataset my.csv --name MyGene --components 2 3
 
-# Use equation for 2c
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --use-equation
-  --components 2
+# Force 3-component only
+python run_pipeline.py --dataset my.csv --name MyGene --components 3
+
+# Fit 5-component model
+python run_pipeline.py --dataset my.csv --name MyGene --components 5
+```
+
+### Prior estimation
+
+```bash
+# Empirical EM estimation (default)
+python run_pipeline.py --dataset my.csv --name MyGene
+
+# Manual prior
+python run_pipeline.py --dataset my.csv --name MyGene --manual-prior 0.001
 
 # Use 5th/95th percentile thresholds instead of median prior
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --no-median-prior
+python run_pipeline.py --dataset my.csv --name MyGene --no-median-prior
 ```
 
-### Benign Sample Method
+### Benign sample method
 
 ```bash
-# Average benign and synonymous (default if both samples exist)
---benign-method avg
-
-# Use benign samples only. (default if no synonymous sample) 
---benign-method benign
-
-# Use synonymous variants only (default if no benign sample)
---benign-method synonymous
+--benign-method avg         # Average benign and synonymous (default when both exist)
+--benign-method benign      # Use benign (ClinVar B/LB) only
+--benign-method synonymous  # Use synonymous only
 ```
 
-### ClinVar Options
+### Point-range postprocessing
 
 ```bash
-python run_pipeline.py \
-  --dataset example/MSH2_Jia_2021.csv \
-  --name MSH2_Jia_2021 \
-  --clinvar-release 2025 \     # Default: 2025
-  --min-clinvar-star 1          # Minimum review stars (default: 1)
+# Default: enforce monotonicity + extend to score-axis limits
+python run_pipeline.py --dataset my.csv --name MyGene
+
+# Disable postprocessing — intended for bidirectional assays (LoF/GoF)
+python run_pipeline.py --dataset my.csv --name MyGene --no-postprocess
+
+# Conservative (stricter) monotonicity enforcement
+python run_pipeline.py --dataset my.csv --name MyGene --conservative-monotonicity
 ```
-
-Note: this functionality is only supported within IGVF-formatted scoresets.
-
-## Output Files
-
-The pipeline generates:
-
-### Essential Outputs
-
-1. **Calibration JSON** (`MSH2_Jia_2021_2c_calibration.json`)
-   ```json
-   {
-     "dataset": "MSH2_Jia_2021",
-     "component": "2c",
-     "prior": 0.0034,
-     "point_ranges": {
-       "1": [[0.12, 0.45]],
-       "2": [[0.45, 0.78]],
-       ...
-       "-1": [[-0.45, -0.12]],
-       "-2": [[-0.78, -0.45]]
-     },
-     "scoreset_flipped": true,
-     "n_valid_fits": 998,
-     "config": {...}
-   }
-   ```
-
-2. **Visualization** (`MSH2_Jia_2021_2c_visualization.png`)
-   - Density plots for each sample
-   - Calibration thresholds overlaid
-
-3. **Model Selection Results** (`MSH2_Jia_2021_model_selection.json`)
-   ```json
-   {
-     "selected_k": 2,
-     "conservative_k": 2,
-     "p_value": 0.1234,
-     "mean_diff": 0.0012,
-     "fifth_percentile": -0.0003,
-     ...
-   }
-   ```
-
-### Optional Outputs
-
-4. **Full Results** (with `--save-fits`)
-   - `MSH2_Jia_2021_2c_full.json.gz` - Complete calibration data
-   - `MSH2_Jia_2021_bootstrap_fits.pkl` - All bootstrap fit results
-
-5. **Log Files** (`logs/MSH2_Jia_2021_pipeline.log`)
-
-Optionally, change the output directory with `--output-dir /path/to/output`.
-
 
 ## Troubleshooting
-
-### Common Issues
-
 
 **"Insufficient samples"**
 - Need at least 3 sample categories
 - Check for empty samples (all NaN scores)
 
 **SLURM jobs fail**
-- Check account/partition settings
-- Verify conda environment is activated in submission script
-- Check logs in `./calibration_output/slurm_jobs/logs/`
+- Verify `SLURM_ACCOUNT` and `SLURM_PARTITION` match your cluster
+- Check `module avail anaconda` and set `CONDA_MODULE` accordingly
+- Check logs in `<output_dir>/logs/`
 
 **Low number of valid fits**
 - Increase `--n-bootstraps` or `--fits-per-bootstrap`
 - Check for score range issues (all variants at same score)
-- Review log files for warnings
+
+**GPU runs (JAX)**
+- Requires `excalibr-gpu.yml` environment (Python 3.11 + JAX)
+- Test: `python -c "import jax; print(jax.devices())"`
+- Use `CUDA_VISIBLE_DEVICES=0` to pin to a specific GPU
 
 ## Citation
 
-If you use this pipeline, please cite:
+If you use ExCALIBR, please cite:
 
 ```
 Gene-based calibration of high-throughput functional assays for clinical variant classification.
-Daniel Zeiberg, Malvika Tejura, Abbye E. McEwen, Shawn Fayer, Vikas Pejaver, Alan F. Rubin, Lea M. Starita, Douglas M. Fowler, Anne O’Donnell-Luria, Predrag Radivojac
+Daniel Zeiberg, Malvika Tejura, Abbye E. McEwen, Shawn Fayer, Vikas Pejaver, Alan F. Rubin,
+Lea M. Starita, Douglas M. Fowler, Anne O'Donnell-Luria, Predrag Radivojac
 bioRxiv 2025.04.29.651326; doi: https://doi.org/10.1101/2025.04.29.651326
 ```
 
-## Contributing
+For the IGVF dataset and format:
 
-Contributions are welcome! Please submit issues or pull requests to help improve the project.
+```
+A scalable approach to resolving variants of uncertain significance.
+Malvika Tejura, Yile Chen, Abbye E. McEwen, Ross Stewart, et al.
+bioRxiv 2026.02.14.705848; doi: https://doi.org/10.64898/2026.02.14.705848
+```
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT License](LICENSE)
 
 ## Contact
 
-For questions or feedback, please contact [stewart.ro@northeastern.edu](mailto:stewart.ro@northeastern.edu).
+[stewart.ro@northeastern.edu](mailto:stewart.ro@northeastern.edu)

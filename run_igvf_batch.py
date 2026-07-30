@@ -61,8 +61,8 @@ def parse_dataset_config(
       - ["3c", "avg"]                          -> n_c="3c", benign="avg", overrides={}
       - ["3c", "avg", {"liberal_monotonicity": false}] -> with overrides
 
-    Recognized override keys include "liberal_monotonicity", "scoreset_flipped_override",
-    and "pathogenic_percentile" (float, default 5.0) -- e.g.:
+    Recognized override keys include "liberal_monotonicity", "postprocess_point_ranges",
+    "scoreset_flipped_override", and "pathogenic_percentile" (float, default 5.0) -- e.g.:
       {"n_c": "3c", "benign_method": "avg", "pathogenic_percentile": 5.0}
     or list form:
       ["3c", "avg", {"pathogenic_percentile": 5.0}]
@@ -149,6 +149,9 @@ def run_single_dataset(
         use_2c_equation=False,
         manual_prior=getattr(args, "manual_prior", None),
         liberal_monotonicity=overrides.get("liberal_monotonicity", True),
+        postprocess_point_ranges=overrides.get(
+            "postprocess_point_ranges", not getattr(args, "no_postprocess", False)
+        ),
         benign_method=benign_method,
         scoreset_flipped_override=overrides.get("scoreset_flipped_override", None),
         pathogenic_percentile=overrides.get(
@@ -421,6 +424,7 @@ def _run_one_combo(
     precomputed_log_fp_all=None,
     return_log_fp_all: bool = False,
     liberal_monotonicity: bool = True,
+    postprocess_point_ranges: bool = True,
     pathogenic_percentile: float = 5.0,
     filter_pathogenic_sample_by_lr: bool = False,
     pathomechanism_method: Optional[str] = None,
@@ -447,6 +451,7 @@ def _run_one_combo(
         use_2c_equation=False,
         manual_prior=getattr(args, "manual_prior", None),
         liberal_monotonicity=liberal_monotonicity,
+        postprocess_point_ranges=postprocess_point_ranges,
         benign_method=benign_method,
         clinvar_release=clinvar_release,
         min_clinvar_star=args.min_clinvar_star,
@@ -564,6 +569,9 @@ def run_all_configs_for_dataset(
     n_bootstrap_jobs = total_inner
 
     liberal_mono = (overrides or {}).get("liberal_monotonicity", True)
+    postprocess = (overrides or {}).get(
+        "postprocess_point_ranges", not getattr(args, "no_postprocess", False)
+    )
     pathogenic_percentile = (overrides or {}).get(
         "pathogenic_percentile", getattr(args, "pathogenic_percentile", 5.0)
     )
@@ -583,6 +591,7 @@ def run_all_configs_for_dataset(
                 precomputed_log_fp_all=log_fp_all if not is_avg else None,
                 return_log_fp_all=is_avg and both_needed,
                 liberal_monotonicity=liberal_mono,
+                postprocess_point_ranges=postprocess,
                 pathogenic_percentile=pathogenic_percentile,
                 filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
                 pathomechanism_method=pathomechanism_method,
@@ -696,6 +705,9 @@ def generate_all_configs_viz(
         use_2c_equation=False,
         manual_prior=getattr(args, "manual_prior", None),
         liberal_monotonicity=(overrides or {}).get("liberal_monotonicity", True),
+        postprocess_point_ranges=(overrides or {}).get(
+            "postprocess_point_ranges", not getattr(args, "no_postprocess", False)
+        ),
         benign_method="avg",
         clinvar_release=clinvar_release,
         min_clinvar_star=args.min_clinvar_star,
@@ -955,6 +967,11 @@ def main():
                        dest="pathomechanism_method", choices=["off", "subtraction", "masking"],
                        default=None,
                        help=argparse.SUPPRESS)
+    parser.add_argument("--no-postprocess", action="store_true",
+                       help="Skip point-range postprocessing (monotonicity enforcement and "
+                            "extend-to-limits). Returns raw LR-threshold-crossing intervals "
+                            "as fitted. Intended for bidirectional assays (e.g. LoF/GoF in "
+                            "one assay) where standard monotonicity assumptions do not hold.")
     parser.add_argument("--viz-only", action="store_true",
                        help="Regenerate visualizations only — skip variant tables and calibration JSON save "
                             "(useful for rerunning after fixing a plot bug)")

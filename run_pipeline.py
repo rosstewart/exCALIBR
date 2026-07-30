@@ -73,8 +73,9 @@ Examples:
                        help="Path to precomputed bootstrap splits pickle (for OOB with precomputed fits)")
 
     # Model parameters
-    parser.add_argument("--components", type=int, nargs="+", choices=[2, 3, 4],
-                       default=[2, 3], help="Component counts to fit (default: 2 3)")
+    parser.add_argument("--components", type=int, nargs="+",
+                       default=[2, 3], metavar="K",
+                       help="Component counts to fit (default: 2 3; integers 2–10)")
     parser.add_argument("--benign-method", choices=["benign", "avg", "synonymous"],
                        default="avg", help="Method for benign sample (default: avg)")
     parser.add_argument("--no-median-prior", action="store_true",
@@ -83,6 +84,11 @@ Examples:
                        help="Use equation for 2c prior (instead of EM estimation)")
     parser.add_argument("--conservative-monotonicity", action="store_true",
                        help="Conservative enforcement of monotonicity on evidence thresholds")
+    parser.add_argument("--no-postprocess", action="store_true",
+                       help="Skip point-range postprocessing (monotonicity enforcement and "
+                            "extend-to-limits). Returns raw LR-threshold-crossing intervals "
+                            "as fitted. Intended for bidirectional assays (e.g. LoF/GoF in "
+                            "one assay) where standard monotonicity assumptions do not hold.")
     parser.add_argument("--manual-prior", type=float, default=None,
                        help="Manually set prior probability (0-1). Skips empirical estimation.")
     parser.add_argument("--population-type", default="gnomAD",
@@ -152,10 +158,10 @@ Examples:
                        help="Min OOB bootstrap samples per variant (default: 1)")
 
     # Bootstrap parameters
-    parser.add_argument("--n-bootstraps", type=int, default=1000,
-                       help="Number of bootstrap iterations (default: 1000)")
-    parser.add_argument("--fits-per-bootstrap", type=int, default=100,
-                       help="Fits per bootstrap iteration (default: 100)")
+    parser.add_argument("--n-bootstraps", type=int, default=20,
+                       help="Number of bootstrap iterations (default: 20; use 1000 for production)")
+    parser.add_argument("--fits-per-bootstrap", type=int, default=8,
+                       help="Fits per bootstrap iteration (default: 8; use 100 for production)")
     parser.add_argument("--seed", type=int, default=None,
                        help="Master seed for full reproducibility (train/val splits, EM "
                             "initializations, and E-step Monte Carlo draws are all derived "
@@ -262,6 +268,7 @@ Examples:
         use_median_prior=not args.no_median_prior,
         use_2c_equation=args.use_equation,
         liberal_monotonicity=not args.conservative_monotonicity,
+        postprocess_point_ranges=not args.no_postprocess,
         benign_method=args.benign_method,
         manual_prior=args.manual_prior,
         population_type=args.population_type,

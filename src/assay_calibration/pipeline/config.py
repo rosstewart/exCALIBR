@@ -18,8 +18,8 @@ class PipelineConfig:
     splits_file: Optional[str] = None       # Path to precomputed splits pickle (for OOB)
 
     # Bootstrap parameters
-    n_bootstraps: int = 1000
-    num_fits_per_bootstrap: int = 100
+    n_bootstraps: int = 20
+    num_fits_per_bootstrap: int = 8
 
     # Master seed for full reproducibility (train/val splits, EM initializations,
     # and E-step Monte Carlo draws are all derived from this). None (default)
@@ -31,6 +31,7 @@ class PipelineConfig:
     use_median_prior: bool = True
     use_2c_equation: bool = False  # Use EM estimation instead
     liberal_monotonicity: bool = True
+    postprocess_point_ranges: bool = True
     benign_method: Literal["benign", "avg", "synonymous"] = "avg"
     manual_prior: float = None  # If set, skip prior estimation and use this value
     population_type: str = "gnomAD"
@@ -214,8 +215,8 @@ class PipelineConfig:
             self.point_values = [1, 2, 3, 4, 5, 6, 7, 8]
 
         # Validate components
-        if not all(c in [2, 3, 4] for c in self.components):
-            raise ValueError("Components must be 2, 3, or 4")
+        if not all(2 <= c <= 10 for c in self.components):
+            raise ValueError("Components must be integers between 2 and 10")
 
         # Validate manual_prior
         if self.manual_prior is not None:
