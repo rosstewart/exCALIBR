@@ -2,9 +2,9 @@ name: excalibr
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
-  - numpy=1.26
-  - scipy=1.10
+  - python=3.11
+  - numpy>=2.0
+  - scipy>=1.14
   - pandas
   - scikit-learn
   - matplotlib
@@ -17,3 +17,9 @@ dependencies:
   - fire
   - ffmpeg
   - adjusttext
+  - pip
+  - pip:
+    # JAX with CUDA 12 — bundles its own nvidia-* runtime libs, no module load needed.
+    # For CPU-only installs (no GPU), replace with: jax==0.10.2
+    - jax[cuda12]==0.10.2
+    - jaxlib==0.10.2
