@@ -257,7 +257,7 @@ def _interpolate(old, new, alpha):
     static_argnames=("max_em_iters", "n_backtrack"),
 )
 def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
-                     mu0, Delta0, Gamma0, W0, max_em_iters=2000, n_backtrack=10):
+                     mu0, Delta0, Gamma0, W0, max_em_iters=10000, n_backtrack=10):
     """Batched, unconstrained-only CFUSN (q=2) EM fit.
 
     observations, obs_mask : (batch, N, p) — NaNs pre-filled as 0 in
@@ -345,5 +345,5 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
         jnp.zeros((batch,), dtype=bool),
         jnp.zeros((batch,), dtype=bool),
     )
-    it_final, mu, Delta, Gamma, W, _ll, failed, _done = lax.while_loop(cond, body, init_state)
-    return mu, Delta, Gamma, W, failed, it_final
+    it_final, mu, Delta, Gamma, W, _ll, failed, done = lax.while_loop(cond, body, init_state)
+    return mu, Delta, Gamma, W, failed, it_final, done

@@ -250,12 +250,13 @@ def test_cfusn_parity_unconstrained():
 
 
 # ---------------------------------------------------------------------------
-# max_em_iters=500 non-truncation tests
+# max_em_iters non-truncation tests
 #
-# Strategy: run the SAME batch with cap=500 and cap=2000 from identical init.
-# If no fit was truncated by the 500-cap, the two runs must:
-#   (a) it_final < 500  (the cap was never the exit condition)
-#   (b) it_final_500 == it_final_2000  (same convergence point)
+# Strategy: run the SAME batch with cap=5000 (production default) and cap=10000
+# from identical init.  If no fit was truncated by the 5000-cap, the two runs
+# must:
+#   (a) it_final < 5000  (the cap was never the exit condition)
+#   (b) it_final_5000 == it_final_10000  (same convergence point)
 #   (c) params bitwise identical  (no fit was cut short)
 #
 # Datasets are intentionally diverse — well-separated and heavily overlapping —
@@ -266,10 +267,10 @@ def test_cfusn_parity_unconstrained():
 _UV_CAP_SCENARIOS = [
     # (label,  scoreset_factory,                        seed, K,  constrained)
     # K=3 unconstrained is omitted: on this small test dataset (n=150/sample) it
-    # needs >2000 iterations to satisfy _REL_TOL=1e-8, which is an artifact of
+    # needs >5000 iterations to satisfy _REL_TOL=1e-8, which is an artifact of
     # small n, not a production concern.  Production datasets have n≥500/sample
     # and converge within the cap.  K=3 *constrained* (the primary production
-    # case) needs ~953 iterations on this test data → well within 2000.
+    # case) needs ~953 iterations on this test data → well within 5000.
     ("easy_K2_unconstrained",    _make_univariate_scoreset,             0, 2, False),
     ("easy_K2_constrained",      _make_univariate_scoreset,             0, 2, True),
     ("easy_K3_constrained",      _make_univariate_scoreset,             0, 3, True),
@@ -286,12 +287,12 @@ _UV_CAP_SCENARIOS = [
     [pytest.param(*s, id=s[0]) for s in _UV_CAP_SCENARIOS],
 )
 def test_max_em_iters_not_binding_univariate(label, factory, seed, K, constrained):
-    """max_em_iters=2000 (production default) must not truncate any univariate fit.
+    """max_em_iters=10000 (production default) must not truncate any univariate fit.
 
-    Runs cap=2000 (production default) and cap=5000 from the same CPU init.
+    Runs cap=10000 (production default) and cap=20000 from the same CPU init.
     Asserts:
-    - it_final < 2000  (the cap was never the exit condition)
-    - it_final_2000 == it_final_5000  (same convergence point)
+    - it_final < 10000  (the cap was never the exit condition)
+    - it_final_10000 == it_final_20000  (same convergence point)
     - params bitwise identical  (no fit was cut short)
     """
     from src.assay_calibration.fit_utils.jax_batch import batch_em
@@ -309,49 +310,49 @@ def test_max_em_iters_not_binding_univariate(label, factory, seed, K, constraine
     obs, sample_idx, S, a0, loc0, scale0, W0, xmin, xmax = packed
 
     kw = dict(constrained=constrained)
-    a2k, loc2k, scale2k, W2k, failed2k, it2k = batch_em.fit_batch(
+    a10k, loc10k, scale10k, W10k, failed10k, it10k, _done10k = batch_em.fit_batch(
         obs, sample_idx, S, a0, loc0, scale0, W0, xmin, xmax,
-        max_em_iters=2000, **kw,
+        max_em_iters=10000, **kw,
     )
-    a5k, loc5k, scale5k, W5k, failed5k, it5k = batch_em.fit_batch(
+    a20k, loc20k, scale20k, W20k, failed20k, it20k, _done20k = batch_em.fit_batch(
         obs, sample_idx, S, a0, loc0, scale0, W0, xmin, xmax,
-        max_em_iters=5000, **kw,
+        max_em_iters=20000, **kw,
     )
 
-    it2k_np = int(np.asarray(it2k))
-    it5k_np = int(np.asarray(it5k))
-    print(f"  {label}: it_final={it2k_np} (cap=2000 vs cap=5000: {it5k_np})")
+    it10k_np = int(np.asarray(it10k))
+    it20k_np = int(np.asarray(it20k))
+    print(f"  {label}: it_final={it10k_np} (cap=10000 vs cap=20000: {it20k_np})")
 
-    assert it2k_np < 2000, (
-        f"{label}: it_final={it2k_np} reached the cap — "
-        f"max_em_iters=2000 is truncating fits and reducing quality."
+    assert it10k_np < 10000, (
+        f"{label}: it_final={it10k_np} reached the cap — "
+        f"max_em_iters=10000 is truncating fits and reducing quality."
     )
-    assert it2k_np == it5k_np, (
-        f"{label}: cap=2000 exited at iteration {it2k_np} but cap=5000 "
-        f"exited at {it5k_np} — the 2000-cap truncated at least one fit."
-    )
-    np.testing.assert_array_equal(
-        np.asarray(failed2k), np.asarray(failed5k),
-        err_msg=f"{label}: failed mask differs between cap=2000 and cap=5000",
+    assert it10k_np == it20k_np, (
+        f"{label}: cap=10000 exited at iteration {it10k_np} but cap=20000 "
+        f"exited at {it20k_np} — the 10000-cap truncated at least one fit."
     )
     np.testing.assert_array_equal(
-        np.asarray(a2k), np.asarray(a5k),
+        np.asarray(failed10k), np.asarray(failed20k),
+        err_msg=f"{label}: failed mask differs between cap=10000 and cap=20000",
+    )
+    np.testing.assert_array_equal(
+        np.asarray(a10k), np.asarray(a20k),
         err_msg=f"{label}: a differs despite same it_final",
     )
     np.testing.assert_array_equal(
-        np.asarray(loc2k), np.asarray(loc5k),
+        np.asarray(loc10k), np.asarray(loc20k),
         err_msg=f"{label}: loc differs despite same it_final",
     )
     np.testing.assert_array_equal(
-        np.asarray(scale2k), np.asarray(scale5k),
+        np.asarray(scale10k), np.asarray(scale20k),
         err_msg=f"{label}: scale differs despite same it_final",
     )
 
 
 def test_max_em_iters_not_binding_cfusn():
-    """max_em_iters=2000 (production default) must not truncate any CFUSN fit.
+    """max_em_iters=10000 (production default) must not truncate any CFUSN fit.
 
-    Same methodology as the univariate version: cap=2000 vs cap=5000.
+    Same methodology as the univariate version: cap=10000 vs cap=20000.
     Uses both the default (well-separated) and an alternative seed.
     CFUSN EM converges quickly (32 iterations on typical test data) so this
     cap is very conservative.
@@ -371,32 +372,32 @@ def test_max_em_iters_not_binding_cfusn():
         assert packed is not None, f"CFUSN seed={seed}: all CPU inits failed"
         obs, obs_mask, sample_idx, S, mu0, Delta0, Gamma0, W0 = packed
 
-        mu2k, D2k, G2k, W2k, failed2k, it2k = batch_em_cfusn.fit_batch_cfusn(
+        mu10k, D10k, G10k, W10k, failed10k, it10k, _done10k = batch_em_cfusn.fit_batch_cfusn(
             obs, obs_mask, sample_idx, S, mu0, Delta0, Gamma0, W0,
-            max_em_iters=2000,
+            max_em_iters=10000,
         )
-        mu5k, D5k, G5k, W5k, failed5k, it5k = batch_em_cfusn.fit_batch_cfusn(
+        mu20k, D20k, G20k, W20k, failed20k, it20k, _done20k = batch_em_cfusn.fit_batch_cfusn(
             obs, obs_mask, sample_idx, S, mu0, Delta0, Gamma0, W0,
-            max_em_iters=5000,
+            max_em_iters=20000,
         )
 
-        it2k_np = int(np.asarray(it2k))
-        it5k_np = int(np.asarray(it5k))
-        print(f"  CFUSN seed={seed}: it_final={it2k_np} (cap=2000 vs cap=5000: {it5k_np})")
+        it10k_np = int(np.asarray(it10k))
+        it20k_np = int(np.asarray(it20k))
+        print(f"  CFUSN seed={seed}: it_final={it10k_np} (cap=10000 vs cap=20000: {it20k_np})")
 
-        assert it2k_np < 2000, (
-            f"CFUSN seed={seed}: it_final={it2k_np} reached the cap — "
-            f"max_em_iters=2000 is truncating fits."
+        assert it10k_np < 10000, (
+            f"CFUSN seed={seed}: it_final={it10k_np} reached the cap — "
+            f"max_em_iters=10000 is truncating fits."
         )
-        assert it2k_np == it5k_np, (
-            f"CFUSN seed={seed}: cap=2000 exited at {it2k_np}, cap=5000 "
-            f"exited at {it5k_np} — 2000-cap truncated at least one fit."
+        assert it10k_np == it20k_np, (
+            f"CFUSN seed={seed}: cap=10000 exited at {it10k_np}, cap=20000 "
+            f"exited at {it20k_np} — 10000-cap truncated at least one fit."
         )
         np.testing.assert_array_equal(
-            np.asarray(failed2k), np.asarray(failed5k),
+            np.asarray(failed10k), np.asarray(failed20k),
             err_msg=f"CFUSN seed={seed}: failed mask differs",
         )
         np.testing.assert_array_equal(
-            np.asarray(mu2k), np.asarray(mu5k),
+            np.asarray(mu10k), np.asarray(mu20k),
             err_msg=f"CFUSN seed={seed}: mu differs despite same it_final",
         )

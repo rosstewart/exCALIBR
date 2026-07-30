@@ -162,7 +162,7 @@ def _m_step(observations, resp, a, loc, scale, constrained, x_grid, force_gaussi
 )
 def fit_batch(observations, sample_idx, n_samples, a0, loc0, scale0, W0,
               xmin, xmax, constrained=True, force_gaussian=False,
-              max_em_iters=2000):
+              max_em_iters=10000):
     """Batched EM fit for a group of univariate jobs sharing (dataset, num_components).
 
     Parameters
@@ -231,5 +231,5 @@ def fit_batch(observations, sample_idx, n_samples, a0, loc0, scale0, W0,
         jnp.zeros((batch,), dtype=bool),
         jnp.zeros((batch,), dtype=bool),
     )
-    it_final, a, loc, scale, W, _ll, failed, _done = lax.while_loop(cond, body, init_state)
-    return a, loc, scale, W, failed, it_final
+    it_final, a, loc, scale, W, _ll, failed, done = lax.while_loop(cond, body, init_state)
+    return a, loc, scale, W, failed, it_final, done

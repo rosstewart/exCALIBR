@@ -199,13 +199,15 @@ def _run_univariate_chunk(specs, use_gpu_init=True, max_em_iters=None):
     fit_kw = dict(constrained=constrained, force_gaussian=force_gaussian)
     if max_em_iters is not None:
         fit_kw["max_em_iters"] = max_em_iters
-    a, loc, scale, W, failed, it_final = batch_em.fit_batch(
+    a, loc, scale, W, failed, it_final, done = batch_em.fit_batch(
         obs, sample_idx, S, a0, loc0, scale0, W0,
         xmin, xmax, **fit_kw,
     )
-    a, loc, scale, W, failed = map(np.asarray, (a, loc, scale, W, failed))
+    a, loc, scale, W, failed, done = map(np.asarray, (a, loc, scale, W, failed, done))
     it_final_np = int(np.asarray(it_final))
-    print(f"  [batch_em] iterations: {it_final_np} (batch={len(specs)})", flush=True)
+    hit_cap = ~done
+    n_hit_cap = int(hit_cap.sum())
+    print(f"  [batch_em] iterations: {it_final_np} (batch={len(specs)}, cap_hits={n_hit_cap})", flush=True)
     if use_gpu_init:
         failed = failed | np.asarray(init_failed)
 
@@ -254,6 +256,7 @@ def _run_univariate_chunk(specs, use_gpu_init=True, max_em_iters=None):
             "fit": result,
             "val_ll": val_ll if val_ll is not None else -np.inf,
             "calibrated_dims": full_job.get("calibrated_dims"),
+            "hit_cap": bool(hit_cap[i]),
         }))
     return results
 
@@ -367,14 +370,16 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
     cfusn_kw = {}
     if max_em_iters is not None:
         cfusn_kw["max_em_iters"] = max_em_iters
-    mu, Delta, Gamma, W, failed, it_final = batch_em_cfusn.fit_batch_cfusn(
+    mu, Delta, Gamma, W, failed, it_final, done = batch_em_cfusn.fit_batch_cfusn(
         obs, obs_mask, sample_idx, S,
         mu0, Delta0, Gamma0, W0,
         **cfusn_kw,
     )
-    mu, Delta, Gamma, W, failed = map(np.asarray, (mu, Delta, Gamma, W, failed))
+    mu, Delta, Gamma, W, failed, done = map(np.asarray, (mu, Delta, Gamma, W, failed, done))
     it_final_np = int(np.asarray(it_final))
-    print(f"  [batch_em_cfusn] iterations: {it_final_np} (batch={len(specs)})", flush=True)
+    hit_cap = ~done
+    n_hit_cap = int(hit_cap.sum())
+    print(f"  [batch_em_cfusn] iterations: {it_final_np} (batch={len(specs)}, cap_hits={n_hit_cap})", flush=True)
     if use_gpu_init and not any_anchored:
         failed = failed | np.asarray(init_failed)
 
@@ -397,6 +402,7 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
             "fit": result,
             "val_ll": val_ll if val_ll is not None else -np.inf,
             "calibrated_dims": full_job.get("calibrated_dims"),
+            "hit_cap": bool(hit_cap[i]),
         }))
     return results
 

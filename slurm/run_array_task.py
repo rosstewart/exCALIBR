@@ -155,6 +155,7 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
     # matching the joblib.Parallel-based pipeline path (which preserves
     # submission order).
     best: dict = {}                              # key → (val_ll, -fit_idx, result)
+    cap_hits: dict = defaultdict(int)            # (bs_seed, label, save_dir) → cap hit count
     remaining = dict(fits_per_bootstrap)
 
     if device == "gpu":
@@ -178,17 +179,22 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
         if sort_key > best.get(key, (-np.inf, None, None))[:2]:
             best[key] = (val_ll, -(fit_idx if fit_idx is not None else 0), result)
 
+        if result and result.get("hit_cap", False):
+            cap_hits[key] += 1
+
         bs_key = (bs_seed, save_dir)
         remaining[bs_key] -= 1
 
         # ── Save as soon as all fits for this bootstrap are done ──
         if remaining[bs_key] == 0:
             save_path = Path(save_dir) / f"bootstrap_{bs_seed}_best_fits.pkl"
-            new_results = {
-                lbl: res
-                for (b, lbl, sd), (_, _, res) in best.items()
-                if b == bs_seed and sd == save_dir
-            }
+            new_results = {}
+            for (b, lbl, sd), (_, _, res) in best.items():
+                if b == bs_seed and sd == save_dir:
+                    n_cap = cap_hits.get((b, lbl, sd), 0)
+                    if res is not None:
+                        res = {**res, "n_cap_hits": n_cap}
+                    new_results[lbl] = res
             # Merge with pre-existing (preserves already-complete components)
             existing = {}
             if save_path.exists():
@@ -202,7 +208,9 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
             with open(save_path, "wb") as f:
                 pickle.dump(existing, f)
             components = sorted(existing.keys())
-            print(f"  ✓ bootstrap {bs_seed} → {save_path.parent.name}  [{', '.join(components)}]")
+            total_cap = sum(cap_hits.get((bs_seed, lbl, save_dir), 0) for lbl in new_results)
+            cap_str = f"  ⚠ {total_cap} cap hits" if total_cap > 0 else ""
+            print(f"  ✓ bootstrap {bs_seed} → {save_path.parent.name}  [{', '.join(components)}]{cap_str}")
 
 
 # ---------------------------------------------------------------------------
