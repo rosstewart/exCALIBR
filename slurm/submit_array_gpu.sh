@@ -42,6 +42,8 @@ PARTITION="${SLURM_PARTITION:-gpu}"
 GRES="${SLURM_GRES:-gpu:1}"
 N_GPUS="${N_GPUS:-8}"
 PYTHON="${PYTHON:-/home/stewart.ro/.conda/envs/pillar_project/bin/python}"
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.1.1}"
+CONDA_MODULE="${CONDA_MODULE:-anaconda3/2024.06}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Each SLURM array element covers this many consecutive array tasks
@@ -59,6 +61,9 @@ JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 #SBATCH --cpus-per-task=${CPUS}
 #SBATCH --partition=${PARTITION}
 #SBATCH --gres=${GRES}
+
+module purge
+module load ${CONDA_MODULE} ${CUDA_MODULE}
 
 START=\$(( \${SLURM_ARRAY_TASK_ID} * ${TASKS_PER_GPU} ))
 END=\$(( START + ${TASKS_PER_GPU} - 1 ))
