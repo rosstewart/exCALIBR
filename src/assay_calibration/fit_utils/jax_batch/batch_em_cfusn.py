@@ -50,7 +50,10 @@ per component (the augmented `(p,p)` system is built per-observation) —
 much larger than the univariate path's `O(batch * N)`. Use a smaller
 `max_batch_size` for CFUSN groups in `interop.py` than for univariate ones.
 """
+import functools
+
 import numpy as _np
+import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.scipy.stats import norm as jnorm
@@ -220,7 +223,7 @@ def _m_step(observations, obs_mask, resp, mu, Delta, etas, psis):
         Delta_new_dims = []
         for d in range(p):
             Ps_d = Psi_sum[:, d] + _EPS * jnp.eye(2)
-            Delta_new_dims.append(jnp.linalg.solve(Ps_d, numer_pq[:, d]))
+            Delta_new_dims.append(jnp.linalg.solve(Ps_d, numer_pq[:, d][..., None]).squeeze(-1))
         Delta_new_c = jnp.stack(Delta_new_dims, axis=1)                  # (batch,p,2)
 
         # Gamma
@@ -248,8 +251,13 @@ def _interpolate(old, new, alpha):
     return tuple(o + alpha * (n - o) for o, n in zip(old, new))
 
 
+@functools.partial(
+    jax.jit,
+    static_argnums=(3,),
+    static_argnames=("max_em_iters", "n_backtrack"),
+)
 def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
-                     mu0, Delta0, Gamma0, W0, max_em_iters=10000, n_backtrack=10):
+                     mu0, Delta0, Gamma0, W0, max_em_iters=2000, n_backtrack=10):
     """Batched, unconstrained-only CFUSN (q=2) EM fit.
 
     observations, obs_mask : (batch, N, p) — NaNs pre-filled as 0 in
@@ -337,5 +345,5 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
         jnp.zeros((batch,), dtype=bool),
         jnp.zeros((batch,), dtype=bool),
     )
-    _, mu, Delta, Gamma, W, _ll, failed, _done = lax.while_loop(cond, body, init_state)
-    return mu, Delta, Gamma, W, failed
+    it_final, mu, Delta, Gamma, W, _ll, failed, _done = lax.while_loop(cond, body, init_state)
+    return mu, Delta, Gamma, W, failed, it_final

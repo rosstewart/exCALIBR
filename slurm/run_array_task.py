@@ -210,10 +210,19 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir")
-    parser.add_argument("array_idx", type=int)
+    parser.add_argument("array_idx", type=int,
+                        help="Array task index, or start index when --end is given.")
+    parser.add_argument("--end", type=int, default=None,
+                        help="If given, run array indices array_idx..end inclusive "
+                             "in a single process (keeps JAX JIT cache alive across "
+                             "tasks — critical for GPU runs to avoid per-task recompilation).")
     parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
                         help="cpu (default): existing per-job ProcessPoolExecutor path. "
                              "gpu: batch jobs through jax_batch and run on GPU "
                              "(see slurm/submit_array_gpu.sh).")
     args = parser.parse_args()
-    run_array_task(args.output_dir, args.array_idx, device=args.device)
+    if args.end is not None:
+        for idx in range(args.array_idx, args.end + 1):
+            run_array_task(args.output_dir, idx, device=args.device)
+    else:
+        run_array_task(args.output_dir, args.array_idx, device=args.device)

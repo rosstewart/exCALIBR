@@ -26,11 +26,22 @@ OUTPUT_DIR="${1:?Usage: $0 <output_dir> <start_idx> <end_idx>}"
 START="${2:?Usage: $0 <output_dir> <start_idx> <end_idx>}"
 END="${3:?Usage: $0 <output_dir> <start_idx> <end_idx>}"
 
+LOG_DIR="${OUTPUT_DIR}/logs"
+mkdir -p "$LOG_DIR"
+
 echo "Running GPU array indices ${START}-${END} on $(hostname)"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset, JAX default>}"
+echo "  logs: ${LOG_DIR}/array_NNNN.log"
 
-for idx in $(seq "$START" "$END"); do
-    python "${SCRIPT_DIR}/run_array_task.py" "$OUTPUT_DIR" "$idx" --device gpu
-done
+PYTHON="${PYTHON:-python}"
+export PYTHONUNBUFFERED=1
+
+# Run all indices in ONE Python process so JAX JIT cache stays alive across
+# array tasks. A fresh process per task would recompile (~10 min) every time,
+# turning a ~11h run into a week of compilation overhead.
+log="${LOG_DIR}/array_$(printf '%04d' "$START")_to_$(printf '%04d' "$END").log"
+$PYTHON "${SCRIPT_DIR}/run_array_task.py" "$OUTPUT_DIR" "$START" \
+    --end "$END" --device gpu \
+    2>&1 | tee "$log"
 
 echo "Done: indices ${START}-${END} on $(hostname)"

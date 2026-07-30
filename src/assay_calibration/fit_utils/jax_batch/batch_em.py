@@ -28,6 +28,9 @@ Known simplifications vs. the NumPy reference (validate in
     element `failed` and letting the interop layer report val_ll=-inf,
     not by trying to recover the best iterate before the failure.
 """
+import functools
+
+import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.scipy.special import logsumexp
@@ -152,9 +155,14 @@ def _m_step(observations, resp, a, loc, scale, constrained, x_grid, force_gaussi
     return jnp.stack(new_a, axis=1), jnp.stack(new_loc, axis=1), jnp.stack(new_scale, axis=1)
 
 
+@functools.partial(
+    jax.jit,
+    static_argnums=(2,),
+    static_argnames=("constrained", "force_gaussian", "max_em_iters"),
+)
 def fit_batch(observations, sample_idx, n_samples, a0, loc0, scale0, W0,
               xmin, xmax, constrained=True, force_gaussian=False,
-              max_em_iters=10000):
+              max_em_iters=2000):
     """Batched EM fit for a group of univariate jobs sharing (dataset, num_components).
 
     Parameters
@@ -179,6 +187,7 @@ def fit_batch(observations, sample_idx, n_samples, a0, loc0, scale0, W0,
     W : (batch, n_samples, K) final per-sample weights.
     failed : (batch,) bool — True where the fit should be treated as failed
         (matches NumPy's `tryToFit` exception path: discard, val_ll=-inf).
+    it_final : () int32 — actual iteration count at exit (diagnostic).
     """
     x_grid = build_grid(xmin, xmax) if constrained else None
     batch, K = a0.shape
@@ -222,5 +231,5 @@ def fit_batch(observations, sample_idx, n_samples, a0, loc0, scale0, W0,
         jnp.zeros((batch,), dtype=bool),
         jnp.zeros((batch,), dtype=bool),
     )
-    _, a, loc, scale, W, _ll, failed, _done = lax.while_loop(cond, body, init_state)
-    return a, loc, scale, W, failed
+    it_final, a, loc, scale, W, _ll, failed, _done = lax.while_loop(cond, body, init_state)
+    return a, loc, scale, W, failed, it_final

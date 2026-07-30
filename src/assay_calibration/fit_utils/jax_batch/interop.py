@@ -1,11 +1,14 @@
 """Glue between the existing job-pickle format (``fit.py``/``run_array_task.py``)
 and the batched JAX fitters in ``batch_em.py`` / ``batch_em_cfusn.py``.
 
-Initialization (kmeans / method-of-moments) is **not** batched — it stays on
-CPU, one call per job via the existing NumPy routines in
-``cfusn/initializations.py``, mirroring ``cfusn/fit.py::single_fit``'s init
-block. It's cheap relative to the thousands of EM iterations that follow, so
-this isn't a bottleneck; only the EM loop itself is moved to the GPU.
+By default (``use_gpu_init=True`` in :func:`run_gpu`) initialization (k-means /
+method-of-moments) is performed on the GPU via the batched JAX routines in
+``init_jax.py``, eliminating the sequential CPU init loop that was responsible
+for 97-99 % of total wall time (see ``tests/benchmark_scaling.py``).
+
+Pass ``use_gpu_init=False`` to fall back to the original sequential CPU init
+(``cfusn/initializations.py``) — used by ``tests/test_batch_em_parity.py`` to
+keep the tight float64-parity assertions valid.
 
 Only supports the common case each `prepare.py` invocation actually produces:
 one `constrained`/`force_gaussian`/`multivariate` setting per (dataset,
@@ -16,6 +19,8 @@ a job dict is malformed) rather than silently mishandling it.
 from collections import defaultdict
 
 import numpy as np
+import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from ..cfusn.initializations import (
@@ -24,6 +29,9 @@ from ..cfusn.initializations import (
 from ..cfusn.update_steps import get_sample_weights
 from ..cfusn.fit import _ensure_cfusn_params
 from . import batch_em, batch_em_cfusn
+from .init_jax import batch_init_univariate, batch_init_cfusn
+from .batch_em import _log_pdfs, _gather_sample_weights
+from jax.scipy.special import logsumexp as jax_logsumexp
 
 MAX_BATCH_UNIVARIATE = 20_000
 MAX_BATCH_CFUSN = 500
@@ -63,7 +71,7 @@ def group_fit_specs(fit_specs, max_batch_univariate=MAX_BATCH_UNIVARIATE,
 
 
 # ---------------------------------------------------------------------------
-# CPU-side initialization (per job, cheap — see module docstring)
+# CPU-side initialization (legacy — only used when use_gpu_init=False)
 # ---------------------------------------------------------------------------
 
 def _init_univariate(full_job):
@@ -126,52 +134,108 @@ def _init_cfusn(full_job):
 # Univariate batch: pack / run / unpack
 # ---------------------------------------------------------------------------
 
-def _run_univariate_chunk(specs):
+def _run_univariate_chunk(specs, use_gpu_init=True, max_em_iters=None):
     # NB: don't use `spec in valid_specs` anywhere here — specs are tuples
     # containing job dicts with ndarray values, and `==`/`in` on those raises
     # ValueError ("truth value of an array is ambiguous"). Track validity by
     # index instead.
-    inits = []
-    valid_specs = []
-    results = []
-    for spec in specs:
-        full_job = spec[0]
-        init = _init_univariate(full_job)
-        if init is None:
-            results.append(_failed_result(spec))  # init failure -> val_ll=-inf
-            continue
-        inits.append(init)
-        valid_specs.append(spec)
+    if not specs:
+        return []
 
-    if not valid_specs:
-        return results
+    K = specs[0][0]["num_components"]
+    S = specs[0][0]["train_sample_assignments"].shape[1]
+    constrained = bool(specs[0][0]["constrained"])
+    force_gaussian = bool(specs[0][0].get("kwargs", {}).get("force_gaussian", False))
 
-    K = valid_specs[0][0]["num_components"]
-    N = len(valid_specs[0][0]["train_observations"])
-    S = valid_specs[0][0]["train_sample_assignments"].shape[1]
-    constrained = bool(valid_specs[0][0]["constrained"])
-    force_gaussian = bool(valid_specs[0][0].get("kwargs", {}).get("force_gaussian", False))
-
-    obs = np.stack([np.asarray(s[0]["train_observations"]).ravel() for s in valid_specs])
-    sample_idx = np.stack([
-        np.argmax(s[0]["train_sample_assignments"], axis=1) for s in valid_specs
-    ])
-    a0 = np.stack([[p[0] for p in init[0]] for init in inits])
-    loc0 = np.stack([[p[1] for p in init[0]] for init in inits])
-    scale0 = np.stack([[p[2] for p in init[0]] for init in inits])
-    W0 = np.stack([init[1] for init in inits])
+    obs = jnp.asarray(np.stack([
+        np.asarray(s[0]["train_observations"]).ravel() for s in specs
+    ]))  # (batch, N)
+    sample_idx = jnp.asarray(np.stack([
+        np.argmax(s[0]["train_sample_assignments"], axis=1) for s in specs
+    ]))  # (batch, N)
     xmin = obs.min(axis=1)
     xmax = obs.max(axis=1)
 
-    a, loc, scale, W, failed = batch_em.fit_batch(
-        jnp.asarray(obs), jnp.asarray(sample_idx), S,
-        jnp.asarray(a0), jnp.asarray(loc0), jnp.asarray(scale0), jnp.asarray(W0),
-        jnp.asarray(xmin), jnp.asarray(xmax),
-        constrained=constrained, force_gaussian=force_gaussian,
+    if use_gpu_init:
+        fit_seeds = [s[0].get("kwargs", {}).get("fit_seed") or 0 for s in specs]
+        key = jax.random.PRNGKey(int(np.array(fit_seeds, dtype=np.uint32).sum()))
+        a0, loc0, scale0, W0, init_failed = batch_init_univariate(
+            obs, sample_idx, S, K, constrained, xmin, xmax, key)
+        results = []
+        valid_mask = [True] * len(specs)  # all specs go to EM
+    else:
+        # Legacy sequential CPU init (used by parity tests)
+        inits = []
+        valid_specs = []
+        results = []
+        valid_mask = []
+        for spec in specs:
+            init = _init_univariate(spec[0])
+            if init is None:
+                results.append(_failed_result(spec))
+                valid_mask.append(False)
+                continue
+            inits.append(init)
+            valid_specs.append(spec)
+            valid_mask.append(True)
+
+        if not valid_specs:
+            return results
+
+        a0 = jnp.asarray(np.stack([[p[0] for p in init[0]] for init in inits]))
+        loc0 = jnp.asarray(np.stack([[p[1] for p in init[0]] for init in inits]))
+        scale0 = jnp.asarray(np.stack([[p[2] for p in init[0]] for init in inits]))
+        W0 = jnp.asarray(np.stack([init[1] for init in inits]))
+        obs = jnp.asarray(np.stack([
+            np.asarray(s[0]["train_observations"]).ravel() for s in valid_specs
+        ]))
+        sample_idx = jnp.asarray(np.stack([
+            np.argmax(s[0]["train_sample_assignments"], axis=1) for s in valid_specs
+        ]))
+        xmin = obs.min(axis=1)
+        xmax = obs.max(axis=1)
+        specs = valid_specs  # only run EM on valid inits
+
+    fit_kw = dict(constrained=constrained, force_gaussian=force_gaussian)
+    if max_em_iters is not None:
+        fit_kw["max_em_iters"] = max_em_iters
+    a, loc, scale, W, failed, it_final = batch_em.fit_batch(
+        obs, sample_idx, S, a0, loc0, scale0, W0,
+        xmin, xmax, **fit_kw,
     )
     a, loc, scale, W, failed = map(np.asarray, (a, loc, scale, W, failed))
+    it_final_np = int(np.asarray(it_final))
+    print(f"  [batch_em] iterations: {it_final_np} (batch={len(specs)})", flush=True)
+    if use_gpu_init:
+        failed = failed | np.asarray(init_failed)
 
-    for i, spec in enumerate(valid_specs):
+    # Batched GPU val_ll — one call for the whole chunk instead of one
+    # scipy.stats.skewnorm.logpdf loop per fit (~18s/task on CPU).
+    # All specs in a chunk share the same dataset so N_val is uniform.
+    has_val = specs[0][0].get("val_observations") is not None
+    batch_val_lls = None
+    if has_val:
+        val_obs_list, val_idx_list, n_orig_list = [], [], []
+        for spec in specs:
+            fj = spec[0]
+            vo = np.asarray(fj["val_observations"]).ravel()
+            vi = np.argmax(fj["val_sample_assignments"], axis=1)
+            val_obs_list.append(vo)
+            val_idx_list.append(vi)
+            n_orig_list.append(len(vo))
+        # Pad to max N_val with NaN so rows can be stacked; NaN obs are masked
+        # in _val_ll_batch_uv. Denominator uses n_orig (unpadded length) to
+        # match CPU's division by len(val_sample_assignments).
+        max_n = max(n_orig_list)
+        val_obs_np = np.full((len(specs), max_n), np.nan)
+        val_idx_np = np.zeros((len(specs), max_n), dtype=int)
+        for i, (vo, vi) in enumerate(zip(val_obs_list, val_idx_list)):
+            val_obs_np[i, :len(vo)] = vo
+            val_idx_np[i, :len(vi)] = vi
+        n_orig_np = np.array(n_orig_list, dtype=float)
+        batch_val_lls = _val_ll_batch_uv(val_obs_np, val_idx_np, a, loc, scale, W, n_orig_np)
+
+    for i, spec in enumerate(specs):
         full_job, bs_seed, label, save_dir = spec
         if failed[i]:
             results.append(_failed_result(spec))
@@ -181,9 +245,7 @@ def _run_univariate_chunk(specs):
         ]
         weights = W[i]
         result = {"component_params": component_params, "weights": weights}
-        val_ll = None
-        if full_job.get("val_observations") is not None:
-            val_ll = _val_ll_univariate(full_job, component_params, weights)
+        val_ll = float(batch_val_lls[i]) if batch_val_lls is not None else None
         results.append((bs_seed, label, save_dir, full_job.get("fit_idx"), {
             "dataset_name": full_job.get("dataset_name"),
             "bootstrap_seed": bs_seed,
@@ -194,6 +256,28 @@ def _run_univariate_chunk(specs):
             "calibrated_dims": full_job.get("calibrated_dims"),
         }))
     return results
+
+
+def _val_ll_batch_uv(val_obs_np, val_sample_idx_np, a_np, loc_np, scale_np, W_np, n_orig_np):
+    """Batched GPU val log-likelihood for univariate SN mixture.
+
+    val_obs_np: (batch, N_val) — NaN-padded to a common max length;
+    n_orig_np: (batch,) — original unpadded N_val per fit (used as denominator
+               to match CPU's division by len(val_sample_assignments)).
+    """
+    val_obs = jnp.asarray(val_obs_np)
+    sample_idx = jnp.asarray(val_sample_idx_np)
+    a = jnp.asarray(a_np); loc = jnp.asarray(loc_np); scale = jnp.asarray(scale_np)
+    W = jnp.asarray(W_np)
+
+    valid = jnp.isfinite(val_obs)                                  # (batch, N_val)
+    log_pdfs = _log_pdfs(val_obs, a, loc, scale)                   # (batch, K, N_val)
+    log_pdfs_bnk = jnp.moveaxis(log_pdfs, 1, 2)                    # (batch, N_val, K)
+    w_n = _gather_sample_weights(W, sample_idx)                    # (batch, N_val, K)
+    log_w = jnp.where(w_n > 0, jnp.log(jnp.where(w_n > 0, w_n, 1.0)), -jnp.inf)
+    log_mix = jax_logsumexp(log_pdfs_bnk + log_w, axis=-1)         # (batch, N_val)
+    n_orig = jnp.asarray(n_orig_np, dtype=jnp.float64)
+    return np.asarray((log_mix * valid).sum(-1) / n_orig)
 
 
 def _val_ll_univariate(full_job, component_params, weights):
@@ -221,45 +305,80 @@ def _failed_result(spec):
 # CFUSN batch: pack / run / unpack
 # ---------------------------------------------------------------------------
 
-def _run_cfusn_chunk(specs):
+def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
     # See _run_univariate_chunk's note: track validity by index, never `in`.
-    inits = []
-    valid_specs = []
-    results = []
-    for spec in specs:
-        full_job = spec[0]
-        init = _init_cfusn(full_job)
-        if init is None:
-            results.append(_failed_result(spec))
-            continue
-        inits.append(init)
-        valid_specs.append(spec)
+    if not specs:
+        return []
 
-    if not valid_specs:
-        return results
+    K = specs[0][0]["num_components"]
+    S = specs[0][0]["train_sample_assignments"].shape[1]
 
-    K = valid_specs[0][0]["num_components"]
-    S = valid_specs[0][0]["train_sample_assignments"].shape[1]
-    p = np.asarray(valid_specs[0][0]["train_observations"]).shape[1]
+    obs_raw = np.stack([np.asarray(s[0]["train_observations"], dtype=float) for s in specs])
+    obs_mask_np = ~np.isnan(obs_raw)
+    obs_np = np.where(obs_mask_np, obs_raw, 0.0)
 
-    obs_raw = np.stack([np.asarray(s[0]["train_observations"], dtype=float) for s in valid_specs])
-    obs_mask = ~np.isnan(obs_raw)
-    obs = np.where(obs_mask, obs_raw, 0.0)
-    sample_idx = np.stack([
-        np.argmax(s[0]["train_sample_assignments"], axis=1) for s in valid_specs
-    ])
-    mu0 = np.stack([[p_[0] for p_ in init[0]] for init in inits])
-    Delta0 = np.stack([[p_[1] for p_ in init[0]] for init in inits])
-    Gamma0 = np.stack([[p_[2] for p_ in init[0]] for init in inits])
-    W0 = np.stack([init[1] for init in inits])
+    obs = jnp.asarray(obs_np)
+    obs_mask = jnp.asarray(obs_mask_np)
+    sample_idx = jnp.asarray(np.stack([
+        np.argmax(s[0]["train_sample_assignments"], axis=1) for s in specs
+    ]))
 
-    mu, Delta, Gamma, W, failed = batch_em_cfusn.fit_batch_cfusn(
-        jnp.asarray(obs), jnp.asarray(obs_mask), jnp.asarray(sample_idx), S,
-        jnp.asarray(mu0), jnp.asarray(Delta0), jnp.asarray(Gamma0), jnp.asarray(W0),
+    # Fall back to CPU init for anchored jobs (kmeans_init_mv_anchored too
+    # complex to batch on GPU; anchored is a minority in practice)
+    any_anchored = any(s[0].get("init_method") == "anchored" for s in specs)
+    if use_gpu_init and not any_anchored:
+        latent_q = int(specs[0][0].get("kwargs", {}).get("latent_q", 2))
+        fit_seeds = [s[0].get("kwargs", {}).get("fit_seed") or 0 for s in specs]
+        key = jax.random.PRNGKey(int(np.array(fit_seeds, dtype=np.uint32).sum()))
+        mu0, Delta0, Gamma0, W0, init_failed = batch_init_cfusn(
+            obs, obs_mask, sample_idx, S, K, latent_q, key)
+        results = []
+    else:
+        # Legacy sequential CPU init
+        inits = []
+        valid_specs = []
+        results = []
+        for spec in specs:
+            init = _init_cfusn(spec[0])
+            if init is None:
+                results.append(_failed_result(spec))
+                continue
+            inits.append(init)
+            valid_specs.append(spec)
+
+        if not valid_specs:
+            return results
+
+        p = np.asarray(valid_specs[0][0]["train_observations"]).shape[1]
+        mu0 = jnp.asarray(np.stack([[p_[0] for p_ in init[0]] for init in inits]))
+        Delta0 = jnp.asarray(np.stack([[p_[1] for p_ in init[0]] for init in inits]))
+        Gamma0 = jnp.asarray(np.stack([[p_[2] for p_ in init[0]] for init in inits]))
+        W0 = jnp.asarray(np.stack([init[1] for init in inits]))
+        # Rebuild obs/obs_mask/sample_idx for valid specs only
+        obs_raw_v = np.stack([np.asarray(s[0]["train_observations"], dtype=float) for s in valid_specs])
+        obs_mask_v = ~np.isnan(obs_raw_v)
+        obs = jnp.asarray(np.where(obs_mask_v, obs_raw_v, 0.0))
+        obs_mask = jnp.asarray(obs_mask_v)
+        sample_idx = jnp.asarray(np.stack([
+            np.argmax(s[0]["train_sample_assignments"], axis=1) for s in valid_specs
+        ]))
+        specs = valid_specs
+
+    cfusn_kw = {}
+    if max_em_iters is not None:
+        cfusn_kw["max_em_iters"] = max_em_iters
+    mu, Delta, Gamma, W, failed, it_final = batch_em_cfusn.fit_batch_cfusn(
+        obs, obs_mask, sample_idx, S,
+        mu0, Delta0, Gamma0, W0,
+        **cfusn_kw,
     )
     mu, Delta, Gamma, W, failed = map(np.asarray, (mu, Delta, Gamma, W, failed))
+    it_final_np = int(np.asarray(it_final))
+    print(f"  [batch_em_cfusn] iterations: {it_final_np} (batch={len(specs)})", flush=True)
+    if use_gpu_init and not any_anchored:
+        failed = failed | np.asarray(init_failed)
 
-    for i, spec in enumerate(valid_specs):
+    for i, spec in enumerate(specs):
         full_job, bs_seed, label, save_dir = spec
         if failed[i]:
             results.append(_failed_result(spec))
@@ -294,13 +413,21 @@ def _val_ll_cfusn(full_job, component_params, weights):
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
-def run_gpu(fit_specs):
+def run_gpu(fit_specs, use_gpu_init=True, max_em_iters=None):
     """fit_specs: the same flat list run_array_task.py builds for the CPU path.
     Returns a flat list of (bs_seed, label, save_dir, fit_idx, result) tuples,
     matching `_run_one_fit`'s contract, so the caller's existing
     best-fit-selection/save loop needs no changes.
+
+    use_gpu_init: if True (default), init is batched on GPU via init_jax.py —
+        eliminates the CPU init bottleneck.  Set False for parity tests that
+        require the same init as the NumPy path.
+    max_em_iters: if set, overrides the default cap (500) passed to fit_batch.
+        Pass a higher value in parity tests to ensure convergence is not
+        truncated — parity tests should use max_em_iters=2000.
     """
     out = []
     for is_mv, chunk in group_fit_specs(fit_specs):
-        out.extend(_run_cfusn_chunk(chunk) if is_mv else _run_univariate_chunk(chunk))
+        fn = _run_cfusn_chunk if is_mv else _run_univariate_chunk
+        out.extend(fn(chunk, use_gpu_init=use_gpu_init, max_em_iters=max_em_iters))
     return out

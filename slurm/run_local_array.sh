@@ -29,9 +29,15 @@ CPUS_PER_TASK=$(( TOTAL_CPUS / CONCURRENCY ))
 if [ "$CPUS_PER_TASK" -lt 1 ]; then CPUS_PER_TASK=1; fi
 export SLURM_CPUS_PER_TASK="$CPUS_PER_TASK"
 
+LOG_DIR="${OUTPUT_DIR}/logs"
+mkdir -p "$LOG_DIR"
+
 echo "Running array indices ${START}-${END} on $(hostname)"
 echo "  concurrency: ${CONCURRENCY}  cpus/task: ${CPUS_PER_TASK}  (of ${TOTAL_CPUS} total)"
+echo "  logs: ${LOG_DIR}/array_NNNN.log"
 
-seq "$START" "$END" | xargs -P "$CONCURRENCY" -I{} python "${SCRIPT_DIR}/run_array_task.py" "$OUTPUT_DIR" {}
+seq "$START" "$END" | xargs -P "$CONCURRENCY" -I IDX \
+    bash -c "python '${SCRIPT_DIR}/run_array_task.py' '${OUTPUT_DIR}' IDX \
+             2>&1 | tee '${LOG_DIR}/array_\$(printf \"%04d\" IDX).log'"
 
 echo "Done: indices ${START}-${END} on $(hostname)"
