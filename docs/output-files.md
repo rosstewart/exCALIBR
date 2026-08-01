@@ -13,9 +13,7 @@ For each run, `run_pipeline.py` and `run_igvf_batch.py` produce:
 | `<name>_model_selection.json` | 2c vs. 3c bootstrap test results |
 | `<name>_bootstrap_fits.json.gz` | Saved bootstrap fit results (when fitting fresh) |
 
-The `calibration.json` includes (abbreviated; see
-`src/assay_calibration/pipeline/utils.py:save_results` for the exhaustive
-field list):
+`calibration.json` (abbreviated; full field list in `src/assay_calibration/pipeline/utils.py:save_results`):
 ```json
 {
   "dataset": "MSH2_Jia_2021",

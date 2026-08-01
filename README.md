@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/excalibr_logo.png" alt="ExCALIBR logo" width="200">
+  <img src="assets/excalibr_logo.png" alt="ExCALIBR logo" width="100">
 </p>
 
 # ExCALIBR
@@ -30,12 +30,7 @@ pip install -e .
 
 ### Interactive (single dataset)
 
-The simplest way to run ExCALIBR on your own data is the **BasicScoreset**
-format: a CSV with just a `score` column (your assay's per-variant score)
-and a `sample_assignments` column you fill in yourself, marking which rows
-are known-Pathogenic, known-Benign, gnomAD/population, or Synonymous
-controls (see [Input Data Formats](#input-data-formats) below for exactly
-how to fill that column in). No ClinVar lookups or extra metadata needed.
+Start with **BasicScoreset**: a `score` column + a `sample_assignments` column marking Pathogenic/Benign/gnomAD/Synonymous rows yourself (see [Input Data Formats](#input-data-formats)).
 
 ```bash
 python run_pipeline.py \
@@ -43,27 +38,25 @@ python run_pipeline.py \
     --sample-names "Pathogenic/Likely Pathogenic" "Benign/Likely Benign" "gnomAD" "Synonymous"
 ```
 
-This fits a bootstrap mixture model to the score distribution, calibrates
-it against the labeled control groups, and writes a calibration JSON,
-score-distribution plot, and per-variant evidence table to
-`./calibration_output/` (see [Output Files](docs/output-files.md)).
+Writes a calibration JSON, score-distribution plot, and per-variant evidence table to `./calibration_output/` (see [Output Files](docs/output-files.md)). Default: `--preset light` — fast; use `--preset medium`/`large`/`xl`/`finest` for higher quality (see [presets](docs/configuration.md#quality-vs-speed-presets)).
 
-By default this runs 20 bootstrap iterations × 8 fits each — fast, good
-for a first look, and takes a few minutes on a laptop. A few flags you'll
-likely want to reach for right away:
+### Common options
 
-| Flag | What it does |
-|------|--------------|
-| `--n-bootstraps` / `--fits-per-bootstrap` | Trade speed for stability/quality — see the [quality vs. speed presets](docs/configuration.md#quality-vs-speed-presets) for concrete numbers (defaults are the fastest "Light" preset). |
-| `--n-jobs` | How many CPU cores to use (`-1` = all available, the default). |
-| `--output-dir` | Where results are written (default: `./calibration_output`). |
-| `--components` | Which mixture-model sizes to fit (default: `3`; pass `2 3` to fit both and auto-select). |
-| `--sample-names` | Required for BasicScoreset CSVs — labels your `sample_assignments` columns in order (see above). |
-| `--manual-prior` | Override the estimated prior if you have your own domain-knowledge estimate — see [Prior estimation](docs/configuration.md#prior-estimation). |
+| Flag | Default | What it does |
+|---|---|---|
+| `--preset` | `light` | Quality/speed level: `light`/`medium`/`large`/`xl`/`finest` — see [presets](docs/configuration.md#quality-vs-speed-presets) |
+| `--n-jobs` | `-1` (all cores) | Parallel workers |
+| `--output-dir` | `./calibration_output` | Output location |
+| `--components` | `3` | Mixture-model size(s) to fit; `2 3` fits both and auto-selects |
+| `--sample-names` | — | Required for BasicScoreset; labels `sample_assignments` columns in order |
+| `--manual-prior` | — | Supply your own prior instead of estimating — see [Prior estimation](docs/configuration.md#prior-estimation) |
+| `--benign-method` | `avg` | `avg`/`benign`/`synonymous` — see [Benign sample method](docs/configuration.md#benign-sample-method) |
+| `--conservative-monotonicity` | off | Stricter evidence-threshold enforcement |
+| `--no-auto-bidirectional` | off (auto-detect on) | For LoF/GoF-style assays — see [Bidirectional detection](docs/configuration.md#bidirectional-assay-auto-detection) |
+| `--precomputed-fits` | — | Skip fitting, load existing bootstrap fits |
+| `--oob` | off | Compute out-of-bag per-variant evidence |
 
-If your data already comes with ClinVar/gnomAD annotations (e.g. an IGVF-
-or PillarProject-formatted table), you can skip manually assigning sample
-groups — see [Input Data Formats](#input-data-formats) below.
+Full flag reference: [docs/script-reference.md](docs/script-reference.md).
 
 ### Production batch (many datasets)
 

@@ -25,6 +25,15 @@ import warnings
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
+# (n_bootstraps, fits_per_bootstrap) shorthands -- see docs/configuration.md#quality-vs-speed-presets
+BOOTSTRAP_PRESETS = {
+    "light": (20, 8),
+    "medium": (100, 8),
+    "large": (500, 8),
+    "xl": (1000, 8),
+    "finest": (1000, 100),
+}
+
 def main():
     parser = argparse.ArgumentParser(
         description="Assay Calibration Pipeline - Bootstrap fitting and calibration",
@@ -45,6 +54,10 @@ Examples:
   # Run with OOB evidence using precomputed splits
   python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
       --precomputed-fits /path/to/results.json.gz --oob --splits-file /path/to/splits.pkl
+
+  # Higher-quality run via a preset shorthand (light/medium/large/xl/finest)
+  python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
+      --preset large
 
   # Run with custom bootstrap count and save fits
   python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
@@ -73,11 +86,23 @@ Examples:
                             "as 2c for most assays, not always true but a reasonable default; pass "
                             "e.g. --components 2 3 to fit both and compare). Integers 2-10.")
 
-    # Bootstrap parameters
-    parser.add_argument("--n-bootstraps", type=int, default=20,
-                       help="Number of bootstrap iterations (default: 20; use 1000 for production)")
-    parser.add_argument("--fits-per-bootstrap", type=int, default=8,
-                       help="Fits per bootstrap iteration (default: 8; use 100 for production)")
+    # Bootstrap parameters. --preset is the primary quality/speed control;
+    # --n-bootstraps/--fits-per-bootstrap are an advanced escape hatch for
+    # setting the two underlying numbers directly (each overrides --preset
+    # for that one setting only, so e.g. --preset large --n-bootstraps 300
+    # uses 300 bootstraps at large's 8 fits-per-bootstrap).
+    parser.add_argument("--preset", choices=list(BOOTSTRAP_PRESETS), default="light",
+                       help="Quality/speed level (default: light, fastest). medium/large/xl/finest "
+                            "are progressively slower and more stable -- see "
+                            "docs/configuration.md#quality-vs-speed-presets for what each buys you. "
+                            "Most users should just pick a preset; --n-bootstraps/"
+                            "--fits-per-bootstrap below are for manual control instead.")
+    parser.add_argument("--n-bootstraps", type=int, default=None,
+                       help="(Advanced) number of bootstrap iterations, overriding --preset's value. "
+                            "Default: whatever --preset implies (20 for 'light').")
+    parser.add_argument("--fits-per-bootstrap", type=int, default=None,
+                       help="(Advanced) fits per bootstrap iteration, overriding --preset's value. "
+                            "Default: whatever --preset implies (8 for 'light').")
 
     # Execution mode
     # NOTE: for running many datasets across a SLURM cluster, use the separate
@@ -267,6 +292,14 @@ Examples:
 
 
     args = parser.parse_args()
+
+    # --n-bootstraps/--fits-per-bootstrap, if explicitly passed, override the
+    # --preset shorthand for that one setting only.
+    preset_n_bootstraps, preset_fits_per_bootstrap = BOOTSTRAP_PRESETS[args.preset]
+    if args.n_bootstraps is None:
+        args.n_bootstraps = preset_n_bootstraps
+    if args.fits_per_bootstrap is None:
+        args.fits_per_bootstrap = preset_fits_per_bootstrap
 
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode

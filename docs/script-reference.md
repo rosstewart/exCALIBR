@@ -12,8 +12,8 @@ Key flags:
 |------|---------|-------------|
 | `--dataset` | (required) | Path to input CSV/TSV |
 | `--name` | (required) | Dataset name for output files |
-| `--n-bootstraps` | 20 | Bootstrap iterations (use 1000 for production) |
-| `--fits-per-bootstrap` | 8 | Fits per bootstrap (use 100 for production) |
+| `--preset` | `light` | Quality/speed level: `light`/`medium`/`large`/`xl`/`finest` (see [presets](configuration.md#quality-vs-speed-presets)) |
+| `--n-bootstraps` / `--fits-per-bootstrap` | from `--preset` | Advanced: override the preset's underlying bootstrap count / fits-per-bootstrap directly |
 | `--components K [K ...]` | `3` | Component counts to fit (integers 2–10; pass `2 3` to fit both and compare) |
 | `--mode` | `parallel` | `parallel` or `single` (single-process debugging; not for cluster execution — see [batch HPC workflow](batch-hpc-workflow.md)) |
 | `--n-jobs` | `-1` | Parallel workers for bootstrap fitting (`-1` = all CPUs) |
