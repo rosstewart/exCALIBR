@@ -28,19 +28,29 @@ Large/xl/finest on many datasets: use the [batch HPC workflow](batch-hpc-workflo
 
 #### Quality vs. speed presets
 
-Tested on 87 real datasets (~85,000 variants), comparing each `--n-bootstraps` level against a ~1000-bootstrap reference run of the same dataset (`--fits-per-bootstrap` fixed at 100 for this test).
+Tested on 87 real datasets (~85,000 variants pooled) against each dataset's own ~1000-bootstrap reference run (`--fits-per-bootstrap` fixed at 100). Evidence-strength bands: Supporting = 1 pt, Moderate = 2–3 pt, Strong = 4–7 pt, Very Strong = 8 pt.
 
-**Per-variant evidence-point changes** — "Unchanged" and "Changed" are means across the 87 datasets. "Changed" covers any difference from the reference: shifted point value (within or across ACMG evidence tier), gained/lost evidence, or direction flip. ACMG tiers: Supporting = 1 pt, Moderate = 2–3 pt, Strong = 4–7 pt, Very Strong = 8 pt.
+Per-variant point-value changes vs. reference (% of all variants):
 
-**Aggregate metric drift** — 90th-percentile absolute Δ across datasets (90% of datasets show smaller drift than this).
+| `--n-bootstraps` | Unchanged | Same band | Diff. band, same direction | 0 → pathogenic | 0 → benign | Pathogenic → 0 | Benign → 0 | Sign flip |
+|---|---|---|---|---|---|---|---|---|
+| 20  | 79.1% | 10.3% | 7.7% | 0.6% | 1.9% | 0.1% | 0.3% | 0.0% |
+| 50  | 83.4% | 7.9%  | 5.4% | 0.2% | 1.6% | 0.1% | 1.5% | 0.0% |
+| 100 | 90.0% | 4.2%  | 3.5% | 0.1% | 1.2% | 0.1% | 0.9% | 0.0% |
+| 250 | 92.9% | 2.8%  | 3.2% | 0.1% | 0.2% | 0.0% | 0.8% | 0.0% |
+| 500 | 95.7% | 1.6%  | 1.6% | 0.0% | 0.1% | 0.0% | 0.9% | 0.0% |
 
-| `--n-bootstraps` | Unchanged | Changed | Accuracy Δ | MCC Δ | Coverage Δ |
-|---|---|---|---|---|---|
-| 20  | 76.4% | 23.6% | 3.3pp | 5.0pp | 9.3pp |
-| 50  | 82.5% | 17.5% | 2.2pp | 4.1pp | 4.9pp |
-| 100 | 87.8% | 12.2% | 2.7pp | 4.0pp | 4.2pp |
-| 250 | 91.1% |  8.9% | 0.8pp | 0.4pp | 1.8pp |
-| 500 | 95.0% |  5.0% | 0.7pp | 0.6pp | 2.0pp |
+Sign flip (pathogenic ↔ benign) is 0.0% at every level tested.
+
+Aggregate-metric drift, 90th-percentile absolute Δ across datasets:
+
+| `--n-bootstraps` | Accuracy Δ | MCC Δ | Coverage Δ |
+|---|---|---|---|
+| 20  | 3.3pp | 5.0pp | 9.3pp |
+| 50  | 2.2pp | 4.1pp | 4.9pp |
+| 100 | 2.7pp | 4.0pp | 4.2pp |
+| 250 | 0.8pp | 0.4pp | 1.8pp |
+| 500 | 0.7pp | 0.6pp | 2.0pp |
 
 #### Speed estimates
 
