@@ -184,36 +184,6 @@ def save_results(
         fits_size_mb = fits_file.stat().st_size / 1e6
         logger.info(f"  Saved bootstrap fits: {fits_file} ({fits_size_mb:.1f} MB)")
 
-def collect_slurm_results(jobs_dir: Path, config: PipelineConfig) -> Dict:
-    """Collect results from completed SLURM jobs"""
-    
-    import glob
-    
-    results_dir = jobs_dir.parent
-    result_files = glob.glob(str(results_dir / "results_array_*.pkl"))
-    
-    if not result_files:
-        raise FileNotFoundError(f"No SLURM results found in {results_dir}")
-    
-    print(f"Found {len(result_files)} result files")
-    
-    # Aggregate all results
-    all_results = {}
-    for result_file in sorted(result_files):
-        with open(result_file, 'rb') as f:
-            array_results = pickle.load(f)
-        
-        for result in array_results:
-            bootstrap_seed = result['bootstrap_seed']
-            all_results[bootstrap_seed] = {
-                k: v for k, v in result.items()
-                if k != 'bootstrap_seed'
-            }
-    
-    print(f"Collected {len(all_results)} bootstrap results")
-    
-    return all_results
-
 def validate_dataset(df, dataset_name: str) -> bool:
     """Validate that dataset has required columns and samples"""
     

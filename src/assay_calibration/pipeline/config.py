@@ -167,19 +167,13 @@ class PipelineConfig:
     compute_oob: bool = False
     oob_min_samples: int = 1
 
-    # Execution parameters
-    execution_mode: Literal["slurm", "parallel", "single"] = "parallel"
+    # Execution parameters. For running many datasets across a SLURM cluster,
+    # use the separate batch HPC workflow (slurm/prepare.py + slurm/submit_array.sh)
+    # documented in the README, not these -- these control single-dataset,
+    # single-process execution only.
+    execution_mode: Literal["parallel", "single"] = "parallel"
     n_jobs: int = -1  # -1 uses all available CPUs
     device: Literal["cpu", "gpu"] = "cpu"  # "gpu" batches fits through jax_batch (see BootstrapRunner)
-
-    # SLURM parameters (only used if execution_mode="slurm")
-    slurm_account: str = "default"
-    slurm_partition: str = "short"
-    slurm_time_hours: int = 23
-    slurm_mem_gb: int = 1
-    slurm_cpus_per_task: int = 12
-    slurm_conda_env: str = "assay_calibration"
-    slurm_module_commands: List[str] = None
 
     # Model selection (only used if components=[2,3])
     auto_select_model: bool = True
@@ -294,11 +288,6 @@ class PipelineConfig:
         }
         if self.population_type not in valid_pop_types:
             raise ValueError(f"population_type must be one of {valid_pop_types}, got {self.population_type}")
-
-
-        # If using SLURM, adjust job count
-        if self.execution_mode == "slurm" and self.n_jobs == -1:
-            self.n_jobs = 30  # Reasonable default for job generation
 
 
 def resolve_prior_mode(filter_flag, pathomechanism_method_flag):

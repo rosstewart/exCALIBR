@@ -8,7 +8,9 @@ For datasets with both components, the one with model_selected=1 is used.
 """
 
 import argparse
+import getpass
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -156,8 +158,13 @@ def main():
     shutil.rmtree(args.output_dir)
     print(f"  Archive → {tar_path}")
 
-    hostname = socket.getfqdn()
-    print(f"\nscp rcstewart@{hostname}:{tar_path} ~/Downloads/")
+    # Only worth suggesting scp if this is actually a remote machine (e.g. an
+    # SSH session) -- on a local run the archive is already sitting on the
+    # user's own filesystem.
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY") or os.environ.get("SSH_CLIENT"):
+        username = getpass.getuser()
+        hostname = socket.getfqdn()
+        print(f"\nscp {username}@{hostname}:{tar_path} ~/Downloads/")
 
 
 if __name__ == "__main__":

@@ -1,20 +1,29 @@
 #!/usr/bin/env python
 """
 IGVF Batch Processing - Run calibration pipeline across multiple datasets
-with per-dataset configurations loaded from a JSON config file.
+from precomputed bootstrap fits (see the batch HPC workflow in the README).
 
 Input:
   - A CSV/TSV containing all datasets, distinguished by a "Dataset" column
-  - A JSON config file mapping dataset names to [n_c, benign_method, {overrides}]
   - Precomputed bootstrap fits (gzipped JSON) keyed by dataset name
+  - Optionally, a JSON config file mapping dataset names to
+    [n_c, benign_method, {overrides}] for finer per-dataset control (most
+    users won't need this -- see --dataset-configs below for the default
+    behavior when it's omitted)
 
-Example:
+Example (typical usage, no --dataset-configs needed):
   python run_igvf_batch.py \\
       --dataset data/integrated_variant_effect_dataset.tsv.gz \\
-      --dataset-configs src/igvf_configs/dataset_configs_jan_2026.json \\
-      --precomputed-fits /data/ross/assay_calibration/results.json.gz \\
+      --precomputed-fits /path/to/bootstrap_results.json.gz \\
+      --output-dir ./igvf_output
+
+Example (advanced: per-dataset overrides via a config file):
+  python run_igvf_batch.py \\
+      --dataset data/integrated_variant_effect_dataset.tsv.gz \\
+      --dataset-configs my_dataset_configs.json \\
+      --precomputed-fits /path/to/bootstrap_results.json.gz \\
       --output-dir ./igvf_output \\
-      --oob --splits-file /data/ross/assay_calibration/splits.pkl
+      --oob --splits-file /path/to/splits.pkl
 """
 import os
 import sys

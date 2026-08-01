@@ -28,20 +28,17 @@ class BootstrapRunner:
         
     def run(self) -> Tuple[Dict, Optional[Dict]]:
         """Main entry point for bootstrap fitting.
-        
+
         Returns
         -------
         (bootstrap_results, dataset_splits)
-            dataset_splits is None when execution_mode == 'slurm'.
         """
-        
+
         # Load dataset
         self._load_dataset()
-        
+
         # Choose execution strategy
-        if self.config.execution_mode == "slurm":
-            return self._run_slurm()
-        elif self.config.execution_mode == "parallel":
+        if self.config.execution_mode == "parallel":
             return self._run_parallel()
         else:  # single
             return self._run_single()
@@ -196,64 +193,6 @@ class BootstrapRunner:
         return self._aggregate_results(results), dataset_splits
 
     
-    def _run_slurm(self) -> Dict:
-        """Run bootstrap fits on SLURM cluster"""
-        print(f"\nPreparing SLURM job array...")
-        
-        # Create jobs directory
-        jobs_dir = Path(self.config.output_dir) / "slurm_jobs"
-        jobs_dir.mkdir(exist_ok=True, parents=True)
-        
-        # Generate and save all jobs
-        print(f"Generating {self.config.n_bootstraps} bootstrap jobs...")
-        jobs_per_array = max(1, self.config.n_bootstraps // 1000)  # Max 1000 array tasks
-        num_arrays = (self.config.n_bootstraps + jobs_per_array - 1) // jobs_per_array
-        
-        for array_idx in range(num_arrays):
-            start_idx = array_idx * jobs_per_array
-            end_idx = min(start_idx + jobs_per_array, self.config.n_bootstraps)
-            
-            array_jobs = []
-            for bootstrap_idx in range(start_idx, end_idx):
-                job = self._generate_bootstrap_job(bootstrap_idx)
-                array_jobs.append(job)
-            
-            # Save array job file
-            job_file = jobs_dir / f"array_{array_idx:04d}.pkl"
-            with open(job_file, 'wb') as f:
-                pickle.dump(array_jobs, f)
-        
-        # Create SLURM submission script
-        slurm_script = self._create_slurm_script(jobs_dir, num_arrays)
-        script_path = jobs_dir / "submit.sh"
-        with open(script_path, 'w') as f:
-            f.write(slurm_script)
-        os.chmod(script_path, 0o755)
-        
-        # Create worker script
-        worker_script = self._create_worker_script()
-        worker_path = jobs_dir / "run_array_task.py"
-        with open(worker_path, 'w') as f:
-            f.write(worker_script)
-        
-        print(f"\nSLURM setup complete:")
-        print(f"  Jobs directory: {jobs_dir}")
-        print(f"  Array tasks: {num_arrays}")
-        print(f"  Jobs per task: {jobs_per_array}")
-        print(f"\nTo submit:")
-        print(f"  cd {jobs_dir}")
-        print(f"  sbatch submit.sh")
-        if self.config.compute_oob:
-            print(f"\nNote: OOB evidence is not supported with SLURM execution.")
-        
-        print(f"\nAfter completion, run:")
-        print(f"  python run_pipeline.py --dataset {self.config.dataset_csv} " +
-              f"--name {self.config.dataset_name} --collect-slurm {jobs_dir}")
-        
-        sys.exit(0)  # Exit after setup
-        
-        sys.exit(0)  # Exit after setup
-    
     @staticmethod
     def _extract_splits(all_jobs: List[Dict]) -> Dict[int, Dict]:
         """Extract val observations/assignments from pre-generated jobs for OOB."""
@@ -376,100 +315,3 @@ class BootstrapRunner:
         
         return aggregated
     
-    def _create_slurm_script(self, jobs_dir: Path, num_arrays: int) -> str:
-        """Create SLURM submission script"""
-        
-        logs_dir = jobs_dir / "logs"
-        logs_dir.mkdir(exist_ok=True)
-
-        # Build module load commands
-        if self.config.slurm_module_commands:
-            module_commands = "\n".join(self.config.slurm_module_commands)
-        else:
-            module_commands = "# No module commands specified - set via --slurm-modules"
-        
-        # Build conda activation
-        if self.config.slurm_conda_env:
-            conda_activate = f"""
-        source $HOME/.bashrc
-        conda activate {self.config.slurm_conda_env}
-        """
-        else:
-            conda_activate = "# No conda environment specified"
-
-        return f"""#!/bin/bash
-#SBATCH --account={self.config.slurm_account}
-#SBATCH --job-name=calibration_{self.config.dataset_name}
-#SBATCH --output={logs_dir}/array_%A_%a.out
-#SBATCH --error={logs_dir}/array_%A_%a.err
-#SBATCH --array=0-{num_arrays-1}
-#SBATCH --time={self.config.slurm_time_hours}:00:00
-#SBATCH --mem={self.config.slurm_mem_gb}G
-#SBATCH --cpus-per-task={self.config.slurm_cpus_per_task}
-#SBATCH --partition={self.config.slurm_partition}
-
-# Load required modules (customize via --slurm-modules)
-{module_commands}
-{conda_activate}
-
-python run_array_task.py {jobs_dir} $SLURM_ARRAY_TASK_ID
-
-echo "Array task $SLURM_ARRAY_TASK_ID completed"
-"""
-    
-    def _create_worker_script(self) -> str:
-        """Create worker script for SLURM array tasks"""
-        
-        return """import sys
-import pickle
-import os
-import concurrent.futures
-from pathlib import Path
-
-# Add package to path
-sys.path.append(str(Path(__file__).parent.parent))
-from fit_bootstrap import BootstrapRunner
-
-def run_array_task(jobs_dir, array_idx):
-    array_file = Path(jobs_dir) / f"array_{array_idx:04d}.pkl"
-    
-    if not array_file.exists():
-        print(f"Error: Array file {array_file} not found")
-        sys.exit(1)
-    
-    with open(array_file, 'rb') as f:
-        jobs = pickle.load(f)
-    
-    print(f"Array task {array_idx}: Processing {len(jobs)} bootstrap iterations")
-    
-    # Execute jobs in parallel
-    n_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
-    
-    # Create dummy runner for execution
-    from config import PipelineConfig
-    config = PipelineConfig(
-        dataset_csv="",  # Not needed for execution
-        dataset_name=jobs[0]['dataset_name']
-    )
-    runner = BootstrapRunner(config)
-    
-    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
-        futures = [ex.submit(runner._execute_bootstrap_job, job) for job in jobs]
-        results = [f.result() for f in concurrent.futures.as_completed(futures)]
-    
-    # Save results
-    output_file = Path(jobs_dir).parent / f"results_array_{array_idx:04d}.pkl"
-    with open(output_file, 'wb') as f:
-        pickle.dump(results, f)
-    
-    print(f"Array task {array_idx} complete!")
-
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python run_array_task.py <jobs_dir> <array_idx>")
-        sys.exit(1)
-    
-    jobs_dir = sys.argv[1]
-    array_idx = int(sys.argv[2])
-    run_array_task(jobs_dir, array_idx)
-"""

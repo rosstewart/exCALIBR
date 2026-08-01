@@ -46,10 +46,6 @@ Examples:
   python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
       --precomputed-fits /path/to/results.json.gz --oob --splits-file /path/to/splits.pkl
 
-  # Run only 2-component fits on SLURM
-  python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
-      --components 2 --mode slurm
-
   # Run with custom bootstrap count and save fits
   python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
       --n-bootstraps 500 --save-fits
@@ -62,12 +58,6 @@ Examples:
     # Required arguments
     parser.add_argument("--dataset", required=True, help="Path to input CSV dataset")
     parser.add_argument("--name", required=True, help="Dataset name (used for output files)")
-
-    # Output options
-    parser.add_argument("--output-dir", default="./calibration_output",
-                       help="Output directory (default: ./calibration_output)")
-    parser.add_argument("--save-fits", action="store_true",
-                       help="(Deprecated, bootstrap fits are now always saved when computed fresh)")
 
     # Precomputed fits
     parser.add_argument("--precomputed-fits", default=None,
@@ -82,20 +72,79 @@ Examples:
                        help="Component counts to fit (default: 3 only -- assumed at least as good "
                             "as 2c for most assays, not always true but a reasonable default; pass "
                             "e.g. --components 2 3 to fit both and compare). Integers 2-10.")
-    parser.add_argument("--benign-method", choices=["benign", "avg", "synonymous"],
-                       default="avg", help="Method for benign sample (default: avg)")
+
+    # Bootstrap parameters
+    parser.add_argument("--n-bootstraps", type=int, default=20,
+                       help="Number of bootstrap iterations (default: 20; use 1000 for production)")
+    parser.add_argument("--fits-per-bootstrap", type=int, default=8,
+                       help="Fits per bootstrap iteration (default: 8; use 100 for production)")
+
+    # Execution mode
+    # NOTE: for running many datasets across a SLURM cluster, use the separate
+    # batch HPC workflow (slurm/prepare.py + slurm/submit_array.sh) documented
+    # in the README instead -- these two modes are for running this single
+    # dataset directly, in this one process.
+    parser.add_argument("--mode", choices=["parallel", "single"],
+                       default="parallel",
+                       help="'parallel' (default): fit bootstraps using --n-jobs worker "
+                            "processes. 'single': fit bootstraps one at a time in this "
+                            "process (slower; only useful for debugging).")
+    parser.add_argument("--n-jobs", type=int, default=-1,
+                       help="Number of parallel jobs (-1 = all CPUs, default: -1)")
+    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
+                       help="cpu (default): existing per-job joblib path. "
+                            "gpu: batch fits through src/assay_calibration/fit_utils/jax_batch and "
+                            "run on GPU instead. "
+                            "Untested on GPU as of authoring -- validate with "
+                            "tests/test_batch_em_parity.py first.")
+
+    # Output options
+    parser.add_argument("--output-dir", default="./calibration_output",
+                       help="Output directory (default: ./calibration_output)")
+    parser.add_argument("--save-fits", action="store_true",
+                       help="(Deprecated, bootstrap fits are now always saved when computed fresh)")
+    parser.add_argument("--viz-only", action="store_true",
+                       help="Regenerate visualizations only — skip variant tables and calibration JSON save")
+
+    # --- Algorithm modifications: knobs that change how the calibration is computed ---
+
+    # Prior
+    parser.add_argument("--manual-prior", type=float, default=None,
+                       help="Manually set prior probability (0-1). Skips empirical estimation.")
     parser.add_argument("--no-median-prior", action="store_true",
                        help="Use 5th percentile thresholds instead of median prior")
     parser.add_argument("--use-equation", action="store_true",
                        help="Use equation for 2c prior (instead of EM estimation)")
+
+    # Benign sample / postprocessing
+    parser.add_argument("--benign-method", choices=["benign", "avg", "synonymous"],
+                       default="avg", help="Method for benign sample (default: avg)")
     parser.add_argument("--conservative-monotonicity", action="store_true",
                        help="Conservative enforcement of monotonicity on evidence thresholds")
     parser.add_argument("--no-postprocess", action="store_true",
-                       help="Skip point-range postprocessing (monotonicity enforcement and "
-                            "extend-to-limits). Returns raw LR-threshold-crossing intervals "
-                            "as fitted. Intended for bidirectional assays (e.g. LoF/GoF in "
-                            "one assay) where standard monotonicity assumptions do not hold.")
-    # Auto-detect bidirectional assays per bootstrap fit (majority vote across
+                       help="Skip all point-range postprocessing (monotonicity enforcement "
+                            "and extend-to-limits) and return raw LR-threshold-crossing "
+                            "intervals exactly as fitted. Mainly a debugging/inspection tool "
+                            "for looking at unprocessed evidence -- NOT needed for "
+                            "bidirectional assays (e.g. LoF/GoF in one assay), which are "
+                            "already handled automatically by --auto-bidirectional.")
+
+    # Percentile thresholds
+    parser.add_argument("--pathogenic-percentile", type=float, default=5.0,
+                       help="Conservative (lower-bound/pathogenic-direction) percentile used for "
+                            "all bootstrap LR+/threshold percentile calculations (conservative "
+                            "thresholds, C-range, OOB LR percentiles, per-variant LR percentiles). "
+                            "Paired by default with 100-p as the upper (benign-direction) bound -- "
+                            "override that independently with --benign-percentile. "
+                            "Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
+    parser.add_argument("--benign-percentile", type=float, default=None,
+                       help="Upper (benign-direction) percentile, independent of "
+                            "--pathogenic-percentile. Omit to keep the historical symmetric "
+                            "pairing (100 - pathogenic-percentile); set explicitly to decouple "
+                            "the two, e.g. to sweep --pathogenic-percentile while always keeping "
+                            "the benign-direction bound at the 95th percentile.")
+
+    # Bidirectional-assay auto-detection (majority vote across bootstrap
     # fits) instead of requiring --no-postprocess by hand. On by default. See
     # PipelineConfig.auto_bidirectional and BIDIRECTIONAL_VOTE_THRESHOLD /
     # clean_benign_fragments_no_extend / clean_bidirectional_pathogenic_evidence
@@ -114,44 +163,8 @@ Examples:
                        help="Disable automatic bidirectional-assay detection; use standard "
                             "monotonicity postprocessing unconditionally (or combine with "
                             "--no-postprocess to disable postprocessing entirely).")
-    parser.add_argument("--manual-prior", type=float, default=None,
-                       help="Manually set prior probability (0-1). Skips empirical estimation.")
-    parser.add_argument("--population-type", default="gnomAD",
-                       choices=["all_variants", "all_nsSNV", "all_missense_nsSNV",
-                                "gnomAD", "gnomAD_nsSNV", "gnomAD_missense_nsSNV"],
-                       help="Population type for dataset loading (default: gnomAD)")
-    parser.add_argument("--scoreset-flipped-override", type=str, default=None,
-                       choices=["true", "false"],
-                       help="Override automatic scoreset flip detection")
-    parser.add_argument("--sample-names", type=str, nargs="+", default=None,
-                       help="Explicit sample names matching column order in data "
-                            "(e.g. 'Pathogenic/Likely Pathogenic' 'Benign/Likely Benign' gnomAD Synonymous)")
-    parser.add_argument("--debug", action="store_true",
-                       help="Enable debug logging (component params, weights, flip detection, point ranges)")
-    parser.add_argument("--viz-only", action="store_true",
-                       help="Regenerate visualizations only — skip variant tables and calibration JSON save")
-    parser.add_argument("--pathogenic-percentile", type=float, default=5.0,
-                       help="Conservative (lower-bound/pathogenic-direction) percentile used for "
-                            "all bootstrap LR+/threshold percentile calculations (conservative "
-                            "thresholds, C-range, OOB LR percentiles, per-variant LR percentiles). "
-                            "Paired by default with 100-p as the upper (benign-direction) bound -- "
-                            "override that independently with --benign-percentile. "
-                            "Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
-    parser.add_argument("--benign-percentile", type=float, default=None,
-                       help="Upper (benign-direction) percentile, independent of "
-                            "--pathogenic-percentile. Omit to keep the historical symmetric "
-                            "pairing (100 - pathogenic-percentile); set explicitly to decouple "
-                            "the two, e.g. to sweep --pathogenic-percentile while always keeping "
-                            "the benign-direction bound at the 95th percentile.")
-    # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
-    # experimentation only -- mutually exclusive with --pathomechanism-prior below.
-    # Parses with default=None; resolve_prior_mode reconciles it after parsing.
-    parser.add_argument("--filter-pathogenic-sample-by-lr",
-                       dest="filter_pathogenic_sample_by_lr", action="store_true", default=None,
-                       help=argparse.SUPPRESS)
-    parser.add_argument("--no-filter-pathogenic-sample-by-lr",
-                       dest="filter_pathogenic_sample_by_lr", action="store_false", default=None,
-                       help=argparse.SUPPRESS)
+
+    # Pathomechanism prior (PN/PU mode only)
     parser.add_argument("--pathomechanism-prior",
                        dest="pathomechanism_prior_enabled", action="store_true", default=None,
                        help="[PN/PU mode only] Enable the dual LR+/prior pathomechanism "
@@ -172,6 +185,15 @@ Examples:
     parser.add_argument("--no-pathomechanism-prior",
                        dest="pathomechanism_prior_enabled", action="store_false", default=None,
                        help=argparse.SUPPRESS)
+    # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
+    # experimentation only -- mutually exclusive with --pathomechanism-prior above.
+    # Parses with default=None; resolve_prior_mode reconciles it after parsing.
+    parser.add_argument("--filter-pathogenic-sample-by-lr",
+                       dest="filter_pathogenic_sample_by_lr", action="store_true", default=None,
+                       help=argparse.SUPPRESS)
+    parser.add_argument("--no-filter-pathogenic-sample-by-lr",
+                       dest="filter_pathogenic_sample_by_lr", action="store_false", default=None,
+                       help=argparse.SUPPRESS)
     # EXPERIMENTAL, hidden: which f_D construction --pathomechanism-prior uses.
     # Only meaningful when --pathomechanism-prior is enabled; defaults to
     # 'subtraction' (per-component excess max(0, w_P - w_N), renormalized) when
@@ -184,47 +206,7 @@ Examples:
                        default=None,
                        help=argparse.SUPPRESS)
 
-    # OOB evidence
-    parser.add_argument("--oob", action="store_true",
-                       help="Compute out-of-bag per-variant evidence (slower)")
-    parser.add_argument("--oob-min-samples", type=int, default=1,
-                       help="Min OOB bootstrap samples per variant (default: 1)")
-
-    # Bootstrap parameters
-    parser.add_argument("--n-bootstraps", type=int, default=20,
-                       help="Number of bootstrap iterations (default: 20; use 1000 for production)")
-    parser.add_argument("--fits-per-bootstrap", type=int, default=8,
-                       help="Fits per bootstrap iteration (default: 8; use 100 for production)")
-    parser.add_argument("--seed", type=int, default=None,
-                       help="Master seed for full reproducibility (train/val splits, EM "
-                            "initializations, and E-step Monte Carlo draws are all derived "
-                            "from this). Omit for the historical unseeded behavior.")
-
-    # Execution mode
-    parser.add_argument("--mode", choices=["slurm", "parallel", "single"],
-                       default="parallel", help="Execution mode (default: parallel)")
-    parser.add_argument("--n-jobs", type=int, default=-1,
-                       help="Number of parallel jobs (-1 = all CPUs, default: -1)")
-    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
-                       help="cpu (default): existing per-job joblib path (--mode parallel/single). "
-                            "gpu: batch fits through src/assay_calibration/fit_utils/jax_batch and "
-                            "run on GPU instead (only affects --mode parallel/single, not slurm). "
-                            "Untested on GPU as of authoring -- validate with "
-                            "tests/test_batch_em_parity.py first.")
-
-    # SLURM options
-    slurm = parser.add_argument_group("SLURM options")
-    slurm.add_argument("--slurm-account", default="default", help="SLURM account")
-    slurm.add_argument("--slurm-partition", default="short", help="SLURM partition")
-    slurm.add_argument("--slurm-time", type=int, default=23, help="SLURM time (hours)")
-    slurm.add_argument("--slurm-mem", type=int, default=1, help="SLURM memory (GB)")
-    slurm.add_argument("--slurm-cpus", type=int, default=12, help="CPUs per SLURM task")
-    slurm.add_argument("--slurm-conda-env", default="assay_calibration",
-                       help="Conda environment name")
-    slurm.add_argument("--slurm-modules", nargs="*",
-                       help="Module load commands (e.g. 'module load anaconda3/2024.06')")
-
-    # Model selection
+    # Model selection (only relevant when fitting multiple --components)
     parser.add_argument("--no-auto-select", action="store_true",
                        help="Disable automatic model selection (use all fitted models)")
     parser.add_argument("--selection-alpha", type=float, default=0.05,
@@ -232,12 +214,10 @@ Examples:
     parser.add_argument("--no-conservative", action="store_true",
                        help="Use p-value test instead of conservative 5th percentile")
 
-    # ClinVar options
+    # ClinVar / ACMG-mapping options
     parser.add_argument("--clinvar-release", choices=["2026", "2025", "2018"], default="2026", help="ClinVar release year")
     parser.add_argument("--min-clinvar-star", type=int, default=1,
                        help="Minimum ClinVar review stars (default: 1)")
-    
-    # ACMG-mapping method
     parser.add_argument("--acmg-mapping-method",
                        choices=["tavtigian", "acmg_bayes", "all"],
                        default="tavtigian",
@@ -258,7 +238,29 @@ Examples:
                             "threshold ever requires evidence in the wrong direction. "
                             "Ignored when acmg-mapping-method=tavtigian.")
 
-    # Progress reporting (for web backend)
+    # OOB evidence
+    parser.add_argument("--oob", action="store_true",
+                       help="Compute out-of-bag per-variant evidence (slower)")
+    parser.add_argument("--oob-min-samples", type=int, default=1,
+                       help="Min OOB bootstrap samples per variant (default: 1)")
+
+    # --- Utilities ---
+    parser.add_argument("--population-type", default="gnomAD",
+                       choices=["all_variants", "all_nsSNV", "all_missense_nsSNV",
+                                "gnomAD", "gnomAD_nsSNV", "gnomAD_missense_nsSNV"],
+                       help="Population type for dataset loading (default: gnomAD)")
+    parser.add_argument("--scoreset-flipped-override", type=str, default=None,
+                       choices=["true", "false"],
+                       help="Override automatic scoreset flip detection")
+    parser.add_argument("--sample-names", type=str, nargs="+", default=None,
+                       help="Explicit sample names matching column order in data "
+                            "(e.g. 'Pathogenic/Likely Pathogenic' 'Benign/Likely Benign' gnomAD Synonymous)")
+    parser.add_argument("--seed", type=int, default=None,
+                       help="Master seed for full reproducibility (train/val splits, EM "
+                            "initializations, and E-step Monte Carlo draws are all derived "
+                            "from this). Omit for the historical unseeded behavior.")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging (component params, weights, flip detection, point ranges)")
     parser.add_argument("--progress-file", default=None,
                         help="Path to write JSON progress updates (used by web backend). "
                             "Has no effect on pipeline output when omitted.")
@@ -312,13 +314,6 @@ Examples:
         execution_mode=args.mode,
         n_jobs=args.n_jobs,
         device=args.device,
-        slurm_account=args.slurm_account,
-        slurm_partition=args.slurm_partition,
-        slurm_time_hours=args.slurm_time,
-        slurm_mem_gb=args.slurm_mem,
-        slurm_cpus_per_task=args.slurm_cpus,
-        slurm_conda_env=args.slurm_conda_env,
-        slurm_module_commands=args.slurm_modules,
         auto_select_model=not args.no_auto_select,
         model_selection_alpha=args.selection_alpha,
         use_conservative_selection=not args.no_conservative,
