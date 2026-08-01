@@ -2,9 +2,45 @@
 
 # Input Data Formats
 
-Three formats are supported:
+Three formats are supported. **Start with BasicScoreset** if you're
+bringing your own assay data — it's the fastest way to get from "I have a
+CSV of scores" to a running calibration.
 
-### 1. IGVF / PillarProject format (standard)
+### 1. BasicScoreset (start here)
+
+Minimal format: `score` column + `sample_assignments` column. No ClinVar
+metadata required — you just tell it which rows belong to which sample
+group yourself.
+
+```
+score,sample_assignments
+-0.37,1
+-0.05,"1,2"
+1.30,2
+0.66,"1,2,3"
+```
+
+- `score` — your assay's per-variant numeric score. Any real number; higher/lower doesn't need to mean pathogenic/benign in any particular direction (the pipeline auto-detects which direction is which).
+- `sample_assignments` — an integer per row (`0`, `1`, `2`, `3`, ...) marking which control group(s) that variant belongs to, or a comma-separated string for a variant that belongs to more than one group (e.g. `"1,2"`). By convention:
+  - `0` = Pathogenic/Likely Pathogenic (known disease-causing variants)
+  - `1` = Benign/Likely Benign (known benign variants)
+  - `2` = gnomAD/population (variants observed in the general population, presumed mostly benign)
+  - `3` = Synonymous (silent/synonymous-coding variants, a common benign proxy)
+  - Rows with no value (or a value outside 0-3, if you're not using extra `--sample-names`) are treated as unlabeled variants-of-uncertain-significance — they still get scored/classified in the output, they just don't inform the fit itself.
+- At least one of Pathogenic + (Benign or Synonymous) must be present for the calibration to run at all.
+- Use `--sample-names` to relabel the convention above if your columns are in a different order, or to add more than 4 groups.
+
+`example/brca_findlay_example.csv` is a ready-to-run BasicScoreset example
+(BRCA1 SGE functional scores from Findlay et al. 2018, with rows labeled
+by ClinVar/population group membership):
+
+```bash
+python run_pipeline.py \
+    --dataset example/brca_findlay_example.csv --name brca_findlay_example \
+    --sample-names "Pathogenic/Likely Pathogenic" "Benign/Likely Benign" "gnomAD" "Synonymous"
+```
+
+### 2. IGVF / PillarProject format
 
 A rich per-variant metadata table (one row per variant, or per variant per
 transcript effect), matching the schema produced by the IGVF Coding
@@ -17,7 +53,7 @@ example — see it (or `Scoreset`/`Variant` in
 python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021
 ```
 
-Unlike the BasicScoreset format below, you don't manually assign each row
+Unlike BasicScoreset above, you don't manually assign each row
 to a sample group. Instead, group membership (Pathogenic/Likely
 Pathogenic, Benign/Likely Benign, gnomAD, Synonymous) is derived
 automatically from ClinVar classification, gnomAD allele frequency, and
@@ -50,27 +86,6 @@ filtering. Everything else in the schema (gene/transcript/position
 metadata, MaveDB interval-classification columns, REVEL/AlphaMissense/
 SpliceAI annotations, etc.) is optional context used by specific
 downstream features — not required to get a basic calibration running.
-
-### 2. BasicScoreset (bare-bones CSV)
-
-Minimal format: `score` column + `sample_assignments` column. No ClinVar
-metadata required — you just tell it which rows belong to which sample
-group yourself. `sample_assignments` is an integer per row (`0`, `1`,
-`2`, `3`, ...), or a comma-separated string for variants that belong to
-more than one group (e.g. `"1,2"`). By convention, column `0` = Pathogenic,
-`1` = Benign, `2` = gnomAD/population, `3` = Synonymous — use
-`--sample-names` to relabel them if your groups don't match that
-convention.
-
-`example/brca_findlay_example.csv` is a ready-to-run BasicScoreset example
-(BRCA1 SGE functional scores from Findlay et al. 2018, with rows labeled
-by ClinVar/population group membership):
-
-```bash
-python run_pipeline.py \
-    --dataset example/brca_findlay_example.csv --name brca_findlay_example \
-    --sample-names "Pathogenic/Likely Pathogenic" "Benign/Likely Benign" "gnomAD" "Synonymous"
-```
 
 ### 3. MaveDB format
 

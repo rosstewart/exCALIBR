@@ -1,15 +1,13 @@
+<p align="center">
+  <img src="assets/excalibr_logo.png" alt="ExCALIBR logo" width="200">
+</p>
+
 # ExCALIBR
 
+[![bioRxiv](https://img.shields.io/badge/bioRxiv-2025.04.29.651326-b31b1b)](https://doi.org/10.1101/2025.04.29.651326)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A pipeline for calibrating functional assays to clinical variant interpretation scales (ACMG/AMP evidence levels) using bootstrap skew-normal mixture model fitting and Bayesian calibration.
-
-## Overview
-
-ExCALIBR takes variant effect scores from functional assays and calibrates them using:
-
-- **Bootstrap mixture modeling** to estimate probability distributions for pathogenic, benign, population, and synonymous variants
-- **Bayesian calibration** to compute likelihood ratios and ACMG evidence thresholds
-- **Statistical model selection** to choose optimal component counts (2c vs 3c)
-- **Flexible execution** via SLURM clusters, parallel processing, or single-CPU
 
 ## Installation
 
@@ -32,11 +30,40 @@ pip install -e .
 
 ### Interactive (single dataset)
 
+The simplest way to run ExCALIBR on your own data is the **BasicScoreset**
+format: a CSV with just a `score` column (your assay's per-variant score)
+and a `sample_assignments` column you fill in yourself, marking which rows
+are known-Pathogenic, known-Benign, gnomAD/population, or Synonymous
+controls (see [Input Data Formats](#input-data-formats) below for exactly
+how to fill that column in). No ClinVar lookups or extra metadata needed.
+
 ```bash
-python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021
+python run_pipeline.py \
+    --dataset example/brca_findlay_example.csv --name brca_findlay_example \
+    --sample-names "Pathogenic/Likely Pathogenic" "Benign/Likely Benign" "gnomAD" "Synonymous"
 ```
 
-Defaults: 20 bootstrap iterations × 8 fits each — fast, good for a first look. For higher-quality (slower) results, see the [quality vs. speed presets](docs/configuration.md#quality-vs-speed-presets), or jump straight to `--n-bootstraps 1000 --fits-per-bootstrap 100`.
+This fits a bootstrap mixture model to the score distribution, calibrates
+it against the labeled control groups, and writes a calibration JSON,
+score-distribution plot, and per-variant evidence table to
+`./calibration_output/` (see [Output Files](docs/output-files.md)).
+
+By default this runs 20 bootstrap iterations × 8 fits each — fast, good
+for a first look, and takes a few minutes on a laptop. A few flags you'll
+likely want to reach for right away:
+
+| Flag | What it does |
+|------|--------------|
+| `--n-bootstraps` / `--fits-per-bootstrap` | Trade speed for stability/quality — see the [quality vs. speed presets](docs/configuration.md#quality-vs-speed-presets) for concrete numbers (defaults are the fastest "Light" preset). |
+| `--n-jobs` | How many CPU cores to use (`-1` = all available, the default). |
+| `--output-dir` | Where results are written (default: `./calibration_output`). |
+| `--components` | Which mixture-model sizes to fit (default: `3`; pass `2 3` to fit both and auto-select). |
+| `--sample-names` | Required for BasicScoreset CSVs — labels your `sample_assignments` columns in order (see above). |
+| `--manual-prior` | Override the estimated prior if you have your own domain-knowledge estimate — see [Prior estimation](docs/configuration.md#prior-estimation). |
+
+If your data already comes with ClinVar/gnomAD annotations (e.g. an IGVF-
+or PillarProject-formatted table), you can skip manually assigning sample
+groups — see [Input Data Formats](#input-data-formats) below.
 
 ### Production batch (many datasets)
 
@@ -46,8 +73,8 @@ See the [Batch HPC Workflow](docs/batch-hpc-workflow.md).
 
 Three formats are supported — see [docs/input-formats.md](docs/input-formats.md) for full details and example commands:
 
-1. **IGVF / PillarProject format** (standard) — a rich per-variant metadata table; sample groups (Pathogenic/Benign/gnomAD/Synonymous) are derived automatically from ClinVar/gnomAD/consequence columns. Example: `example/MSH2_Jia_2021.csv`.
-2. **BasicScoreset** (bare-bones CSV) — just a `score` column and a `sample_assignments` column you fill in yourself. No ClinVar metadata needed. Example: `example/brca_findlay_example.csv`.
+1. **BasicScoreset** (start here) — just a `score` column and a `sample_assignments` column you fill in yourself, marking which variants are Pathogenic/Benign/gnomAD/Synonymous controls. No ClinVar metadata needed. Example: `example/brca_findlay_example.csv`.
+2. **IGVF / PillarProject format** — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
 3. **MaveDB format** — MaveDB-style CSV with functional classification columns.
 
 Multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.) are also supported — see the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
