@@ -73,7 +73,6 @@ class BootstrapRunner:
     def _run_parallel(self) -> Tuple[Dict, Dict]:
         """Run bootstrap fits in parallel using joblib, flattened across bootstraps × fits."""
         print(f"\nRunning {self.config.n_bootstraps} bootstraps in parallel...")
-        print(f"  Jobs: {self.config.n_jobs if self.config.n_jobs > 0 else 'all CPUs'}")
         print(f"  Components: {self.config.components}")
 
         # Generate all bootstrap jobs
@@ -93,8 +92,12 @@ class BootstrapRunner:
         ]
 
         if getattr(self.config, "device", "cpu") == "gpu":
+            import jax
+            gpu_devices = jax.devices("gpu")
+            print(f"  Device: GPU ({len(gpu_devices)}x {gpu_devices[0].device_kind})")
             flat_results = self._execute_flat_tasks_gpu(flat_tasks)
         else:
+            print(f"  Jobs: {self.config.n_jobs if self.config.n_jobs > 0 else 'all CPUs'}")
             # Run all fits; return_as="generator" is joblib >=1.2.0 only so we
             # collect as a plain list and accept that per-fit progress is coarser.
             flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=0)(

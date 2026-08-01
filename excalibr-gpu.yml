@@ -21,5 +21,7 @@ dependencies:
   - pip:
     # JAX with CUDA 12 — bundles nvidia-* runtime libs, no module load cuda needed.
     # For CPU-only installs use excalibr.yml instead.
-    - jax[cuda12]==0.10.2
-    - jaxlib==0.10.2
+    # 0.4.38 is the last release whose jaxlib and nvidia-* deps are on standard PyPI.
+    # Newer versions (0.5+) require nvidia packages hosted only on pypi.nvidia.com.
+    - --extra-index-url https://pypi.nvidia.com/
+    - jax[cuda12]==0.4.38

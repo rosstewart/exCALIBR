@@ -28,29 +28,33 @@ Large/xl/finest on many datasets: use the [batch HPC workflow](batch-hpc-workflo
 
 #### Quality vs. speed presets
 
-Tested on 87 real datasets (~85,000 variants), comparing each `--n-bootstraps` level against a ~1000-bootstrap reference run of the same dataset (`--fits-per-bootstrap` fixed at 100 for this test). Per-variant evidence-point-value changes, plus worst-case (90th-percentile) drift in aggregate classification accuracy, MCC, and coverage:
+Tested on 87 real datasets (~85,000 variants), comparing each `--n-bootstraps` level against a ~1000-bootstrap reference run of the same dataset (`--fits-per-bootstrap` fixed at 100 for this test).
 
-| `--n-bootstraps` | Unchanged | Shifted, same direction | Gained/lost evidence (↔ 0) | Sign flip | Accuracy Δ | MCC Δ | Coverage Δ |
-|---|---|---|---|---|---|---|---|
-| 20  | 79.1% | 18.0% | 3.0% | 0.0% | 3.3pp | 5.0pp | 9.3pp |
-| 50  | 83.4% | 13.3% | 3.4% | 0.0% | 2.2pp | 4.1pp | 4.9pp |
-| 100 | 90.0% | 7.7%  | 2.3% | 0.0% | 2.7pp | 4.0pp | 4.2pp |
-| 250 | 92.9% | 6.0%  | 1.1% | 0.0% | 0.9pp | 0.4pp | 1.8pp |
-| 500 | 95.7% | 3.2%  | 1.0% | 0.0% | 0.7pp | 0.6pp | 2.0pp |
+**Per-variant evidence-point changes** — "Unchanged" and "Changed" are means across the 87 datasets. "Changed" covers any difference from the reference: shifted point value (within or across ACMG evidence tier), gained/lost evidence, or direction flip. ACMG tiers: Supporting = 1 pt, Moderate = 2–3 pt, Strong = 4–7 pt, Very Strong = 8 pt.
+
+**Aggregate metric drift** — 90th-percentile absolute Δ across datasets (90% of datasets show smaller drift than this).
+
+| `--n-bootstraps` | Unchanged | Changed | Accuracy Δ | MCC Δ | Coverage Δ |
+|---|---|---|---|---|---|
+| 20  | 76.4% | 23.6% | 3.3pp | 5.0pp | 9.3pp |
+| 50  | 82.5% | 17.5% | 2.2pp | 4.1pp | 4.9pp |
+| 100 | 87.8% | 12.2% | 2.7pp | 4.0pp | 4.2pp |
+| 250 | 91.1% |  8.9% | 0.8pp | 0.4pp | 1.8pp |
+| 500 | 95.0% |  5.0% | 0.7pp | 0.6pp | 2.0pp |
 
 #### Speed estimates
 
-Timed on `example/MSH2_Jia_2021.csv` (1579 variants) at Light, scaled linearly for other presets/core counts:
+Timed on `example/MSH2_Jia_2021.csv` (1,579 variants) at `--preset light`, scaled linearly for other presets/core counts:
 
-| Preset | 4 cores | 16 cores | 64 cores |
-|---|---|---|---|
-| Light  | ~2.5 hours | ~35 min | ~10 min |
-| Medium | ~12 hours  | ~3 hours | ~45 min |
-| Large  | ~2.5 days  | ~16 hours | ~4 hours |
-| XL     | ~5 days    | ~1.3 days | ~8 hours |
-| Finest | ~2 months  | ~16 days | ~4 days |
+| Preset | 4 cores | 16 cores | 64 cores | V100S GPU |
+|---|---|---|---|---|
+| Light  | ~2.5 hours | ~35 min | ~10 min | ~5.6 min |
+| Medium | ~12 hours  | ~3 hours | ~45 min | ~28 min |
+| Large  | ~2.5 days  | ~16 hours | ~4 hours | ~2.3 hours |
+| XL     | ~5 days    | ~1.3 days | ~8 hours | ~4.6 hours |
+| Finest | ~2 months  | ~16 days  | ~4 days  | ~2.4 days |
 
-`--n-jobs` sets core count (`-1` = all available). 3c fitting is ~15-20% slower than 2c. Reproduce with `tests/benchmark_run_pipeline_speed.py`.
+`--n-jobs` sets core count (`-1` = all available). 3c fitting is ~15-20% slower than 2c. GPU column is for `--device cuda:N` with a Tesla V100S-PCIE-32GB and includes JAX JIT compilation (the first dataset in a process always pays this cost; ~33s overhead). See [GPU Acceleration](gpu-acceleration.md) for details and hardware context. Reproduce timing with `tests/benchmark_run_pipeline_speed.py`.
 
 ### Component selection
 

@@ -46,7 +46,7 @@ Writes a calibration JSON, score-distribution plot, and per-variant evidence tab
 |---|---|---|
 | `--preset` | `light` | Quality/speed level: `light`/`medium`/`large`/`xl`/`finest` — see [presets](docs/configuration.md#quality-vs-speed-presets) |
 | `--n-jobs` | `-1` (all cores) | Parallel workers (`1` = single-threaded, e.g. for debugging) |
-| `--device` | `cpu` | `cpu` or `gpu` (GPU routes through JAX batch; untested as of authoring) |
+| `--device` | `cpu` | `cpu`, `gpu` (JAX-batched, default GPU), or `cuda:N` to pin to GPU N. `run_pipeline.py` runs one dataset at a time so only one GPU is ever used; for multi-dataset GPU runs use the HPC workflow (`hpc/prepare.py`), one process per GPU. |
 | `--output-dir` | `./calibration_output` | Output location |
 | `--components` | `3` | Mixture-model size(s) to fit; `2 3` fits both and auto-selects |
 | `--sample-names` | — | Required for BasicScoreset; labels `sample_assignments` columns in order |
@@ -82,6 +82,7 @@ Multi-assay (multivariate) calibration and calibration of computational variant-
 - [Script Reference](docs/script-reference.md) — every script and its key flags
 - [Output Files](docs/output-files.md) — what gets written, and what's in `calibration.json`
 - [Configuration Options](docs/configuration.md) — bootstrap presets, priors, component selection, postprocessing, bidirectional-assay detection
+- [GPU Acceleration](docs/gpu-acceleration.md) — JAX/CUDA setup, JIT compilation details, and benchmark timings
 - [Troubleshooting](docs/troubleshooting.md)
 
 ## Citation
@@ -101,6 +102,10 @@ A scalable approach to resolving variants of uncertain significance.
 Malvika Tejura, Yile Chen, Abbye E. McEwen, Ross Stewart, Yuriy Sverchkov, Florent Laval, et al.
 bioRxiv 2026.02.14.705848; doi: https://doi.org/10.64898/2026.02.14.705848
 ```
+
+## Software
+
+Software developed by Ross Stewart and Daniel Zeiberg.
 
 ## License
 

@@ -34,6 +34,30 @@ BOOTSTRAP_PRESETS = {
     "finest": (1000, 100),
 }
 
+
+def _parse_device(device: str) -> str:
+    """Parse --device and set CUDA_VISIBLE_DEVICES before any JAX import.
+
+    Accepted forms:
+        cpu      → CPU path
+        gpu      → GPU path, JAX picks the default device
+        cuda:N   → GPU path, pinned to device N
+    """
+    d = device.strip().lower()
+    if d == "cpu":
+        return "cpu"
+    if d == "gpu":
+        return "gpu"
+    if d.startswith("cuda:"):
+        idx = d[len("cuda:"):]
+        if not idx.isdigit():
+            raise SystemExit(f"--device: expected cuda:N (integer index), got '{device}'")
+        os.environ["CUDA_VISIBLE_DEVICES"] = idx
+        return "gpu"
+    raise SystemExit(
+        f"--device: unrecognised value '{device}'. Use cpu, gpu, or cuda:N."
+    )
+
 def main():
     parser = argparse.ArgumentParser(
         description="Assay Calibration Pipeline - Bootstrap fitting and calibration",
@@ -112,12 +136,14 @@ Examples:
     parser.add_argument("--n-jobs", type=int, default=-1,
                        help="Number of parallel jobs (-1 = all CPUs, default: -1; use 1 for "
                             "single-threaded execution, e.g. for debugging with pdb)")
-    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
-                       help="cpu (default): existing per-job joblib path. "
-                            "gpu: batch fits through src/assay_calibration/fit_utils/jax_batch and "
-                            "run on GPU instead. "
-                            "Untested on GPU as of authoring -- validate with "
-                            "tests/test_batch_em_parity.py first.")
+    parser.add_argument("--device", default="cpu",
+                       help="cpu (default): parallel CPU fitting via joblib. "
+                            "gpu: JAX-batched GPU fitting (uses JAX's default device). "
+                            "cuda:N: same but pinned to GPU N (e.g. cuda:1 when GPU 0 is "
+                            "occupied by another job). run_pipeline.py runs one dataset at a "
+                            "time so only one GPU is ever used; for multi-dataset runs use "
+                            "the HPC workflow (hpc/prepare.py) with one process per GPU. "
+                            "Only affects --mode parallel/single.")
 
     # Output options
     parser.add_argument("--output-dir", default="./calibration_output",
@@ -296,6 +322,10 @@ Examples:
         args.n_bootstraps = preset_n_bootstraps
     if args.fits_per_bootstrap is None:
         args.fits_per_bootstrap = preset_fits_per_bootstrap
+
+    # Normalise --device and set CUDA_VISIBLE_DEVICES before any JAX import.
+    # Accepted forms: cpu | gpu | cuda:N | cuda:N-M | cuda:N,M,...
+    args.device = _parse_device(args.device)
 
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode

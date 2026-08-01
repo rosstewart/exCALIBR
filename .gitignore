@@ -1,6 +1,7 @@
 # Python bytecode
 **/__pycache__/
 *.pyc
+**/*.pyc
 
 # macOS system files
 .DS_Store
@@ -10,3 +11,10 @@
 *.log
 .ipynb_checkpoints/
 analysis/analyze_pipeline_output.ipynb
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+#
+# # Jupyter
+.ipynb_checkpoints/

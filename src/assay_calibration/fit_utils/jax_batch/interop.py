@@ -247,7 +247,12 @@ def _run_univariate_chunk(specs, use_gpu_init=True, max_em_iters=None):
             (float(a[i, k]), float(loc[i, k]), float(scale[i, k])) for k in range(K)
         ]
         weights = W[i]
-        result = {"component_params": component_params, "weights": weights}
+        result = {
+            "component_params": component_params,
+            "weights": weights,
+            "xlims": (float(xmin[i]), float(xmax[i])),
+            "times_submerged": [],
+        }
         val_ll = float(batch_val_lls[i]) if batch_val_lls is not None else None
         results.append((bs_seed, label, save_dir, full_job.get("fit_idx"), {
             "dataset_name": full_job.get("dataset_name"),
@@ -299,7 +304,7 @@ def _failed_result(spec):
         "bootstrap_seed": bs_seed,
         "num_components": full_job["num_components"],
         "fit_idx": full_job.get("fit_idx"),
-        "fit": {"component_params": [[] for _ in range(full_job["num_components"])], "weights": None},
+        "fit": {"component_params": [[] for _ in range(full_job["num_components"])], "weights": None, "xlims": None, "times_submerged": []},
         "val_ll": -np.inf,
         "calibrated_dims": full_job.get("calibrated_dims"),
     })
@@ -391,7 +396,20 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
             continue
         component_params = [(mu[i, k], Delta[i, k], Gamma[i, k]) for k in range(K)]
         weights = W[i]
-        result = {"component_params": component_params, "weights": weights}
+        train_obs = np.asarray(full_job["train_observations"])
+        if train_obs.ndim == 2:
+            xlims = tuple(
+                (float(np.nanmin(train_obs[:, d])), float(np.nanmax(train_obs[:, d])))
+                for d in range(train_obs.shape[1])
+            )
+        else:
+            xlims = (float(np.nanmin(train_obs)), float(np.nanmax(train_obs)))
+        result = {
+            "component_params": component_params,
+            "weights": weights,
+            "xlims": xlims,
+            "times_submerged": [],
+        }
         val_ll = None
         if full_job.get("val_observations") is not None:
             val_ll = _val_ll_cfusn(full_job, component_params, weights)

@@ -98,6 +98,81 @@ def sample_specific_bootstrap(sample_assignments, bootstrap_seed=None):
     return train_indices, eval_indices
 
 
+def pattern_stratified_bootstrap(observations, sample_assignments, bootstrap_seed=None):
+    """Bootstrap stratified by (sample class × missingness pattern).
+
+    For multivariate data with missing values, plain sample-specific
+    bootstrapping lets the proportion of complete vs partial observations
+    vary randomly across bootstraps.  That variation directly changes how
+    much joint vs marginal information the EM sees, inflating variance in
+    the fitted parameters and in downstream LR estimates.
+
+    This function adds a second stratification level: within each sample
+    class the variants are grouped by their missingness pattern (which
+    dimensions are observed), and bootstrap resampling is done
+    independently within each (sample, pattern) stratum.  Every bootstrap
+    therefore has the same composition of complete/partial cases per
+    sample class (up to ±1 due to integer rounding), isolating LR
+    variance to genuine parameter uncertainty rather than data-composition
+    fluctuations.
+
+    Parameters
+    ----------
+    observations : (N, D) ndarray — may contain NaN
+    sample_assignments : (N, S) bool array — one-hot per row
+    bootstrap_seed : int or None
+
+    Returns
+    -------
+    train_indices, eval_indices : 1-D int arrays
+    """
+    rng = np.random.RandomState(bootstrap_seed)
+    N = observations.shape[0]
+
+    # Missingness pattern for each variant: tuple of which dims are observed
+    obs_mask = ~np.isnan(observations)
+    patterns = [tuple(obs_mask[i].tolist()) for i in range(N)]
+
+    train_indices = []
+    eval_indices = []
+
+    for sample_num in range(sample_assignments.shape[1]):
+        sample_idx = np.where(sample_assignments[:, sample_num])[0]
+        if not len(sample_idx):
+            continue
+
+        # Group within this sample by missingness pattern
+        strata: dict = {}
+        for idx in sample_idx:
+            strata.setdefault(patterns[idx], []).append(idx)
+
+        for group in strata.values():
+            group = np.array(group)
+            if len(group) == 1:
+                train_indices.append(group)
+                continue
+
+            # Resample within stratum, require at least one OOB sample
+            fails = 0
+            while fails < 100:
+                g_train = rng.choice(group, size=len(group), replace=True)
+                g_eval = np.setdiff1d(group, g_train)
+                if len(g_eval):
+                    break
+                fails += 1
+            else:
+                g_train = group  # last resort: use all, no eval from this stratum
+                g_eval = np.array([], dtype=int)
+
+            train_indices.append(g_train)
+            if len(g_eval):
+                eval_indices.append(g_eval)
+
+    train_out = np.concatenate(train_indices)
+    eval_out = np.concatenate(eval_indices) if eval_indices else np.array([], dtype=int)
+    return train_out, eval_out
+
+
 class Fit:
     def __init__(self, scoreset):
         """Accept Scoreset, BasicScoreset, or MultiScoreset."""
@@ -169,13 +244,46 @@ class Fit:
         observations = observations[include]
         sample_assignments = sample_assignments[include]
 
+        # ── Overlap check: reduce dimensions if assays don't co-occur enough ──
+        if mv:
+            min_overlap = kwargs.get("min_overlap_rows", 30)
+            calibrated_dims = Fit._select_calibration_dims(observations, min_overlap)
+            if len(calibrated_dims) == 0:
+                print(
+                    f"[OVERLAP] No assay pair has ≥{min_overlap} shared observations. "
+                    f"Cannot run multivariate calibration — fall back to per-assay "
+                    f"1D calibrations."
+                )
+                return [], None, None
+            elif len(calibrated_dims) < observations.shape[1]:
+                excluded = sorted(set(range(observations.shape[1])) - set(calibrated_dims))
+                print(
+                    f"[OVERLAP] Assay dim(s) {excluded} lack ≥{min_overlap} shared rows "
+                    f"with the rest. Running {len(calibrated_dims)}D calibration on "
+                    f"dims {calibrated_dims}; use existing 1D calibrations for dim(s) "
+                    f"{excluded}."
+                )
+                observations = observations[:, calibrated_dims]
+                valid = (
+                    ~np.all(np.isnan(observations), axis=1)
+                    & sample_assignments.any(axis=1)
+                )
+                observations = observations[valid]
+                sample_assignments = sample_assignments[valid]
+            kwargs["calibrated_dims"] = calibrated_dims
+
         train_indices = np.arange(len(observations))
         val_indices = np.array([], dtype=int)
         bootstrap_seed = kwargs.get("bootstrap_seed", None)
         if kwargs.get("bootstrap", True):
-            train_indices, val_indices = sample_specific_bootstrap(
-                sample_assignments, bootstrap_seed
-            )
+            if mv:
+                train_indices, val_indices = pattern_stratified_bootstrap(
+                    observations, sample_assignments, bootstrap_seed
+                )
+            else:
+                train_indices, val_indices = sample_specific_bootstrap(
+                    sample_assignments, bootstrap_seed
+                )
 
         constrained = kwargs.get("check_monotonic", True)
 
@@ -403,6 +511,46 @@ class Fit:
             return get_q(params)
         return 1
 
+    @staticmethod
+    def _select_calibration_dims(observations, min_overlap_rows=30):
+        """Find the largest subset of assay dimensions with sufficient pairwise overlap.
+
+        Two dimensions overlap if at least ``min_overlap_rows`` variants have
+        non-NaN scores in both assays simultaneously.
+
+        Returns
+        -------
+        list of int
+            Column indices to use.  Empty list means no pair has sufficient
+            overlap — caller should fall back to per-assay 1-D calibration.
+        """
+        from itertools import combinations
+        D = observations.shape[1]
+        if D == 1:
+            return [0]
+
+        overlap = np.zeros((D, D), dtype=int)
+        for i in range(D):
+            for j in range(i + 1, D):
+                both = ~np.isnan(observations[:, i]) & ~np.isnan(observations[:, j])
+                overlap[i, j] = overlap[j, i] = both.sum()
+
+        # adjacency: edge between i and j if overlap is sufficient
+        adj = overlap >= min_overlap_rows
+        np.fill_diagonal(adj, True)
+
+        all_dims = list(range(D))
+        if all(adj[i, j] for i in all_dims for j in all_dims):
+            return all_dims
+
+        # Find largest clique (brute force; fine for D <= ~10)
+        for size in range(D - 1, 1, -1):
+            for subset in combinations(range(D), size):
+                if all(adj[i, j] for i in subset for j in subset):
+                    return list(subset)
+
+        return []  # no pair has sufficient overlap
+
     # ──────────────────────────────────────
     # Job generation for distributed fitting
     # ──────────────────────────────────────
@@ -433,13 +581,47 @@ class Fit:
         observations = observations[include]
         sample_assignments = sample_assignments[include]
 
+        # ── Overlap check: reduce dimensions if assays don't co-occur enough ──
+        calibrated_dims = list(range(observations.shape[1])) if mv else None
+        if mv:
+            min_overlap = kwargs.get("min_overlap_rows", 30)
+            calibrated_dims = Fit._select_calibration_dims(observations, min_overlap)
+            if len(calibrated_dims) == 0:
+                print(
+                    f"[OVERLAP] No assay pair has ≥{min_overlap} shared observations. "
+                    f"Cannot run multivariate calibration — fall back to per-assay "
+                    f"1D calibrations."
+                )
+                return []
+            elif len(calibrated_dims) < observations.shape[1]:
+                excluded = sorted(set(range(observations.shape[1])) - set(calibrated_dims))
+                print(
+                    f"[OVERLAP] Assay dim(s) {excluded} lack ≥{min_overlap} shared rows "
+                    f"with the rest. Running {len(calibrated_dims)}D calibration on "
+                    f"dims {calibrated_dims}; use existing 1D calibrations for dim(s) "
+                    f"{excluded}."
+                )
+                observations = observations[:, calibrated_dims]
+                valid = (
+                    ~np.all(np.isnan(observations), axis=1)
+                    & sample_assignments.any(axis=1)
+                )
+                observations = observations[valid]
+                sample_assignments = sample_assignments[valid]
+            kwargs["calibrated_dims"] = calibrated_dims
+
         train_indices = np.arange(len(observations))
         val_indices = np.array([], dtype=int)
         bootstrap_seed = kwargs.get("bootstrap_seed", None)
         if kwargs.get("bootstrap", True):
-            train_indices, val_indices = sample_specific_bootstrap(
-                sample_assignments, bootstrap_seed
-            )
+            if mv:
+                train_indices, val_indices = pattern_stratified_bootstrap(
+                    observations, sample_assignments, bootstrap_seed
+                )
+            else:
+                train_indices, val_indices = sample_specific_bootstrap(
+                    sample_assignments, bootstrap_seed
+                )
 
         constrained = kwargs.get("check_monotonic", True)
 
@@ -473,6 +655,7 @@ class Fit:
                     "init_method": init_methods[i],
                     "init_constraint_adjustment": init_constraint_adjustments[i],
                     "multivariate": mv,
+                    "calibrated_dims": calibrated_dims,
                     "kwargs": kwargs.copy(),
                 }
                 jobs.append(job)
@@ -496,6 +679,28 @@ class Fit:
             result.pop("history", None)
             result.pop("likelihoods", None)
 
+            # Guard: if init failed, component_params contains empty lists
+            params = result.get("component_params", [])
+            weights = result.get("weights")
+            init_failed = (
+                weights is None
+                or not params
+                or any(
+                    isinstance(p, (list, tuple)) and len(p) == 0
+                    for p in params
+                )
+            )
+            if init_failed:
+                return {
+                    "dataset_name": job.get("dataset_name"),
+                    "bootstrap_seed": job["bootstrap_seed"],
+                    "num_components": job["num_components"],
+                    "fit_idx": job["fit_idx"],
+                    "fit": result,
+                    "val_ll": -np.inf,
+                    "calibrated_dims": job.get("calibrated_dims"),
+                }
+
             val_ll = None
             if job["val_observations"] is not None:
                 val_ll = get_likelihood(
@@ -513,6 +718,7 @@ class Fit:
                 "fit_idx": job["fit_idx"],
                 "fit": result,
                 "val_ll": val_ll,
+                "calibrated_dims": job.get("calibrated_dims"),
             }
         except Exception as e:
             print(f"Failed: b{job['bootstrap_seed']} c{job['num_components']} f{job['fit_idx']}: {e}")
