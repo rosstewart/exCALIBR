@@ -12,14 +12,14 @@ Sub-commands
 
 Usage
 -----
-  python slurm/prepare.py default       --output-dir DIR [options]
-  python slurm/prepare.py mavedb        --output-dir DIR --score-cols COL ... [options]
-  python slurm/prepare.py basicscoreset --output-dir DIR [--dataframe F | --data-dir D]
-  python slurm/prepare.py multivariate  --output-dir DIR [options]
-  python slurm/prepare.py predictor-mv  --output-dir DIR --data-dir D [options]
+  python hpc/prepare.py default       --output-dir DIR [options]
+  python hpc/prepare.py mavedb        --output-dir DIR --score-cols COL ... [options]
+  python hpc/prepare.py basicscoreset --output-dir DIR [--dataframe F | --data-dir D]
+  python hpc/prepare.py multivariate  --output-dir DIR [options]
+  python hpc/prepare.py predictor-mv  --output-dir DIR --data-dir D [options]
 
 After running, submit with:
-  bash slurm/submit_array.sh <output_dir>
+  bash hpc/submit_array.sh <output_dir>
 """
 
 import sys
@@ -209,7 +209,7 @@ def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int) -> None
     print(f"  2. Monitor:   python {slurm_dir}/count_bootstraps.py {output_dir}")
     print(f"  3. Aggregate: python {slurm_dir}/aggregate_results.py {output_dir}")
     print(f"  4. Logs:      {output_dir}/logs/")
-    print(f"\nSee slurm/README.md for full workflow and tunable parameters.")
+    print(f"\nSee hpc/README.md for full workflow and tunable parameters.")
 
 
 # =============================================================================
@@ -841,7 +841,7 @@ def run_predictor_mv(args):
         )
     except ImportError:
         print("Error: predictor_mv_utils.py not found. "
-              "It should be in the same directory as prepare.py (slurm/).")
+              "It should be in the same directory as prepare.py (hpc/).")
         sys.exit(1)
     from src.assay_calibration.fit_utils.fit import Fit
 

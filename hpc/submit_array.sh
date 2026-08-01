@@ -2,14 +2,14 @@
 # Submit a SLURM array job for ExCALIBR bootstrap fits.
 #
 # Usage:
-#   bash slurm/submit_array.sh <output_dir>
+#   bash hpc/submit_array.sh <output_dir>
 #
 # The job array size is read automatically from <output_dir>/jobs/job_index.json.
 # All SLURM parameters can be overridden via environment variables (see README.md).
 #
 # Example:
-#   bash slurm/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
-#   SLURM_MEM=8G SLURM_CPUS=24 bash slurm/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
+#   bash hpc/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
+#   SLURM_MEM=8G SLURM_CPUS=24 bash hpc/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
 
 set -euo pipefail
 

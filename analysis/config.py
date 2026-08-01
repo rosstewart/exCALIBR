@@ -144,7 +144,7 @@ GMM_BASELINE_OUTPUT_DIR = _env(
 )
 GMM_BASELINE_VARIANTS = ("plp_blb", "plp_blb_synon")
 
-# Older bare-JSON output (slurm/simple_gmm_baseline.py run standalone,
+# Older bare-JSON output (hpc/simple_gmm_baseline.py run standalone,
 # without the wrapper that produces the full GMM_BASELINE_OUTPUT_DIR tree
 # above) -- per_sample_weights only, no point_ranges/variants.csv. Kept as a
 # fallback loader (analysis.comparison_methods.load_gmm_baseline_points) for
@@ -171,7 +171,7 @@ ROBUSTNESS_OUTPUT_DIR = _env(
 # bootstraps x every condition, same {condition_dirname: {seed: {"2c"/"3c":
 # fit}}} format as PRECOMPUTED_FITS above, keyed by the condition directory
 # name itself e.g. "BRCA2_Sahu_2025_SGE_ds16_s0") -- produced by the same
-# slurm/aggregate_results.py run that made the ROBUSTNESS_OUTPUT_DIR tree.
+# hpc/aggregate_results.py run that made the ROBUSTNESS_OUTPUT_DIR tree.
 # Needed for the density-overlay row of plot_robustness_config_summary.
 ROBUSTNESS_BOOTSTRAP_RESULTS = _env(
     "EXCALIBR_ROBUSTNESS_BOOTSTRAP_RESULTS",

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/excalibr_logo.png" alt="ExCALIBR logo" width="100">
+  <img src="assets/excalibr_logo.png" alt="ExCALIBR logo" width="56">
 </p>
 
 # ExCALIBR
@@ -45,7 +45,8 @@ Writes a calibration JSON, score-distribution plot, and per-variant evidence tab
 | Flag | Default | What it does |
 |---|---|---|
 | `--preset` | `light` | Quality/speed level: `light`/`medium`/`large`/`xl`/`finest` — see [presets](docs/configuration.md#quality-vs-speed-presets) |
-| `--n-jobs` | `-1` (all cores) | Parallel workers |
+| `--n-jobs` | `-1` (all cores) | Parallel workers (`1` = single-threaded, e.g. for debugging) |
+| `--device` | `cpu` | `cpu` or `gpu` (GPU routes through JAX batch; untested as of authoring) |
 | `--output-dir` | `./calibration_output` | Output location |
 | `--components` | `3` | Mixture-model size(s) to fit; `2 3` fits both and auto-selects |
 | `--sample-names` | — | Required for BasicScoreset; labels `sample_assignments` columns in order |
@@ -53,6 +54,8 @@ Writes a calibration JSON, score-distribution plot, and per-variant evidence tab
 | `--benign-method` | `avg` | `avg`/`benign`/`synonymous` — see [Benign sample method](docs/configuration.md#benign-sample-method) |
 | `--conservative-monotonicity` | off | Stricter evidence-threshold enforcement |
 | `--no-auto-bidirectional` | off (auto-detect on) | For LoF/GoF-style assays — see [Bidirectional detection](docs/configuration.md#bidirectional-assay-auto-detection) |
+| `--no-postprocess` | off | Raw, unprocessed LR-threshold intervals (debugging only) — see [Point-range postprocessing](docs/configuration.md#point-range-postprocessing) |
+| `--pathomechanism-prior` | off | Mechanism-aware pathogenic-direction prior, for assays that only detect one disease mechanism — see [Pathomechanism prior](docs/configuration.md#pathomechanism-prior-advanced) |
 | `--precomputed-fits` | — | Skip fitting, load existing bootstrap fits |
 | `--oob` | off | Compute out-of-bag per-variant evidence |
 

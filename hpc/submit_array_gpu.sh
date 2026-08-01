@@ -7,11 +7,11 @@
 # compilation (~15 min) over many tasks rather than recompiling once per task.
 #
 # Usage:
-#   bash slurm/submit_array_gpu.sh <output_dir>
+#   bash hpc/submit_array_gpu.sh <output_dir>
 #
 # Override defaults via environment variables:
-#   N_GPUS=8 bash slurm/submit_array_gpu.sh /projects/pedjas_lab/stewart.ro/my_run
-#   N_GPUS=4 SLURM_PARTITION=gpu bash slurm/submit_array_gpu.sh /projects/pedjas_lab/stewart.ro/my_run
+#   N_GPUS=8 bash hpc/submit_array_gpu.sh /projects/pedjas_lab/stewart.ro/my_run
+#   N_GPUS=4 SLURM_PARTITION=gpu bash hpc/submit_array_gpu.sh /projects/pedjas_lab/stewart.ro/my_run
 
 set -euo pipefail
 

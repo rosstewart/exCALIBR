@@ -7,7 +7,7 @@
 # (see its docstring) before trusting this for a real run.
 #
 # Usage:
-#   bash slurm/run_local_array_gpu.sh <output_dir> <start_idx> <end_idx> [gpu_id]
+#   bash hpc/run_local_array_gpu.sh <output_dir> <start_idx> <end_idx> [gpu_id]
 #
 # Unlike run_local_array.sh there's no `concurrency` argument: GPU batching
 # already parallelizes across all of an array task's jobs internally, and
@@ -16,9 +16,9 @@
 # multi-GPU machine, or set CUDA_VISIBLE_DEVICES before calling.
 #
 # Examples:
-#   bash slurm/run_local_array_gpu.sh /shared/mv_run 0   9      # GPU 0 (default)
-#   bash slurm/run_local_array_gpu.sh /shared/mv_run 0   9   1  # GPU 1
-#   bash slurm/run_local_array_gpu.sh /shared/mv_run 125 249 2  # GPU 2
+#   bash hpc/run_local_array_gpu.sh /shared/mv_run 0   9      # GPU 0 (default)
+#   bash hpc/run_local_array_gpu.sh /shared/mv_run 0   9   1  # GPU 1
+#   bash hpc/run_local_array_gpu.sh /shared/mv_run 125 249 2  # GPU 2
 
 set -euo pipefail
 

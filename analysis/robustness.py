@@ -67,7 +67,7 @@ GENES_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}
 # ---------------------------------------------------------------------------
 
 # Inverse of the generator's own suffix-stripping regex
-# ('_ds[0-9]+_s[0-9]+$|_disc[0-9.]+_s[0-9]+$', see slurm/prepare.py
+# ('_ds[0-9]+_s[0-9]+$|_disc[0-9.]+_s[0-9]+$', see hpc/prepare.py
 # --name-strip in test/downsample_discordance_test.ipynb) -- provably
 # consistent with how the condition names were built, not a fresh guess.
 #

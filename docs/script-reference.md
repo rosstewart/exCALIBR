@@ -15,8 +15,7 @@ Key flags:
 | `--preset` | `light` | Quality/speed level: `light`/`medium`/`large`/`xl`/`finest` (see [presets](configuration.md#quality-vs-speed-presets)) |
 | `--n-bootstraps` / `--fits-per-bootstrap` | from `--preset` | Advanced: override the preset's underlying bootstrap count / fits-per-bootstrap directly |
 | `--components K [K ...]` | `3` | Component counts to fit (integers 2–10; pass `2 3` to fit both and compare) |
-| `--mode` | `parallel` | `parallel` or `single` (single-process debugging; not for cluster execution — see [batch HPC workflow](batch-hpc-workflow.md)) |
-| `--n-jobs` | `-1` | Parallel workers for bootstrap fitting (`-1` = all CPUs) |
+| `--n-jobs` | `-1` | Parallel workers for bootstrap fitting (`-1` = all CPUs; use `1` for single-threaded/debugging). Not for cluster execution — see [batch HPC workflow](batch-hpc-workflow.md). |
 | `--device` | `cpu` | `cpu` or `gpu` (GPU: routes through JAX batch, untested as of authoring) |
 | `--precomputed-fits` | — | Skip fitting; load existing bootstrap fits JSON |
 | `--output-dir` | `./calibration_output` | Output directory |
@@ -47,8 +46,7 @@ Key flags:
 | `--dataset-configs` | — | (Advanced, most users can skip) JSON mapping dataset names to `[n_c, benign_method, {overrides}]` for per-dataset control. Omit it and every dataset in `--precomputed-fits` is processed with sensible defaults (2c+3c, avg, model selection). |
 | `--datasets` | all | Only process these dataset names |
 | `--output-dir` | `./igvf_output` | Output directory |
-| `--n-jobs` | 1 | Datasets in parallel (outer) |
-| `--n-jobs-inner` | -1 | Parallel jobs within each dataset |
+| `--n-jobs-inner` | -1 | Parallel jobs within each dataset (`-1` = all CPUs). Datasets are always processed one at a time. |
 | `--skip-existing` | off | Resume a failed run (skip completed datasets) |
 | `--all-configs` | off | Run all 4 (2c/3c)×(avg/benign) combos per dataset with comparison plot |
 | `--no-postprocess` | off | Return raw, unprocessed LR-threshold intervals (same as `run_pipeline.py`; a debugging tool, not needed for bidirectional assays) |
@@ -62,12 +60,12 @@ Key flags:
 
 ---
 
-### `slurm/prepare.py` — Job manifest generation
+### `hpc/prepare.py` — Job manifest generation
 
 Generates array job files from a dataset dataframe. Must be run before submitting fits.
 
 ```bash
-python slurm/prepare.py <subcommand> --output-dir /path/to/run [options]
+python hpc/prepare.py <subcommand> --output-dir /path/to/run [options]
 ```
 
 Subcommands:
@@ -82,10 +80,10 @@ Common options: `--n-bootstraps` (default: 1000), `--components`, `--datasets`, 
 
 ---
 
-### `slurm/submit_array.sh` — SLURM CPU array submission
+### `hpc/submit_array.sh` — SLURM CPU array submission
 
 ```bash
-bash slurm/submit_array.sh /path/to/run
+bash hpc/submit_array.sh /path/to/run
 ```
 
 Env-var overrides (all optional):
@@ -102,10 +100,10 @@ Env-var overrides (all optional):
 
 ---
 
-### `slurm/submit_array_gpu.sh` — SLURM GPU array submission
+### `hpc/submit_array_gpu.sh` — SLURM GPU array submission
 
 ```bash
-N_GPUS=32 bash slurm/submit_array_gpu.sh /path/to/run
+N_GPUS=32 bash hpc/submit_array_gpu.sh /path/to/run
 ```
 
 Same overrides as `submit_array.sh` plus:
@@ -119,52 +117,52 @@ Same overrides as `submit_array.sh` plus:
 
 ---
 
-### `slurm/run_local_array.sh` — Local CPU execution
+### `hpc/run_local_array.sh` — Local CPU execution
 
 ```bash
-bash slurm/run_local_array.sh /path/to/run START END [concurrency]
+bash hpc/run_local_array.sh /path/to/run START END [concurrency]
 ```
 
 Runs array tasks `START` to `END` locally using `xargs -P` for parallelism.
 
 ---
 
-### `slurm/run_local_array_gpu.sh` — Local GPU execution
+### `hpc/run_local_array_gpu.sh` — Local GPU execution
 
 ```bash
 PYTHON=/path/to/envs/excalibr/bin/python \
 CUDA_VISIBLE_DEVICES=0 \
-bash slurm/run_local_array_gpu.sh /path/to/run START END [gpu_id]
+bash hpc/run_local_array_gpu.sh /path/to/run START END [gpu_id]
 ```
 
 Runs all tasks in one process to keep the JAX JIT cache alive across tasks.
 
 ---
 
-### `slurm/run_array_task.py` — Array task worker
+### `hpc/run_array_task.py` — Array task worker
 
 Called by the submission scripts; not intended to be invoked directly.
 
 ```
-python slurm/run_array_task.py <output_dir> <array_idx> [--end <end_idx>] [--device {cpu,gpu}]
+python hpc/run_array_task.py <output_dir> <array_idx> [--end <end_idx>] [--device {cpu,gpu}]
 ```
 
 ---
 
-### `slurm/count_bootstraps.py` — Progress monitoring
+### `hpc/count_bootstraps.py` — Progress monitoring
 
 ```bash
-python slurm/count_bootstraps.py /path/to/run [--verbose]
+python hpc/count_bootstraps.py /path/to/run [--verbose]
 ```
 
 Prints a per-dataset table of completed vs. expected bootstrap iterations.
 
 ---
 
-### `slurm/aggregate_results.py` — Aggregate fit results
+### `hpc/aggregate_results.py` — Aggregate fit results
 
 ```bash
-python slurm/aggregate_results.py /path/to/run [output_file]
+python hpc/aggregate_results.py /path/to/run [output_file]
 ```
 
 Merges all per-bootstrap `*.pkl` files into `bootstrap_results.json.gz`, which is the input for `run_igvf_batch.py --precomputed-fits`.

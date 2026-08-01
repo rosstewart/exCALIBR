@@ -36,7 +36,6 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-from joblib import Parallel, delayed
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -887,9 +886,13 @@ def main():
     parser.add_argument("--datasets", nargs="*", default=None,
                        help="Only process these dataset names (default: all in config)")
 
-    # Parallelization
-    parser.add_argument("--n-jobs", type=int, default=1,
-                       help="Number of datasets to process in parallel (default: 1)")
+    # Parallelization. Datasets are always processed one at a time (not
+    # in parallel with each other) -- --n-jobs-inner is the only dial, and
+    # controls how many CPUs each dataset's own bootstrap fitting/config
+    # combos use. (An earlier --n-jobs "datasets in parallel" option was
+    # removed: combined with --n-jobs-inner's -1/all-CPUs default it was
+    # easy to accidentally oversubscribe the machine by N-datasets-worth of
+    # all-CPU inner pools at once.)
     parser.add_argument("--n-jobs-inner", type=int, default=-1,
                        help="Number of parallel jobs within each dataset (default: -1 = all CPUs)")
 
@@ -1247,24 +1250,11 @@ def main():
             clinvar_mode,
         ))
 
-    # --all-configs: calibration + viz per dataset, parallelised across datasets
+    # --all-configs: calibration + viz per dataset, one dataset at a time
     if getattr(args, "all_configs", False):
-        import multiprocessing as _mp
         from argparse import Namespace as _NS
 
         ac_args = _NS(**vars(args))
-        n_cpus = _mp.cpu_count()
-        if getattr(ac_args, "viz_only", False):
-            # Viz only: no bootstrap workers, so use all CPUs across datasets.
-            # Respect an explicit --n-jobs; default of 1 means "user didn't set it",
-            # so override to all CPUs.
-            ac_args.n_jobs_inner = 1
-            if args.n_jobs == 1:
-                ac_args.n_jobs = -1
-        else:
-            # Scale inner job count so n_jobs outer × n_jobs_inner ≤ n_cpus
-            if args.n_jobs != 1 and args.n_jobs_inner == -1:
-                ac_args.n_jobs_inner = max(1, n_cpus // abs(args.n_jobs))
 
         def _all_configs_job(name, boot_results, sel_cfg, cv_mode, ovr):
             if not getattr(ac_args, "viz_only", False):
@@ -1281,17 +1271,10 @@ def main():
                 sel_cfg = (sel_nc, sel_benign)
             jobs.append((name, boot_results, sel_cfg, cv_mode, ovr))
 
-        print(f"\n[all-configs] {len(jobs)} datasets  (n_jobs={ac_args.n_jobs}, "
-              f"n_jobs_inner={ac_args.n_jobs_inner})...")
-        if ac_args.n_jobs == 1:
-            for idx, (name, boot_results, sel_cfg, cv_mode, ovr) in enumerate(jobs, 1):
-                print(f"\n{'='*80}\n[{idx}/{len(jobs)}] {name}  (selected: {sel_cfg})\n{'='*80}")
-                _all_configs_job(name, boot_results, sel_cfg, cv_mode, ovr)
-        else:
-            Parallel(n_jobs=ac_args.n_jobs, verbose=5)(
-                delayed(_all_configs_job)(name, boot_results, sel_cfg, cv_mode, ovr)
-                for name, boot_results, sel_cfg, cv_mode, ovr in jobs
-            )
+        print(f"\n[all-configs] {len(jobs)} datasets  (n_jobs_inner={ac_args.n_jobs_inner})...")
+        for idx, (name, boot_results, sel_cfg, cv_mode, ovr) in enumerate(jobs, 1):
+            print(f"\n{'='*80}\n[{idx}/{len(jobs)}] {name}  (selected: {sel_cfg})\n{'='*80}")
+            _all_configs_job(name, boot_results, sel_cfg, cv_mode, ovr)
         print(f"\n{'='*80}\nALL-CONFIGS COMPLETE\n{'='*80}")
         return
 
@@ -1304,38 +1287,20 @@ def main():
     print(f"\nProcessing {len(datasets_to_process)} datasets × "
           f"{len(acmg_mapping_methods)} ACMG-mapping method(s)...")
 
-    if args.n_jobs == 1:
-        # Sequential processing
-        idx = 0
-        for name, dataset_df, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process:
-            idx += 1
-            for acmg_mapping_method in acmg_mapping_methods:
-                print(f"\n{'='*80}")
-                print(f"[{idx}/{len(datasets_to_process)}] {name} "
-                      f"({n_c}, {benign}, acmg_mapping_method={acmg_mapping_method})")
-                print(f"{'='*80}")
-                run_single_dataset(name, dataset_df, boot_results, n_c, benign, ovr, args, splits,
-                                   acmg_mapping_method=acmg_mapping_method,
-                                   output_name_suffix=suffix(acmg_mapping_method),
-                                   clinvar_mode=cv_mode)
-    else:
-        # Parallel dataset processing — scale inner jobs to avoid CPU oversubscription
-        import multiprocessing
-        from argparse import Namespace
-        parallel_args = Namespace(**vars(args))
-        if args.n_jobs_inner == -1:
-            n_cpus = multiprocessing.cpu_count()
-            parallel_args.n_jobs_inner = max(1, n_cpus // abs(args.n_jobs))
-        Parallel(n_jobs=args.n_jobs, verbose=10)(
-            delayed(run_single_dataset)(
-                name, dataset_df, boot_results, n_c, benign, ovr, parallel_args, splits,
-                acmg_mapping_method=acmg_mapping_method,
-                output_name_suffix=suffix(acmg_mapping_method),
-                clinvar_mode=cv_mode,
-            )
-            for name, dataset_df, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process
-            for acmg_mapping_method in acmg_mapping_methods
-        )
+    # Datasets are always processed one at a time; --n-jobs-inner controls
+    # parallelism within each dataset's own bootstrap fitting.
+    idx = 0
+    for name, dataset_df, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process:
+        idx += 1
+        for acmg_mapping_method in acmg_mapping_methods:
+            print(f"\n{'='*80}")
+            print(f"[{idx}/{len(datasets_to_process)}] {name} "
+                  f"({n_c}, {benign}, acmg_mapping_method={acmg_mapping_method})")
+            print(f"{'='*80}")
+            run_single_dataset(name, dataset_df, boot_results, n_c, benign, ovr, args, splits,
+                               acmg_mapping_method=acmg_mapping_method,
+                               output_name_suffix=suffix(acmg_mapping_method),
+                               clinvar_mode=cv_mode)
 
     print(f"\n{'='*80}")
     print("BATCH PROCESSING COMPLETE")

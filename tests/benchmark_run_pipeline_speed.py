@@ -46,10 +46,8 @@ def time_one_component_count(n_c: int, n_jobs: int, output_dir: str) -> dict:
         n_bootstraps=DEFAULT_N_BOOTSTRAPS,
         num_fits_per_bootstrap=DEFAULT_FITS_PER_BOOTSTRAP,
         components=[n_c],
-        execution_mode="parallel",
         n_jobs=n_jobs,
-        clinvar_release="2026",  # match run_pipeline.py's CLI default (PipelineConfig's own
-                                 # dataclass default is "2025" -- only the CLI defaults to "2026")
+        clinvar_release="2026",
         auto_select_model=False,  # single component count; model selection N/A
     )
     logger = setup_logging(config.output_dir, config.dataset_name)

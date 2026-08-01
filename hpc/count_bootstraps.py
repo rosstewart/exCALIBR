@@ -3,7 +3,7 @@
 Report bootstrap fit completion progress for an ExCALIBR output directory.
 
 Usage:
-    python slurm/count_bootstraps.py <output_dir> [--verbose]
+    python hpc/count_bootstraps.py <output_dir> [--verbose]
 
 Reads <output_dir>/jobs/job_index.json to know which datasets and how many
 bootstraps are expected, then scans for

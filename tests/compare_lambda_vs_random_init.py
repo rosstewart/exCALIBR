@@ -42,7 +42,7 @@ from tests.benchmark_num_fits_dataframe import (
     build_unbootstrapped_jobs, run_restarts, sign_change, Tee, resolve_inner_jobs,
     RESTART_GRID, _load_new_to_old, _DEFAULT_DATAFRAME, _DEFAULT_CONFIG,
 )
-from slurm.prepare import _components_from_config, _requires_2018
+from hpc.prepare import _components_from_config, _requires_2018
 from src.assay_calibration.data_utils.dataset import Scoreset
 
 _DEFAULT_BOOTSTRAP_RESULTS = "/data/ross/assay_calibration/explorer_jobs_pp_merged_89datasets_bootstrap_results.json.gz"

@@ -168,10 +168,9 @@ class PipelineConfig:
     oob_min_samples: int = 1
 
     # Execution parameters. For running many datasets across a SLURM cluster,
-    # use the separate batch HPC workflow (slurm/prepare.py + slurm/submit_array.sh)
-    # documented in the README, not these -- these control single-dataset,
-    # single-process execution only.
-    execution_mode: Literal["parallel", "single"] = "parallel"
+    # use the separate batch HPC workflow (hpc/prepare.py + hpc/submit_array.sh)
+    # documented in the README, not these -- n_jobs controls single-dataset,
+    # single-process parallelism only (n_jobs=1 for single-threaded execution).
     n_jobs: int = -1  # -1 uses all available CPUs
     device: Literal["cpu", "gpu"] = "cpu"  # "gpu" batches fits through jax_batch (see BootstrapRunner)
 

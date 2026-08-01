@@ -46,8 +46,8 @@ Requires Benign or Synonymous after filtering. All other columns are optional co
 
 ### 3. MaveDB format
 
-MaveDB-style CSV with functional classification columns; used via `slurm/prepare.py mavedb`.
+MaveDB-style CSV with functional classification columns; used via `hpc/prepare.py mavedb`.
 
 Implementation: `src/assay_calibration/data_utils/dataset.py` — `BasicScoreset`, `Scoreset`, `MultiScoreset`, `BasicMultiScoreset`.
 
-> Multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `slurm/prepare.py multivariate`) and calibration of computational predictor scores like REVEL/AlphaMissense (`slurm/prepare.py predictor-mv`, `predictor_mv_utils.py`) are also supported but not yet documented here. Ask in the repo/issues if you want to use either.
+> Multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `hpc/prepare.py multivariate`) and calibration of computational predictor scores like REVEL/AlphaMissense (`hpc/prepare.py predictor-mv`, `predictor_mv_utils.py`) are also supported but not yet documented here. Ask in the repo/issues if you want to use either.

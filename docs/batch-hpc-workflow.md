@@ -7,7 +7,7 @@ For calibrating many datasets, use the decoupled batch workflow: fitting runs on
 ### Step 1 — Generate job manifest
 
 ```bash
-python slurm/prepare.py default \
+python hpc/prepare.py default \
     --output-dir /path/to/run \
     --dataframe variants.tsv.gz
 
@@ -25,41 +25,41 @@ Outputs `<output_dir>/jobs/job_index.json` and `jobs/array_NNNN.pkl` files.
 
 **SLURM CPU array:**
 ```bash
-bash slurm/submit_array.sh /path/to/run
+bash hpc/submit_array.sh /path/to/run
 ```
 
 Key env-var overrides: `SLURM_ACCOUNT`, `SLURM_PARTITION` (default: `short`), `SLURM_TIME` (default: `23:59:00`), `SLURM_MEM` (default: `1G`), `SLURM_CPUS` (default: `8`), `PYTHON` (default: system python).
 
 **SLURM GPU array:**
 ```bash
-bash slurm/submit_array_gpu.sh /path/to/run
+bash hpc/submit_array_gpu.sh /path/to/run
 ```
 
 Additional overrides: `N_GPUS` (default: `32`), `CUDA_MODULE`, `CONDA_MODULE`.
 
 **Local CPU:**
 ```bash
-bash slurm/run_local_array.sh /path/to/run START END [concurrency]
-# Example: bash slurm/run_local_array.sh /path/to/run 0 999 8
+bash hpc/run_local_array.sh /path/to/run START END [concurrency]
+# Example: bash hpc/run_local_array.sh /path/to/run 0 999 8
 ```
 
 **Local GPU:**
 ```bash
 PYTHON=/path/to/envs/excalibr/bin/python \
 CUDA_VISIBLE_DEVICES=0 \
-bash slurm/run_local_array_gpu.sh /path/to/run START END
+bash hpc/run_local_array_gpu.sh /path/to/run START END
 ```
 
 ### Step 3 — Monitor progress
 
 ```bash
-python slurm/count_bootstraps.py /path/to/run [--verbose]
+python hpc/count_bootstraps.py /path/to/run [--verbose]
 ```
 
 ### Step 4 — Aggregate fit results
 
 ```bash
-python slurm/aggregate_results.py /path/to/run
+python hpc/aggregate_results.py /path/to/run
 # Writes /path/to/run/bootstrap_results.json.gz
 ```
 

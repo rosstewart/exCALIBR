@@ -3,7 +3,7 @@
 Aggregate ExCALIBR bootstrap fit results into a single json.gz file.
 
 Usage:
-    python slurm/aggregate_results.py <output_dir> [output_file]
+    python hpc/aggregate_results.py <output_dir> [output_file]
 
 Scans all <output_dir>/<dataset>/bootstrap_*_best_fits.pkl files,
 merges them, and writes:

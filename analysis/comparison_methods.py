@@ -133,7 +133,7 @@ def build_variants_df_from_scoreset(scoreset) -> pd.DataFrame:
     *_variants.csv (see src/assay_calibration/pipeline/variant_evidence.py);
     reused here so run_acmgscaler/make_acmgscaler_figure work identically
     whether df_variants came from a saved *_variants.csv or was built fresh
-    from the master dataframe like run_igvf_batch.py/slurm/simple_gmm_baseline.py do.
+    from the master dataframe like run_igvf_batch.py/hpc/simple_gmm_baseline.py do.
     """
     from src.assay_calibration.pipeline.variant_evidence import _get_variant_ids
 
@@ -310,7 +310,7 @@ def load_comparison_variants(dataset: str, comp: str, output_dir) -> Optional[pd
 
 
 def load_gmm_baseline_points(json_path: Optional[str] = None) -> dict:
-    """Load slurm/simple_gmm_baseline.py's output JSON (once you've run it --
+    """Load hpc/simple_gmm_baseline.py's output JSON (once you've run it --
     see analysis.config.GMM_BASELINE_JSON) into a lookup:
 
         {(dataset_name, variant): {"pathogenic_mean", "pathogenic_std",
@@ -331,7 +331,7 @@ def load_gmm_baseline_points(json_path: Optional[str] = None) -> dict:
     json_path = json_path or cfg.GMM_BASELINE_JSON
     if not json_path:
         raise FileNotFoundError(
-            "No GMM baseline JSON configured -- run slurm/simple_gmm_baseline.py "
+            "No GMM baseline JSON configured -- run hpc/simple_gmm_baseline.py "
             "and set analysis.config.GMM_BASELINE_JSON (or pass json_path explicitly)."
         )
     with open(json_path) as f:

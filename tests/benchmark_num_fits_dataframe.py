@@ -2,10 +2,10 @@
 """
 No-bootstrap, all-dataset restart-count sweep, driven directly from the
 IGVF dataframe + dataset-config JSON (same inputs as
-`slurm/prepare.py pillar_project`), but on the CPU fitting path
+`hpc/prepare.py pillar_project`), but on the CPU fitting path
 (Fit.generate_fit_jobs + tryToFit), not the GPU/jax_batch path.
 
-`slurm/prepare.py`'s pillar_project/default modes hardcode 1000 bootstraps x
+`hpc/prepare.py`'s pillar_project/default modes hardcode 1000 bootstraps x
 100 fits with no CLI override, so this script builds an unbootstrapped
 (bootstrap=False, whole dataset) Fit job list directly instead, runs
 `--num-fits` restarts per dataset, and reports (a) how best-of-N degrades as
@@ -36,7 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from joblib import Parallel, delayed
 
-from slurm.prepare import _components_from_config, _requires_2018
+from hpc.prepare import _components_from_config, _requires_2018
 from src.assay_calibration.data_utils.dataset import Scoreset
 from src.assay_calibration.fit_utils.fit import Fit, _weighted_val_ll
 

@@ -2,7 +2,7 @@
 """
 Run acmgscaler against every dataset, loading directly from the master
 integrated dataframe and building a fresh Scoreset per dataset -- same
-pattern as run_igvf_batch.py / slurm/simple_gmm_baseline.py. No dependency
+pattern as run_igvf_batch.py / hpc/simple_gmm_baseline.py. No dependency
 on ExCALIBR pipeline output existing at all: this never reads
 *_variants.csv, and --output-dir is purely a fresh destination for
 acmgscaler's own figures/CSV, not shared with the pipeline's own output.
@@ -38,7 +38,7 @@ from joblib import Parallel, delayed
 
 from analysis import config as cfg
 
-# Same set run_igvf_batch.py / slurm/simple_gmm_baseline.py use to decide
+# Same set run_igvf_batch.py / hpc/simple_gmm_baseline.py use to decide
 # which datasets need clinvar_release="2018" (those genes were only ever
 # curated with 2018-era ClinVar significance calls).
 GENES_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}

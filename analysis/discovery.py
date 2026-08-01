@@ -274,7 +274,7 @@ def _filter_dataset_df(df_full: pd.DataFrame, dataset: str, dataset_tsv: str) ->
 
 
 def _resolve_n_jobs(n_requested: int) -> int:
-    """CPU-affinity-aware worker count -- same idea as slurm/prepare.py's
+    """CPU-affinity-aware worker count -- same idea as hpc/prepare.py's
     _resolve_n_jobs (cgroup-visible core count, not raw os.cpu_count())."""
     import os as _os
     if n_requested != -1:
@@ -316,7 +316,7 @@ def _run_scoreset_job(dataset: str, method: str, comp: str, cal_path: Path, df_d
                        oob_csv_path: Optional[Path] = None):
     """Module-level (not a closure) so joblib/cloudpickle only ever pickles
     the *one* dataset slice passed in as `df_ds` for this call, matching
-    slurm/prepare.py's `partitions[ds]` pattern -- a nested/closure-based
+    hpc/prepare.py's `partitions[ds]` pattern -- a nested/closure-based
     worker here would instead capture and re-serialize every dataset's slice
     on every single task, which is what made an earlier version of this
     silently thrash (huge duplicated payloads) instead of running in

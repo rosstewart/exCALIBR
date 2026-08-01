@@ -18,14 +18,14 @@ from .config import PipelineConfig
 from .utils import load_dataset_from_df
 
 class BootstrapRunner:
-    """Handles bootstrap fitting with different execution modes"""
-    
+    """Handles bootstrap fitting"""
+
     def __init__(self, config: PipelineConfig, reporter: "ProgressReporter | None" = None):
         self.config = config
         self.reporter = reporter
         self.dataset = None
         self.fitter = None
-        
+
     def run(self) -> Tuple[Dict, Optional[Dict]]:
         """Main entry point for bootstrap fitting.
 
@@ -37,11 +37,7 @@ class BootstrapRunner:
         # Load dataset
         self._load_dataset()
 
-        # Choose execution strategy
-        if self.config.execution_mode == "parallel":
-            return self._run_parallel()
-        else:  # single
-            return self._run_single()
+        return self._run_parallel()
     
     def _load_dataset(self):
         """Load dataset from CSV"""
@@ -168,31 +164,6 @@ class BootstrapRunner:
             print(f"  ✗ Fit failed: {e}")
             return None
     
-    def _run_single(self) -> Tuple[Dict, Dict]:
-        """Run bootstrap fits single-threaded (for debugging)"""
-        print(f"\nRunning {self.config.n_bootstraps} bootstraps (single-threaded)...")
-        print("Warning: This will be slow. Consider using --mode parallel")
-        
-        # Generate all jobs first to extract splits
-        all_jobs = []
-        for bootstrap_idx in range(self.config.n_bootstraps):
-            all_jobs.append(self._generate_bootstrap_job(bootstrap_idx))
-        
-        dataset_splits = self._extract_splits(all_jobs)
-        
-        results = []
-        for bootstrap_idx, bootstrap_job in enumerate(all_jobs):
-            print(f"\nBootstrap {bootstrap_idx + 1}/{self.config.n_bootstraps}")
-            
-            result = self._execute_bootstrap_job(bootstrap_job)
-            results.append(result)
-            
-            if (bootstrap_idx + 1) % 10 == 0:
-                print(f"  Completed {bootstrap_idx + 1}/{self.config.n_bootstraps}")
-        
-        return self._aggregate_results(results), dataset_splits
-
-    
     @staticmethod
     def _extract_splits(all_jobs: List[Dict]) -> Dict[int, Dict]:
         """Extract val observations/assignments from pre-generated jobs for OOB."""
@@ -266,52 +237,4 @@ class BootstrapRunner:
             'dataset_name': self.config.dataset_name,
             'component_jobs': all_jobs
         }
-    
-    def _execute_bootstrap_job(self, bootstrap_job: Dict) -> Dict:
-        """Execute all fits for a single bootstrap iteration"""
-        
-        bootstrap_seed = bootstrap_job['bootstrap_seed']
-        results = {'bootstrap_seed': bootstrap_seed}
-        
-        # Execute fits for each component count
-        for component_key, job_data in bootstrap_job['component_jobs'].items():
-            shared_data = job_data['shared_data']
-            best_val_ll = -np.inf
-            best_result = None
-            
-            # Run all fits for this component count
-            for minimal_job in job_data['jobs']:
-                try:
-                    # Reconstruct full job
-                    full_job = {**minimal_job, **shared_data}
-                    full_job['dataset_name'] = self.config.dataset_name
-                    
-                    # Execute fit
-                    result = Fit.execute_fit_job(full_job)
-                    
-                    # Track best fit
-                    if result['val_ll'] > best_val_ll:
-                        best_result = result
-                        best_val_ll = result['val_ll']
-                
-                except Exception as e:
-                    print(f"  ✗ Fit failed: {e}")
-                    continue
-            
-            results[component_key] = best_result
-        
-        return results
-    
-    def _aggregate_results(self, results: List[Dict]) -> Dict:
-        """Aggregate bootstrap results into final structure"""
-        
-        aggregated = {}
-        for result in results:
-            bootstrap_seed = result['bootstrap_seed']
-            aggregated[bootstrap_seed] = {
-                k: v for k, v in result.items() 
-                if k != 'bootstrap_seed'
-            }
-        
-        return aggregated
     

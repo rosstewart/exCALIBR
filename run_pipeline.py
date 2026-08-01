@@ -63,8 +63,8 @@ Examples:
   python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
       --n-bootstraps 500 --save-fits
 
-  # Single-threaded execution (slow)
-  python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 --mode single
+  # Single-threaded execution (slow, e.g. for debugging with pdb)
+  python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 --n-jobs 1
         """
     )
 
@@ -104,18 +104,14 @@ Examples:
                        help="(Advanced) fits per bootstrap iteration, overriding --preset's value. "
                             "Default: whatever --preset implies (8 for 'light').")
 
-    # Execution mode
-    # NOTE: for running many datasets across a SLURM cluster, use the separate
-    # batch HPC workflow (slurm/prepare.py + slurm/submit_array.sh) documented
-    # in the README instead -- these two modes are for running this single
-    # dataset directly, in this one process.
-    parser.add_argument("--mode", choices=["parallel", "single"],
-                       default="parallel",
-                       help="'parallel' (default): fit bootstraps using --n-jobs worker "
-                            "processes. 'single': fit bootstraps one at a time in this "
-                            "process (slower; only useful for debugging).")
+    # Execution parameters. For running many datasets across a SLURM
+    # cluster, use the separate batch HPC workflow (hpc/prepare.py +
+    # hpc/submit_array.sh) documented in the README instead -- --n-jobs
+    # controls parallelism for this single dataset, in this one process
+    # (pass --n-jobs 1 for single-threaded/debugging execution).
     parser.add_argument("--n-jobs", type=int, default=-1,
-                       help="Number of parallel jobs (-1 = all CPUs, default: -1)")
+                       help="Number of parallel jobs (-1 = all CPUs, default: -1; use 1 for "
+                            "single-threaded execution, e.g. for debugging with pdb)")
     parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
                        help="cpu (default): existing per-job joblib path. "
                             "gpu: batch fits through src/assay_calibration/fit_utils/jax_batch and "
@@ -344,7 +340,6 @@ Examples:
         scoreset_flipped_override=flipped_override,
         compute_oob=args.oob,
         oob_min_samples=args.oob_min_samples,
-        execution_mode=args.mode,
         n_jobs=args.n_jobs,
         device=args.device,
         auto_select_model=not args.no_auto_select,
@@ -440,7 +435,7 @@ def run_calibration_pipeline(config: PipelineConfig, fits_name: Optional[str] = 
         logger.info(f"Precomputed fits: {config.precomputed_fits}")
     else:
         logger.info(f"Bootstraps: {config.n_bootstraps}")
-    logger.info(f"Execution: {config.execution_mode}")
+    logger.info(f"n_jobs: {config.n_jobs}")
 
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)

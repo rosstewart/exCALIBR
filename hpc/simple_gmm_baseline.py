@@ -29,7 +29,7 @@ calculate_score_ranges — no bootstrap variance, no restarts.
 
 Usage
 -----
-  python slurm/simple_gmm_baseline.py --output-dir DIR [--dataframe F] [--n-jobs N] [--prior P]
+  python hpc/simple_gmm_baseline.py --output-dir DIR [--dataframe F] [--n-jobs N] [--prior P]
 """
 
 import sys

@@ -1,6 +1,6 @@
 # ExCALIBR SLURM Workflow
 
-All scripts live in `slurm/` and accept an `<output_dir>` argument so they can be
+All scripts live in `hpc/` and accept an `<output_dir>` argument so they can be
 run from any directory.
 
 ---
@@ -9,11 +9,11 @@ run from any directory.
 
 ### 1. Generate the job manifest
 
-All manifest modes are unified in `slurm/prepare.py`.  Run with a sub-command:
+All manifest modes are unified in `hpc/prepare.py`.  Run with a sub-command:
 
 ```bash
 # Standard univariate (most common):
-python slurm/prepare.py default \
+python hpc/prepare.py default \
     --output-dir /projects/pedjas_lab/stewart.ro/my_run \
     --dataframe /data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz \
     --config-file src/igvf_configs/dataset_configs_jan_2026.json \
@@ -21,30 +21,30 @@ python slurm/prepare.py default \
     --n-jobs 30
 
 # MaveDB / label-seq input:
-python slurm/prepare.py mavedb \
+python hpc/prepare.py mavedb \
     --output-dir /projects/pedjas_lab/stewart.ro/my_run \
     --dataframe /data/ross/labelseq/my_data.csv.gz \
     --score-cols "Median activation" "Median PemR" \
     --splice-measure no --n-jobs 30
 
 # BasicScoreset (pre-built sample_assignments column):
-python slurm/prepare.py basicscoreset \
+python hpc/prepare.py basicscoreset \
     --output-dir /projects/pedjas_lab/stewart.ro/my_run \
     --data-dir /data/ross/predictor_scores/single_gene_calibration_data
 
 # Multi-assay multivariate:
-python slurm/prepare.py multivariate \
+python hpc/prepare.py multivariate \
     --output-dir /projects/pedjas_lab/stewart.ro/my_run \
     --genes BRCA1 BRCA2 --components 2 3 --constraints both
 
 # Predictor-score multivariate (REVEL / MutPred2 / AlphaMissense):
-python slurm/prepare.py predictor-mv \
+python hpc/prepare.py predictor-mv \
     --output-dir /projects/pedjas_lab/stewart.ro/my_run \
     --data-dir /data/ross/predictor_scores/single_gene_calibration_data \
     --genes BRCA1 --components 2 3
 
 # List available multi-assay genes without generating jobs:
-python slurm/prepare.py multivariate --output-dir /tmp/ignore --list-only
+python hpc/prepare.py multivariate --output-dir /tmp/ignore --list-only
 ```
 
 This writes:
@@ -65,7 +65,7 @@ One dataset name per line; `#` comments are supported.
 ### 2. Submit the array job
 
 ```bash
-bash slurm/submit_array.sh <output_dir>
+bash hpc/submit_array.sh <output_dir>
 ```
 
 **Tunable parameters** (set as environment variables before calling):
@@ -85,7 +85,7 @@ Example with overrides:
 
 ```bash
 SLURM_MEM=8G SLURM_CPUS=24 SLURM_TIME=11:00:00 \
-    bash slurm/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
+    bash hpc/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
 ```
 
 Each worker reads `SLURM_CPUS_PER_TASK` from the environment to set its own
@@ -96,9 +96,9 @@ Each worker reads `SLURM_CPUS_PER_TASK` from the environment to set its own
 ### 3. Monitor progress
 
 ```bash
-python slurm/count_bootstraps.py <output_dir>
+python hpc/count_bootstraps.py <output_dir>
 # or with per-dataset missing-seed details:
-python slurm/count_bootstraps.py <output_dir> --verbose
+python hpc/count_bootstraps.py <output_dir> --verbose
 ```
 
 Shows completed / expected bootstraps per dataset, broken down by component (2c / 3c).
@@ -114,7 +114,7 @@ the file is updated in place.  Re-submitting the same array job is therefore saf
 To re-run only specific tasks you can also call the worker directly:
 
 ```bash
-python slurm/run_array_task.py <output_dir> <array_idx>
+python hpc/run_array_task.py <output_dir> <array_idx>
 ```
 
 ---
@@ -124,11 +124,11 @@ python slurm/run_array_task.py <output_dir> <array_idx>
 Once all tasks are complete:
 
 ```bash
-python slurm/aggregate_results.py <output_dir>
+python hpc/aggregate_results.py <output_dir>
 # writes <output_dir>/bootstrap_results.json.gz
 
 # or to a custom path:
-python slurm/aggregate_results.py <output_dir> /path/to/results.json.gz
+python hpc/aggregate_results.py <output_dir> /path/to/results.json.gz
 ```
 
 ---
@@ -138,7 +138,7 @@ python slurm/aggregate_results.py <output_dir> /path/to/results.json.gz
 ```
 <output_dir>/
   jobs/
-    job_index.json          ← task index; read by all slurm/ scripts
+    job_index.json          ← task index; read by all hpc/ scripts
     array_0000.pkl
     array_0001.pkl
     ...

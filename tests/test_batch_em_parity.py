@@ -3,7 +3,7 @@ vs. the existing per-job NumPy path (cfusn/fit.py::single_fit via
 Fit.execute_fit_job).
 
 These were written without ever running them (no CUDA/JAX available on the
-authoring machine — see slurm/README.md and the "gpu" branch's plan). Run
+authoring machine — see hpc/README.md and the "gpu" branch's plan). Run
 this file FIRST on the GPU machine, before trusting any GPU output:
 
     source activate excalibr   # or your env

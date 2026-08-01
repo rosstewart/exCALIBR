@@ -4,7 +4,7 @@
 # ProcessPoolExecutor for parallelism (sized via SLURM_CPUS_PER_TASK).
 #
 # Usage:
-#   bash slurm/run_local_array.sh <output_dir> <start_idx> <end_idx> [concurrency]
+#   bash hpc/run_local_array.sh <output_dir> <start_idx> <end_idx> [concurrency]
 #
 # concurrency (default 1): how many array indices to run at once. Each one
 # gets nproc/concurrency cores. Leave at 1 unless a single array task's job
@@ -13,8 +13,8 @@
 # for less idle time between tasks.
 #
 # Examples:
-#   bash slurm/run_local_array.sh /shared/mv_run 0   499
-#   bash slurm/run_local_array.sh /shared/mv_run 500 999
+#   bash hpc/run_local_array.sh /shared/mv_run 0   499
+#   bash hpc/run_local_array.sh /shared/mv_run 500 999
 
 set -euo pipefail
 

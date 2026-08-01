@@ -3,7 +3,7 @@
 ExCALIBR bootstrap fit worker — runs one SLURM array task.
 
 Usage:
-    python slurm/run_array_task.py <output_dir> <array_idx> [--device {cpu,gpu}]
+    python hpc/run_array_task.py <output_dir> <array_idx> [--device {cpu,gpu}]
 
 Loads <output_dir>/jobs/array_<NNNN>.pkl, runs the fits it describes,
 and writes per-bootstrap results to <output_dir>/<dataset_name>/.
@@ -227,7 +227,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
                         help="cpu (default): existing per-job ProcessPoolExecutor path. "
                              "gpu: batch jobs through jax_batch and run on GPU "
-                             "(see slurm/submit_array_gpu.sh).")
+                             "(see hpc/submit_array_gpu.sh).")
     args = parser.parse_args()
     if args.end is not None:
         for idx in range(args.array_idx, args.end + 1):
