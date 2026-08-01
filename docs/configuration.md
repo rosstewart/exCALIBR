@@ -42,15 +42,15 @@ Per-variant point-value changes vs. reference (% of all variants):
 
 Sign flip (pathogenic ↔ benign) is 0.0% at every level tested.
 
-Aggregate-metric drift, 90th-percentile absolute Δ across datasets:
+Aggregate-metric drift across datasets, median (IQR: 25th–75th percentile), absolute Δ:
 
 | `--n-bootstraps` | Accuracy Δ | MCC Δ | Coverage Δ |
 |---|---|---|---|
-| 20  | 3.3pp | 5.0pp | 9.3pp |
-| 50  | 2.2pp | 4.1pp | 4.9pp |
-| 100 | 2.7pp | 4.0pp | 4.2pp |
-| 250 | 0.8pp | 0.4pp | 1.8pp |
-| 500 | 0.7pp | 0.6pp | 2.0pp |
+| 20  | 0.06pp (0–0.73) | 0.04pp (0–0.91) | 0.84pp (0–2.52) |
+| 50  | 0.01pp (0–0.23) | 0.01pp (0–0.39) | 0.28pp (0–1.68) |
+| 100 | 0.00pp (0–0.23) | 0.00pp (0–0.28) | 0.17pp (0–1.68) |
+| 250 | 0.00pp (0–0.04) | 0.00pp (0–0.02) | 0.00pp (0–0.35) |
+| 500 | 0.00pp (0–0.00) | 0.00pp (0–0.00) | 0.00pp (0–0.19) |
 
 #### Speed estimates
 
