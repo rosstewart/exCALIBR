@@ -62,17 +62,17 @@ def parse_dataset_config(
       - ["3c", "avg", {"liberal_monotonicity": false}] -> with overrides
 
     Recognized override keys include "liberal_monotonicity", "postprocess_point_ranges",
-    "scoreset_flipped_override", and "pathogenic_percentile" (float, default 5.0) -- e.g.:
-      {"n_c": "3c", "benign_method": "avg", "pathogenic_percentile": 5.0}
+    and "scoreset_flipped_override" -- e.g.:
+      {"n_c": "3c", "benign_method": "avg", "liberal_monotonicity": false}
     or list form:
-      ["3c", "avg", {"pathogenic_percentile": 5.0}]
-    Precedence: per-dataset override > global --pathogenic-percentile CLI flag > field
-    default (5.0).
+      ["3c", "avg", {"liberal_monotonicity": false}]
 
-    "filter_pathogenic_sample_by_lr" is NOT a per-dataset override -- it is a global,
-    batch-wide setting controlled only by the --filter-pathogenic-sample-by-lr CLI flag,
-    applied uniformly to every dataset in the run. Same for "pathomechanism_method"
-    (controlled only by --pathomechanism-method).
+    "pathogenic_percentile" and "benign_percentile" are NOT per-dataset overrides --
+    they are global, batch-wide settings controlled only by the
+    --pathogenic-percentile/--benign-percentile CLI flags, applied uniformly to
+    every dataset in the run. Same for "filter_pathogenic_sample_by_lr"
+    (controlled only by --filter-pathogenic-sample-by-lr) and
+    "pathomechanism_method" (controlled only by --pathomechanism-method).
     """
     if isinstance(config_entry, dict):
         n_c = config_entry["n_c"]
@@ -90,7 +90,7 @@ def parse_dataset_config(
 
 def run_single_dataset(
     dataset_name: str,
-    df: pd.DataFrame,
+    dataset_df: pd.DataFrame,
     bootstrap_results: Dict,
     n_c: str,
     benign_method: str,
@@ -105,6 +105,11 @@ def run_single_dataset(
 
     Parameters
     ----------
+    dataset_df : pd.DataFrame
+        Already filtered to just this dataset's rows by the caller (so that
+        parallel/multi-process dispatch -- e.g. joblib's process-based
+        backend -- only ever copies the small per-dataset slice into each
+        worker, not the entire multi-dataset input CSV/TSV).
     n_c : str
         Component key, e.g. ``"2c"`` or ``"3c"``.  The special value
         ``"all"`` processes both 2c and 3c (with model selection saved
@@ -114,8 +119,7 @@ def run_single_dataset(
         ``"default"``  – use dataset name / ``--clinvar-release`` arg as before
     """
 
-    csv_name = dataset_name.replace("_clinvar_2018", "")
-    dataset_df = df[df["Dataset"] == csv_name].copy()
+    dataset_df = dataset_df.copy()
     if len(dataset_df) == 0:
         print(f"  SKIP {dataset_name}: no rows in dataset CSV")
         return None
@@ -152,11 +156,11 @@ def run_single_dataset(
         postprocess_point_ranges=overrides.get(
             "postprocess_point_ranges", not getattr(args, "no_postprocess", False)
         ),
+        auto_bidirectional=getattr(args, "auto_bidirectional", True),
         benign_method=benign_method,
         scoreset_flipped_override=overrides.get("scoreset_flipped_override", None),
-        pathogenic_percentile=overrides.get(
-            "pathogenic_percentile", getattr(args, "pathogenic_percentile", 5.0)
-        ),
+        pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
+        benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=getattr(args, "filter_pathogenic_sample_by_lr", False),
         pathomechanism_method=getattr(args, "pathomechanism_method", None),
         compute_oob=args.oob,
@@ -233,6 +237,8 @@ def run_single_dataset(
                                 fits=fits, score_range=np.asarray(indv_summary["score_range"]),
                                 config=f"({benign_method})", n_c=comp_key, n_samples=n_samples,
                                 relax=False, flipped=indv_summary.get("scoreset_flipped", False),
+                                pathogenic_percentile=config.pathogenic_percentile,
+                                benign_percentile=config.benign_percentile,
                             )
                             fig.savefig(figure_path, dpi=150)
                             os._exit(0)
@@ -425,7 +431,6 @@ def _run_one_combo(
     return_log_fp_all: bool = False,
     liberal_monotonicity: bool = True,
     postprocess_point_ranges: bool = True,
-    pathogenic_percentile: float = 5.0,
     filter_pathogenic_sample_by_lr: bool = False,
     pathomechanism_method: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[np.ndarray]]:
@@ -463,9 +468,11 @@ def _run_one_combo(
         acmg_bayes_targets=getattr(args, "acmg_bayes_targets", None),
         acmg_bayes_floor_at_neutral=getattr(args, "acmg_bayes_floor_at_neutral", False),
         seed=getattr(args, "seed", None),
-        pathogenic_percentile=pathogenic_percentile,
+        pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
+        benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
         pathomechanism_method=pathomechanism_method,
+        auto_bidirectional=getattr(args, "auto_bidirectional", True),
     )
 
     # Reload scoreset inside the worker (avoids large object serialization)
@@ -572,9 +579,6 @@ def run_all_configs_for_dataset(
     postprocess = (overrides or {}).get(
         "postprocess_point_ranges", not getattr(args, "no_postprocess", False)
     )
-    pathogenic_percentile = (overrides or {}).get(
-        "pathogenic_percentile", getattr(args, "pathogenic_percentile", 5.0)
-    )
     filter_pathogenic_sample_by_lr = getattr(args, "filter_pathogenic_sample_by_lr", False)
     pathomechanism_method = getattr(args, "pathomechanism_method", None)
     for n_c_str, benign_methods in nc_groups.items():
@@ -592,7 +596,6 @@ def run_all_configs_for_dataset(
                 return_log_fp_all=is_avg and both_needed,
                 liberal_monotonicity=liberal_mono,
                 postprocess_point_ranges=postprocess,
-                pathogenic_percentile=pathogenic_percentile,
                 filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
                 pathomechanism_method=pathomechanism_method,
             )
@@ -716,6 +719,8 @@ def generate_all_configs_viz(
         n_jobs=1,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         seed=getattr(args, "seed", None),
+        pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
+        benign_percentile=getattr(args, "benign_percentile", None),
     )
     scoreset = load_dataset_from_df(dataset_df, config_load)
 
@@ -801,6 +806,8 @@ def generate_all_configs_viz(
                     n_samples=scoreset.n_samples,
                     relax=False,
                     flipped=calib.get("scoreset_flipped", False),
+                    pathogenic_percentile=config_load.pathogenic_percentile,
+                    benign_percentile=config_load.benign_percentile,
                 )
                 fig.savefig(fig_path, dpi=150)
                 os._exit(0)
@@ -827,6 +834,8 @@ def generate_all_configs_viz(
                 calibrations=calibrations,
                 selected_config=selected_config,
                 metrics=metrics or None,
+                pathogenic_percentile=config_load.pathogenic_percentile,
+                benign_percentile=config_load.benign_percentile,
             )
             if fig is not None:
                 fig.savefig(comp_path, dpi=120, bbox_inches="tight")
@@ -862,8 +871,8 @@ def main():
                        help="Compute OOB per-variant evidence")
     parser.add_argument("--splits-file", default=None,
                        help="Path to precomputed splits pickle for OOB")
-    parser.add_argument("--oob-min-samples", type=int, default=10,
-                       help="Min OOB samples per variant (default: 10)")
+    parser.add_argument("--oob-min-samples", type=int, default=1,
+                       help="Min OOB samples per variant (default: 1)")
 
     # Filtering
     parser.add_argument("--datasets", nargs="*", default=None,
@@ -919,11 +928,21 @@ def main():
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging (component params, flip detection, point ranges)")
     parser.add_argument("--pathogenic-percentile", type=float, default=5.0,
-                       help="Conservative percentile (paired with 100-p as the upper bound) used for "
+                       help="Conservative (lower-bound/pathogenic-direction) percentile used for "
                             "all bootstrap LR+/threshold percentile calculations (conservative "
                             "thresholds, C-range, OOB LR percentiles, per-variant LR percentiles). "
-                            "Global default for datasets that don't set 'pathogenic_percentile' in "
-                            "--dataset-configs. Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
+                            "Paired by default with 100-p as the upper (benign-direction) bound -- "
+                            "override that independently with --benign-percentile. Global, "
+                            "batch-wide -- applies uniformly to every dataset in the run; not "
+                            "settable per-dataset via --dataset-configs. "
+                            "Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
+    parser.add_argument("--benign-percentile", type=float, default=None,
+                       help="Upper (benign-direction) percentile, independent of "
+                            "--pathogenic-percentile. Omit to keep the historical symmetric "
+                            "pairing (100 - pathogenic-percentile); set explicitly to decouple "
+                            "the two, e.g. to sweep --pathogenic-percentile while always keeping "
+                            "the benign-direction bound at the 95th percentile. Global, batch-wide "
+                            "-- not settable per-dataset via --dataset-configs.")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
     # experimentation only -- mutually exclusive with --pathomechanism-prior below.
     # Parses with default=None; resolve_prior_mode reconciles it after parsing.
@@ -972,6 +991,26 @@ def main():
                             "extend-to-limits). Returns raw LR-threshold-crossing intervals "
                             "as fitted. Intended for bidirectional assays (e.g. LoF/GoF in "
                             "one assay) where standard monotonicity assumptions do not hold.")
+    # Auto-detect bidirectional assays per bootstrap fit (majority vote across
+    # fits) instead of requiring --no-postprocess by hand. On by default.
+    # Global, batch-wide, like --no-postprocess. See PipelineConfig.auto_bidirectional
+    # and BIDIRECTIONAL_VOTE_THRESHOLD / clean_benign_fragments_no_extend /
+    # clean_bidirectional_pathogenic_evidence in fit_utils/point_ranges.py.
+    parser.add_argument("--auto-bidirectional", dest="auto_bidirectional",
+                       action="store_true", default=True,
+                       help="(default: on) Auto-detect bidirectional assays from mixture-component "
+                            "weights (a pathogenic-like component on each side of a benign-like "
+                            "component) and, when a majority of bootstrap fits show the pattern, "
+                            "skip standard monotonicity enforcement for a dataset's pathogenic "
+                            "tiers (benign tiers still get cleaned up, just without extend-to-limits) "
+                            "instead of the standard monotonicity/extend-to-xlims postprocessing. "
+                            "Only applies for n_c >= 3.")
+    parser.add_argument("--no-auto-bidirectional", dest="auto_bidirectional",
+                       action="store_false",
+                       help="Disable automatic bidirectional-assay detection; use standard "
+                            "monotonicity postprocessing unconditionally (or combine with "
+                            "--no-postprocess to disable postprocessing entirely). Global, "
+                            "batch-wide -- not settable per-dataset via --dataset-configs.")
     parser.add_argument("--viz-only", action="store_true",
                        help="Regenerate visualizations only — skip variant tables and calibration JSON save "
                             "(useful for rerunning after fixing a plot bug)")
@@ -1184,8 +1223,16 @@ def main():
         if all_splits and effective_dataset_name in all_splits:
             dataset_splits = all_splits[effective_dataset_name]
 
+        # Slice out just this dataset's rows here, once, in the parent process
+        # -- so process-based parallel dispatch (joblib's loky backend) only
+        # ever copies this small per-dataset frame into each worker, instead
+        # of the entire multi-dataset input CSV/TSV (which can be several GB
+        # and would otherwise get fully duplicated into every worker).
+        dataset_df_slice = df[df["Dataset"] == dataset_name].copy()
+
         datasets_to_process.append((
             effective_dataset_name,
+            dataset_df_slice,
             all_bootstrap_results[bootstrap_key],
             n_c, benign_method, overrides, dataset_splits,
             clinvar_mode,
@@ -1216,7 +1263,7 @@ def main():
             generate_all_configs_viz(name, df, boot_results, ac_args, sel_cfg, cv_mode, ovr)
 
         jobs = []
-        for name, boot_results, n_c, benign, ovr, _splits, cv_mode in datasets_to_process:
+        for name, _dataset_df, boot_results, n_c, benign, ovr, _splits, cv_mode in datasets_to_process:
             if n_c == "" and benign == "":
                 sel_cfg = None  # no config selected yet; comparison plot shows all without highlight
             else:
@@ -1251,14 +1298,14 @@ def main():
     if args.n_jobs == 1:
         # Sequential processing
         idx = 0
-        for name, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process:
+        for name, dataset_df, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process:
             idx += 1
             for acmg_mapping_method in acmg_mapping_methods:
                 print(f"\n{'='*80}")
                 print(f"[{idx}/{len(datasets_to_process)}] {name} "
                       f"({n_c}, {benign}, acmg_mapping_method={acmg_mapping_method})")
                 print(f"{'='*80}")
-                run_single_dataset(name, df, boot_results, n_c, benign, ovr, args, splits,
+                run_single_dataset(name, dataset_df, boot_results, n_c, benign, ovr, args, splits,
                                    acmg_mapping_method=acmg_mapping_method,
                                    output_name_suffix=suffix(acmg_mapping_method),
                                    clinvar_mode=cv_mode)
@@ -1272,12 +1319,12 @@ def main():
             parallel_args.n_jobs_inner = max(1, n_cpus // abs(args.n_jobs))
         Parallel(n_jobs=args.n_jobs, verbose=10)(
             delayed(run_single_dataset)(
-                name, df, boot_results, n_c, benign, ovr, parallel_args, splits,
+                name, dataset_df, boot_results, n_c, benign, ovr, parallel_args, splits,
                 acmg_mapping_method=acmg_mapping_method,
                 output_name_suffix=suffix(acmg_mapping_method),
                 clinvar_mode=cv_mode,
             )
-            for name, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process
+            for name, dataset_df, boot_results, n_c, benign, ovr, splits, cv_mode in datasets_to_process
             for acmg_mapping_method in acmg_mapping_methods
         )
 

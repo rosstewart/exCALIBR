@@ -62,18 +62,29 @@ def _kmeans_1d(obs, K, n_lloyd=20):
     return locs, scales
 
 
-def _random_a_batch(key, batch, K):
-    """(batch, K) skewness: random +/-1 sign * U(0, 0.25).
+def _lambda_sign_batch(fit_idx, K):
+    """(batch,) int fit_idx -> (batch, K) deterministic +/-1 skew signs,
+    enumerating all 2**K sign patterns in fit_idx order.
 
-    Mirrors initializations._lambda_signs (random path, no lambdaIndex).
+    GPU counterpart of initializations._lambda_signs's lambdaIndex path
+    (cfusn/initializations.py:27-38): lambdaIndex = fit_idx % 2**K, then bit
+    `k` of lambdaIndex (MSB-first, i.e. bit position K-1-k) gives component
+    k's sign -- this ordering is chosen to match
+    itertools.product([-1, 1], repeat=K)'s enumeration exactly, so restart i
+    gets the identical sign pattern on GPU and CPU (values still differ --
+    magnitude is still an independent random draw each restart, see callers
+    below, and interop.py's per-chunk shared PRNGKey vs. CPU's per-restart
+    RandomState seeding means the literal magnitude numbers won't match --
+    but the sign *pattern* and its period-2**K cycling do).
     """
-    k1, k2 = jax.random.split(key)
-    signs = 2.0 * jax.random.randint(k1, (batch, K), 0, 2).astype(jnp.float64) - 1.0
-    mags = jax.random.uniform(k2, (batch, K), dtype=jnp.float64, minval=0.0, maxval=0.25)
-    return signs * mags
+    n_patterns = 2 ** K
+    lam_idx = jnp.mod(fit_idx, n_patterns).astype(jnp.int32)      # (batch,)
+    bit_positions = jnp.arange(K - 1, -1, -1)                     # MSB..LSB
+    bits = (lam_idx[:, None] >> bit_positions[None, :]) & 1       # (batch, K)
+    return 2.0 * bits.astype(jnp.float64) - 1.0
 
 
-def _mom_1d(obs, K, key):
+def _mom_1d(obs, K, key, fit_idx):
     """obs: (batch, N) → a, locs, scales (batch, K), valid (batch,) bool.
 
     Quantile-split MoM: evenly-spaced percentile cut-points, then
@@ -87,7 +98,7 @@ def _mom_1d(obs, K, key):
 
     a1 = jnp.sqrt(2.0 / jnp.pi)
     c_coef = (4.0 - jnp.pi) / 2.0
-    key_fb, key_sign = jax.random.split(key)
+    key_fb = key
 
     a_list, loc_list, scale_list, ok_list = [], [], [], []
     for k in range(K):
@@ -137,8 +148,11 @@ def _mom_1d(obs, K, key):
     scale_mom = jnp.stack(scale_list, axis=-1)
     valid = jnp.stack(ok_list, axis=-1).all(-1)  # (batch,)
 
-    # Override a-signs with random +/-1 (mirrors lambdas[i] * abs(params[0]))
-    signs = 2.0 * jax.random.randint(key_sign, (batch, K), 0, 2).astype(jnp.float64) - 1.0
+    # Override a-signs with the enumerated lambdaIndex pattern (mirrors
+    # methodOfMomentsInit's `params[0] = lambdas[i] * abs(params[0])`,
+    # initializations.py:143-147) -- magnitude stays the MoM-estimated
+    # |alpha|, unchanged, only the sign is replaced.
+    signs = _lambda_sign_batch(fit_idx, K)
     a_mom = signs * jnp.abs(a_mom)
 
     return a_mom, loc_mom, scale_mom, valid
@@ -178,24 +192,31 @@ def _initial_weights_uv(obs, sample_idx, a0, loc0, scale0, S):
 
 
 @functools.partial(jax.jit, static_argnums=(2, 3, 4))
-def batch_init_univariate(obs, sample_idx, S, K, constrained, xmin, xmax, key):
+def batch_init_univariate(obs, sample_idx, S, K, constrained, xmin, xmax, key, fit_idx):
     """Batched univariate init: k-means + MoM (with k-means fallback) + W.
 
     obs: (batch, N); sample_idx: (batch, N) int; xmin/xmax: (batch,);
-    key: a single JAX PRNGKey for this batch (created from fit_seeds in interop.py).
+    key: a single JAX PRNGKey for this batch (created from fit_seeds in
+    interop.py) used only for magnitude draws now; fit_idx: (batch,) int,
+    each restart's index within its (dataset, num_components) job list --
+    drives the deterministic lambdaIndex-style skew SIGN enumeration
+    (_lambda_sign_batch) that replaces the old random-sign draw, matching
+    the CPU path's lambdaIndex behavior (cfusn/initializations.py:27-38).
 
     Returns a0, loc0, scale0: (batch, K);  W0: (batch, S, K);
             init_failed: (batch,) bool (True when constraint cannot be satisfied).
     """
     batch = obs.shape[0]
-    key_km_a, key_mom = jax.random.split(key)
+    key_km_mag, key_mom = jax.random.split(key)
 
-    # Deterministic k-means + random a signs
+    # Deterministic k-means + enumerated (lambdaIndex-style) a signs
     locs_km, scales_km = _kmeans_1d(obs, K)
-    a_km = _random_a_batch(key_km_a, batch, K)
+    signs_km = _lambda_sign_batch(fit_idx, K)
+    mags_km = jax.random.uniform(key_km_mag, (batch, K), dtype=jnp.float64, minval=0.0, maxval=0.25)
+    a_km = signs_km * mags_km
 
     # Method of moments (falls back to k-means when slices too small / MoM fails)
-    a_mom, locs_mom, scales_mom, mom_valid = _mom_1d(obs, K, key_mom)
+    a_mom, locs_mom, scales_mom, mom_valid = _mom_1d(obs, K, key_mom, fit_idx)
 
     a0 = jnp.where(mom_valid[:, None], a_mom, a_km)
     loc0 = jnp.where(mom_valid[:, None], locs_mom, locs_km)

@@ -158,9 +158,55 @@ def piecewise_additive_log_lr(T: ArrayLike, prior: float) -> ArrayLike:
     return out
 
 
+def piecewise_log_lr_custom(T: ArrayLike, prior: float,
+                             targets: Dict[str, float] = None,
+                             add_neutral_knot: bool = False) -> ArrayLike:
+    """Forward direction of piecewise_display_points: T -> log(LR+), with
+    the same *targets*/*add_neutral_knot* override support (piecewise_log_lr
+    itself is the special case targets=None, add_neutral_knot=False, kept
+    separate for backward compatibility since it's already used throughout
+    this codebase without a targets argument).
+
+    Used to plot/tabulate ACMG-Bayes's per-code and per-boundary LR+ (and,
+    via bayes_posterior_from_lr, posteriors) under this paper's corrected
+    LB/B targets, the same knot construction piecewise_display_points
+    inverts for display points.
+    """
+    T_arr = np.atleast_1d(np.asarray(T, dtype=float))
+    lpo = float(_log_prior_odds(prior))
+    if targets is None and not add_neutral_knot:
+        knot_T = _KNOT_T
+        knot_log_lr = _KNOT_LOG_POST_ODDS - lpo
+    else:
+        merged = {**DEFAULT_TARGETS, **(targets or {})}
+        if add_neutral_knot:
+            knot_T = np.array([-7.0, -1.0, 0.0, 6.0, 10.0])
+            knot_log_lr = np.array([
+                np.log(merged["B"] / (1.0 - merged["B"])) - lpo,
+                np.log(merged["LB"] / (1.0 - merged["LB"])) - lpo,
+                0.0,
+                np.log(merged["LP"] / (1.0 - merged["LP"])) - lpo,
+                np.log(merged["P"] / (1.0 - merged["P"])) - lpo,
+            ])
+            if np.any(np.diff(knot_log_lr) < 0):
+                raise ValueError(
+                    f"add_neutral_knot=True produced a non-monotonic knot sequence "
+                    f"at prior={prior}, targets={merged} -- a target sits on the "
+                    f"wrong side of this prior.")
+        else:
+            knot_T = _KNOT_T
+            knot_q = np.array([merged["B"], merged["LB"], merged["LP"], merged["P"]])
+            knot_log_lr = np.log(knot_q / (1.0 - knot_q)) - lpo
+    out = _piecewise_log_lr_impl(T_arr, knot_T, knot_log_lr)
+    if np.ndim(T) == 0:
+        return float(out[0])
+    return out
+
+
 def piecewise_display_points(log_lr: ArrayLike, prior: float,
                               targets: Dict[str, float] = None,
-                              floor_at_neutral: bool = False) -> ArrayLike:
+                              floor_at_neutral: bool = False,
+                              add_neutral_knot: bool = False) -> ArrayLike:
     """Invert ``piecewise_log_lr``: log(LR+) -> a (generally fractional) point
     label, for display purposes only.
 
@@ -200,12 +246,42 @@ def piecewise_display_points(log_lr: ArrayLike, prior: float,
         0.0) despite representing near-identical evidence. This is a
         display-only artifact; ``continuous_classify``'s P/LP/VUS/LB/B
         labels have no such discontinuity.
+    add_neutral_knot : bool, optional
+        Insert the same explicit T=0 knot pinned at log(LR+)=0 that
+        floor_at_neutral uses, WITHOUT also clamping targets via
+        _floor_targets_at_prior -- i.e. isolates the "positive points
+        depend only on LP/P, negative only on LB/B" fix from the separate
+        "never require wrong-direction evidence" fix. Ignored if
+        floor_at_neutral is True (which already implies this). Targets
+        are used as given (or corrected/shifted, via *targets*), so this
+        does NOT protect against a target sitting on the wrong side of the
+        prior -- if that happens the resulting knot_log_lr sequence is
+        non-monotonic and this raises rather than silently mis-ordering
+        segments (see floor_at_neutral's docstring for why that situation
+        arises and how clamping avoids it).
     """
     log_lr_arr = np.atleast_1d(np.asarray(log_lr, dtype=float))
     lpo = float(_log_prior_odds(prior))
-    if targets is None and not floor_at_neutral:
+    if targets is None and not floor_at_neutral and not add_neutral_knot:
         knot_T = _KNOT_T
         knot_log_lr = _KNOT_LOG_POST_ODDS - lpo
+    elif add_neutral_knot and not floor_at_neutral:
+        merged = {**DEFAULT_TARGETS, **(targets or {})}
+        knot_T = np.array([-7.0, -1.0, 0.0, 6.0, 10.0])
+        knot_log_lr = np.array([
+            np.log(merged["B"] / (1.0 - merged["B"])) - lpo,
+            np.log(merged["LB"] / (1.0 - merged["LB"])) - lpo,
+            0.0,
+            np.log(merged["LP"] / (1.0 - merged["LP"])) - lpo,
+            np.log(merged["P"] / (1.0 - merged["P"])) - lpo,
+        ])
+        if np.any(np.diff(knot_log_lr) < 0):
+            raise ValueError(
+                f"add_neutral_knot=True produced a non-monotonic knot sequence "
+                f"at prior={prior}, targets={merged} (knot_log_lr={knot_log_lr}) -- "
+                f"a target sits on the wrong side of this prior (see "
+                f"floor_at_neutral's docstring); use floor_at_neutral=True "
+                f"instead, which clamps targets to avoid this.")
     elif floor_at_neutral:
         merged = {**DEFAULT_TARGETS, **(targets or {})}
         merged = _floor_targets_at_prior(merged, prior)
@@ -259,6 +335,16 @@ def piecewise_posterior(T: ArrayLike, prior: float) -> ArrayLike:
     Exact at the four ACMG boundary points for any prior.
     """
     return bayes_posterior_from_lr(piecewise_lr_plus(T, prior), prior)
+
+
+def piecewise_posterior_custom(T: ArrayLike, prior: float,
+                                targets: Dict[str, float] = None,
+                                add_neutral_knot: bool = False) -> ArrayLike:
+    """Posterior at total points T using piecewise_log_lr_custom -- the
+    targets-aware counterpart to piecewise_posterior, for plotting/tabulating
+    ACMG-Bayes posteriors under this paper's corrected LB/B targets."""
+    log_lr = piecewise_log_lr_custom(T, prior, targets, add_neutral_knot)
+    return bayes_posterior_from_lr(np.exp(np.asarray(log_lr, dtype=float)), prior)
 
 
 def piecewise_additive_lr_plus(T: ArrayLike, prior: float) -> ArrayLike:

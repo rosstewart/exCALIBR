@@ -159,8 +159,9 @@ def _run_univariate_chunk(specs, use_gpu_init=True, max_em_iters=None):
     if use_gpu_init:
         fit_seeds = [s[0].get("kwargs", {}).get("fit_seed") or 0 for s in specs]
         key = jax.random.PRNGKey(int(np.array(fit_seeds, dtype=np.uint32).sum()))
+        fit_idx = jnp.asarray([s[0].get("fit_idx") or 0 for s in specs], dtype=jnp.int32)
         a0, loc0, scale0, W0, init_failed = batch_init_univariate(
-            obs, sample_idx, S, K, constrained, xmin, xmax, key)
+            obs, sample_idx, S, K, constrained, xmin, xmax, key, fit_idx)
         results = []
         valid_mask = [True] * len(specs)  # all specs go to EM
     else:

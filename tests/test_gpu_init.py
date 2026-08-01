@@ -156,9 +156,10 @@ def test_univariate_gpu_init_params_sane(constrained, K):
     xmin = obs.min(axis=1)
     xmax = obs.max(axis=1)
     key = jax.random.PRNGKey(42)
+    fit_idx = jnp.asarray([j.get("fit_idx") or 0 for j in jobs], dtype=jnp.int32)
 
     a0, loc0, scale0, W0, init_failed = batch_init_univariate(
-        obs, sample_idx, S, K, constrained, xmin, xmax, key)
+        obs, sample_idx, S, K, constrained, xmin, xmax, key, fit_idx)
 
     a0_np, loc0_np, scale0_np, W0_np = map(np.asarray, (a0, loc0, scale0, W0))
 

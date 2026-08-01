@@ -118,7 +118,6 @@ def _run_fits(observations, sample_assignments, n_reps, seed):
 
     for i in range(n_reps):
         lam_idx = i % n_patterns
-        init_signs = lambda_table[lam_idx]
 
         rng = np.random.RandomState(seed + i)
         n = len(observations)
@@ -142,12 +141,22 @@ def _run_fits(observations, sample_assignments, n_reps, seed):
         )
 
         params = result.get("component_params", [])
-        if not params or any(len(p) == 0 for p in params):
+        init_params = result.get("initial_params", [])
+        if not params or any(len(p) == 0 for p in params) \
+                or not init_params or any(len(p) == 0 for p in init_params):
             continue
 
-        # Sort components by mu[0] for consistent ordering
+        # Sort components by mu[0] for consistent ordering. Read the init
+        # sign from the fit's own returned initial_params (sorted the same
+        # way below) instead of lambda_table[lam_idx] -- that raw table
+        # entry is in kmeans's unsorted, per-restart-random cluster-label
+        # order and does not reliably correspond to the mu[0]-sorted order
+        # used for final_signs (see the identical fix + measured 8/40 false
+        # positive rate in tests/verify_skew_sign_change_univariate.py).
         params_sorted = sorted(params, key=lambda p: np.asarray(p[0])[0])
         final_signs = tuple(_delta_sign(np.asarray(p[1])) for p in params_sorted)
+        init_sorted = sorted(init_params, key=lambda p: np.asarray(p[0])[0])
+        init_signs = tuple(_delta_sign(np.asarray(p[1])) for p in init_sorted)
 
         results.append((lam_idx, init_signs, final_signs))
 
@@ -176,8 +185,11 @@ def _report(results, lambda_table):
 
     for lam_idx in sorted(by_pattern.keys()):
         rows = by_pattern[lam_idx]
+        # init_signs is read per-restart from the fit's own initial_params
+        # (see _run_fits), so it isn't guaranteed identical across every rep
+        # sharing this lam_idx -- compare each row against its own init.
         init = rows[0][0]
-        n_changed = sum(1 for _, f in rows if f != init)
+        n_changed = sum(1 for i, f in rows if f != i)
         final_counts = {}
         for _, f in rows:
             final_counts[f] = final_counts.get(f, 0) + 1

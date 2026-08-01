@@ -284,6 +284,14 @@ class BasicScoreset:
             if self._ids is not None:
                 self._ids = self._ids[keep]
 
+        # Global score range over EVERY variant with a non-NaN score,
+        # regardless of sample membership (this class never filters rows by
+        # sample-assignment membership, only NaN scores above). Used by the
+        # shared score-axis grid (score_range) in pipeline/visualize.py
+        # instead of the sample-filtered range.
+        self.global_score_min = float(np.nanmin(self.scores))
+        self.global_score_max = float(np.nanmax(self.scores))
+
         self.validate_inputs()
         self.validate_sample_assignments()
         self.sample_counts = self._sample_assignments.sum(axis=0)
@@ -855,11 +863,11 @@ class Scoreset:
             # print('filtering nonsense variants within 50 aa of termini...')
             mask = (
                 # Keep all non-stop_gained variants
-                (self.dataframe['simplified_consequence'] != 'stop_gained') |
+                (self.dataframe['simplified_consequence'] != 'stop_gained')# |
                 # OR keep stop_gained only if position is between 51-349
-                ((self.dataframe['simplified_consequence'] == 'stop_gained') &
-                 (self.dataframe['aa_pos'] >= 51) &
-                 (self.dataframe['aa_pos'] <= 349))
+                # ((self.dataframe['simplified_consequence'] == 'stop_gained') &
+                #  (self.dataframe['aa_pos'] >= 51) &
+                #  (self.dataframe['aa_pos'] <= 349))
             )
             self.dataframe = self.dataframe[mask]
             _dropped = _before - len(self.dataframe)
@@ -1091,6 +1099,14 @@ class Scoreset:
             if is_reg is not None and any(is_reg(v) for v in variants):
                 self._sample_assignments[idx, 4] = True
         
+        # Global score range over EVERY variant, regardless of sample
+        # membership -- snapshotted here, before the sample-membership
+        # keep_mask below permanently drops unlabeled/VUS-only rows from
+        # self._scores. Used by the shared score-axis grid (score_range) in
+        # pipeline/visualize.py instead of the sample-filtered range.
+        self.global_score_min = float(np.nanmin(self._scores))
+        self.global_score_max = float(np.nanmax(self._scores))
+
         keep_mask = self._sample_assignments.any(axis=1)
         self._keep_mask = keep_mask
         self._scores = self.scores[keep_mask]
@@ -2107,6 +2123,13 @@ class MultiScoreset:
             (np.nanmin(self._scores[:, dim]), np.nanmax(self._scores[:, dim]))
             for dim in range(self.d)
         )
+        # Global per-dimension score range regardless of sample membership
+        # (self._scores here is only filtered by "at least one observed
+        # score across dimensions", never by sample-assignment membership,
+        # so this is identical to _xlims -- named separately for parity with
+        # Scoreset/BasicScoreset's global_score_min/max).
+        self.global_score_min = tuple(lo for lo, _hi in self._xlims)
+        self.global_score_max = tuple(hi for _lo, hi in self._xlims)
         self.sample_counts = self._sample_assignments.sum(axis=0)
 
     # ──────────────────────────────────────
@@ -2408,6 +2431,13 @@ class BasicMultiScoreset:
             (np.nanmin(obj._scores[:, dim]), np.nanmax(obj._scores[:, dim]))
             for dim in range(d)
         )
+        # Global per-dimension score range regardless of sample membership
+        # (obj._scores here is only filtered by "at least one observed score
+        # across dimensions", never by sample-assignment membership, so this
+        # is identical to _xlims -- named separately for parity with
+        # Scoreset/BasicScoreset's global_score_min/max).
+        obj.global_score_min = tuple(lo for lo, _hi in obj._xlims)
+        obj.global_score_max = tuple(hi for _lo, hi in obj._xlims)
         obj.sample_counts = obj._sample_assignments.sum(axis=0)
 
         return obj
@@ -2452,6 +2482,13 @@ class BasicMultiScoreset:
             (np.nanmin(self._scores[:, dim]), np.nanmax(self._scores[:, dim]))
             for dim in range(self.d)
         )
+        # Global per-dimension score range regardless of sample membership
+        # (self._scores here is only filtered by "at least one observed
+        # score across dimensions", never by sample-assignment membership,
+        # so this is identical to _xlims -- named separately for parity with
+        # Scoreset/BasicScoreset's global_score_min/max).
+        self.global_score_min = tuple(lo for lo, _hi in self._xlims)
+        self.global_score_max = tuple(hi for _lo, hi in self._xlims)
         self.sample_counts = self._sample_assignments.sum(axis=0)
 
     # ── Scoreset/MultiScoreset-compatible API ────────────────────────

@@ -1020,3 +1020,267 @@ def plot_robustness_confusion_grid(
             mats, [f"seed{i}" for i in range(len(mats))],
             label=base_dataset, figure_dir=out_dir, tag=f"{ptype}_{level}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap-count-reduction plotting (tests/benchmark_bootstrap_reduction.py)
+#
+# That script computes exactly ONE calibration per (dataset, bootstrap-count
+# level) -- e.g. N in {1000, 500, 250, 100, 50, 20} -- not repeated seeds per
+# level the way the downsample/discordance robustness conditions above do.
+# So there is no seed-to-seed spread to measure at a fixed level, and
+# deliberately not adding one (re-running each level several times with
+# independent bootstrap subsamples just to get that spread) was a conscious
+# cost call, not an oversight -- each level already carries its OWN free
+# bootstrap-resampling uncertainty: process_component_fits computes
+# [p5,p50,p95] across whatever bootstrap fits that level was actually given
+# (1000 down to 20), so comparing every level's own band directly already
+# shows (a) how the median curve drifts as N shrinks and (b) how each
+# level's own reported uncertainty widens as N shrinks -- with zero extra
+# fitting beyond what tests/benchmark_bootstrap_reduction.py already ran.
+# ---------------------------------------------------------------------------
+
+def plot_bootstrap_reduction_config_summary(
+    dataset_name: str,
+    reference_df: pd.DataFrame,
+    levels_data: Dict[int, dict],
+    figure_dir: Optional[Path] = None,
+    show: bool = True,
+):
+    """One figure per dataset, same 3-row layout as
+    src.assay_calibration.plot_utils.utils.plot_scoreset_best_config /
+    plot_robustness_config_summary above (fits / point assignments / Log
+    LR+), but overlaying bootstrap-COUNT LEVELS instead of seeds -- see the
+    module-level comment just above for why each level's own [p5,p50,p95]
+    band is already a valid, free uncertainty measure here.
+
+    reference_df : DataFrame with "score" and "sample" (pipe-separated
+        multi-label, matching analysis.plot_common.sample_matches) columns
+        for the FULL, unperturbed dataset -- the fixed population every
+        level's histogram/LR+ curve is compared against, mirroring
+        plot_robustness_config_summary's reference_df.
+    levels_data : {N: {"calib_path": Path, "lr_path": Path,
+                        "fits": Optional[List[dict]]}}, one entry per
+        bootstrap-count level. The largest N is the reference/baseline level
+        (bold curve). "fits" -- that level's own pool of per-bootstrap
+        component fits (e.g. sliced from the same precomputed-fits file
+        tests/benchmark_bootstrap_reduction.py reads) -- is optional; Row 0
+        falls back to histogram-only for any level it's omitted for.
+    """
+    from src.assay_calibration.plot_utils.utils import (
+        sample_density, add_thresholds, log_thresholds_with_ylim_pad,
+    )
+    from analysis.calibration_plots import _SAMPLE_ORDER, _SAMPLE_LABELS
+    from analysis.legacy_fits import _load_calibration_and_lr
+
+    if not levels_data:
+        print(f"  SKIP bootstrap-reduction config summary for {dataset_name}: no levels")
+        return None
+
+    levels_sorted = sorted(levels_data.keys(), reverse=True)
+    baseline_n = levels_sorted[0]
+    cmap = plt.get_cmap("viridis")
+    level_colors = {N: cmap(i / max(1, len(levels_sorted) - 1)) for i, N in enumerate(levels_sorted)}
+
+    baseline_entry = levels_data[baseline_n]
+    with open(baseline_entry["calib_path"]) as f:
+        ref_cal = json.load(f)
+    ref_data = _load_calibration_and_lr(baseline_entry["calib_path"], baseline_entry["lr_path"])
+    score_range = np.asarray(ref_data["score_range"])
+
+    samples_present = [s for s in _SAMPLE_ORDER if sample_matches(reference_df, s).any()]
+    n_samples = len(samples_present)
+    if n_samples == 0:
+        print(f"  SKIP bootstrap-reduction config summary for {dataset_name}: "
+              f"reference has no recognized sample categories")
+        return None
+
+    fig, ax = plt.subplots(3, n_samples, figsize=(6 * n_samples, 16), squeeze=False,
+                            gridspec_kw={"hspace": 0.35, "wspace": 0.3})
+
+    # ---- Row 0: reference histogram + per-level density (if fits given) ----
+    for col, sample_label in enumerate(samples_present):
+        ax_fit = ax[0, col]
+        mask = sample_matches(reference_df, sample_label)
+        sample_scores = reference_df.loc[mask, "score"].values
+        n = len(sample_scores)
+        if n > 1:
+            q1, q3 = np.percentile(sample_scores, [25, 75])
+            iqr = q3 - q1
+            fd_width = 2 * iqr * n ** (-1 / 3) if iqr > 0 else 0
+            score_width = sample_scores.max() - sample_scores.min()
+            bins = min(100, int(score_width / fd_width)) if fd_width > 0 else 50
+            bins = max(bins, 10)
+            ax_fit.hist(sample_scores, bins=bins, density=True, alpha=0.4, color="#A0A0A0")
+        max_hist_density = max([p.get_height() for p in ax_fit.patches]) if ax_fit.patches else 1.0
+
+        for N in levels_sorted:
+            fits = levels_data[N].get("fits")
+            if not fits:
+                continue
+            try:
+                density = sample_density(score_range, fits, col)
+            except IndexError:
+                # Same root cause as PTEN_Mighell_2018_clinvar_2018's
+                # get_fit_prior IndexError (see
+                # tests/benchmark_bootstrap_reduction.py's run_one_level
+                # docstring): a precomputed fit's "weights" is shaped for
+                # however many samples the dataset had when the
+                # precomputed-fits file was generated, which can mismatch
+                # the CURRENT reference_df's sample count/order if that
+                # dataset's sample composition changed since. Skip just this
+                # (dataset, level)'s density curve rather than losing the
+                # whole dataset's figure -- the other levels' curves and
+                # rows 1/2 (points, LR+, which don't index into "fits") are
+                # unaffected.
+                print(f"    Row 0 density skipped for N={N}, sample={sample_label}: "
+                      f"IndexError (likely a sample-composition mismatch between "
+                      f"this level's precomputed fits and the current dataframe)")
+                continue
+            total = np.nansum(density, axis=1)
+            med = np.nanpercentile(total, 50, axis=0)
+            ax_fit.plot(score_range, med, color=level_colors[N],
+                        linewidth=2.2 if N == baseline_n else 1.2,
+                        alpha=1.0 if N == baseline_n else 0.85,
+                        label=f"N={N}")
+
+        ax_fit.set_title(f"{_SAMPLE_LABELS.get(sample_label, sample_label)} (n={int(mask.sum()):,d})")
+        ax_fit.set_xlabel("Score")
+        ax_fit.set_ylabel("Density")
+        if max_hist_density:
+            ax_fit.set_ylim([0, max_hist_density * 1.1])
+        if ax_fit.get_legend_handles_labels()[0]:
+            ax_fit.legend(fontsize=7)
+        ax_fit.grid(linewidth=0.5, alpha=0.3)
+
+    xlim = ax[0, 0].get_xlim()
+
+    # ---- Row 1: point-assignment overlay across levels ----
+    per_level_point_ranges = []
+    for N in levels_sorted:
+        with open(levels_data[N]["calib_path"]) as f:
+            cal = json.load(f)
+        pr = cal.get("point_ranges")
+        if pr:
+            per_level_point_ranges.append((N, pr))
+
+    all_point_values = sorted({int(k) for _, pr in per_level_point_ranges for k in pr.keys()})
+    for col in range(n_samples):
+        ax_pts = ax[1, col]
+        for N, pr in per_level_point_ranges:
+            for k, ranges in pr.items():
+                point_val = int(k)
+                y = all_point_values.index(point_val)
+                for sr in ranges:
+                    x0 = xlim[0] if np.isneginf(sr[0]) else max(sr[0], xlim[0])
+                    x1 = xlim[1] if np.isposinf(sr[1]) else min(sr[1], xlim[1])
+                    ax_pts.plot([x0, x1], [y, y], color=level_colors[N],
+                                linewidth=5, alpha=0.5, solid_capstyle="butt")
+        ax_pts.set_ylim(-1, max(len(all_point_values), 1))
+        ax_pts.set_yticks(range(len(all_point_values)),
+                           labels=[f"{v:+d}" if v != 0 else "0" for v in all_point_values])
+        ax_pts.set_xlim(xlim)
+        ax_pts.set_xlabel("Score")
+        ax_pts.set_ylabel("Points")
+        ax_pts.set_title(f"Point assignments ({len(per_level_point_ranges)} levels overlaid)", fontsize=10)
+        ax_pts.grid(linewidth=0.5, alpha=0.3)
+
+    # ---- Row 2: each level's own [p5,p50,p95] LR+ band ----
+    point_values_all = sorted({abs(int(k)) for k in ref_cal["point_ranges"].keys()})
+    tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(ref_cal["prior"], point_values_all)
+
+    for col in range(n_samples):
+        ax_lr = ax[2, col]
+        for N in levels_sorted:
+            entry = levels_data[N]
+            data = ref_data if N == baseline_n else _load_calibration_and_lr(entry["calib_path"], entry["lr_path"])
+            curve_score = np.asarray(data["score_range"])
+            pct = np.asarray(data["log_lr_pct"])
+            p5 = np.interp(score_range, curve_score, pct[0])
+            p50 = np.interp(score_range, curve_score, pct[1])
+            p95 = np.interp(score_range, curve_score, pct[2])
+            lw = 2.2 if N == baseline_n else 1.2
+            ax_lr.plot(score_range, p50, color=level_colors[N], linewidth=lw, label=f"N={N}")
+            ax_lr.fill_between(score_range, p5, p95, color=level_colors[N], alpha=0.10)
+        add_thresholds(tauP, tauB, ax_lr)
+        ax_lr.set_ylim([ylim_bottom, ylim_top])
+        ax_lr.set_xlim(xlim)
+        ax_lr.set_xlabel("Score")
+        ax_lr.set_ylabel("Log LR+")
+        ax_lr.set_title("Log LR+ (median + own [p5,p95] band per level)", fontsize=10)
+        if col == n_samples - 1:
+            ax_lr.legend(fontsize=7, loc="center left", bbox_to_anchor=(1, 0.5))
+        ax_lr.grid(linewidth=0.5, alpha=0.3)
+
+    fig.suptitle(f"{dataset_name}: bootstrap-count reduction ({len(levels_sorted)} levels: {levels_sorted})",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    if figure_dir is not None:
+        out_dir = Path(figure_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"bootstrap_reduction_config_{dataset_name}.png"
+        if show:
+            save_and_show(fig, out_path)
+        else:
+            fig.savefig(out_path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+        print(f"  Saved: {out_path}")
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Fit-number (restart-count) comparison plotting
+# (tests/benchmark_num_fits_dataframe.py's summary.csv)
+# ---------------------------------------------------------------------------
+
+def plot_fit_number_comparison_curve(
+    summary_df: pd.DataFrame,
+    metric: str = "delta",
+    figure_dir: Optional[Path] = None,
+    label: str = "all_datasets",
+):
+    """Median + IQR ribbon of `metric` (default "delta" = mean_best_of_N
+    train_ll minus the best-of-all-fits baseline, from
+    tests/benchmark_num_fits_dataframe.py's summary.csv) vs. num_fits
+    (restart count), pooling every (dataset, n_c) row at each level --
+    same median-line + IQR-ribbon + scatter + dashed-reference-line design
+    as plot_downsample_robustness_curve above, adapted from "seed spread at
+    one dataset, one level" to "cross-dataset spread at one restart count".
+    """
+    levels = sorted(summary_df["num_fits"].unique())
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    medians, p25s, p75s, xs_scatter, ys_scatter = [], [], [], [], []
+    for level in levels:
+        vals = summary_df.loc[summary_df["num_fits"] == level, metric].values
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0:
+            medians.append(np.nan); p25s.append(np.nan); p75s.append(np.nan)
+            continue
+        p25, p50, p75 = np.percentile(vals, [25, 50, 75])
+        medians.append(p50); p25s.append(p25); p75s.append(p75)
+        xs_scatter.extend([level] * len(vals))
+        ys_scatter.extend(vals.tolist())
+
+    ax.fill_between(levels, p25s, p75s, alpha=0.25, color="C0")
+    ax.plot(levels, medians, marker="o", color="C0", label="median")
+    ax.scatter(xs_scatter, ys_scatter, alpha=0.3, s=12, color="C0")
+    ax.axhline(0.0, linestyle="--", color="black", alpha=0.6, label="no degradation")
+
+    ax.set_xscale("log")
+    ax.set_xticks(levels)
+    ax.set_xticklabels([str(l) for l in levels])
+    ax.set_xlabel("Restart count (num_fits)")
+    ax.set_ylabel(f"{metric} (best_of_N − best_of_all train_ll)" if metric == "delta" else metric)
+    ax.set_title(f"{label}: fit quality vs. restart count")
+    ax.legend(fontsize=8)
+    ax.grid(linewidth=0.5, alpha=0.3)
+    fig.tight_layout()
+
+    if figure_dir is not None:
+        out_dir = Path(figure_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"fit_number_comparison_{label}.png"
+        save_and_show(fig, out_path)
+        print(f"  Saved: {out_path}")
+    return fig

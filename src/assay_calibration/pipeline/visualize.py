@@ -29,6 +29,11 @@ from ..fit_utils.point_ranges import (
     compute_pathomechanism_lr_curves,
     resolve_pathomechanism_anchor,
     _compute_log_fp_only,
+    is_bidirectional_by_weights,
+    resolve_bidirectional_weight_vectors,
+    clean_benign_fragments_no_extend,
+    clean_bidirectional_pathogenic_evidence,
+    BIDIRECTIONAL_VOTE_THRESHOLD,
 )
 from ..data_utils.dataset import Scoreset, BasicScoreset
 from ..fit_utils.utils import serialize_dict
@@ -176,7 +181,9 @@ def generate_visualizations(
                     n_c=component_key,
                     n_samples=len([s for s in scoreset.samples]),
                     relax=False,
-                    flipped=calibration.get('scoreset_flipped', False)
+                    flipped=calibration.get('scoreset_flipped', False),
+                    pathogenic_percentile=config.pathogenic_percentile,
+                    benign_percentile=config.benign_percentile,
                 )
                 fig.savefig(figure_path, dpi=150)
                 os._exit(0)
@@ -574,9 +581,12 @@ def process_component_fits(
     # Indices into all_fits_prefilter that survived prior filtering
     valid_original_indices = np.where(valid_mask)[0]
 
-    # Setup score range
-    observed_scores = scoreset.scores[scoreset._sample_assignments.any(1)]
-    score_range = np.linspace(*np.percentile(observed_scores, [0, 100]), config.score_range_points)
+    # Setup score range -- use the scoreset's GLOBAL score min/max (every
+    # variant with a score, regardless of sample membership), not just the
+    # sample-labeled subset. See Scoreset/BasicScoreset.global_score_min/max
+    # (data_utils/dataset.py).
+    score_range = np.linspace(scoreset.global_score_min, scoreset.global_score_max,
+                               config.score_range_points)
 
     # Build per-fit precomputed log_fp array (shape: n_fits_prefilter × score_range_points)
     # when pathogenic samples exist.  Two cases:
@@ -669,7 +679,7 @@ def process_component_fits(
         if Cs_valid_p:
             C_pathogenic = np.array([
                 np.nanpercentile(Cs_valid_p, config.pathogenic_percentile),
-                np.nanpercentile(Cs_valid_p, 100 - config.pathogenic_percentile),
+                np.nanpercentile(Cs_valid_p, config.benign_percentile),
             ])
     else:
         # Legacy single-prior/single-LR path, unchanged.
@@ -731,7 +741,7 @@ def process_component_fits(
     if Cs_valid:
         C = np.array([
             np.nanpercentile(Cs_valid, config.pathogenic_percentile),
-            np.nanpercentile(Cs_valid, 100 - config.pathogenic_percentile),
+            np.nanpercentile(Cs_valid, config.benign_percentile),
         ])
     else:
         C = np.array([np.nan, np.nan])
@@ -739,27 +749,35 @@ def process_component_fits(
     # Detect if scoreset is flipped - USE MEAN SCORES INSTEAD OF WEIGHTS
     scoreset_flipped = False
     
+    # NOTE: pathogenic_idx/benign_idx/gnomad_idx/synonymous_idx here are the
+    # SHIFTED indices computed above (matching the fit-weights/filtered
+    # column layout, i.e. scoreset.sample_assignments -- empty standard
+    # columns dropped, preserving order). They must NOT be used to index
+    # scoreset._sample_assignments, which is the RAW/unfiltered array that
+    # always keeps all 4 (or 5) standard columns regardless of emptiness --
+    # doing so silently grabs the wrong sample (or an empty one, producing
+    # NaN) whenever a standard column is empty (any PU/NU-mode dataset).
     if pathogenic_idx is not None:
-        path_mean_score = np.mean(scoreset.scores[scoreset._sample_assignments[:, pathogenic_idx]])
+        path_mean_score = np.mean(scoreset.scores[scoreset.sample_assignments[:, pathogenic_idx]])
     else:
-        path_mean_score = np.mean(scoreset.scores[scoreset._sample_assignments[:, gnomad_idx]])
-    
+        path_mean_score = np.mean(scoreset.scores[scoreset.sample_assignments[:, gnomad_idx]])
+
     if benign_idx is not None or synonymous_idx is not None:
         if config.benign_method == 'avg' and benign_idx is not None and synonymous_idx is not None:
             ben_mean_score = (
-                np.mean(scoreset.scores[scoreset._sample_assignments[:, benign_idx]]) +
-                np.mean(scoreset.scores[scoreset._sample_assignments[:, synonymous_idx]])
+                np.mean(scoreset.scores[scoreset.sample_assignments[:, benign_idx]]) +
+                np.mean(scoreset.scores[scoreset.sample_assignments[:, synonymous_idx]])
             ) / 2
         elif config.benign_method == 'synonymous' and synonymous_idx is not None:
-            ben_mean_score = np.mean(scoreset.scores[scoreset._sample_assignments[:, synonymous_idx]])
+            ben_mean_score = np.mean(scoreset.scores[scoreset.sample_assignments[:, synonymous_idx]])
         else:
             ben_mean_score = (
-                np.mean(scoreset.scores[scoreset._sample_assignments[:, benign_idx]])
+                np.mean(scoreset.scores[scoreset.sample_assignments[:, benign_idx]])
                 if benign_idx is not None
-                else np.mean(scoreset.scores[scoreset._sample_assignments[:, synonymous_idx]])
+                else np.mean(scoreset.scores[scoreset.sample_assignments[:, synonymous_idx]])
             )
     else:
-        ben_mean_score = np.mean(scoreset.scores[scoreset._sample_assignments[:, gnomad_idx]])
+        ben_mean_score = np.mean(scoreset.scores[scoreset.sample_assignments[:, gnomad_idx]])
     
     if path_mean_score > ben_mean_score:
         scoreset_flipped = True
@@ -795,7 +813,7 @@ def process_component_fits(
             # tavtigian path is reachable here.
             point_ranges_pathogenic, point_ranges_benign, C_p_dual, C_b_dual = calculate_score_ranges_dual(
                 np.nanpercentile(log_lr_pathogenic[:, range_subset], config.pathogenic_percentile, axis=0),
-                np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], config.benign_percentile, axis=0),
                 prior_pathogenic, prior,
                 score_range[range_subset],
                 config.point_values,
@@ -814,7 +832,7 @@ def process_component_fits(
             from ..fit_utils.fit import calculate_classification_ranges
             cls_p, cls_b, lr_thresholds = calculate_classification_ranges(
                 np.nanpercentile(log_lr_plus[:, range_subset], config.pathogenic_percentile, axis=0),
-                np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], config.benign_percentile, axis=0),
                 prior,
                 score_range[range_subset],
                 targets=getattr(config, "acmg_bayes_targets", None),
@@ -828,7 +846,7 @@ def process_component_fits(
         else:
             point_ranges_pathogenic, point_ranges_benign, C = calculate_score_ranges(
                 np.nanpercentile(log_lr_plus[:, range_subset], config.pathogenic_percentile, axis=0),
-                np.nanpercentile(log_lr_plus[:, range_subset], 100 - config.pathogenic_percentile, axis=0),
+                np.nanpercentile(log_lr_plus[:, range_subset], config.benign_percentile, axis=0),
                 prior,
                 score_range[range_subset],
                 config.point_values,
@@ -840,12 +858,13 @@ def process_component_fits(
                     point_ranges[point] = []
     else:
         # Use pathogenic_percentile-th conservative thresholds
-        logger.info(f"  Using {config.pathogenic_percentile:g}th percentile conservative thresholds")
+        logger.info(f"  Using {config.pathogenic_percentile:g}th/{config.benign_percentile:g}th "
+                    f"percentile conservative thresholds")
         p_xaxis_5percentile_conservative = (
-            config.pathogenic_percentile if not scoreset_flipped else 100 - config.pathogenic_percentile
+            config.pathogenic_percentile if not scoreset_flipped else config.benign_percentile
         )
         b_xaxis_5percentile_conservative = (
-            100 - config.pathogenic_percentile if not scoreset_flipped else config.pathogenic_percentile
+            config.benign_percentile if not scoreset_flipped else config.pathogenic_percentile
         )
         
         p_max = max if not scoreset_flipped else min
@@ -901,6 +920,45 @@ def process_component_fits(
     # Check for insufficient bootstrap coverage
     percent_no_evidence = {point: 0.0 for point in config.point_values + list(-1 * np.array(config.point_values))}
 
+    # Auto-detect bidirectional assays (e.g. LoF/GoF in one assay) per
+    # bootstrap fit from mixture-component weights, and force
+    # postprocess_point_ranges=False (custom pathogenic-island extend
+    # instead of standard monotonicity/extend-to-xlims) for this dataset
+    # when a majority of fits are flagged -- see PipelineConfig.auto_bidirectional
+    # and BIDIRECTIONAL_VOTE_THRESHOLD (fit_utils/point_ranges.py).
+    force_no_postprocess = False
+    auto_bidirectional = getattr(config, "auto_bidirectional", False)
+    if auto_bidirectional and n_c >= 3:
+        n_flagged = 0
+        for fit in fits:
+            # PN mode: pathogenic vs effective benign. PU mode (no
+            # benign/synonymous): pathogenic vs gnomAD. NU mode (no
+            # pathogenic): gnomAD vs effective benign, since gnomAD is
+            # the closest available "more-pathogenic-leaning" proxy --
+            # see resolve_bidirectional_weight_vectors.
+            source_w, reference_w = resolve_bidirectional_weight_vectors(
+                fit["fit"]["weights"], config.benign_method,
+                pathogenic_idx, benign_idx, synonymous_idx, gnomad_idx,
+            )
+            if source_w is None or reference_w is None:
+                continue
+            if is_bidirectional_by_weights(fit["fit"]["component_params"], source_w, reference_w):
+                n_flagged += 1
+        frac_flagged = n_flagged / len(fits) if fits else 0.0
+        force_no_postprocess = frac_flagged >= BIDIRECTIONAL_VOTE_THRESHOLD
+        logger.info(
+            f"  Bidirectional auto-detect: {n_flagged}/{len(fits)} bootstrap fits flagged "
+            f"({frac_flagged:.1%}), threshold={BIDIRECTIONAL_VOTE_THRESHOLD:.0%} -> "
+            f"{'forcing postprocess_point_ranges=False' if force_no_postprocess else 'no override'}"
+        )
+    # benign_center: same actual-score mean already used for scoreset_flipped
+    # detection above (ben_mean_score), reused here as the reference position
+    # for extend_bidirectional_pathogenic_islands -- simpler and more robust
+    # than trying to identify "the benign component" from an EM fit (which
+    # has no stable identity across bootstrap fits; see git history for the
+    # per-fit component-weighted-argmax version this replaced).
+    benign_center = float(ben_mean_score) if force_no_postprocess else None
+
     # Monotonicity enforcement and extend-to-xlims are integer-point-specific.
     # Continuous uses string-keyed ranges but still needs the outermost P and B
     # ranges extended to ±inf so scores beyond the observed range are classified.
@@ -933,7 +991,7 @@ def process_component_fits(
             for k in sorted(point_ranges.keys(), key=lambda x: -x):
                 logger.info(f"    {k:+d}: {point_ranges[k]}")
 
-        if getattr(config, "postprocess_point_ranges", True):
+        if getattr(config, "postprocess_point_ranges", True) and not force_no_postprocess:
             # Enforce monotonicity (first pass)
             enforce_monotonicity_point_ranges(
                 point_ranges,
@@ -973,6 +1031,33 @@ def process_component_fits(
 
             if config.debug:
                 logger.info("  [DEBUG] Point ranges AFTER second enforce_monotonicity (final):")
+                for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                    logger.info(f"    {k:+d}: {point_ranges[k]}")
+        elif force_no_postprocess:
+            # Auto-detected bidirectional: pathogenic evidence may be
+            # genuinely non-monotonic (that's the whole premise). Benign
+            # evidence is assumed to NEVER be bidirectional (a single
+            # unimodal region), so it just gets its noisy same-tier
+            # fragmentation cleaned up -- see clean_benign_fragments_no_extend
+            # and clean_bidirectional_pathogenic_evidence docstrings for the
+            # full algorithms/rationale.
+            if config.debug:
+                logger.info("  [DEBUG] Point ranges BEFORE bidirectional cleanup:")
+                for k in sorted(point_ranges.keys(), key=lambda x: -x):
+                    logger.info(f"    {k:+d}: {point_ranges[k]}")
+
+            clean_benign_fragments_no_extend(
+                point_ranges, config.point_values, score_range[range_subset],
+                liberal=config.liberal_monotonicity,
+            )
+            clean_bidirectional_pathogenic_evidence(
+                point_ranges, config.point_values, score_range[range_subset],
+                benign_center, liberal=config.liberal_monotonicity, inf=True,
+            )
+
+            if config.debug:
+                logger.info(f"  [DEBUG] Point ranges AFTER bidirectional cleanup "
+                            f"(benign_center={benign_center}):")
                 for k in sorted(point_ranges.keys(), key=lambda x: -x):
                     logger.info(f"    {k:+d}: {point_ranges[k]}")
         elif config.debug:
@@ -1116,6 +1201,8 @@ def plot_all_configs_comparison(
     calibrations: Dict,
     selected_config: tuple,
     metrics: Optional[Dict] = None,
+    pathogenic_percentile: float = 5.0,
+    benign_percentile: float = 95.0,
 ) -> plt.Figure:
     """
     Grid comparison of all (2c/3c) × (avg/benign) calibration configs.
@@ -1126,6 +1213,11 @@ def plot_all_configs_comparison(
       benign row  : [density + benign shading]        … | benign LR+ | benign confusion
 
     The selected config panels are highlighted with a green border and bold title.
+
+    pathogenic_percentile/benign_percentile: the conservative/upper percentiles
+    actually used to compute these calibrations (PipelineConfig.pathogenic_percentile/
+    benign_percentile) -- drives the LR+ percentile bands drawn below, instead of a
+    hardcoded 5th/95th.
     """
     import seaborn as sns
 
@@ -1204,11 +1296,11 @@ def plot_all_configs_comparison(
                              alpha=0.5, color=hist_colors[s_raw % len(hist_colors)])
                 density = sample_density(score_range_ref, fits, s_col)
                 for c in range(density.shape[1]):
-                    d = np.nanpercentile(density[:, c, :], [5, 50, 95], axis=0)
+                    d = np.nanpercentile(density[:, c, :], [pathogenic_percentile, 50, benign_percentile], axis=0)
                     ax_fit.plot(score_range_ref, d[1], color=f"C{c}", linestyle="--",
                                 label=f"Comp {c+1}", linewidth=1.2)
                 d_tot = np.nansum(density, axis=1)
-                d_pct = np.nanpercentile(d_tot, [5, 50, 95], axis=0)
+                d_pct = np.nanpercentile(d_tot, [pathogenic_percentile, 50, benign_percentile], axis=0)
                 ax_fit.plot(score_range_ref, d_pct[1], color="black", alpha=0.5)
                 ax_fit.fill_between(score_range_ref, d_pct[0], d_pct[2], color="gray", alpha=0.2)
                 ax_fit.set_title(f"{n_c_str}: {scoreset.sample_names[s_raw]}\n(n={n:,d})", fontsize=8)
@@ -1238,7 +1330,8 @@ def plot_all_configs_comparison(
             if "log_lr_pct" in calib:
                 llr = np.asarray(calib["log_lr_pct"])
             else:
-                llr = np.nanpercentile(np.asarray(calib["log_lr_plus"]), [5, 50, 95], axis=0)
+                llr = np.nanpercentile(np.asarray(calib["log_lr_plus"]),
+                                        [pathogenic_percentile, 50, benign_percentile], axis=0)
             prior = float(calib["prior"])
 
             def _sel_spine(a):
@@ -1293,8 +1386,24 @@ def plot_all_configs_comparison(
 
             # LR+ panel
             ax_lr = ax[row_m, n_samples]
-            for curve, color, lbl in zip(llr, ["red", "black", "blue"], ["5th", "Med", "95th"]):
+            for curve, color, lbl in zip(llr, ["red", "black", "blue"],
+                                          [f"{pathogenic_percentile:g}th", "Med", f"{benign_percentile:g}th"]):
                 ax_lr.plot(score_range, curve, color=color, label=lbl, linewidth=1.5)
+
+            # Faint reference curve(s) for the standard 5th/95th when a
+            # non-default percentile was used and we have the real
+            # per-bootstrap matrix (see plot_scoreset_best_config for the
+            # same logic/rationale -- avoids the re-percentiling bias of
+            # deriving 5/95 from an already-percentiled 3-row array).
+            has_raw_bootstraps = "log_lr_pct" not in calib and np.asarray(calib["log_lr_plus"]).shape[0] > 3
+            if has_raw_bootstraps:
+                ref = np.nanpercentile(np.asarray(calib["log_lr_plus"]), [5, 95], axis=0)
+                if not np.isclose(pathogenic_percentile, 5.0):
+                    ax_lr.plot(score_range, ref[0], color="red", alpha=0.25,
+                               linewidth=0.8, linestyle="--", label="5th (ref)")
+                if not np.isclose(benign_percentile, 95.0):
+                    ax_lr.plot(score_range, ref[1], color="blue", alpha=0.25,
+                               linewidth=0.8, linestyle="--", label="95th (ref)")
             pt_vals = sorted({abs(int(k)) for k in calib["point_ranges"]})
             if 0 < prior < 1 and pt_vals:
                 try:
@@ -1307,7 +1416,8 @@ def plot_all_configs_comparison(
                 pp = calib["priors_pct"]
             elif "priors" in calib:
                 priors_arr = np.atleast_1d(calib["priors"])
-                pp = np.percentile(priors_arr, [5, 50, 95]) if len(priors_arr) > 1 else [prior] * 3
+                pp = (np.percentile(priors_arr, [pathogenic_percentile, 50, benign_percentile])
+                      if len(priors_arr) > 1 else [prior] * 3)
             else:
                 pp = [prior, prior, prior]
             ax_lr.set_title(f"{n_c_str} {benign_method} LR+\nprior {pp[1]:.3f} ({pp[0]:.3f}–{pp[2]:.3f})",

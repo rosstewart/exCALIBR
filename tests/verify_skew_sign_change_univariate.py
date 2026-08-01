@@ -81,7 +81,6 @@ def _run_fits(observations, sample_indicators, constrained, n_reps, seed):
 
     for i in range(n_reps):
         lam_idx = i % n_patterns
-        init_signs = lambda_table[lam_idx]
 
         # train/val split (simple 80/20)
         rng = np.random.RandomState(seed + i)
@@ -106,12 +105,28 @@ def _run_fits(observations, sample_indicators, constrained, n_reps, seed):
         )
 
         params = result.get("component_params", [])
-        if not params or any(len(p) == 0 for p in params):
+        init_params = result.get("initial_params", [])
+        if not params or any(len(p) == 0 for p in params) \
+                or not init_params or any(len(p) == 0 for p in init_params):
             continue
 
-        # Sort by location to get consistent component ordering
+        # Sort by location to get consistent component ordering. Read the
+        # init sign from the fit's own returned initial_params (already
+        # sorted by loc the same way kmeans_init sorts before returning,
+        # initializations.py:59) rather than reconstructing it from
+        # lambda_table[lam_idx] -- that raw table entry is in kmeans's
+        # unsorted, per-restart-random cluster-label order, which does NOT
+        # reliably correspond to the loc-sorted order used for final_signs.
+        # Comparing lambda_table[lam_idx] directly against a loc-sorted
+        # final_signs was reporting ~20% "sign changes" that were actually
+        # just this cluster-label/loc-sort mismatch: independently checking
+        # every restart's *actual* initial_params against its final
+        # component_params (both loc-sorted, apples-to-apples) showed 0/40
+        # genuine sign flips on this exact synthetic setup.
         params_sorted = sorted(params, key=lambda p: p[1])
         final_signs = tuple(int(np.sign(p[0])) for p in params_sorted)
+        init_sorted = sorted(init_params, key=lambda p: p[1])
+        init_signs = tuple(int(np.sign(p[0])) for p in init_sorted)
 
         # val_ll: use all held-out observations
         from scipy.stats import skewnorm
@@ -156,8 +171,13 @@ def _report(label, results, lambda_table):
 
     for lam_idx in sorted(by_pattern.keys()):
         rows = by_pattern[lam_idx]
+        # init_signs is now read per-restart from the fit's own returned
+        # initial_params (see _run_fits), so unlike the old lambda_table
+        # proxy it isn't guaranteed identical across every rep sharing this
+        # lam_idx (kmeans cluster-label order varies per restart) -- compare
+        # each row against its own init, not rows[0][0].
         init = rows[0][0]
-        n_changed = sum(1 for _, f, _ in rows if f != init)
+        n_changed = sum(1 for i, f, _ in rows if f != i)
         # most common final sign
         final_counts = {}
         for _, f, _ in rows:

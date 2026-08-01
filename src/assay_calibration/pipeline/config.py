@@ -32,13 +32,38 @@ class PipelineConfig:
     use_2c_equation: bool = False  # Use EM estimation instead
     liberal_monotonicity: bool = True
     postprocess_point_ranges: bool = True
+
+    # Auto-detect bidirectional assays (e.g. LoF/GoF in one assay) per
+    # bootstrap fit, from mixture-component weights (a pathogenic-like
+    # component on each side of a benign-like one -- see
+    # is_bidirectional_by_weights/resolve_bidirectional_weight_vectors in
+    # fit_utils/point_ranges.py, which also handle the PU/NU sample-
+    # availability cases via a gnomAD fallback). When a majority of
+    # bootstrap fits are flagged (BIDIRECTIONAL_VOTE_THRESHOLD), skips
+    # monotonicity enforcement for this dataset (like --no-postprocess) and
+    # instead extends only the outermost pathogenic evidence island on each
+    # side to the axis limit, via extend_bidirectional_pathogenic_islands --
+    # see that function's docstring for the full rationale/algorithm.
+    # Only applies when n_c >= 3 (2c can't exhibit a sandwiched pattern).
+    # (An earlier "raw points" detection method -- is_bidirectional_by_raw_points
+    # -- was tried and archived in favor of this weights-based method.)
+    auto_bidirectional: bool = True
+
     benign_method: Literal["benign", "avg", "synonymous"] = "avg"
     manual_prior: float = None  # If set, skip prior estimation and use this value
     population_type: str = "gnomAD"
 
-    # Configurable conservative percentile (paired with 100 - pathogenic_percentile as the
-    # upper bound). Replaces hardcoded 5/95 in conservative threshold/LR calculations.
+    # Configurable conservative percentile, paired by default with
+    # 100 - pathogenic_percentile as the upper (benign-direction) bound.
+    # Replaces hardcoded 5/95 in conservative threshold/LR calculations.
     pathogenic_percentile: float = 5.0
+
+    # Independent upper (benign-direction) percentile. None (default) keeps
+    # the historical symmetric pairing (100 - pathogenic_percentile); set
+    # explicitly to decouple the two, e.g. to sweep pathogenic_percentile
+    # (5/50/25) while always keeping the benign-direction bound at the 95th
+    # percentile. Resolved to a concrete float in __post_init__.
+    benign_percentile: Optional[float] = None
 
     # Opt-in: restrict the "effective pathogenic sample" used for prior estimation to
     # pathogenic-labeled rows whose conservative (pathogenic_percentile-th) bootstrap
@@ -140,7 +165,7 @@ class PipelineConfig:
 
     # OOB evidence
     compute_oob: bool = False
-    oob_min_samples: int = 10
+    oob_min_samples: int = 1
 
     # Execution parameters
     execution_mode: Literal["slurm", "parallel", "single"] = "parallel"
@@ -198,7 +223,7 @@ class PipelineConfig:
     acmg_bayes_floor_at_neutral: bool = False
 
     # ClinVar parameters
-    clinvar_release: str = "2025"
+    clinvar_release: str = "2026"
     min_clinvar_star: int = 1
     synonymous_exclusive: bool = False
 
@@ -210,7 +235,7 @@ class PipelineConfig:
 
     def __post_init__(self):
         if self.components is None:
-            self.components = [2, 3]
+            self.components = [3]
         if self.point_values is None:
             self.point_values = [1, 2, 3, 4, 5, 6, 7, 8]
 
@@ -223,11 +248,27 @@ class PipelineConfig:
             if not (0 < self.manual_prior < 1):
                 raise ValueError(f"manual_prior must be in (0, 1), got {self.manual_prior}")
 
-        # Validate pathogenic_percentile (must stay below its paired upper bound
-        # 100 - pathogenic_percentile, i.e. below 50)
-        if not (0 < self.pathogenic_percentile < 50):
+        # Resolve/validate the (pathogenic_percentile, benign_percentile) pair.
+        # benign_percentile defaults to the historical symmetric pairing
+        # (100 - pathogenic_percentile) when not set explicitly; once
+        # decoupled, the only remaining constraint is pathogenic_percentile <
+        # benign_percentile (both valid percentiles in (0, 100)) -- e.g.
+        # pathogenic_percentile=50 is now allowed as long as benign_percentile
+        # is set independently (e.g. to 95) rather than defaulting to 50.
+        if not (0 < self.pathogenic_percentile < 100):
             raise ValueError(
-                f"pathogenic_percentile must be in (0, 50), got {self.pathogenic_percentile}"
+                f"pathogenic_percentile must be in (0, 100), got {self.pathogenic_percentile}"
+            )
+        if self.benign_percentile is None:
+            self.benign_percentile = 100 - self.pathogenic_percentile
+        if not (0 < self.benign_percentile < 100):
+            raise ValueError(
+                f"benign_percentile must be in (0, 100), got {self.benign_percentile}"
+            )
+        if not (self.pathogenic_percentile < self.benign_percentile):
+            raise ValueError(
+                f"pathogenic_percentile ({self.pathogenic_percentile}) must be less than "
+                f"benign_percentile ({self.benign_percentile})"
             )
 
         # Validate pathomechanism_method

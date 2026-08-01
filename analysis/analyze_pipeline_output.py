@@ -615,6 +615,90 @@ if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis
     )
 
 # %% [markdown]
+# ### 3a6. Bootstrap-count-reduction analysis
+#
+# How much does reducing the number of bootstrap fits (e.g. 1000 -> 20) used
+# to build a calibration degrade it? Unlike the downsample/discordance
+# robustness conditions above, `tests/benchmark_bootstrap_reduction.py`
+# computes exactly ONE calibration per (dataset, bootstrap-count level) --
+# no repeated seeds per level. Deliberately not adding those (rerunning each
+# level several times with independent bootstrap subsamples just to measure
+# seed-to-seed spread) was a cost call, not an oversight: each level already
+# carries its own free bootstrap-resampling uncertainty --
+# `process_component_fits` computes `[p5,p50,p95]` across whatever bootstrap
+# fits that level actually got, so comparing every level's own band directly
+# already shows (a) how the median LR+ curve drifts as N shrinks and (b) how
+# each level's own reported uncertainty widens as N shrinks, with zero extra
+# fitting. See `analysis.robustness.plot_bootstrap_reduction_config_summary`'s
+# docstring for the full reasoning.
+#
+# Data assembly (matching `tests/benchmark_bootstrap_reduction.py`'s on-disk
+# `{dataset}/level_{N}/..._calibration.json` layout, and the fixed reference
+# population every level's histogram/LR+ curve is compared against) is
+# reused directly from `tests/plot_bootstrap_reduction_config.py` — the
+# standalone script and this notebook cell call the exact same
+# `_process_one_dataset`/`build_reference_df` helpers, so there is only one
+# place that logic lives.
+
+# %%
+if not config.warn_if_missing(config.BOOTSTRAP_REDUCTION_OUTPUT_DIR, "bootstrap-count-reduction analysis"):
+    import gzip as _gzip
+    import multiprocessing as _mp
+    from joblib import Parallel as _Parallel, delayed as _delayed
+    from run_igvf_batch import parse_dataset_config as _parse_dataset_config
+    from tests.benchmark_bootstrap_reduction import build_dataset_df as _build_bsr_dataset_df
+    from tests.plot_bootstrap_reduction_config import _process_one_dataset as _process_bsr_dataset
+
+    br_dir = Path(config.BOOTSTRAP_REDUCTION_OUTPUT_DIR)
+    bsr_datasets = sorted(
+        d.name for d in br_dir.iterdir() if d.is_dir() and any(d.glob("level_*"))
+    )
+    print(f"Discovered {len(bsr_datasets)} dataset(s) with bootstrap-reduction output")
+
+    with open(config.DATASET_CONFIGS) as f:
+        bsr_dataset_configs = json.load(f)
+    _sep = "\t" if config.DATASET_TSV.endswith((".tsv", ".tsv.gz")) else ","
+    bsr_df = pd.read_csv(config.DATASET_TSV, sep=_sep)
+
+    bsr_bootstrap_results = None
+    if config.PRECOMPUTED_FITS and Path(config.PRECOMPUTED_FITS).exists():
+        print(f"  Loading {config.PRECOMPUTED_FITS} for Row 0 density overlay...")
+        with _gzip.open(config.PRECOMPUTED_FITS, "rt", encoding="utf-8") as f:
+            bsr_bootstrap_results = json.load(f)
+
+    bsr_per_dataset_df = {d: _build_bsr_dataset_df(d, bsr_df) for d in bsr_datasets}
+    print(f"  Rendering {len(bsr_datasets)} bootstrap-reduction config-summary figures "
+          f"across {_mp.cpu_count()} CPUs...")
+    bsr_results = _Parallel(n_jobs=-1, batch_size=1, backend="loky", verbose=5)(
+        _delayed(_process_bsr_dataset)(
+            dataset_name, br_dir / dataset_name, bsr_dataset_configs, config.DATASET_TSV,
+            bsr_per_dataset_df[dataset_name], bsr_bootstrap_results, FIGURE_DIR,
+        )
+        for dataset_name in bsr_datasets
+    )
+    for dataset_name, err in bsr_results:
+        if err is not None:
+            print(f"  SKIP {dataset_name}: {err}")
+
+# %% [markdown]
+# ### 3a7. Fit-number (restart-count) comparison
+#
+# How much does reducing the number of EM restarts per fit degrade the
+# best-of-N training log-likelihood? Median + IQR ribbon (across every
+# dataset x n_c row) vs. restart count, from
+# `tests/benchmark_num_fits_dataframe.py`'s `summary.csv`.
+
+# %%
+if not config.warn_if_missing(config.FIT_NUMBER_COMPARISON_SUMMARY_CSV, "fit-number comparison"):
+    from analysis.robustness import plot_fit_number_comparison_curve
+
+    fit_number_summary = pd.read_csv(config.FIT_NUMBER_COMPARISON_SUMMARY_CSV)
+    print(f"Loaded {len(fit_number_summary)} rows, "
+          f"{fit_number_summary['dataset'].nunique()} datasets, "
+          f"num_fits levels: {sorted(fit_number_summary['num_fits'].unique())}")
+    plot_fit_number_comparison_curve(fit_number_summary, figure_dir=FIGURE_DIR, label="all_datasets")
+
+# %% [markdown]
 # ### 3b. Aggregate performance report + manuscript LaTeX table
 #
 # `print_aggregate_performance` (src/assay_calibration/plot_utils/utils.py)

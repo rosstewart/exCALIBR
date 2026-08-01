@@ -184,6 +184,398 @@ def extend_points_to_xlims(point_ranges, point_values, score_range, scoreset_fli
             print(neg,'extends the whole score range, removing...')
 
 
+# Fraction of bootstrap fits that must be flagged bidirectional (by either
+# is_bidirectional_by_weights or is_bidirectional_by_raw_points) before a
+# dataset's postprocess_point_ranges is auto-forced to False. Prototyping
+# constant, not currently exposed as a CLI flag.
+BIDIRECTIONAL_VOTE_THRESHOLD = 0.5
+
+
+def _skewnorm_mean(component_params):
+    a, loc, scale = component_params
+    delta = a / np.sqrt(1.0 + a * a)
+    return loc + scale * delta * np.sqrt(2.0 / np.pi)
+
+
+def get_effective_benign_weights(weights, benign_method, benign_idx, synonymous_idx):
+    """Resolve the per-component "effective benign" mixture-weight vector for
+    a fit, honoring benign_method the same way the rest of the pipeline does
+    (see e.g. the w_bs blend in the 2c-equation branch of process_component_fits,
+    and the ben_mean_score blend used for scoreset_flipped detection): average
+    of benign+synonymous when benign_method="avg" and both are present, else
+    whichever of the two is configured/available. Returns None if neither
+    benign nor synonymous is present (nothing to compare against).
+    """
+    if benign_method == "avg" and benign_idx is not None and synonymous_idx is not None:
+        return (np.asarray(weights[benign_idx]) + np.asarray(weights[synonymous_idx])) / 2
+    if benign_method == "synonymous" and synonymous_idx is not None:
+        return np.asarray(weights[synonymous_idx])
+    if benign_idx is not None:
+        return np.asarray(weights[benign_idx])
+    if synonymous_idx is not None:
+        return np.asarray(weights[synonymous_idx])
+    return None
+
+
+def resolve_bidirectional_weight_vectors(weights, benign_method, pathogenic_idx, benign_idx,
+                                          synonymous_idx, gnomad_idx):
+    """Resolve the (source, reference) weight vectors for is_bidirectional_by_weights,
+    handling the same PN/PU/NU sample-availability cases as get_fit_prior /
+    resolve_pathomechanism_anchor elsewhere in this module:
+
+      - PN (pathogenic + benign/synonymous both present): source=pathogenic,
+        reference=effective benign (get_effective_benign_weights).
+      - PU (pathogenic present, benign/synonymous absent): no benign-like
+        anchor exists, so reference falls back to gnomAD/population.
+      - NU (pathogenic absent, benign/synonymous present): no pathogenic-like
+        sample exists, so source falls back to gnomAD/population instead
+        (a component gnomAD over-weights relative to effective benign is the
+        NU analogue of "pathogenic-like").
+
+    Returns (source_weights, reference_weights), either of which may be None
+    if there isn't enough information to form a comparison (e.g. only gnomAD
+    is present, with no pathogenic AND no benign/synonymous).
+    """
+    reference_weights = get_effective_benign_weights(weights, benign_method, benign_idx, synonymous_idx)
+
+    if pathogenic_idx is not None:
+        source_weights = np.asarray(weights[pathogenic_idx])
+        if reference_weights is None and gnomad_idx is not None:
+            reference_weights = np.asarray(weights[gnomad_idx])  # PU mode
+    elif reference_weights is not None and gnomad_idx is not None:
+        source_weights = np.asarray(weights[gnomad_idx])  # NU mode
+    else:
+        source_weights = None
+
+    return source_weights, reference_weights
+
+
+def is_bidirectional_by_weights(component_params, source_weights, reference_weights):
+    """Method B auto-detection: does this fit look bidirectional (e.g. LoF/GoF)?
+
+    Sorts components by skew-normal mean along the score axis, labels each
+    "pathogenic-like" if the source sample's mixture weight in that component
+    exceeds the reference sample's weight (else "benign-like"), and flags the
+    fit if any benign-like component has at least one pathogenic-like
+    component before it and at least one after it in the sorted order.
+    Generalizes to any K: e.g. P,B,B,P or P,B,P,B both flag; only a fully
+    monotonic label sequence (e.g. B,B,P,P) does not.
+
+    ``source_weights``/``reference_weights`` are per-component weight vectors
+    -- normally (pathogenic, effective-benign), but see
+    ``resolve_bidirectional_weight_vectors`` for the PU/NU fallbacks (gnomAD
+    substituted for whichever of pathogenic/benign is unavailable).
+    """
+    order = sorted(range(len(component_params)), key=lambda k: _skewnorm_mean(component_params[k]))
+    path_like = [source_weights[k] > reference_weights[k] for k in order]
+
+    any_p_before = False
+    for i, is_p in enumerate(path_like):
+        if is_p:
+            any_p_before = True
+            continue
+        if any_p_before and any(path_like[i + 1:]):
+            return True
+    return False
+
+
+def is_bidirectional_by_raw_points(ranges_p, ranges_b):
+    """ARCHIVED, unused: Method A ("raw points") auto-detection, superseded by
+    the component-weights method (is_bidirectional_by_weights) as the
+    canonical bidirectional-detection approach. No longer wired into
+    process_component_fits/PipelineConfig/CLI -- kept here for reference
+    only. Does this fit's RAW (pre-postprocess) set of pathogenic/benign
+    point ranges show a pathogenic -> benign -> pathogenic pattern along the
+    score axis (pathogenic evidence on both sides of a benign region)?
+
+    ``ranges_p``/``ranges_b`` are the per-fit dicts of point_value -> flat
+    [lo, hi, lo, hi, ...] arrays produced by ``get_point_ranges`` (positive
+    point values in ``ranges_p``, negative in ``ranges_b``), as already
+    computed per-bootstrap-fit in ``process_component_fits`` before
+    aggregation/postprocessing.
+    """
+    segments = []  # (lo, sign)
+    for flat in ranges_p.values():
+        arr = np.asarray(flat).reshape(-1, 2)
+        for lo, _hi in arr:
+            segments.append((lo, 1))
+    for flat in ranges_b.values():
+        arr = np.asarray(flat).reshape(-1, 2)
+        for lo, _hi in arr:
+            segments.append((lo, -1))
+    if not segments:
+        return False
+
+    segments.sort(key=lambda s: s[0])
+    signs = [s[1] for s in segments]
+    merged = [signs[0]]
+    for s in signs[1:]:
+        if s != merged[-1]:
+            merged.append(s)
+
+    any_p_before = False
+    for i, s in enumerate(merged):
+        if s == 1:
+            any_p_before = True
+            continue
+        if any_p_before and any(x == 1 for x in merged[i + 1:]):
+            return True
+    return False
+
+
+def benign_reference_center(component_params, reference_weights):
+    """ARCHIVED, unused: superseded by simply reusing the actual mean score of
+    the benign/synonymous-labeled sample (ben_mean_score, already computed in
+    process_component_fits for scoreset_flipped detection) as the reference
+    position for extend_bidirectional_pathogenic_islands -- simpler and more
+    robust than this per-fit EM-component approach, since components have no
+    stable identity across bootstrap fits (only their weights/positions are
+    comparable fit-to-fit, requiring an extra median-across-fits aggregation
+    this function's callers had to do). Kept here for reference only.
+
+    For a single bootstrap fit, returns the score-axis position (skew-normal
+    mean) of whichever component the effective-benign/reference sample
+    weights most heavily -- the fit's own local "benign center of mass".
+    """
+    k = int(np.argmax(reference_weights))
+    return _skewnorm_mean(component_params[k])
+
+
+def extend_bidirectional_pathogenic_islands(point_ranges, point_values, score_range, benign_center, inf=True):
+    """ARCHIVED, unused: superseded by clean_bidirectional_pathogenic_evidence,
+    which reuses the exact canonical enforce_monotonicity_point_ranges/
+    extend_points_to_xlims machinery per-side instead of this bespoke
+    edge-extension algorithm -- that correctly reduces a sandwiched-peak
+    pattern (e.g. raw +1,+2,+3,+2,+1) to a properly nested +3,+2,+1 chain
+    with the strongest tier extending outward, which this function's
+    "extend whatever fragment sits at the literal edge" approach did not do
+    (it would extend the weakest edge fragment instead). Kept for reference
+    only.
+
+    Custom postprocessing for auto-detected bidirectional assays (see
+    PipelineConfig.auto_bidirectional), used INSTEAD of
+    enforce_monotonicity_point_ranges + extend_points_to_xlims -- those
+    assume a single monotonic direction (scoreset_flipped), which does not
+    apply here since evidence can be pathogenic-leaning on BOTH extremes
+    with benign evidence in the middle.
+
+    Rationale: bidirectional evidence is assumed pathogenic-leaning at the
+    extremes with benign in the middle (never at an axis edge), so only
+    pathogenic evidence ever needs extending -- benign ranges are left
+    untouched. Interior structure (whatever tiers/ranges exist between the
+    two extremes) is also left untouched: no monotonicity-nesting is
+    enforced, since it may be genuinely non-monotonic.
+
+    Algorithm: merge all positive (pathogenic) point-tier sub-ranges into
+    contiguous score-axis "islands" (adjacent/overlapping sub-ranges from
+    any tier become one island). For the leftmost island, extend its left
+    edge to the axis limit only if ``benign_center`` lies entirely to its
+    right (i.e. this island is unambiguously the far-left lobe). Mirror for
+    the rightmost island (extend right edge only if benign_center lies
+    entirely to its left). If there is only a single island overall, only
+    the side away from benign_center is extended (and not at all if
+    benign_center falls inside the island itself -- ambiguous). Any islands
+    strictly between the two extremes are left untouched, as are all
+    benign (negative) ranges.
+
+    Mutates point_ranges in place; returns nothing (matches
+    enforce_monotonicity_point_ranges/extend_points_to_xlims convention).
+    """
+    left = -np.inf if inf else score_range[0]
+    right = np.inf if inf else score_range[-1]
+
+    all_ranges = []  # (lo, hi, point_value, index_in_point_ranges[point_value])
+    for pv in point_values:
+        for i, (lo, hi) in enumerate(point_ranges.get(pv, [])):
+            all_ranges.append((lo, hi, pv, i))
+    if not all_ranges or benign_center is None:
+        return
+
+    all_ranges.sort(key=lambda r: r[0])
+
+    islands = []  # [{"lo", "hi", "members": [(pv, i, lo, hi), ...]}]
+    for lo, hi, pv, i in all_ranges:
+        if islands and lo <= islands[-1]["hi"]:
+            islands[-1]["hi"] = max(islands[-1]["hi"], hi)
+            islands[-1]["members"].append((pv, i, lo, hi))
+        else:
+            islands.append({"lo": lo, "hi": hi, "members": [(pv, i, lo, hi)]})
+
+    def _extend_left_edge(island):
+        for pv, i, lo, hi in island["members"]:
+            if lo == island["lo"]:
+                point_ranges[pv][i][0] = left
+                return
+
+    def _extend_right_edge(island):
+        for pv, i, lo, hi in island["members"]:
+            if hi == island["hi"]:
+                point_ranges[pv][i][1] = right
+                return
+
+    left_island, right_island = islands[0], islands[-1]
+
+    if left_island is right_island:
+        # Only one pathogenic island total -- extend only the side away
+        # from the benign center; if benign_center falls inside the
+        # island itself, that's ambiguous, so leave it untouched.
+        if benign_center > left_island["hi"]:
+            _extend_left_edge(left_island)
+        elif benign_center < left_island["lo"]:
+            _extend_right_edge(left_island)
+        return
+
+    if benign_center > left_island["hi"]:
+        _extend_left_edge(left_island)
+    if benign_center < right_island["lo"]:
+        _extend_right_edge(right_island)
+
+
+def clean_benign_fragments_no_extend(point_ranges, point_values, score_range=None, liberal=True):
+    """Auto-bidirectional benign-side cleanup (see PipelineConfig.auto_bidirectional).
+
+    Benign evidence is assumed to NEVER be bidirectional (a single, unimodal
+    region). Never calls extend_points_to_xlims regardless of ``liberal``
+    (no reason to assume unobserved territory beyond the benign region
+    continues indefinitely).
+
+    ``liberal`` mirrors PipelineConfig.liberal_monotonicity -- respect the
+    dataset's configured strictness instead of always using one behavior:
+
+    liberal=True (default): the raw per-tier fragments can still show noisy
+    alternation (e.g. -1,-2,-1,-2,-1) when the percentile-aggregated LR+
+    curve wobbles back and forth across adjacent thresholds instead of
+    crossing each one exactly once. Process benign tiers from STRONGEST
+    (most negative) to WEAKEST (closest to zero); each tier's final range is
+    the envelope (min-to-max span) of its own raw fragments, MINUS whatever
+    territory a stronger tier has already claimed. Example: raw
+    -1: [[A,B],[C,D],[E,F]], -2: [[B,C],[D,E]] (i.e. -1,-2,-1,-2,-1 reading
+    left to right) becomes -2: [[B,E]] (claimed first, its own envelope)
+    then -1: [[A,B],[E,F]] (envelope [A,F] minus the already-claimed [B,E])
+    -- i.e. a clean -1,-2,-1, with the noisy middle -1 fragment correctly
+    absorbed into -2's territory. (Plain liberal-mode
+    enforce_monotonicity_point_ranges is NOT used here even though
+    liberal=True mirrors it conceptually -- its "keep only one fragment
+    total" rule would discard one of the two genuine flanking regions
+    rather than merely absorbing the noise between them.)
+
+    liberal=False: reuses the EXACT canonical strict
+    enforce_monotonicity_point_ranges algorithm, called TWICE with no
+    extend_points_to_xlims in between (matching the non-bidirectional
+    path's "remove evidence that goes back to indeterminate" intent, minus
+    the extend-to-axis-limit step, which is never appropriate for benign in
+    bidirectional mode) -- restricted to the benign/negative tiers only (the
+    positive/pathogenic tiers are snapshotted and restored unchanged around
+    both calls). Each pass treats a highest-evidence tier that doesn't touch
+    either score_range edge as "evidence goes back to neutral" and wipes
+    that tier and everything weaker/beyond it; running it twice catches
+    tiers that only became "the sole remaining evidence" as a result of the
+    first pass's own removals (e.g. a fragmented weak tier that gets
+    flattened to a single span in pass 1, with nothing stronger left beside
+    it, gets wiped in pass 2 too). For a genuinely bidirectional dataset,
+    benign sits in the MIDDLE by construction (the pathogenic islands
+    occupy the true edges), so this ends up discarding ALL benign evidence
+    here in practice -- matching how a liberal_monotonicity=False dataset
+    was treated before auto-bidirectional detection existed. Requires
+    ``score_range``.
+
+    Mutates point_ranges in place for negative point_values only.
+    """
+    if not liberal:
+        raw_pathogenic = {pv: list(point_ranges[pv]) for pv in point_values}
+        enforce_monotonicity_point_ranges(
+            point_ranges, point_values, score_range, scoreset_flipped=False, liberal=False,
+        )
+        enforce_monotonicity_point_ranges(
+            point_ranges, point_values, score_range, scoreset_flipped=False, liberal=False,
+        )
+        for pv in point_values:
+            point_ranges[pv] = raw_pathogenic[pv]
+        return
+
+    def _envelope(ranges):
+        if not ranges:
+            return None
+        return [min(r[0] for r in ranges), max(r[1] for r in ranges)]
+
+    def _subtract(interval, claimed_list):
+        pieces = [list(interval)]
+        for c_lo, c_hi in claimed_list:
+            next_pieces = []
+            for lo, hi in pieces:
+                if c_hi <= lo or c_lo >= hi:
+                    next_pieces.append([lo, hi])
+                    continue
+                if c_lo > lo:
+                    next_pieces.append([lo, c_lo])
+                if c_hi < hi:
+                    next_pieces.append([c_hi, hi])
+            pieces = next_pieces
+        return pieces
+
+    claimed = []
+    for pv in sorted(point_values, reverse=True):  # strongest (most negative) first
+        point = -pv
+        env = _envelope(point_ranges.get(point, []))
+        if env is None:
+            point_ranges[point] = []
+            continue
+        point_ranges[point] = _subtract(env, claimed)
+        claimed.append(env)
+
+
+def clean_bidirectional_pathogenic_evidence(point_ranges, point_values, score_range, benign_center,
+                                             liberal=True, inf=True):
+    """Auto-bidirectional pathogenic-side cleanup (see PipelineConfig.auto_bidirectional).
+
+    Splits each pathogenic tier's raw fragments by position relative to
+    ``benign_center`` into a "left" and a "right" subset, then runs the
+    EXACT canonical enforce_monotonicity_point_ranges + extend_points_to_xlims
+    machinery independently on each subset -- as if it were an ordinary
+    single-direction (non-bidirectional) pathogenic problem. Left fragments
+    are processed as scoreset_flipped=False (pathogenic extends toward
+    -inf); right fragments as scoreset_flipped=True (pathogenic extends
+    toward +inf).
+
+    This correctly handles both:
+      - a genuine two-sided (pathogenic-benign-pathogenic) pattern: each
+        side gets its own canonical nested/extended structure independently
+        (no cross-contamination between the two lobes), and
+      - a single-sided "peak" pattern where a stronger tier is sandwiched
+        inside weaker flanking fragments (e.g. raw +1,+2,+3,+2,+1 all left
+        of benign_center): canonical liberal monotonicity naturally
+        collapses this into a properly nested +3,+2,+1 chain (discarding
+        the redundant weaker-tier fragment on the "wrong" side of the peak,
+        since it's already covered once the strongest tier's edge is
+        extended outward) -- matching exactly what the ordinary
+        non-bidirectional path does for a normal monotonic assay.
+
+    Mutates point_ranges in place for positive point_values only.
+    """
+    if benign_center is None:
+        return
+
+    left = {pv: [] for pv in point_values}
+    right = {pv: [] for pv in point_values}
+    for pv in point_values:
+        left[-pv] = []
+        right[-pv] = []
+        for lo, hi in point_ranges.get(pv, []):
+            mid = (lo + hi) / 2.0
+            (left if mid < benign_center else right)[pv].append([lo, hi])
+
+    enforce_monotonicity_point_ranges(left, point_values, score_range, scoreset_flipped=False, liberal=liberal)
+    extend_points_to_xlims(left, point_values, score_range, False, inf=inf)
+    enforce_monotonicity_point_ranges(left, point_values, score_range, scoreset_flipped=False, liberal=liberal)
+
+    enforce_monotonicity_point_ranges(right, point_values, score_range, scoreset_flipped=True, liberal=liberal)
+    extend_points_to_xlims(right, point_values, score_range, True, inf=inf)
+    enforce_monotonicity_point_ranges(right, point_values, score_range, scoreset_flipped=True, liberal=liberal)
+
+    for pv in point_values:
+        point_ranges[pv] = left[pv] + right[pv]
+
+
 def prior_equation_2c(w_p, w_b, w_g):
     return (w_g[1] - w_b[1]) / (w_p[1] - w_b[1])
 

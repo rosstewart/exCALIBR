@@ -123,11 +123,22 @@ def make_confusion_figure(
     label2: str,
     figure_dir: Path,
     tag: str = "",
+    xlabel: Optional[str] = None,
+    xticklabels: Optional[List[str]] = None,
 ):
     """Aggregate confusion heatmap comparing two sets of per-dataset matrices.
 
     Calls plot_aggregate_confusion_matrices from plot_utils.utils unmodified
     (letters=True); only re-labels the two panel titles.
+
+    *xlabel*/*xticklabels*, if given, override
+    plot_aggregate_confusion_matrices' hardcoded "Evidence Direction" axis
+    label and its Normal/IR/Abnormal -> Benign/Indeterminate/Pathogenic
+    tick-label mapping on both panels -- additive only (default None
+    preserves the exact existing look), for callers whose column semantics
+    aren't the Normal/IR/Abnormal evidence-direction convention (e.g. a
+    points-sign family, where the columns are Negative/Indeterminate/
+    Positive rather than a ClinVar-style label).
     """
     fig, _, _ = plot_aggregate_confusion_matrices(
         danzs_m1, danzs_m2, dataset_names, letters=True
@@ -136,6 +147,12 @@ def make_confusion_figure(
     if len(axes) >= 2:
         axes[0].set_title(_pretty(label1), fontsize=18, fontweight="bold", pad=10)
         axes[1].set_title(_pretty(label2), fontsize=18, fontweight="bold", pad=10)
+    if xlabel is not None or xticklabels is not None:
+        for ax in axes[:2]:
+            if xlabel is not None:
+                ax.set_xlabel(xlabel, fontsize=14)
+            if xticklabels is not None:
+                ax.set_xticklabels(xticklabels, rotation=0, fontsize=12)
 
     tag_suffix = f"_{tag}" if tag else ""
     _save(fig, figure_dir / f"confusion_heatmap_{label1}_vs_{label2}{tag_suffix}.png")

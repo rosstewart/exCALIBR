@@ -248,6 +248,115 @@ def add_thresholds(tauP, tauB, ax):
         ax.axhline(tb,color='blue',linestyle='--',alpha=0.5)
 
 
+def plot_initial_vs_final_skew(dataset_name, observations, initial_params, final_params,
+                                initial_weights=None, final_weights=None,
+                                sample_assignments=None, ax=None, annotate_params=True):
+    """Overlay one fit's initial (dashed) vs. converged (solid) skew-normal
+    component curves on the dataset's score histogram.
+
+    `initial_params`/`final_params` are lists of (a, loc, scale) tuples, e.g.
+    a fit result's "initial_params"/"component_params" (see
+    tests/verify_skew_sign_change_univariate.py for the synthetic-data
+    version of comparing these two). Per-component curves are drawn with
+    density_utils.joint_densities; when weights aren't supplied (initial
+    params have no associated mixture weights), components are shown with
+    equal weight so the comparison is about shape/location/sign, not mixing
+    proportion.
+
+    When annotate_params=True (default), the actual (a, loc, scale) values
+    for every component are printed in a legend-adjacent textbox, color-coded
+    to match that component's curves, so the sign/magnitude change is
+    readable directly off the figure rather than only inferable from curve
+    shape.
+    """
+    observations = np.asarray(observations)
+    n_components = len(final_params)
+    if initial_weights is None:
+        initial_weights = np.full(n_components, 1.0 / n_components)
+    if final_weights is None:
+        final_weights = np.full(n_components, 1.0 / n_components)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
+
+    if sample_assignments is not None:
+        sample_assignments = np.asarray(sample_assignments)
+        for s in range(sample_assignments.shape[1]):
+            vals = observations[sample_assignments[:, s].astype(bool)]
+            if len(vals):
+                ax.hist(vals, bins=40, density=True, alpha=0.25)
+    else:
+        ax.hist(observations, bins=40, density=True, alpha=0.3, color="gray")
+
+    x = np.linspace(observations.min(), observations.max(), 400)
+    init_density = density_utils.joint_densities(x, initial_params, initial_weights)
+    final_density = density_utils.joint_densities(x, final_params, final_weights)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_components, 1)))
+    for k in range(n_components):
+        ax.plot(x, init_density[k], linestyle="--", color=colors[k], alpha=0.8)
+        ax.plot(x, final_density[k], linestyle="-", color=colors[k], alpha=0.9)
+
+    ax.plot([], [], linestyle="--", color="black", label="initial")
+    ax.plot([], [], linestyle="-", color="black", label="final")
+    ax.set_title(dataset_name, fontsize=10)
+    ax.legend(fontsize=7, loc="upper left")
+
+    if annotate_params:
+        lines = []
+        for k in range(n_components):
+            a0, loc0, scale0 = initial_params[k]
+            a1, loc1, scale1 = final_params[k]
+            changed = " *" if np.sign(a0) != np.sign(a1) else ""
+            lines.append(
+                f"comp {k}: a {a0:+.2f}→{a1:+.2f}{changed}  "
+                f"loc {loc0:.2f}→{loc1:.2f}  scale {scale0:.2f}→{scale1:.2f}"
+            )
+        text = "\n".join(lines)
+        ax.text(
+            0.98, 0.02, text, transform=ax.transAxes, fontsize=6.5,
+            ha="right", va="bottom", family="monospace",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.7"),
+        )
+
+    return fig, ax
+
+
+def plot_initial_vs_final_skew_grid(records, output_path=None, n_cols=4):
+    """Grid of plot_initial_vs_final_skew panels, one per record.
+
+    Each record is a dict with keys "dataset_name", "observations",
+    "initial_params", "component_params", and optionally
+    "sample_assignments"/"initial_weights"/"final_weights" -- the shape
+    produced by tests/benchmark_num_fits_dataframe.py and
+    tests/compare_lambda_vs_random_init.py's best-restart records.
+    """
+    n = len(records)
+    if n == 0:
+        return None
+    n_cols = max(1, min(n_cols, n))
+    n_rows = int(np.ceil(n / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 3.5 * n_rows), squeeze=False)
+    for i, rec in enumerate(records):
+        ax = axes[i // n_cols][i % n_cols]
+        plot_initial_vs_final_skew(
+            rec["dataset_name"], rec["observations"],
+            rec["initial_params"], rec["component_params"],
+            initial_weights=rec.get("initial_weights"),
+            final_weights=rec.get("final_weights"),
+            sample_assignments=rec.get("sample_assignments"),
+            ax=ax,
+        )
+    for i in range(n, n_rows * n_cols):
+        axes[i // n_cols][i % n_cols].axis("off")
+    fig.tight_layout()
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150)
+    return fig
+
+
 def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2):
     """log(lrP)/log(lrB) tier thresholds for `point_values`, plus a y-axis
     padding value extrapolated `pad_points` tiers beyond the highest one.
@@ -290,10 +399,12 @@ def plot_summary(scoreset: Scoreset, fits: List[Dict], summary:Dict, score_range
 
 
 # claude generated. do not want to deal with the matplotlib headache :)
-def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range, config, n_c, n_samples, relax=False, flipped=False, debug=False):
+def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range, config, n_c, n_samples,
+                               relax=False, flipped=False, debug=False,
+                               pathogenic_percentile=5.0, benign_percentile=95.0):
     """
     Plot a single configuration with samples in one row, point assignments below, and LR+ below that.
-    
+
     Parameters:
     -----------
     dataset : str
@@ -317,6 +428,13 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     flipped : bool
         Whether the scoreset is flipped (higher scores = more pathogenic)
         Pass True if P/LP is on the right side
+    pathogenic_percentile, benign_percentile : float
+        The conservative (lower-bound/pathogenic-direction) and upper
+        (benign-direction) percentiles actually used to compute this
+        calibration's thresholds (PipelineConfig.pathogenic_percentile/
+        benign_percentile) -- drives both the LR+ band drawn/labeled below
+        and the bootstrap-variability bands in the sample-fit row, so the
+        plot matches whatever percentiles were used, not a hardcoded 5/95.
     """
     
     # Create figure: 3 rows, n_samples columns (all square)
@@ -366,12 +484,12 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         density = sample_density(score_range, fits, sample_num-num_skipped)
         for compNum in range(density.shape[1]):
             compDensity = density[:,compNum,:]
-            d = np.nanpercentile(compDensity,[5,50,95],axis=0)
+            d = np.nanpercentile(compDensity,[pathogenic_percentile,50,benign_percentile],axis=0)
             ax_fit.plot(score_range, d[1], color=f"C{compNum}", linestyle='--', label=f"Comp {compNum+1}")
         ax_fit.legend(fontsize=8)
-        
+
         d = np.nansum(density, axis=1)
-        d_perc = np.percentile(d, [5,50,95], axis=0)
+        d_perc = np.percentile(d, [pathogenic_percentile,50,benign_percentile], axis=0)
         ax_fit.plot(score_range, d_perc[1], color='black', alpha=.5)
         ax_fit.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
         ax_fit.set_title(f"{n_c}{relax_code}: {scoreset.sample_names[sample_num].replace('population','gnomAD')}\n(n={scoreset.sample_assignments[:,sample_num-num_skipped].sum():,d})")
@@ -413,7 +531,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(
         indv_summary['prior'], point_values_all,
     )
-    priors = np.percentile(np.array(indv_summary['priors']),[5,50,95])
+    priors = np.percentile(np.array(indv_summary['priors']),[pathogenic_percentile,50,benign_percentile])
     
     # Identify which point values have insufficient evidence (empty ranges)
     point_ranges_dict = {int(k): v for k, v in indv_summary['point_ranges'].items()}
@@ -453,11 +571,29 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         if log_lr_pct is not None and np.asarray(log_lr_pct).shape[0] == 3:
             llr_curves = np.asarray(log_lr_pct)
         else:
-            llr_curves = np.nanpercentile(np.array(log_lr_plus),[5,50,95],axis=0)
-        labels = ['5th percentile','Median','95th percentile']
+            llr_curves = np.nanpercentile(np.array(log_lr_plus),[pathogenic_percentile,50,benign_percentile],axis=0)
+        labels = [f'{pathogenic_percentile:g}th percentile','Median',f'{benign_percentile:g}th percentile']
         colors = ['red','black','blue']
-        
-        # Check 5th percentile: find max and its position
+
+        # If the caller used a non-default percentile pair, also draw the
+        # standard 5th/95th curve(s) as a faint reference for comparison --
+        # only whichever side actually differs, and only when we have the
+        # real per-bootstrap log_lr_plus matrix (not a pre-percentiled
+        # 3-row array, which cannot be re-percentiled at 5/95 without the
+        # interpolation bias described above).
+        has_raw_bootstraps = log_lr_pct is None and np.asarray(log_lr_plus).shape[0] > 3
+        show_ref_pathogenic = has_raw_bootstraps and not np.isclose(pathogenic_percentile, 5.0)
+        show_ref_benign = has_raw_bootstraps and not np.isclose(benign_percentile, 95.0)
+        if show_ref_pathogenic or show_ref_benign:
+            ref_curves = np.nanpercentile(np.array(log_lr_plus), [5, 95], axis=0)
+            if show_ref_pathogenic:
+                ax_lr.plot(score_range, ref_curves[0], color='red', alpha=0.25,
+                           linewidth=1, linestyle='--', label='5th percentile (ref)')
+            if show_ref_benign:
+                ax_lr.plot(score_range, ref_curves[1], color='blue', alpha=0.25,
+                           linewidth=1, linestyle='--', label='95th percentile (ref)')
+
+        # Check pathogenic-direction (lower-bound) percentile: find max and its position
         lr_5th = llr_curves[0]
         max_5th_idx = np.nanargmax(lr_5th)
         max_5th = lr_5th[max_5th_idx]
@@ -568,11 +704,11 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
             print(f"\nSample {sample_num}:")
             print(f"  Highest pathogenic with evidence: {highest_pathogenic_with_evidence}, cutoff_idx: {insufficient_evidence_pathogenic_idx}")
             print(f"  Lowest benign with evidence: {lowest_benign_with_evidence}, cutoff_idx: {insufficient_evidence_benign_idx}")
-            print(f"  5th percentile: max={max_5th:.3f} at idx={max_5th_idx}, exceeds_pathogenic={exceeds_pathogenic}")
+            print(f"  {pathogenic_percentile:g}th percentile: max={max_5th:.3f} at idx={max_5th_idx}, exceeds_pathogenic={exceeds_pathogenic}")
             if exceeds_pathogenic:
                 print(f"    highest_tau_exceeded={highest_tau_exceeded:.3f}, crossing_idx={pathogenic_crossing_idx}, should_plot_dotted={should_plot_pathogenic_dotted}")
             print(f"  tauP thresholds: {[f'{t:.3f}' for t in tauP]}")
-            print(f"  95th percentile: min={min_95th:.3f} at idx={min_95th_idx}, exceeds_benign={exceeds_benign}")
+            print(f"  {benign_percentile:g}th percentile: min={min_95th:.3f} at idx={min_95th_idx}, exceeds_benign={exceeds_benign}")
             if exceeds_benign:
                 print(f"    lowest_tau_crossed={lowest_tau_crossed:.3f}, crossing_idx={benign_crossing_idx}, should_plot_dotted={should_plot_benign_dotted}")
             print(f"  tauB thresholds: {[f'{t:.3f}' for t in tauB]}")
@@ -590,7 +726,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
                 # Handle insufficient evidence
                 if insufficient_evidence_pathogenic_idx is not None:
                     if debug:
-                        print(f"  Plotting 5th percentile with insufficient evidence cutoff at idx {insufficient_evidence_pathogenic_idx}")
+                        print(f"  Plotting {pathogenic_percentile:g}th percentile with insufficient evidence cutoff at idx {insufficient_evidence_pathogenic_idx}")
                     if not flipped:
                         # Regular: dotted up to cutoff, solid after
                         ax_lr.plot(score_range[:insufficient_evidence_pathogenic_idx+1], curve[:insufficient_evidence_pathogenic_idx+1], 
@@ -606,7 +742,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
                 # Handle non-monotonic
                 elif should_plot_pathogenic_dotted and pathogenic_crossing_idx is not None:
                     if debug:
-                        print(f"  Plotting 5th percentile with non-monotonic cutoff at idx {pathogenic_crossing_idx}")
+                        print(f"  Plotting {pathogenic_percentile:g}th percentile with non-monotonic cutoff at idx {pathogenic_crossing_idx}")
                     if not flipped:
                         # Normal: dotted before crossing, solid after
                         ax_lr.plot(score_range[:pathogenic_crossing_idx+1], curve[:pathogenic_crossing_idx+1], 
@@ -633,7 +769,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
                 # Handle insufficient evidence
                 if insufficient_evidence_benign_idx is not None:
                     if debug:
-                        print(f"  Plotting 95th percentile with insufficient evidence cutoff at idx {insufficient_evidence_benign_idx}")
+                        print(f"  Plotting {benign_percentile:g}th percentile with insufficient evidence cutoff at idx {insufficient_evidence_benign_idx}")
                     if not flipped:
                         # Regular: solid up to cutoff, dotted after
                         ax_lr.plot(score_range[:insufficient_evidence_benign_idx+1], curve[:insufficient_evidence_benign_idx+1], 
@@ -649,7 +785,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
                 # Handle non-monotonic
                 elif should_plot_benign_dotted and benign_crossing_idx is not None:
                     if debug:
-                        print(f"  Plotting 95th percentile with non-monotonic cutoff at idx {benign_crossing_idx}")
+                        print(f"  Plotting {benign_percentile:g}th percentile with non-monotonic cutoff at idx {benign_crossing_idx}")
                     if not flipped:
                         # Normal: solid before crossing, dotted after
                         ax_lr.plot(score_range[:benign_crossing_idx+1], curve[:benign_crossing_idx+1], 
@@ -691,7 +827,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     
     return fig
 
-def plot_scores_only(dataset, scoreset):
+def plot_scores_only(dataset, scoreset, bins=None):
     n_samples = len([s for s in scoreset.samples])
     score_range = [min(scoreset.scores), max(scoreset.scores)]
 
@@ -711,6 +847,8 @@ def plot_scores_only(dataset, scoreset):
         if scoreset.sample_counts[sample_num] > 0
     ]
     shared_n_bins = max(n_bins_per_sample) if n_bins_per_sample else 1
+    if bins is not None:
+        shared_n_bins = bins
     bin_edges = np.linspace(score_range[0], score_range[1], shared_n_bins + 1)
 
     num_skipped = 0

@@ -209,6 +209,30 @@ EXCALIBR_DATASETS_TABLE_CSV = _env(
     "EXCALIBR_DATASETS_TABLE_CSV", "/data/ross/assay_calibration/dataframe/excalibr_datasets.csv"
 )
 
+# Bootstrap-count-reduction experiment (tests/benchmark_bootstrap_reduction.py)
+# -- how much does reducing the number of bootstrap fits (e.g. 1000 -> 20)
+# degrade the final calibration? Output tree is
+# {dir}/{dataset}/level_{N}/{dataset}_{n_c}_{benign}_calibration.json (+
+# _lr_values.json.gz), one calibration per (dataset, N) -- no repeated seeds
+# per level, unlike ROBUSTNESS_OUTPUT_DIR above (see
+# analysis.robustness.plot_bootstrap_reduction_config_summary's docstring
+# for why that's fine: each level already carries its own free bootstrap-
+# resampling [p5,p50,p95] uncertainty).
+BOOTSTRAP_REDUCTION_OUTPUT_DIR = _env(
+    "EXCALIBR_BOOTSTRAP_REDUCTION_OUTPUT_DIR",
+    "/data/ross/assay_calibration/hyperparam_sweep_oldclinvar/bootstrap_reduction",
+)
+
+# Fit-number (restart-count) comparison experiment
+# (tests/benchmark_num_fits_dataframe.py) -- how much does reducing the
+# number of EM restarts per fit degrade the best-of-N training
+# log-likelihood? Path to that script's summary.csv (columns: dataset, n_c,
+# num_fits, baseline, mean_best, std_best, delta, n_valid, n_failed).
+FIT_NUMBER_COMPARISON_SUMMARY_CSV = _env(
+    "EXCALIBR_FIT_NUMBER_COMPARISON_SUMMARY_CSV",
+    "/data/ross/assay_calibration/hyperparam_sweep_oldclinvar/benchmark_num_fits_dataframe/summary.csv",
+)
+
 
 def warn_if_missing(path: str, what: str) -> bool:
     """Print a warning and return True if `path` does not exist on disk.

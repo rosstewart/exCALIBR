@@ -131,12 +131,18 @@ def _compute_bootstrap_lr_percentiles(
     scores: np.ndarray,
     calibration: Dict,
     percentile: float = 5.0,
+    benign_percentile: Optional[float] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
            Optional[np.ndarray], Optional[np.ndarray]]:
     """Interpolate per-bootstrap LR+ curves at each variant score and return
     (lr_plus_5th, lr_plus_95th, posterior_5th, posterior_95th) arrays of shape
     (n_variants,), or (None, None, None, None) when bootstrap curves unavailable.
+
+    ``benign_percentile`` defaults to ``100 - percentile`` (historical
+    symmetric pairing) when not given explicitly.
     """
+    if benign_percentile is None:
+        benign_percentile = 100 - percentile
     score_range = np.asarray(calibration.get("score_range", []))
     if len(score_range) == 0:
         return None, None, None, None
@@ -163,7 +169,7 @@ def _compute_bootstrap_lr_percentiles(
     ])
 
     lr_5 = np.exp(np.nanpercentile(log_lr_at_scores, percentile, axis=0))
-    lr_95 = np.exp(np.nanpercentile(log_lr_at_scores, 100 - percentile, axis=0))
+    lr_95 = np.exp(np.nanpercentile(log_lr_at_scores, benign_percentile, axis=0))
 
     def _posterior(lr_arr: np.ndarray) -> np.ndarray:
         out = np.full_like(lr_arr, np.nan)
@@ -174,19 +180,23 @@ def _compute_bootstrap_lr_percentiles(
     return lr_5, lr_95, _posterior(lr_5), _posterior(lr_95)
 
 
-def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0) -> pd.DataFrame:
+def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0,
+                           benign_percentile: Optional[float] = None) -> pd.DataFrame:
     """Assign every variant its evidence points from the global calibration.
 
     Always includes standard_points.  Also includes lr_plus_5th, lr_plus_95th,
     posterior_5th, posterior_95th when bootstrap LR+ curves are present in the
-    calibration dict. Column names stay fixed regardless of `percentile` (schema
-    stability) -- only the percentile value used to populate them changes.
+    calibration dict. Column names stay fixed regardless of `percentile`/
+    `benign_percentile` (schema stability) -- only the values used to
+    populate them change. ``benign_percentile`` defaults to
+    ``100 - percentile`` when not given explicitly.
     """
     flat = _flatten_point_ranges(calibration["point_ranges"])
     ids = _get_variant_ids(scoreset)
 
     scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
-    lr_5, lr_95, post_5, post_95 = _compute_bootstrap_lr_percentiles(scores, calibration, percentile)
+    lr_5, lr_95, post_5, post_95 = _compute_bootstrap_lr_percentiles(
+        scores, calibration, percentile, benign_percentile)
     has_percentiles = lr_5 is not None
     auth_labels = getattr(scoreset, "auth_labels", None)
     is_vus = _get_variant_is_vus(scoreset)
@@ -272,12 +282,13 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
     targets = getattr(config, "acmg_bayes_targets", None)
     floor_at_neutral = getattr(config, "acmg_bayes_floor_at_neutral", False)
     percentile = getattr(config, "pathogenic_percentile", 5.0)
+    benign_percentile = getattr(config, "benign_percentile", None)
     ids = _get_variant_ids(scoreset)
     auth_labels = getattr(scoreset, "auth_labels", None)
     is_vus = _get_variant_is_vus(scoreset)
 
     scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
-    lr_5, lr_95, _, _ = _compute_bootstrap_lr_percentiles(scores, calibration, percentile)
+    lr_5, lr_95, _, _ = _compute_bootstrap_lr_percentiles(scores, calibration, percentile, benign_percentile)
     if lr_5 is None:
         raise ValueError(
             "_build_continuous_table (ACMG-Bayes) requires bootstrap log(LR+) curves "
@@ -475,6 +486,7 @@ def _process_variant_oob(
     min_samples: int = 1,
     acmg_mapping_method: str = "tavtigian",
     percentile: float = 5.0,
+    benign_percentile: Optional[float] = None,
     postprocess: bool = True,
 ) -> Tuple[int, Optional[Dict]]:
     """
@@ -522,12 +534,13 @@ def _process_variant_oob(
 
     vsr = score_range[subset]
     vlr = lr_plus[:, subset]
+    _benign_percentile = benign_percentile if benign_percentile is not None else 100 - percentile
 
     try:
         # Step 5: calculate_score_ranges (same as in-bag median_prior branch)
         pr_p, pr_b, C = calculate_score_ranges(
             np.nanpercentile(vlr, percentile, axis=0),
-            np.nanpercentile(vlr, 100 - percentile, axis=0),
+            np.nanpercentile(vlr, _benign_percentile, axis=0),
             prior, vsr, point_values, acmg_mapping_method=acmg_mapping_method,
         )
         pr = {**pr_p, **pr_b}
@@ -593,10 +606,11 @@ def _compute_oob_evidence(
             vidx, oob_idx, scoreset.scores[vidx],
             priors, log_fp, log_fb, score_range,
             config.point_values, flipped, liberal,
-            config.oob_min_samples,
-            oob_acmg_mapping_method,
-            getattr(config, "pathogenic_percentile", 5.0),
-            postprocess,
+            min_samples=config.oob_min_samples,
+            acmg_mapping_method=oob_acmg_mapping_method,
+            percentile=getattr(config, "pathogenic_percentile", 5.0),
+            benign_percentile=getattr(config, "benign_percentile", None),
+            postprocess=postprocess,
         )
         for vidx, oob_idx in oob_map.items()
     )
@@ -667,7 +681,11 @@ def compute_variant_table(
     if acmg_mapping_method == "acmg_bayes":
         df = _build_continuous_table(scoreset, calibration, config)
     else:
-        df = _build_standard_table(scoreset, calibration, getattr(config, "pathogenic_percentile", 5.0))
+        df = _build_standard_table(
+            scoreset, calibration,
+            getattr(config, "pathogenic_percentile", 5.0),
+            getattr(config, "benign_percentile", None),
+        )
     log(f"  Standard evidence assigned to {len(df)} variants "
         f"(acmg_mapping_method={acmg_mapping_method})")
 

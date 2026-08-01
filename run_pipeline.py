@@ -31,8 +31,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run with default settings (2c and 3c, parallel execution)
+  # Run with default settings (3c only, parallel execution)
   python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021
+
+  # Also fit 2c (e.g. to compare against 3c)
+  python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
+      --components 2 3
 
   # Run from precomputed bootstrap fits
   python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021 \\
@@ -74,8 +78,10 @@ Examples:
 
     # Model parameters
     parser.add_argument("--components", type=int, nargs="+",
-                       default=[2, 3], metavar="K",
-                       help="Component counts to fit (default: 2 3; integers 2–10)")
+                       default=[3], metavar="K",
+                       help="Component counts to fit (default: 3 only -- assumed at least as good "
+                            "as 2c for most assays, not always true but a reasonable default; pass "
+                            "e.g. --components 2 3 to fit both and compare). Integers 2-10.")
     parser.add_argument("--benign-method", choices=["benign", "avg", "synonymous"],
                        default="avg", help="Method for benign sample (default: avg)")
     parser.add_argument("--no-median-prior", action="store_true",
@@ -89,6 +95,25 @@ Examples:
                             "extend-to-limits). Returns raw LR-threshold-crossing intervals "
                             "as fitted. Intended for bidirectional assays (e.g. LoF/GoF in "
                             "one assay) where standard monotonicity assumptions do not hold.")
+    # Auto-detect bidirectional assays per bootstrap fit (majority vote across
+    # fits) instead of requiring --no-postprocess by hand. On by default. See
+    # PipelineConfig.auto_bidirectional and BIDIRECTIONAL_VOTE_THRESHOLD /
+    # clean_benign_fragments_no_extend / clean_bidirectional_pathogenic_evidence
+    # in fit_utils/point_ranges.py.
+    parser.add_argument("--auto-bidirectional", dest="auto_bidirectional",
+                       action="store_true", default=True,
+                       help="(default: on) Auto-detect bidirectional assays from mixture-component "
+                            "weights (a pathogenic-like component on each side of a benign-like "
+                            "component) and, when a majority of bootstrap fits show the pattern, "
+                            "skip standard monotonicity enforcement for this dataset's pathogenic "
+                            "tiers (benign tiers still get cleaned up, just without extend-to-limits) "
+                            "instead of the standard monotonicity/extend-to-xlims postprocessing. "
+                            "Only applies for n_c >= 3.")
+    parser.add_argument("--no-auto-bidirectional", dest="auto_bidirectional",
+                       action="store_false",
+                       help="Disable automatic bidirectional-assay detection; use standard "
+                            "monotonicity postprocessing unconditionally (or combine with "
+                            "--no-postprocess to disable postprocessing entirely).")
     parser.add_argument("--manual-prior", type=float, default=None,
                        help="Manually set prior probability (0-1). Skips empirical estimation.")
     parser.add_argument("--population-type", default="gnomAD",
@@ -106,10 +131,18 @@ Examples:
     parser.add_argument("--viz-only", action="store_true",
                        help="Regenerate visualizations only — skip variant tables and calibration JSON save")
     parser.add_argument("--pathogenic-percentile", type=float, default=5.0,
-                       help="Conservative percentile (paired with 100-p as the upper bound) used for "
+                       help="Conservative (lower-bound/pathogenic-direction) percentile used for "
                             "all bootstrap LR+/threshold percentile calculations (conservative "
                             "thresholds, C-range, OOB LR percentiles, per-variant LR percentiles). "
+                            "Paired by default with 100-p as the upper (benign-direction) bound -- "
+                            "override that independently with --benign-percentile. "
                             "Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
+    parser.add_argument("--benign-percentile", type=float, default=None,
+                       help="Upper (benign-direction) percentile, independent of "
+                            "--pathogenic-percentile. Omit to keep the historical symmetric "
+                            "pairing (100 - pathogenic-percentile); set explicitly to decouple "
+                            "the two, e.g. to sweep --pathogenic-percentile while always keeping "
+                            "the benign-direction bound at the 95th percentile.")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
     # experimentation only -- mutually exclusive with --pathomechanism-prior below.
     # Parses with default=None; resolve_prior_mode reconciles it after parsing.
@@ -184,7 +217,7 @@ Examples:
     slurm.add_argument("--slurm-account", default="default", help="SLURM account")
     slurm.add_argument("--slurm-partition", default="short", help="SLURM partition")
     slurm.add_argument("--slurm-time", type=int, default=23, help="SLURM time (hours)")
-    slurm.add_argument("--slurm-mem", type=int, default=8, help="SLURM memory (GB)")
+    slurm.add_argument("--slurm-mem", type=int, default=1, help="SLURM memory (GB)")
     slurm.add_argument("--slurm-cpus", type=int, default=12, help="CPUs per SLURM task")
     slurm.add_argument("--slurm-conda-env", default="assay_calibration",
                        help="Conda environment name")
@@ -269,6 +302,7 @@ Examples:
         use_2c_equation=args.use_equation,
         liberal_monotonicity=not args.conservative_monotonicity,
         postprocess_point_ranges=not args.no_postprocess,
+        auto_bidirectional=args.auto_bidirectional,
         benign_method=args.benign_method,
         manual_prior=args.manual_prior,
         population_type=args.population_type,
@@ -296,6 +330,7 @@ Examples:
         viz_only=args.viz_only,
         progress_file=args.progress_file,
         pathogenic_percentile=args.pathogenic_percentile,
+        benign_percentile=args.benign_percentile,
         filter_pathogenic_sample_by_lr=args.filter_pathogenic_sample_by_lr,
         pathomechanism_method=args.pathomechanism_method,
         acmg_mapping_method=(args.acmg_mapping_method

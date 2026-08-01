@@ -66,12 +66,23 @@ At least one of Benign or Synonymous samples is required.
 
 ### 2. BasicScoreset (bare-bones CSV)
 
-Minimal format: `score` column + `sample_assignments` integer column. No ClinVar required. Use `--sample-names` to label samples.
+Minimal format: `score` column + `sample_assignments` column. No ClinVar
+metadata required — you just tell it which rows belong to which sample
+group yourself. `sample_assignments` is an integer per row (`0`, `1`,
+`2`, `3`, ...), or a comma-separated string for variants that belong to
+more than one group (e.g. `"1,2"`). By convention, column `0` = Pathogenic,
+`1` = Benign, `2` = gnomAD/population, `3` = Synonymous — use
+`--sample-names` to relabel them if your groups don't match that
+convention.
+
+`example/brca_findlay_example.csv` is a ready-to-run BasicScoreset example
+(BRCA1 SGE functional scores from Findlay et al. 2018, with rows labeled
+by ClinVar/population group membership):
 
 ```bash
 python run_pipeline.py \
-    --dataset basic.csv --name MyGene \
-    --sample-names "Pathogenic/Likely Pathogenic" "Benign/Likely Benign" "gnomAD"
+    --dataset example/brca_findlay_example.csv --name brca_findlay_example \
+    --sample-names "Pathogenic/Likely Pathogenic" "Benign/Likely Benign" "gnomAD" "Synonymous"
 ```
 
 ### 3. MaveDB format
@@ -181,6 +192,9 @@ Key flags:
 | `--precomputed-fits` | — | Skip fitting; load existing bootstrap fits JSON |
 | `--output-dir` | `./calibration_output` | Output directory |
 | `--no-postprocess` | off | Skip monotonicity enforcement and extend-to-limits on point ranges. Intended for bidirectional assays (e.g. LoF/GoF in one assay) where standard monotonicity assumptions do not hold. |
+| `--no-auto-bidirectional` | off (auto-detection on by default) | Disable automatic bidirectional-assay detection (see [Bidirectional assay auto-detection](#bidirectional-assay-auto-detection) below). |
+| `--pathogenic-percentile` | `5.0` | Conservative (pathogenic-direction) percentile for all bootstrap LR+/threshold calculations |
+| `--benign-percentile` | `100 - pathogenic-percentile` | Upper (benign-direction) percentile; set independently to decouple from `--pathogenic-percentile` |
 | `--conservative-monotonicity` | off | Use stricter monotonicity enforcement (default is liberal) |
 | `--manual-prior` | — | Override prior probability (0–1); skip estimation |
 | `--benign-method` | `avg` | `avg`, `benign`, or `synonymous` |
@@ -208,6 +222,9 @@ Key flags:
 | `--skip-existing` | off | Resume a failed run (skip completed datasets) |
 | `--all-configs` | off | Run all 4 (2c/3c)×(avg/benign) combos per dataset with comparison plot |
 | `--no-postprocess` | off | Skip point-range postprocessing (same as `run_pipeline.py`) |
+| `--no-auto-bidirectional` | off (auto-detection on by default) | Disable automatic bidirectional-assay detection (see [Bidirectional assay auto-detection](#bidirectional-assay-auto-detection) below). Global, batch-wide — not settable per-dataset via `--dataset-configs`. |
+| `--pathogenic-percentile` | `5.0` | Conservative (pathogenic-direction) percentile, batch-wide |
+| `--benign-percentile` | `100 - pathogenic-percentile` | Upper (benign-direction) percentile, batch-wide; set independently to decouple |
 | `--manual-prior` | — | Override prior for all datasets |
 | `--oob` | off | Compute OOB per-variant evidence |
 | `--generate-config-template` | — | Write a blank dataset config JSON and exit |
@@ -375,14 +392,132 @@ python run_pipeline.py --dataset my.csv --name MyGene \
     --n-bootstraps 1000 --fits-per-bootstrap 100
 ```
 
+The calibration works by repeatedly refitting the model to resampled
+("bootstrapped") versions of your data, then combining the results — this
+is what makes the output stable and gives you a confidence range instead
+of a single brittle fit. Two settings control how much of this resampling
+is done:
+
+- `--n-bootstraps`: how many resampled versions of the dataset get fit.
+  This is the main quality/speed dial.
+- `--fits-per-bootstrap`: for each resampled version, how many times the
+  fitting is retried from a different random starting point (only the
+  best-scoring attempt is kept). A secondary dial.
+
+Turning either one up gives a more stable, reproducible result, at the
+cost of more compute time.
+
+#### Quality vs. speed presets
+
+We tested how much the final result changes as `--n-bootstraps` is
+lowered, using 87 real assay datasets and comparing each reduced run
+against a much larger (~1000-bootstrap) run of the same dataset as a
+"ground truth" reference. The easiest number to interpret is: *out of all
+the variants in a dataset, what percent end up in a different ACMG
+category (e.g. "Likely Benign" instead of "Benign") than they would with
+the much larger reference run?*
+
+| `--n-bootstraps` tested | Typical dataset | A harder-than-typical dataset (worst ~10%) |
+|---|---|---|
+| 20  | ~14 in 100 variants change category | up to ~61 in 100 |
+| 50  | ~9 in 100 variants change category  | up to ~51 in 100 |
+| 100 | ~6 in 100 variants change category  | up to ~34 in 100 |
+| 250 | ~3 in 100 variants change category  | up to ~17 in 100 |
+| 500 | ~2 in 100 variants change category  | up to ~10 in 100 |
+
+Overall classification performance (how well the calibration separates
+pathogenic from benign variants) barely changes even at 20 bootstraps for
+a typical dataset — it's specific individual variants near a category
+boundary that are more likely to move. So the numbers above should be read
+as "how many variants might sit close enough to a boundary to flip," not
+as "the calibration is unreliable."
+
+**Caveat:** this comparison only varies `--n-bootstraps`; it always used
+`--fits-per-bootstrap 100`, not the pipeline's default of 8. The presets
+below assume the two dials affect quality in a similar way, which we
+believe is reasonable but have not separately confirmed.
+
+Based on this, here are five presets to choose from:
+
+| Preset | `--n-bootstraps` | `--fits-per-bootstrap` | What to expect |
+|---|---|---|---|
+| Light (default) | 20   | 8   | Fastest option, good for a first look. ~14 in 100 variants could land in a different category than a much larger run. |
+| Medium           | 100  | 8   | Noticeably more stable, still practical to run on a laptop/desktop. ~6 in 100 variants could shift. |
+| Large            | 500  | 8   | Good for a result you plan to rely on. ~2 in 100 variants could shift. Best run on a shared server or cluster. |
+| XL               | 1000 | 8   | Matches the bootstrap count used as the reference standard above, so drift should be minimal — but we only directly confirmed this at `--fits-per-bootstrap 100`, not 8. Needs a server/cluster. |
+| Finest           | 1000 | 100 | The reference-quality configuration itself. Very slow — intended for a compute cluster, not a personal computer. |
+
+```bash
+# Light (default) — fast, exploratory
+python run_pipeline.py --dataset my.csv --name MyGene
+
+# Medium — better stability, still practical on a laptop/desktop
+python run_pipeline.py --dataset my.csv --name MyGene \
+    --n-bootstraps 100 --fits-per-bootstrap 8
+
+# Large
+python run_pipeline.py --dataset my.csv --name MyGene \
+    --n-bootstraps 500 --fits-per-bootstrap 8
+
+# XL
+python run_pipeline.py --dataset my.csv --name MyGene \
+    --n-bootstraps 1000 --fits-per-bootstrap 8
+
+# Finest — the reference-quality configuration; run on a cluster
+python run_pipeline.py --dataset my.csv --name MyGene \
+    --n-bootstraps 1000 --fits-per-bootstrap 100
+```
+
+For Large/XL/Finest on many datasets, prefer the
+[batch HPC workflow](#batch-hpc-workflow) (SLURM array jobs, one dataset
+per node) instead of running them one at a time on your own computer.
+
+#### Speed estimates
+
+How long a run takes mostly depends on two things: how big your preset is
+(`--n-bootstraps × --fits-per-bootstrap`) and how many CPU cores your
+computer can devote to the job (`--n-jobs`; use `--n-jobs -1` to use all
+available cores). Almost all your CPU cores can work on this at the same
+time, so more cores means a roughly proportional speedup.
+
+We timed the example dataset (`example/MSH2_Jia_2021.csv`, 1579 variants)
+at the Light preset (20 bootstraps × 8 fits) and scaled that measurement
+up for the other presets, assuming the same proportional speedup on more
+cores. Real times will vary by dataset size and computer, but this should
+give a reasonable ballpark:
+
+| Preset | 4 cores (typical laptop) | 16 cores (workstation) | 64 cores (server/cluster node) |
+|---|---|---|---|
+| Light  | ~2.5 hours | ~35 min | ~10 min |
+| Medium | ~12 hours  | ~3 hours | ~45 min |
+| Large  | ~2.5 days  | ~16 hours | ~4 hours |
+| XL     | ~5 days    | ~1.3 days | ~8 hours |
+| Finest | ~2 months  | ~16 days | ~4 days |
+
+A few notes:
+- These are for a single dataset, single gene/assay. If you're calibrating
+  many datasets at once, use the [batch HPC workflow](#batch-hpc-workflow)
+  so datasets run in parallel across a cluster instead of one after another.
+- Most of this time (well over 90%, in our test) goes to the bootstrap
+  fitting step itself; the plotting/export steps that follow take well
+  under a minute regardless of preset.
+- Fitting only a 3-component model (the default) is slightly slower than
+  fitting only a 2-component model (roughly 15-20% slower in our test) —
+  fitting both (`--components 2 3`) takes about as long as the two added
+  together.
+
+You can reproduce or extend these measurements with
+`tests/benchmark_run_pipeline_speed.py`.
+
 ### Component selection
 
 ```bash
-# Default: fit both 2c and 3c, auto-select
-python run_pipeline.py --dataset my.csv --name MyGene --components 2 3
+# Default: 3-component only (assumed at least as good as 2c for most assays,
+# not always true, but a reasonable default for typical usage)
+python run_pipeline.py --dataset my.csv --name MyGene
 
-# Force 3-component only
-python run_pipeline.py --dataset my.csv --name MyGene --components 3
+# Fit both 2c and 3c and auto-select the better one
+python run_pipeline.py --dataset my.csv --name MyGene --components 2 3
 
 # Fit 5-component model
 python run_pipeline.py --dataset my.csv --name MyGene --components 5
@@ -415,11 +550,48 @@ python run_pipeline.py --dataset my.csv --name MyGene --no-median-prior
 # Default: enforce monotonicity + extend to score-axis limits
 python run_pipeline.py --dataset my.csv --name MyGene
 
-# Disable postprocessing — intended for bidirectional assays (LoF/GoF)
+# Disable postprocessing entirely — intended for bidirectional assays (LoF/GoF)
+# where standard monotonicity assumptions do not hold
 python run_pipeline.py --dataset my.csv --name MyGene --no-postprocess
 
 # Conservative (stricter) monotonicity enforcement
 python run_pipeline.py --dataset my.csv --name MyGene --conservative-monotonicity
+```
+
+### Bidirectional assay auto-detection
+
+Some assays (e.g. LoF/GoF in one assay) show pathogenic-leaning evidence on
+**both** sides of a benign region — the standard single-direction
+monotonicity/extend-to-limits postprocessing assumes one direction and is
+inappropriate for these. Instead of requiring `--no-postprocess` by hand,
+`run_pipeline.py` and `run_igvf_batch.py` **auto-detect this pattern by
+default** (`n_c >= 3` fits only):
+
+- For each bootstrap fit, mixture components are sorted along the score
+  axis and labeled pathogenic-like/benign-like by comparing the pathogenic
+  and benign samples' mixture weights (PU/NU sample-availability cases fall
+  back to gnomAD in place of whichever of pathogenic/benign is unavailable).
+  A fit is flagged if a benign-like component has a pathogenic-like
+  component on each side.
+- If a majority of bootstrap fits are flagged, standard monotonicity
+  enforcement is skipped for that dataset's **pathogenic** tiers (each side
+  of the benign region is independently re-nested and extended toward its
+  own axis limit, honoring `--conservative-monotonicity` per side). Benign
+  tiers are assumed to never be bidirectional: they still get cleaned up
+  (noisy same-tier fragmentation merged in liberal mode; the standard
+  strict "evidence goes back to indeterminate" removal in conservative
+  mode), but are never extended to the axis limit.
+- Otherwise, standard postprocessing runs unchanged.
+
+```bash
+# Default: auto-detection on
+python run_pipeline.py --dataset my.csv --name MyGene --components 3
+
+# Disable auto-detection; use standard postprocessing unconditionally
+python run_pipeline.py --dataset my.csv --name MyGene --components 3 --no-auto-bidirectional
+
+# Disable auto-detection AND all postprocessing (old bidirectional-assay workflow)
+python run_pipeline.py --dataset my.csv --name MyGene --components 3 --no-auto-bidirectional --no-postprocess
 ```
 
 ## Troubleshooting
