@@ -1233,6 +1233,71 @@ def plot_bootstrap_reduction_config_summary(
 # (tests/benchmark_num_fits_dataframe.py's summary.csv)
 # ---------------------------------------------------------------------------
 
+def compute_delta_std_column(summary_df: pd.DataFrame, train_lls_path) -> pd.DataFrame:
+    """Add a "delta_std" column: `delta` (raw train_ll units, not
+    interpretable across datasets with very different likelihood scales)
+    divided by that (dataset, n_c)'s OWN restart-to-restart standard
+    deviation (computed across all its valid best_of_100 restarts, from
+    tests/benchmark_num_fits_dataframe.py's train_lls.json). This turns
+    "how much worse is best-of-N" into a dimensionless "how many SDs of this
+    dataset's own restart-to-restart noise" measure, comparable across
+    datasets.
+
+    train_lls.json is keyed "{dataset}|{n_c}c" (see
+    tests/benchmark_num_fits_dataframe.py's train_lls_all dict) -- must
+    match summary_df's own "dataset"/"n_c" columns exactly.
+    """
+    with open(train_lls_path) as f:
+        train_lls = json.load(f)
+
+    std_by_key = {}
+    for key, lls in train_lls.items():
+        arr = np.asarray(lls, dtype=float)
+        valid = arr[np.isfinite(arr)]
+        std_by_key[key] = float(valid.std()) if len(valid) > 1 else np.nan
+
+    df = summary_df.copy()
+    keys = df["dataset"].astype(str) + "|" + df["n_c"].astype(int).astype(str) + "c"
+    df["restart_std"] = keys.map(std_by_key)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        df["delta_std"] = df["delta"] / df["restart_std"]
+    df.loc[~np.isfinite(df["restart_std"]) | (df["restart_std"] == 0), "delta_std"] = np.nan
+
+    # geometric_mean_lr_pct = 100 * exp(delta): mathematically bounded in
+    # (0%, 100%] regardless of the raw LL values' sign/scale (delta is a
+    # DIFFERENCE of two per-observation average log-densities, so exp(delta)
+    # is the ratio of their GEOMETRIC MEANS -- the difference structure is
+    # what makes this scale-invariant, not anything about the LL values
+    # themselves). Do NOT read this as a "quality percentage", though:
+    # densities aren't probabilities (they can exceed 1), so "90%" here does
+    # NOT mean "90% as many correct classifications" or any other
+    # intuitively-linear/bounded notion of quality -- it is specifically a
+    # geometric-mean likelihood *ratio*, nothing more. delta_std above is
+    # the more defensible interpretable metric; keep this one only as a
+    # secondary, explicitly-labeled number.
+    df["geometric_mean_lr_pct"] = 100.0 * np.exp(df["delta"])
+    return df
+
+
+def summarize_delta_std_table(summary_df: pd.DataFrame, levels=(1, 8, 20, 50, 100),
+                              metric: str = "delta_std") -> pd.DataFrame:
+    """Median (IQR: 25th-75th percentile) of `metric` across every (dataset,
+    n_c) row, at each of `levels` -- the exact numbers behind the
+    "fits-per-bootstrap" table in docs/configuration.md. Call
+    compute_delta_std_column first if `metric="delta_std"` isn't already a
+    column."""
+    rows = []
+    for N in levels:
+        vals = summary_df.loc[summary_df["num_fits"] == N, metric].values
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0:
+            rows.append({"num_fits": N, "median": np.nan, "p25": np.nan, "p75": np.nan, "n": 0})
+            continue
+        p25, p50, p75 = np.percentile(vals, [25, 50, 75])
+        rows.append({"num_fits": N, "median": p50, "p25": p25, "p75": p75, "n": len(vals)})
+    return pd.DataFrame(rows)
+
+
 def plot_fit_number_comparison_curve(
     summary_df: pd.DataFrame,
     metric: str = "delta",
@@ -1265,13 +1330,25 @@ def plot_fit_number_comparison_curve(
     ax.fill_between(levels, p25s, p75s, alpha=0.25, color="C0")
     ax.plot(levels, medians, marker="o", color="C0", label="median")
     ax.scatter(xs_scatter, ys_scatter, alpha=0.3, s=12, color="C0")
-    ax.axhline(0.0, linestyle="--", color="black", alpha=0.6, label="no degradation")
 
+    # "No degradation" reference: 0 for the two difference-based metrics
+    # (delta, delta_std), 100 for geometric_mean_lr_pct (a ratio expressed
+    # as a percentage, not a difference) -- see
+    # compute_delta_std_column's docstring for why this is bounded (0%,
+    # 100%] and, just as importantly, why it is NOT a "quality percentage".
+    ref_value = 100.0 if metric == "geometric_mean_lr_pct" else 0.0
+    ax.axhline(ref_value, linestyle="--", color="black", alpha=0.6, label="no degradation")
+
+    _YLABELS = {
+        "delta": "delta (best_of_N − best_of_all train_ll)",
+        "delta_std": "delta / restart-to-restart SD (dimensionless)",
+        "geometric_mean_lr_pct": "geometric-mean likelihood ratio vs. best_of_all (%)",
+    }
     ax.set_xscale("log")
     ax.set_xticks(levels)
     ax.set_xticklabels([str(l) for l in levels])
     ax.set_xlabel("Restart count (num_fits)")
-    ax.set_ylabel(f"{metric} (best_of_N − best_of_all train_ll)" if metric == "delta" else metric)
+    ax.set_ylabel(_YLABELS.get(metric, metric))
     ax.set_title(f"{label}: fit quality vs. restart count")
     ax.legend(fontsize=8)
     ax.grid(linewidth=0.5, alpha=0.3)

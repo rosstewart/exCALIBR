@@ -66,6 +66,24 @@ Timed on `example/MSH2_Jia_2021.csv` (1,579 variants) at `--preset light`, scale
 
 `--n-jobs` sets core count (`-1` = all available). 3c fitting is ~15-20% slower than 2c. GPU column is for `--device cuda:N` with a Tesla V100S-PCIE-32GB and includes JAX JIT compilation (the first dataset in a process always pays this cost; ~33s overhead). See [GPU Acceleration](gpu-acceleration.md) for details and hardware context. Reproduce timing with `tests/benchmark_run_pipeline_speed.py`.
 
+#### Fits per bootstrap
+
+`--fits-per-bootstrap` controls how many random EM restarts each fit tries. Every preset except `finest` defaults to 8: a 3-component mixture has `2³ = 8` skew-sign combinations, enumerated (not randomly searched) across restarts — 8 is the minimum that covers all of them.
+
+Median (IQR) degradation vs. `--fits-per-bootstrap`, tested on 91 real datasets:
+
+| `--fits-per-bootstrap` | Δ log-likelihood (SDs from best) | % of best likelihood achieved* |
+|---|---|---|
+| 1   | -0.59 (-1.29 to -0.39) | 92.7% (83.4–96.3%) |
+| 8   | -0.05 (-0.17 to -0.02) | 99.4% (98.4–99.8%) |
+| 20  | -0.01 (-0.05 to -0.00) | 99.8% (99.2–99.9%) |
+| 50  | -0.00 (-0.02 to -0.00) | 100.0% (99.7–100.0%) |
+| 100 | 0.00 (0.00 to 0.00) | 100.0% (100.0–100.0%) |
+
+Skew-sign changes between init and converged fit: 0/117 (0%).
+
+*Geometric-mean likelihood ratio vs. best-of-100, not an accuracy score. Reproduce with `tests/benchmark_num_fits_dataframe.py` + `tests/plot_fit_number_comparison.py`.
+
 ### Component selection
 
 ```bash
