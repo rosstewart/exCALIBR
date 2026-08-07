@@ -40,7 +40,8 @@ import warnings
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
-from src.assay_calibration.pipeline.config import PipelineConfig, resolve_prior_mode
+from src.assay_calibration.pipeline.config import PipelineConfig, resolve_prior_mode, parse_master_seed
+from src.assay_calibration.fit_utils.fit import DEFAULT_MASTER_SEED
 
 GENES_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}
 ALL_CONFIGS = [("2c", "avg"), ("2c", "benign"), ("3c", "avg"), ("3c", "benign")]
@@ -919,10 +920,12 @@ def main():
                        help="Number of parallel jobs within each dataset (default: -1 = all CPUs)")
 
     # Reproducibility
-    parser.add_argument("--seed", type=int, default=None,
+    parser.add_argument("--seed", type=parse_master_seed, default=DEFAULT_MASTER_SEED,
                        help="Master seed for full reproducibility, forwarded to every "
-                            "PipelineConfig built in this batch run. Omit for the "
-                            "historical unseeded behavior.")
+                            "PipelineConfig built in this batch run. Default 0: fully "
+                            "reproducible, matches historical behavior. Any other int: also "
+                            "perturbs bootstrap composition (where applicable). 'none': "
+                            "explicit opt-out, true entropy (non-reproducible).")
 
     # ClinVar
     parser.add_argument("--clinvar-release", default=None, choices=["2026", "2025", "2018"],

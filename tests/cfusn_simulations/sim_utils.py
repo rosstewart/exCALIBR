@@ -681,7 +681,6 @@ def init_delta_matrix_mom(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=Non
     return Delta
 
 
-
 # ── Skewness-seeking direction finders (Item 4: is PCA's variance-maximizing ──
 # ── column-1 direction the reason boosting magnitude sometimes backfires?) ──
 
@@ -938,6 +937,112 @@ def init_delta_matrix_mom_shrunk(cov, p, q, Xc=None, cluster_sign_pattern=None, 
                 break
 
     return Delta
+
+
+def init_delta_matrix_mom_shrunk_cycling(cov, p, q, Xc=None, cluster_sign_pattern=None,
+                                         rng=None, fallback_scale=0.1,
+                                         shrinkage_fn=_shrinkage_james_stein,
+                                         restart_idx=0, multiplier_tiers=(0.5, 1.0, 2.0),
+                                         **shrinkage_kwargs):
+    """Item 1 + Item 2 combined: use the James-Stein/sigmoid-shrunk MoM
+    magnitude (init_delta_matrix_mom_shrunk) as a data/confidence-informed
+    CENTER, then cycle a multiplier around that center by restart_idx (the
+    same free relabeling init_delta_matrix_cycling_magnitude uses) instead
+    of cycling among data-blind fixed absolute scale_factors.
+
+    This is deliberately NOT "run Item 1 and Item 2 as two independent
+    magnitude-setters" -- that would be redundant (Item 1's fixed tiers
+    ignore the data-driven estimate; Item 2's shrunk estimate never varies
+    across restarts on its own, since it's deterministic given the data,
+    which is exactly why a fixed-magnitude Item 2 can't use its restart
+    budget to hedge against its own point estimate being wrong). Instead
+    the shrunk estimate sets the center and cycling only varies AROUND it,
+    still at zero added restart cost (same restart_idx already used for
+    sign-pattern lambdaIndex decoding).
+    """
+    rng = rng or np.random.RandomState()
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    top_idx = np.argsort(eigvals)[::-1][:q]
+    multiplier = multiplier_tiers[restart_idx % len(multiplier_tiers)]
+
+    Delta = np.zeros((p, q))
+    for j, idx in enumerate(top_idx):
+        evec = eigvecs[:, idx]
+        fallback = fallback_scale * np.sqrt(eigvals[idx])
+
+        skew_sign = 1
+        center = fallback
+        if Xc is not None:
+            complete_rows = ~np.isnan(Xc).any(axis=1)
+            Xc_comp = Xc[complete_rows]
+            if len(Xc_comp) >= 8:
+                projected = Xc_comp @ evec
+                m3, z = _skewness_z_score(projected)
+                if abs(m3) > 1e-6:
+                    skew_sign = int(np.sign(m3))
+                delta_mag = _mom_delta_magnitude(projected)
+                if delta_mag is not None:
+                    mom_scale = delta_mag * np.sqrt(eigvals[idx])
+                    weight = float(shrinkage_fn(z, **shrinkage_kwargs))
+                    weight = min(max(weight, 0.0), 1.0)
+                    center = weight * mom_scale + (1 - weight) * fallback
+
+        scale = multiplier * center
+
+        enum_sign = (
+            int(cluster_sign_pattern[j])
+            if cluster_sign_pattern is not None
+            else rng.choice([-1, 1])
+        )
+        Delta[:, j] = skew_sign * enum_sign * scale * evec
+
+    Delta += rng.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
+
+    Gamma = cov - Delta @ Delta.T
+    eigvals_G = np.linalg.eigvalsh(Gamma)
+    if eigvals_G.min() < 1e-6:
+        for _ in range(20):
+            Delta *= 0.9
+            Gamma = cov - Delta @ Delta.T
+            if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                break
+
+    return Delta
+
+
+def init_delta_matrix_mom_shrunk_bimodal(cov, p, q, Xc=None, cluster_sign_pattern=None,
+                                         rng=None, fallback_scale=0.1,
+                                         shrinkage_fn=_shrinkage_james_stein,
+                                         restart_idx=0,
+                                         null_c=25.0, trust_c=0.0,
+                                         **shrinkage_kwargs):
+    """Alternative to init_delta_matrix_mom_shrunk_cycling: rather than
+    diluting ONE shrunk-magnitude center with a symmetric multiplier around
+    it (which sim_delta_init_combined_1_2.py showed actively hurts
+    medium/large-regime recovery -- the shrunk center was already a good
+    calibrated estimate there, and multiplying it by 0.5x/2x just adds noise
+    for best-of-LL to occasionally pick a worse local optimum from), give
+    the restart budget to the two competing HYPOTHESES explicitly instead of
+    asking one shrinkage constant to average across both:
+
+      - even restart_idx -> "probably no real skew": shrink hard (null_c,
+        a high James-Stein c -- defaults to 25.0, the top of the swept
+        z_threshold**2 grid, i.e. close to pure fallback_scale)
+      - odd restart_idx  -> "trust the data's own estimate": shrink little
+        or not at all (trust_c, defaults to 0.0 -- the raw, ungated MoM
+        magnitude)
+
+    No shrinkage formula is asked to be simultaneously right about both
+    "truly no skew" and "real skew" at once; the SIGN dimension still
+    enumerates via cluster_sign_pattern exactly as in every other
+    init_delta_matrix_* variant, orthogonal to this restart_idx-driven
+    magnitude-hypothesis toggle. Still zero added restart cost (same
+    restart_idx already used for sign-pattern lambdaIndex decoding).
+    """
+    c = null_c if (restart_idx % 2 == 0) else trust_c
+    return init_delta_matrix_mom_shrunk(cov, p, q, Xc=Xc, cluster_sign_pattern=cluster_sign_pattern,
+                                        rng=rng, fallback_scale=fallback_scale,
+                                        shrinkage_fn=shrinkage_fn, c=c)
 
 
 def init_delta_matrix_mom_gated(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=None,

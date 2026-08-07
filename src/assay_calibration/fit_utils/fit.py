@@ -264,6 +264,37 @@ def derive_fit_seed(master_seed, bootstrap_idx, num_components, fit_idx):
     return int(ss.generate_state(1)[0])
 
 
+DEFAULT_MASTER_SEED = 0
+
+
+def derive_bootstrap_seed(master_seed, bootstrap_idx):
+    """Seed for bootstrap composition (resampling, one-hot resolution of
+    ambiguous multi-labeled rows, init-method choice) -- as opposed to
+    derive_fit_seed above, which only seeds a single fit's own EM
+    initialization/E-step Monte Carlo draws.
+
+    master_seed == DEFAULT_MASTER_SEED (0, the default): returns
+    bootstrap_idx unchanged -- bit-identical to historical composition
+    (bootstrap composition has always been keyed purely by the loop index,
+    never by master_seed).
+
+    master_seed is None (explicit opt-out, e.g. CLI --seed none): returns
+    None, so callers fall back to RandomState(None) -- true OS entropy,
+    genuinely different composition on every invocation. For users who want
+    independent random draws across repeated runs, not reproducibility.
+
+    Any other master_seed: derives a real, collision-free per-bootstrap seed
+    via SeedSequence, so distinct explicit seeds also genuinely vary
+    composition (not just the EM fitting on top of it).
+    """
+    if master_seed == DEFAULT_MASTER_SEED:
+        return bootstrap_idx
+    if master_seed is None:
+        return None
+    ss = np.random.SeedSequence([master_seed, bootstrap_idx])
+    return int(ss.generate_state(1)[0])
+
+
 class Fit:
     def __init__(self, scoreset):
         """Accept Scoreset, BasicScoreset, or MultiScoreset."""
@@ -623,7 +654,9 @@ class Fit:
             )
 
         bootstrap_seed = kwargs.get("bootstrap_seed", None)
-        onehot_rng = np.random.RandomState(bootstrap_seed)
+        master_seed = kwargs.get("master_seed", None)
+        composition_seed = derive_bootstrap_seed(master_seed, bootstrap_seed)
+        onehot_rng = np.random.RandomState(composition_seed)
         sample_assignments = self.scoreset.sample_assignments
         sample_assignments = makeOneHot(sample_assignments, rng=onehot_rng)
 
@@ -697,15 +730,14 @@ class Fit:
 
         train_indices = np.arange(len(observations))
         val_indices = np.array([], dtype=int)
-        bootstrap_seed = kwargs.get("bootstrap_seed", None)
         if kwargs.get("bootstrap", True):
             if mv:
                 train_indices, val_indices = pattern_stratified_bootstrap(
-                    observations, sample_assignments, bootstrap_seed
+                    observations, sample_assignments, composition_seed
                 )
             else:
                 train_indices, val_indices = sample_specific_bootstrap(
-                    sample_assignments, bootstrap_seed
+                    sample_assignments, composition_seed
                 )
 
         constrained = kwargs.get("check_monotonic", True)
@@ -717,14 +749,13 @@ class Fit:
             if mv:
                 init_methods = np.full(NUM_FITS, "kmeans")
             else:
-                init_method_rng = np.random.RandomState(bootstrap_seed)
+                init_method_rng = np.random.RandomState(composition_seed)
                 init_methods = init_method_rng.choice(["kmeans", "method_of_moments"], size=NUM_FITS)
 
         init_constraint_adjustment = "scale"
         init_constraint_adjustments = np.full(NUM_FITS, init_constraint_adjustment)
 
         _latent_q_jobs = kwargs.get("latent_q", 2)
-        master_seed = kwargs.get("master_seed", None)
 
         jobs = []
         for i in range(NUM_FITS):

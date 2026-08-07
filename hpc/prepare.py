@@ -221,6 +221,22 @@ def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int) -> None
 # Mode: default / mavedb  (univariate Scoreset)
 # =============================================================================
 
+DEFAULT_MASTER_SEED = 0  # keep in sync with fit_utils.fit.DEFAULT_MASTER_SEED
+
+
+def _parse_seed(s: str):
+    """argparse type= for --seed. Deliberately duplicated (not imported) from
+    src.assay_calibration.pipeline.config.parse_master_seed -- this module
+    avoids top-level src.assay_calibration imports (~800 MB per worker, see
+    the module docstring) so argparse setup in the parent process stays
+    light; the 4 generate_fit_jobs call sites this feeds already do their own
+    lazy `from ...fit_utils.fit import Fit` inside each worker function.
+    """
+    if s.lower() in ("none", "random"):
+        return None
+    return int(s)
+
+
 def _requires_2018(df: pd.DataFrame, dataset: str) -> bool:
     genes_2018 = {"BRCA1", "PTEN", "MSH2", "TP53"}
     return df[df["Dataset"] == dataset]["Gene"].iloc[0] in genes_2018
@@ -274,7 +290,8 @@ def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
 
 def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type,
-                              force_gaussian=False, default_release="2026"):
+                              force_gaussian=False, default_release="2026",
+                              master_seed=DEFAULT_MASTER_SEED):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -305,7 +322,7 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
         ref_jobs = None
         for nc in selected_components:
             jobs = fitter.generate_fit_jobs(
-                component_range=[nc], bootstrap_seed=bs,
+                component_range=[nc], bootstrap_seed=bs, master_seed=master_seed,
                 check_monotonic=True, num_fits=NUM_FITS,
                 force_gaussian=force_gaussian)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
@@ -328,7 +345,8 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
 
 def _process_mavedb_dataset(df_gene, gene, score_col, dataset_col, output_dir,
                              N_BOOTSTRAPS, NUM_FITS, selected_components,
-                             population_type, regularization_type, splice_measure):
+                             population_type, regularization_type, splice_measure,
+                             master_seed=DEFAULT_MASTER_SEED):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -367,7 +385,7 @@ def _process_mavedb_dataset(df_gene, gene, score_col, dataset_col, output_dir,
         ref_jobs = None
         for nc in selected_components:
             jobs = fitter.generate_fit_jobs(
-                component_range=[nc], bootstrap_seed=bs,
+                component_range=[nc], bootstrap_seed=bs, master_seed=master_seed,
                 check_monotonic=True, num_fits=NUM_FITS)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
             if ref_jobs is None:
@@ -453,6 +471,7 @@ def run_default(args):
             ),
             population_type=args.population_type,
             force_gaussian=args.force_gaussian,
+            master_seed=args.seed,
         )
         for ds in datasets
     )
@@ -484,6 +503,7 @@ def run_mavedb(args):
             population_type=args.population_type,
             regularization_type=args.regularization_type,
             splice_measure=args.splice_measure,
+            master_seed=args.seed,
         )
         for gene, score_col in combinations
     )
@@ -529,7 +549,8 @@ def _lookup_nc(dataset_name: str, cfg: dict, name_strip_re, fallback_components:
 
 
 def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
-                                   N_BOOTSTRAPS, num_fits_by_nc, selected_components):
+                                   N_BOOTSTRAPS, num_fits_by_nc, selected_components,
+                                   master_seed=DEFAULT_MASTER_SEED):
     from src.assay_calibration.data_utils.dataset import BasicScoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -570,7 +591,7 @@ def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
         for nc in selected_components:
             num_fits = num_fits_by_nc.get(nc, num_fits_by_nc.get("default", 8))
             jobs = fitter.generate_fit_jobs(
-                component_range=[nc], bootstrap_seed=bs,
+                component_range=[nc], bootstrap_seed=bs, master_seed=master_seed,
                 check_monotonic=True, num_fits=num_fits)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
             if ref_jobs is None:
@@ -630,6 +651,7 @@ def run_basicscoreset(args):
         delayed(_process_basicscoreset_dataset)(
             name, df_ds, output_dir, N_BOOTSTRAPS, num_fits_by_nc,
             _lookup_nc(name, cfg, name_strip_re, fallback_components),
+            master_seed=args.seed,
         )
         for name, df_ds in partitions.items()
     )
@@ -679,7 +701,7 @@ def _discover_gene_groups(df, max_dimensions=None, manual_groups=None):
 def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
                                   component_range, constraint_modes, latent_q, init_strategy,
                                   min_overlap_rows=30, sample_balance_beta=None,
-                                  extra_cjob_fields=None):
+                                  extra_cjob_fields=None, master_seed=DEFAULT_MASTER_SEED):
     """Shared bootstrap x component x constraint job-generation loop, backed
     by Fit.generate_fit_jobs. Used by every multivariate pipeline in this
     file: the integrated-dataframe multi-assay genes (BRCA1/PTEN/MSH2/
@@ -723,7 +745,7 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                     fit_kwargs["num_fits"] = NUM_FITS
                 try:
                     jobs = fitter.generate_fit_jobs(
-                        component_range=[nc], bootstrap_seed=bs,
+                        component_range=[nc], bootstrap_seed=bs, master_seed=master_seed,
                         check_monotonic=constrained, **fit_kwargs)
                 except Exception as e:
                     print(f"  {dataset_label} bs={bs} {mode_key}: {e}")
@@ -757,7 +779,8 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
 
 def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
                                 clinvar_release, component_range, constraint_modes,
-                                latent_q, init_strategy, population_type):
+                                latent_q, init_strategy, population_type,
+                                master_seed=DEFAULT_MASTER_SEED):
     from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
 
     gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
@@ -781,6 +804,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
         ms, gene_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
         component_range, constraint_modes, latent_q, init_strategy,
         extra_cjob_fields={"assay_datasets": list(ms.dataset_names)},
+        master_seed=master_seed,
     )
 
 
@@ -915,6 +939,7 @@ def _generate_jobs_for_gene_ms_map(gene_set, gene_ms_map, args):
             component_range, constraint_modes, latent_q, args.init_strategy,
             min_overlap_rows=1,  # pattern_stratified_bootstrap already guards sparse dims
             extra_cjob_fields={"gene_set": gene_set, "assay_datasets": list(ms.dataset_names)},
+            master_seed=args.seed,
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1006,6 +1031,7 @@ def _generate_integrated_jobs(df, gene_groups, args):
             latent_q=latent_q,
             init_strategy=args.init_strategy,
             population_type=args.population_type,
+            master_seed=args.seed,
         )
         for gene, datasets in gene_groups.items()
     )
@@ -1092,6 +1118,7 @@ def _generate_predictor_mv_jobs(by_gene, args):
             component_range, constraint_modes, latent_q, args.init_strategy,
             min_overlap_rows=1,  # pattern_stratified_bootstrap already guards sparse dims
             sample_balance_beta=args.sample_balance_beta,
+            master_seed=args.seed,
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1212,6 +1239,11 @@ def _add_common_args(p):
                    help="Target SLURM array size (default: 1000)")
     p.add_argument("--n-jobs", type=int, default=30,
                    help="Parallel workers for job generation (default: 30)")
+    p.add_argument("--seed", type=_parse_seed, default=DEFAULT_MASTER_SEED,
+                   help="Master reproducibility seed (default: 0, matches historical "
+                        "bootstrap composition). Pass a non-zero int to also perturb "
+                        "bootstrap composition, or 'none' to opt out entirely (true "
+                        "entropy, non-reproducible).")
 
 
 def main():

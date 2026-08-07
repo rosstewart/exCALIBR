@@ -21,10 +21,20 @@ class PipelineConfig:
     n_bootstraps: int = 20
     num_fits_per_bootstrap: int = 8
 
-    # Master seed for full reproducibility (train/val splits, EM initializations,
-    # and E-step Monte Carlo draws are all derived from this). None (default)
-    # preserves the historical unseeded behaviour.
-    seed: Optional[int] = None
+    # Master seed for full reproducibility (bootstrap composition -- train/val
+    # splits, one-hot resolution, init-method choice -- as well as EM
+    # initializations and E-step Monte Carlo draws are all derived from
+    # this). Three modes, resolved by fit_utils.fit.derive_bootstrap_seed/
+    # derive_fit_seed:
+    #   0 (the default): fully reproducible, and bootstrap composition
+    #     matches the historical bootstrap_idx-keyed values exactly (that
+    #     was always the composition, regardless of any seed).
+    #   any other int: fully reproducible, but bootstrap composition itself
+    #     is also genuinely different per seed value (not just EM fitting).
+    #   None (explicit opt-out, e.g. CLI --seed none): true OS entropy for
+    #     both composition and EM fitting -- deliberately non-reproducible,
+    #     for users who want independent random draws across repeated runs.
+    seed: Optional[int] = 0
 
     # Model parameters
     components: List[int] = None  # [2], [3], or [2, 3]
@@ -349,6 +359,16 @@ class PipelineConfig:
         }
         if self.population_type not in valid_pop_types:
             raise ValueError(f"population_type must be one of {valid_pop_types}, got {self.population_type}")
+
+
+def parse_master_seed(s: str):
+    """argparse ``type=`` for --seed: an int, or the literal "none"/"random"
+    for the explicit true-entropy opt-out (see PipelineConfig.seed's
+    docstring for what each of the three resulting modes does).
+    """
+    if s.lower() in ("none", "random"):
+        return None
+    return int(s)
 
 
 def resolve_prior_mode(filter_flag, pathomechanism_method_flag):

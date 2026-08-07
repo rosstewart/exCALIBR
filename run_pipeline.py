@@ -11,7 +11,8 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Optional
 
-from src.assay_calibration.pipeline.config import PipelineConfig, resolve_prior_mode
+from src.assay_calibration.pipeline.config import PipelineConfig, resolve_prior_mode, parse_master_seed
+from src.assay_calibration.fit_utils.fit import DEFAULT_MASTER_SEED
 from src.assay_calibration.pipeline.fit_bootstrap import BootstrapRunner
 from src.assay_calibration.pipeline.model_selection import bootstrap_paired_test
 from src.assay_calibration.pipeline.visualize import (
@@ -320,10 +321,13 @@ Examples:
     parser.add_argument("--sample-names", type=str, nargs="+", default=None,
                        help="Explicit sample names matching column order in data "
                             "(e.g. 'Pathogenic/Likely Pathogenic' 'Benign/Likely Benign' gnomAD Synonymous)")
-    parser.add_argument("--seed", type=int, default=None,
-                       help="Master seed for full reproducibility (train/val splits, EM "
+    parser.add_argument("--seed", type=parse_master_seed, default=DEFAULT_MASTER_SEED,
+                       help="Master seed for full reproducibility (bootstrap composition, EM "
                             "initializations, and E-step Monte Carlo draws are all derived "
-                            "from this). Omit for the historical unseeded behavior.")
+                            "from this). Default 0: fully reproducible, bootstrap composition "
+                            "matches historical behavior. Any other int: also perturbs bootstrap "
+                            "composition itself. 'none': explicit opt-out, true entropy "
+                            "(non-reproducible), for independent random draws across runs.")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging (component params, weights, flip detection, point ranges)")
     parser.add_argument("--progress-file", default=None,
@@ -672,6 +676,11 @@ def _recover_splits_from_seeds(
     """
     Recover train/val splits from bootstrap seeds by re-running the bootstrap
     sampling with the same seeds (deterministic).
+
+    Note: if config.seed is the explicit None opt-out (true entropy), the
+    recovered splits can't actually match the original run's composition
+    either, since the original also used true entropy -- an inherent,
+    acceptable limitation of deliberately requesting non-reproducible mode.
     """
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -690,6 +699,7 @@ def _recover_splits_from_seeds(
         jobs = fitter.generate_fit_jobs(
             component_range=[n_c],
             bootstrap_seed=seed,
+            master_seed=config.seed,
             check_monotonic=True,
             num_fits=1,  # only need 1 to get the split
         )
