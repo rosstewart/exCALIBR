@@ -19,7 +19,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
-from src.assay_calibration.plot_utils.utils import (
+from ..plot_utils.utils import (
     compute_classification_metrics,
     plot_aggregate_confusion_matrices,
 )
@@ -615,14 +615,15 @@ def plot_mv_confusion_by_gene(gene_ms, mv_points_by_gene,
 
 def plot_rpv_classification_matrix(scores, ms,
                                    sample_idx_map=None,
-                                   title='RPV Classification',
+                                   title=None,
+                                   class_label='RPV',
                                    extra_plp_mask=None,
-                                   extra_plp_label='P/LP (non-called)',
+                                   extra_plp_label='P/LP (indet.)',
                                    figsize=None, ax=None,
                                    save_path=None):
-    """Heatmap of RPV classification breakdown per sample.
+    """Heatmap of RPV-style classification breakdown per sample.
 
-    Rows: samples (B/LB, P/LP, RPV by default)
+    Rows: samples (B/LB, P/LP, and the auxiliary "RPV-like" sample by default)
     Cols: rpv_class categories from score_rpv_penetrance
 
     Parameters
@@ -631,12 +632,15 @@ def plot_rpv_classification_matrix(scores, ms,
     ms              : MultiScoreset (provides _sample_assignments, same N as scores)
     sample_idx_map  : dict {display_name: sa_column_index}, ordered
                       Default: {'B/LB': 1, 'P/LP': 0, 'RPV': 4}
+    class_label     : name of the auxiliary sample's class, used in the "low-pen"
+                      column label and axis label (e.g. 'BENTA', 'CADINS') — 'RPV'
+                      is only the historical TP53-specific name, not universal.
     extra_plp_mask  : bool array (N,) — subset of P/LP variants to show as an
                       additional row, e.g. those not called pathogenic by the main model:
                           plp_mask = ms._sample_assignments[:, 0].astype(bool)
                           pts      = analysis.results[config]['points']
                           extra_plp_mask = plp_mask & (pts <= 0)
-    extra_plp_label : row label for the extra P/LP row (default 'P/LP (non-called)')
+    extra_plp_label : row label for the extra P/LP row (default 'P/LP (indet.)')
 
     Returns
     -------
@@ -648,9 +652,11 @@ def plot_rpv_classification_matrix(scores, ms,
 
     if sample_idx_map is None:
         sample_idx_map = OrderedDict([('B/LB', 1), ('P/LP', 0), ('RPV', 4)])
+    if title is None:
+        title = f'{class_label} Classification'
 
     ordered_classes = ['benign_like', 'intermediate', 'plp_like', 'low_pen_rpv']
-    col_labels      = ['Benign-like', 'Intermediate', 'PLP-like', 'Low-pen RPV']
+    col_labels      = ['Benign-like', 'Intermediate', 'PLP-like', f'Low-pen {class_label}']
 
     sa = ms._sample_assignments
     rows = {}
@@ -708,7 +714,7 @@ def plot_rpv_classification_matrix(scores, ms,
     ax.tick_params(length=0)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    ax.set_xlabel('RPV Classification', fontsize=12)
+    ax.set_xlabel(f'{class_label} Classification', fontsize=12)
     ax.set_ylabel('Sample', fontsize=12)
     ax.set_title(title, fontsize=13, fontweight='bold', pad=10)
     ax.set_facecolor('#F9F9F9')
@@ -723,10 +729,11 @@ def plot_rpv_classification_matrix(scores, ms,
 
 def plot_penetrance_score_hist(scores, ms,
                                sample_idx_map=None,
+                               class_label='RPV',
                                extra_plp_mask=None,
                                extra_plp_label='P/LP (indet.)',
                                bins=20,
-                               title='Penetrance Score Distribution',
+                               title=None,
                                figsize=None,
                                save_path=None):
     """Stacked per-sample histograms of penetrance_score.
@@ -740,6 +747,9 @@ def plot_penetrance_score_hist(scores, ms,
     ms              : MultiScoreset
     sample_idx_map  : dict {display_name: sa_column_index}, ordered
                       Default: {'B/LB': 1, 'P/LP': 0, 'RPV': 4}
+    class_label     : name of the auxiliary sample's class (e.g. 'BENTA', 'CADINS')
+                      used in the x-axis description — 'RPV' is only the historical
+                      TP53-specific name, not universal.
     extra_plp_mask  : bool array (N,) for an additional group (e.g. P/LP non-called)
     extra_plp_label : label for that group
     bins            : number of histogram bins (default 20)
@@ -748,11 +758,14 @@ def plot_penetrance_score_hist(scores, ms,
 
     if sample_idx_map is None:
         sample_idx_map = OrderedDict([('B/LB', 1), ('P/LP', 0), ('RPV', 4)])
+    if title is None:
+        title = f'{class_label} Penetrance Score Distribution'
 
     _palette = {
         'B/LB':          '#2E6B7E',
         'P/LP':          '#943744',
         'RPV':           '#2E7D4F',
+        class_label:     '#2E7D4F',
         extra_plp_label: '#e05c00',
     }
     _default_colors = ['#555555', '#7B2D8B', '#B8860B', '#1A6B3C']
@@ -802,7 +815,7 @@ def plot_penetrance_score_hist(scores, ms,
                 fontsize=9, color=color, fontweight='bold')
 
     axes[-1].set_xlabel(
-        'Penetrance score  (0 = low pen. / RPV-like,  1 = high pen. / PLP-like)',
+        f'Penetrance score  (0 = low pen. / {class_label}-like,  1 = high pen. / PLP-like)',
         fontsize=10)
     axes[0].set_title(title, fontsize=12, fontweight='bold', pad=8)
     plt.tight_layout()

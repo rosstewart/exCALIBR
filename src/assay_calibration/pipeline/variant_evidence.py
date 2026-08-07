@@ -26,36 +26,26 @@ from .config import PipelineConfig
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _flatten_point_ranges(point_ranges: Dict) -> Dict:
-    """Flatten {k: [[lo, hi]]} or {k: []} to {k: [lo, hi]} or {k: []}."""
-    flat = {}
+def _assign_points(score: float, point_ranges: Dict) -> int:
+    """Return the evidence point value whose sub-range contains *score*, else 0.
+
+    `point_ranges` is the raw {key: [[lo, hi], ...]} structure (a point value
+    may have zero, one, or multiple disjoint sub-ranges -- e.g. from
+    bidirectional postprocessing, see `clean_bidirectional_pathogenic_evidence`)
+    -- every sub-range is checked directly, with no prior flattening step.
+    Flattening multiple disjoint sub-ranges into their bounding interval
+    (the old behavior) silently merged the neutral score band between two
+    real islands into one of them.
+    """
+    if score is None or np.isnan(score):
+        return 0
     for key, ranges in point_ranges.items():
         if isinstance(ranges, np.ndarray):
             ranges = ranges.tolist()
-        if isinstance(ranges, list):
-            if len(ranges) == 0:
-                flat[key] = []
-            elif len(ranges) == 1 and isinstance(ranges[0], (list, np.ndarray)):
-                flat[key] = list(ranges[0])
-            elif len(ranges) == 2 and not isinstance(ranges[0], (list, np.ndarray)):
-                flat[key] = list(ranges)  # already flat
-            else:
-                # multiple sub-ranges -- take bounding interval
-                all_lo = min(r[0] for r in ranges)
-                all_hi = max(r[1] for r in ranges)
-                flat[key] = [all_lo, all_hi]
-        else:
-            flat[key] = ranges
-    return flat
-
-
-def _assign_points(score: float, flat_ranges: Dict) -> int:
-    """Return the evidence point value whose range contains *score*, else 0."""
-    if score is None or np.isnan(score):
-        return 0
-    for key, bounds in flat_ranges.items():
-        if len(bounds) == 2:
-            lo, hi = bounds
+        if not ranges:
+            continue
+        subranges = ranges if isinstance(ranges[0], (list, tuple, np.ndarray)) else [ranges]
+        for lo, hi in subranges:
             if lo <= score <= hi:
                 return int(key)
     return 0
@@ -191,7 +181,7 @@ def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0,
     populate them change. ``benign_percentile`` defaults to
     ``100 - percentile`` when not given explicitly.
     """
-    flat = _flatten_point_ranges(calibration["point_ranges"])
+    point_ranges = calibration["point_ranges"]
     ids = _get_variant_ids(scoreset)
 
     scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
@@ -204,7 +194,7 @@ def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0,
     rows = []
     for idx in range(len(scoreset.scores)):
         score = scores[idx]
-        pts = _assign_points(score, flat)
+        pts = _assign_points(score, point_ranges)
 
         # scoreset._sample_assignments is a multi-label one-hot row — a
         # variant can genuinely belong to more than one sample category at
@@ -561,7 +551,7 @@ def _process_variant_oob(
             enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
         # Step 9: flatten and assign
-        pts = _assign_points(score, _flatten_point_ranges(pr))
+        pts = _assign_points(score, pr)
     except Exception as e:
         return variant_idx, {"_fail": f"exception: {type(e).__name__}: {str(e)[:200]}"}
 

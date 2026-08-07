@@ -603,7 +603,7 @@ def estimate_prior_from_class_densities(
     no_signal_prior=0.1, floor_low=0.01, discard_high=0.99,
 ):
     """Numeric core of prior estimation, shared by get_fit_prior (below) and
-    the multivariate analysis harness (test/analyze_mv_results.py), so both
+    the multivariate analysis harness (src/assay_calibration/multivariate_analysis/mv_calibration.py), so both
     pipelines run the exact same math instead of maintaining independent
     copies.
 
@@ -626,7 +626,21 @@ def estimate_prior_from_class_densities(
         identical across every current call site.
 
     Returns a float, or np.nan for the PU/NU branch when the boundary
-    estimate is too close to 1 to trust (see `discard_high`).
+    estimate is too close to 1 to trust (see `discard_high`), OR when
+    `boundary > 1` -- i.e. the labeled-vs-mixture ratio never dips below 1
+    anywhere in the reference sample. For mode='positive_unlabeled',
+    prior_raw = boundary directly, so boundary > 1 already triggers the
+    `prior_raw >= discard_high` check above (discard_high < 1). For
+    mode='negative_unlabeled', prior_raw = 1 - boundary, so the SAME
+    boundary > 1 condition instead produces a NEGATIVE prior_raw -- without
+    an explicit check, `max(prior_raw, floor_low)` would silently floor this
+    up to floor_low, which is backwards: boundary > 1 means no point in the
+    reference sample ever looked "purely" like the other class, i.e. there
+    is no evidence constraining the estimate to be small at all (the
+    opposite of what flooring to a low value implies). Discarding here
+    mirrors how the positive_unlabeled branch already handles this same
+    condition, rather than introducing a second, differently-signed
+    treatment for the negative_unlabeled branch.
     """
     if mode == 'standard':
         prior_estimate = 0.5
@@ -652,7 +666,7 @@ def estimate_prior_from_class_densities(
         return no_signal_prior
     boundary = float(np.min(f2[valid] / f1[valid]))
     prior_raw = boundary if mode == 'positive_unlabeled' else (1.0 - boundary)
-    if prior_raw >= discard_high:
+    if prior_raw >= discard_high or prior_raw < 0:
         return np.nan
     return float(max(prior_raw, floor_low))
 
@@ -766,46 +780,47 @@ def _w_D_masking(w_P_raw, w_N):
     return w_D / w_D.sum()
 
 
-def _gamma_em(labeled_scores, population, params, w_D, w_N,
-               gamma_init, max_em_steps, tolerance, multivariate):
-    """Shared gamma-EM core for compute_pathomechanism_pathogenic_density and
-    its masked sibling: given FIXED f_D (via w_D) and f_N (via w_N) densities,
-    estimate gamma (the pathogenic-labeled sample's mechanistic-coverage
-    fraction) via a two-known-densities mixture-proportion EM against
+def _mechanism_match_em(labeled_scores, population, params, w_D, w_N,
+                         mechanism_match_frac_init, max_em_steps, tolerance, multivariate):
+    """Shared EM core for compute_pathomechanism_pathogenic_density and its
+    masked sibling: given FIXED f_D (via w_D) and f_N (via w_N) densities,
+    estimate P(M=1|Y=1) (the pathogenic-labeled sample's mechanistic-coverage
+    fraction -- the fraction of it whose disease mechanism this assay
+    measures) via a two-known-densities mixture-proportion EM against
     labeled_scores, then evaluate the resulting f_D at `population`.
 
-    Returns (pathogenic_density_at_population_points, gamma_hat).
+    Returns (pathogenic_density_at_population_points, mechanism_match_frac_hat).
     """
     log_fD = density_utils.mixture_pdf(labeled_scores, params, w_D, multivariate=multivariate)
     log_fN = density_utils.mixture_pdf(labeled_scores, params, w_N, multivariate=multivariate)
-    gamma = float(gamma_init)
+    match_frac = float(mechanism_match_frac_init)
     for _ in range(max_em_steps):
         with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-            posteriors = 1.0 / (1.0 + (1.0 - gamma) / gamma * np.exp(log_fN - log_fD))
-        new_gamma = float(np.nanmean(posteriors))
-        if abs(new_gamma - gamma) < tolerance:
-            gamma = new_gamma
+            posteriors = 1.0 / (1.0 + (1.0 - match_frac) / match_frac * np.exp(log_fN - log_fD))
+        new_match_frac = float(np.nanmean(posteriors))
+        if abs(new_match_frac - match_frac) < tolerance:
+            match_frac = new_match_frac
             break
-        gamma = new_gamma
-        if not np.isfinite(gamma) or gamma <= 0.0 or gamma >= 1.0:
+        match_frac = new_match_frac
+        if not np.isfinite(match_frac) or match_frac <= 0.0 or match_frac >= 1.0:
             break
 
     pathogenic_density = density_utils.joint_densities(
         population, params, w_D, multivariate=multivariate
     ).sum(axis=0)
-    return pathogenic_density, gamma
+    return pathogenic_density, match_frac
 
 
 def compute_pathomechanism_pathogenic_density(
     labeled_scores, population, params, w_P_raw, w_N,
-    gamma_init=0.5, max_em_steps=10000, tolerance=1e-8,
+    mechanism_match_frac_init=0.5, max_em_steps=10000, tolerance=1e-8,
     multivariate=False,
 ):
     """
     EXPERIMENTAL. Estimates the pathogenic-labeled sample's "assay
-    mechanistic coverage" fraction gamma in
+    mechanistic coverage" fraction P(M=1|Y=1) in
 
-        f_pathogenic_labeled(x) = gamma * f_D(x) + (1 - gamma) * f_N(x)
+        f_pathogenic_labeled(x) = P(M=1|Y=1) * f_D(x) + (1 - P(M=1|Y=1)) * f_N(x)
 
     and returns the resulting "assay-relevant" pathogenic density f_D
     evaluated at `population` (the gnomAD/population points used elsewhere
@@ -820,18 +835,21 @@ def compute_pathomechanism_pathogenic_density(
     (log_fp - log_f_population), just formalized as a proper generative
     mixture instead of a hard per-row threshold. No attempt is made to
     unmix gnomAD's own (typically small) real-disease-variant content
-    first: writing f_gnomAD = pi*f_D + (1-pi)*f_N, the excess construction
-    below is provably invariant to pi -- (w_P_raw - w_gnomAD) = (gamma-pi)*
-    (w_D-w_N), and gamma > pi always holds (a curated pathogenic-labeled
-    sample is by construction more disease-enriched than the general
-    population), so renormalizing after max(0, ...) cancels the (gamma-pi)
-    scale factor regardless of its value. The one place pi's absence from
-    a pure reference does matter is gamma_hat itself, which becomes a mildly
-    conservative (downward-biased) estimate of true mechanistic coverage:
-    gamma_hat = 1 - (1-gamma_true)/(1-pi) <= gamma_true, with zero bias when
-    pi ~ 0 (empirically confirmed on TARDBP_Bolognesi_Faure_2019, where
-    gnomAD carries ~no disease-relevant mass: gamma_hat's median matched the
-    LR-filter's independently-computed kept-row fraction almost exactly).
+    first: writing f_gnomAD = P(Y=1)*f_D + (1-P(Y=1))*f_N, the excess
+    construction below is provably invariant to P(Y=1) -- (w_P_raw -
+    w_gnomAD) = (P(M=1|Y=1)-P(Y=1)) * (w_D-w_N), and P(M=1|Y=1) > P(Y=1)
+    always holds (a curated pathogenic-labeled sample is by construction
+    more disease-enriched than the general population), so renormalizing
+    after max(0, ...) cancels the (P(M=1|Y=1)-P(Y=1)) scale factor
+    regardless of its value. The one place P(Y=1)'s absence from a pure
+    reference does matter is the mechanism_match_frac_hat estimate itself,
+    which becomes a mildly conservative (downward-biased) estimate of true
+    mechanistic coverage: mechanism_match_frac_hat = 1 -
+    (1-mechanism_match_frac_true)/(1-P(Y=1)) <= mechanism_match_frac_true,
+    with zero bias when P(Y=1) ~ 0 (empirically confirmed on
+    TARDBP_Bolognesi_Faure_2019, where gnomAD carries ~no disease-relevant
+    mass: the estimate's median matched the LR-filter's independently-
+    computed kept-row fraction almost exactly).
 
     f_D is built directly from the per-component EXCESS of the raw
     pathogenic-labeled weights over the anchor weights:
@@ -839,11 +857,11 @@ def compute_pathomechanism_pathogenic_density(
         w_D[k] = max(0, w_P_raw[k] - w_N[k]),  renormalized to sum to 1
 
     This is a fixed, non-tautological density (it does not depend on
-    gamma), constructed independently of any gamma value -- unlike an
-    earlier version of this estimator that solved for gamma via
-    w_D(gamma) = (w_P_raw - (1-gamma)*w_N)/gamma, which reconstructs
-    f_pathogenic_labeled EXACTLY for every gamma and therefore carries zero
-    likelihood information about gamma (a proven tautology -- only the
+    P(M=1|Y=1)), constructed independently of any such value -- unlike an
+    earlier version of this estimator that solved for it via
+    w_D(m) = (w_P_raw - (1-m)*w_N)/m, which reconstructs
+    f_pathogenic_labeled EXACTLY for every m and therefore carries zero
+    likelihood information about m (a proven tautology -- only the
     non-negativity boundary constraint identified anything in that
     framework). Building w_D directly from the excess breaks that
     tautology, at the cost of a known, deliberate asymmetry: on any shared
@@ -859,38 +877,39 @@ def compute_pathomechanism_pathogenic_density(
     without any hardcoded component classification.
 
     Because f_D (via w_D) and f_N (via w_N) are now both FIXED densities,
-    estimating gamma from the pathogenic-labeled sample's own scores is a
-    classic two-known-densities mixture-proportion EM -- the same update
+    estimating P(M=1|Y=1) from the pathogenic-labeled sample's own scores is
+    a classic two-known-densities mixture-proportion EM -- the same update
     rule as the standard-mode joint prior EM below, just applied here
     against the pathogenic-labeled sample instead of the population sample.
     This is provably well-behaved (a concave problem in the single scalar
-    gamma) and was confirmed empirically init-robust to ~1e-10 across
-    gamma_init in [0.01, 0.99] on real data -- unlike the free-weight-vector
-    EM this replaced, which was strongly initialization-dependent (median
-    gamma shifted from ~0.91 to ~0.81 across gamma_init=0.9 vs 0.1).
+    P(M=1|Y=1)) and was confirmed empirically init-robust to ~1e-10 across
+    mechanism_match_frac_init in [0.01, 0.99] on real data -- unlike the
+    free-weight-vector EM this replaced, which was strongly initialization-
+    dependent (median estimate shifted from ~0.91 to ~0.81 across init=0.9
+    vs 0.1).
 
-    Returns (pathogenic_density_at_population_points, gamma_hat). Returns
-    (None, np.nan) when w_P_raw <= w_N on every component (no assay-relevant
-    excess signal at all -- degenerate). get_fit_prior discards this
-    individual bootstrap fit from prior estimation rather than falling back
-    to the raw pathogenic density for it: that raw density is itself the
-    degenerate case this correction exists to move away from (e.g. a fit
-    that collapses w_P_raw onto the same component as the anchor, so the two
-    densities are identical and any downstream prior EM is a trivial fixed
-    point). process_component_fits falls back to raw-density prior
-    estimation only if every bootstrap fit for the combo is degenerate this
-    way.
+    Returns (pathogenic_density_at_population_points, mechanism_match_frac_hat).
+    Returns (None, np.nan) when w_P_raw <= w_N on every component (no
+    assay-relevant excess signal at all -- degenerate). get_fit_prior
+    discards this individual bootstrap fit from prior estimation rather
+    than falling back to the raw pathogenic density for it: that raw
+    density is itself the degenerate case this correction exists to move
+    away from (e.g. a fit that collapses w_P_raw onto the same component as
+    the anchor, so the two densities are identical and any downstream prior
+    EM is a trivial fixed point). process_component_fits falls back to
+    raw-density prior estimation only if every bootstrap fit for the combo
+    is degenerate this way.
     """
     w_D = _w_D_subtraction(w_P_raw, w_N)
     if w_D is None:
         return None, np.nan
-    return _gamma_em(labeled_scores, population, params, w_D, w_N,
-                      gamma_init, max_em_steps, tolerance, multivariate)
+    return _mechanism_match_em(labeled_scores, population, params, w_D, w_N,
+                                mechanism_match_frac_init, max_em_steps, tolerance, multivariate)
 
 
 def compute_pathomechanism_pathogenic_density_masked(
     labeled_scores, population, params, w_P_raw, w_N,
-    gamma_init=0.5, max_em_steps=10000, tolerance=1e-8,
+    mechanism_match_frac_init=0.5, max_em_steps=10000, tolerance=1e-8,
     multivariate=False,
 ):
     """
@@ -899,23 +918,153 @@ def compute_pathomechanism_pathogenic_density_masked(
     f_D: w_D[k] = w_P_raw[k] if w_P_raw[k] > w_N[k] else 0, renormalized.
 
     Same contract as compute_pathomechanism_pathogenic_density in every other
-    respect (same gamma-EM core via _gamma_em, same (None, np.nan) degenerate
-    return when no component has w_P_raw > w_N). The two differ only in how a
-    component that just barely exceeds w_N is treated: subtraction keeps only
-    the thin excess (degrading gracefully toward zero near a tie), masking
-    keeps the component's FULL raw weight the instant it exceeds w_N (a
-    harder, less smooth transition, more generous toward borderline
-    components, but a bigger jump in response to bootstrap noise right at the
-    w_P_raw==w_N boundary). Kept here purely as an experimental point of
-    comparison against subtraction, not as a replacement for it.
+    respect (same EM core via _mechanism_match_em, same (None, np.nan)
+    degenerate return when no component has w_P_raw > w_N). The two differ
+    only in how a component that just barely exceeds w_N is treated:
+    subtraction keeps only the thin excess (degrading gracefully toward
+    zero near a tie), masking keeps the component's FULL raw weight the
+    instant it exceeds w_N (a harder, less smooth transition, more generous
+    toward borderline components, but a bigger jump in response to
+    bootstrap noise right at the w_P_raw==w_N boundary). Kept here purely as
+    an experimental point of comparison against subtraction, not as a
+    replacement for it.
 
-    Returns (pathogenic_density_at_population_points, gamma_hat).
+    Returns (pathogenic_density_at_population_points, mechanism_match_frac_hat).
     """
     w_D = _w_D_masking(w_P_raw, w_N)
     if w_D is None:
         return None, np.nan
-    return _gamma_em(labeled_scores, population, params, w_D, w_N,
-                      gamma_init, max_em_steps, tolerance, multivariate)
+    return _mechanism_match_em(labeled_scores, population, params, w_D, w_N,
+                                mechanism_match_frac_init, max_em_steps, tolerance, multivariate)
+
+
+# Below this, match_frac is "effectively zero": the boundary estimate found
+# a labeled point whose f_N/f_Praw ratio sits right at (or just under) 1, so
+# P(M=1|Y=1) is a genuine but vanishingly small estimate -- not the
+# no-candidate-found default of 1.0, and not NaN/invalid either. The
+# unmixing formula f_D = (f_Praw - (1-match_frac)*f_N) / match_frac divides
+# by match_frac, so at this scale it amplifies any numerator noise (fit
+# imprecision, floating-point error) by a factor of >=100, producing a
+# wildly non-monotonic, meaningless f_D/log-LR curve rather than a merely
+# noisy one. Below this floor, f_D is treated as not existing: both
+# functions fall back to reporting "no mechanism-specific evidence"
+# (pathogenic-direction LR == 1 everywhere) instead of constructing it.
+_PATHOMECHANISM_MATCH_FRAC_FLOOR = 0.01
+
+
+def _pathomechanism_boundary_match_frac(f_N_at_labeled, f_Praw_at_labeled):
+    """Estimate P(M=1|Y=1) via the Blanchard-Lee-Scott boundary identity,
+    restricted to labeled points where f_N(x) >= f_Praw(x) (ratio <= 1) --
+    shared by compute_pathomechanism_pathogenic_density_boundary and
+    compute_pathomechanism_lr_curves so the two never drift apart on this
+    logic, the same way _w_D_subtraction/_w_D_masking are shared for the
+    other two methods.
+
+    Points where f_Praw(x) > f_N(x) provide no evidence that ANY of the
+    labeled sample needs explaining by the anchor at that location -- unlike
+    an unfiltered min (which such points could still corrupt if the true
+    minimum-ratio point happens to sit among them, producing a ratio > 1 and
+    silently inverting 1-boundary into a negative number), they're excluded
+    from the candidate set entirely. If NO labeled point has f_N(x) >=
+    f_Praw(x) anywhere, there is no evidence constraining P(M=1|Y=1) below 1
+    at all. Unlike genuine PU/NU population-prior estimation (where a LOW
+    default is the sensible prior for an untested gene), the sensible
+    default here is HIGH: assays usually do measure the dominant disease
+    mechanism, so absent a labeled point demonstrating otherwise, assume the
+    whole PLP-labeled sample is on-mechanism.
+
+    Returns match_frac in (0, 1] -- exactly 1 is a legitimate value here
+    (unlike P(Y=1)/P(Y=1,M=1) elsewhere, which treat exactly 1 as a
+    degenerate/untrustworthy saturation artifact): it means "no evidence
+    constrains this below full mechanism coverage", and the downstream
+    unmixing formula f_D = (f_Praw - (1-match_frac)*f_N) / match_frac is
+    perfectly well-defined at match_frac=1 (reduces to f_D = f_Praw exactly,
+    no division-by-zero -- the divisor is match_frac itself, not 1-match_frac).
+    Callers must use `<= 1` (not the pipeline's usual strict `< 1`) when
+    validating this specific return value. Returns np.nan if f_N_at_labeled
+    is zero everywhere (no informative points at all)."""
+    valid = f_N_at_labeled > 0
+    if not np.any(valid):
+        return np.nan
+    ratio = f_Praw_at_labeled[valid] / f_N_at_labeled[valid]
+    candidates = ratio <= 1.0
+    if not np.any(candidates):
+        return 1.0
+    boundary = float(np.min(ratio[candidates]))
+    return 1.0 - boundary
+
+
+def compute_pathomechanism_pathogenic_density_boundary(
+    labeled_scores, population, params, w_P_raw, w_N, multivariate=False,
+):
+    """
+    Density-level alternative to compute_pathomechanism_pathogenic_density /
+    _masked: instead of building f_D from the fitted mixture model's
+    per-component WEIGHTS (which requires the shared components to
+    individually align with f_D's true support -- not guaranteed with only
+    2-3 components), this estimates P(M=1|Y=1) and f_D directly from
+    DENSITIES, via the same Blanchard-Lee-Scott boundary/min-ratio identity
+    underlying this codebase's PU/NU prior estimator -- but with its own
+    dedicated candidate-filtering and default-direction logic (see
+    _pathomechanism_boundary_match_frac), since this application's sensible
+    default (high, absent counter-evidence) is the opposite of PU/NU
+    population-prior estimation's (low, absent evidence) -- just pointed at
+    the pathogenic-labeled sample in place of the population sample:
+
+        P(M=1|Y=1) = 1 - min_{s in labeled_scores} [ f_P_raw(s) / f_N(s) ]
+
+    evaluated ONLY at the pathogenic-labeled sample's own observed score
+    points (never at a synthetic grid or in unlabeled tails), then f_D is
+    recovered by the same _unmix_density rearrangement already used for
+    PU/NU density unmixing:
+
+        f_D(x) = ( f_P_raw(x) - (1-P(M=1|Y=1)) * f_N(x) ) / P(M=1|Y=1)
+
+    This needs no per-fit EM (unlike _mechanism_match_em's iterative core)
+    since the boundary estimate is closed-form. It also requires no
+    assumption that f_D lies in the span of the shared mixture components --
+    only the density-level mixture identity f_P_raw = P(M=1|Y=1)*f_D +
+    (1-P(M=1|Y=1))*f_N, the same assumption already underlying every PU/NU
+    call site in this module.
+
+    Validated empirically: on 4 PN datasets (ASPA toxicity/abundance, both
+    GCK assays), the resulting pathogenic-direction prior matched the
+    subtraction method's within ~0.001-0.0015; on ASPA toxicity, the
+    P(M=1|Y=1) estimate (~0.75) independently matched DistCurve
+    (Zeiberg/Jain/Radivojac 2020) run on the same raw score arrays.
+
+    Returns (pathogenic_density_at_population_points, mechanism_match_frac_hat).
+    Returns (None, np.nan) when the boundary estimate is invalid (mirrors
+    estimate_prior_from_class_densities' own floor/discard contract).
+    """
+    f_N_at_labeled = density_utils.joint_densities(
+        labeled_scores, params, w_N, multivariate=multivariate
+    ).sum(axis=0)
+    f_Praw_at_labeled = density_utils.joint_densities(
+        labeled_scores, params, w_P_raw, multivariate=multivariate
+    ).sum(axis=0)
+    match_frac = _pathomechanism_boundary_match_frac(f_N_at_labeled, f_Praw_at_labeled)
+    # match_frac == 1 is a legitimate value here (see
+    # _pathomechanism_boundary_match_frac's docstring) -- unlike every other
+    # prior-type quantity in this module, so this uses <= 1, not < 1.
+    if not (np.isfinite(match_frac) and 0 < match_frac <= 1):
+        return None, np.nan
+
+    f_N_at_pop = density_utils.joint_densities(
+        population, params, w_N, multivariate=multivariate
+    ).sum(axis=0)
+    if match_frac < _PATHOMECHANISM_MATCH_FRAC_FLOOR:
+        # f_D is not estimable at this scale (see
+        # _PATHOMECHANISM_MATCH_FRAC_FLOOR) -- fall back to the anchor
+        # density itself, so downstream pathogenic-direction evidence
+        # against this same anchor comes out as LR=1 (no evidence) rather
+        # than corrupted.
+        return f_N_at_pop, match_frac
+    f_Praw_at_pop = density_utils.joint_densities(
+        population, params, w_P_raw, multivariate=multivariate
+    ).sum(axis=0)
+    pathogenic_density = _unmix_density(f_Praw_at_pop, 1 - match_frac, f_N_at_pop)
+    return pathogenic_density, match_frac
 
 
 def resolve_pathomechanism_anchor(weights, benign_method, benign_idx, synonymous_idx, gnomad_idx):
@@ -941,8 +1090,9 @@ def _unmix_density(pop_linear, prior, positive_linear):
     pop_linear*1e-10 -- same formula/floor compute_single_fit_log_densities
     has always used for PU/NU unmixing, generalized to take an arbitrary
     (prior, positive-class density) pair rather than being hardcoded to
-    (pi, f_P_raw), so it can serve either the benign-direction (pi, f_P_raw)
-    or the pathogenic-direction (rho, f_D) unmixing below."""
+    (P(Y=1), f_P_raw), so it can serve either the benign-direction
+    (P(Y=1), f_P_raw) or the pathogenic-direction (P(Y=1,M=1), f_D) unmixing
+    below."""
     with np.errstate(invalid='ignore'):
         f_negative_linear = (pop_linear - prior * positive_linear) / (1 - prior)
     return np.maximum(f_negative_linear, pop_linear * 1e-10)
@@ -951,7 +1101,7 @@ def _unmix_density(pop_linear, prior, positive_linear):
 def compute_pathomechanism_lr_curves(fit, score_range, w_P_raw, w_N_anchor,
                                       pathomechanism_method, is_pu=False,
                                       prior_pathogenic=None, prior_benign=None,
-                                      multivariate=False):
+                                      multivariate=False, labeled_scores=None):
     """Log-density curves for the two-LR/two-prior PS3/BS3 scheme, evaluated
     at score_range.
 
@@ -967,43 +1117,81 @@ def compute_pathomechanism_lr_curves(fit, score_range, w_P_raw, w_N_anchor,
     single-prior path's own unmixed curve vs. ~2 here without unmixing).
     Each direction must instead be purified against population using ITS OWN
     native (prior, density) pair -- the two are NOT interchangeable:
-      - benign-direction:     f_B  = unmix(pop, prior_benign, f_P_raw)   [pi]
-        (unchanged from the historical PU/NU unmixing formula -- pi and
+      - benign-direction:     f_B  = unmix(pop, prior_benign, f_P_raw)   [P(Y=1)]
+        (unchanged from the historical PU/NU unmixing formula -- P(Y=1) and
         f_P_raw are estimated identically regardless of pathomechanism_method)
-      - pathogenic-direction: f_B' = unmix(pop, prior_pathogenic, f_D)   [rho]
-        (new: derived from f_pop = rho*f_D + (1-rho)*f_B', where f_B' is
-        provably a valid convex combination of the raw anchor and f_B,
-        representing "off-mechanism-pathogenic-looking OR truly benign" --
-        the correct negative reference class for PS3 evidence)
+      - pathogenic-direction: f_B' = unmix(pop, prior_pathogenic, f_D)   [P(Y=1,M=1)]
+        (new: derived from f_pop = P(Y=1,M=1)*f_D + (1-P(Y=1,M=1))*f_B',
+        where f_B' is provably a valid convex combination of the raw anchor
+        and f_B, representing "off-mechanism-pathogenic-looking OR truly
+        benign" -- the correct negative reference class for PS3 evidence)
     prior_pathogenic/prior_benign are required (and assumed already validated
     -- non-NaN, in (0,1) -- by the caller's upstream valid_mask filtering)
     when is_pu=True.
 
+    labeled_scores (the pathogenic-labeled sample's own real score points) is
+    required only when pathomechanism_method == 'boundary' -- unlike
+    subtraction/masking's w_D (a fixed weight-vector construction independent
+    of P(M=1|Y=1)), the boundary method's f_D construction needs P(M=1|Y=1)
+    itself, which can only be estimated from the labeled sample's own scores
+    (see compute_pathomechanism_pathogenic_density_boundary).
+
     Returns (log_fD_or_None, log_fN_benign, log_fP_raw, log_fN_pathogenic_or_None):
       log_fN_benign, log_fP_raw are always arrays.
-      log_fD is None when w_D is degenerate on this fit (mirrors
+      log_fD is None when f_D is degenerate on this fit (mirrors
       compute_pathomechanism_pathogenic_density's (None, nan) contract) --
-      this fit contributes no pathogenic-direction curve; its rho was already
-      nan from get_fit_prior and is already excluded from the rho
-      aggregation/valid_mask upstream. log_fN_pathogenic is None exactly when
-      log_fD is None.
+      this fit contributes no pathogenic-direction curve; its P(Y=1,M=1) was
+      already nan from get_fit_prior and is already excluded from the
+      P(Y=1,M=1) aggregation/valid_mask upstream. log_fN_pathogenic is None
+      exactly when log_fD is None.
       In PN mode, log_fN_benign and log_fN_pathogenic are identical (both the
       direct w_N_anchor mixture) -- unchanged from prior behavior.
 
     Caller forms lrD = log_fD - log_fN_pathogenic (pathogenic-direction,
-    paired with rho) and lrPB = log_fP_raw - log_fN_benign (benign-direction,
-    paired with pi).
+    paired with P(Y=1,M=1)) and lrPB = log_fP_raw - log_fN_benign
+    (benign-direction, paired with P(Y=1)).
     """
     params = fit['fit']['component_params']
-    build_w_D = {
-        'subtraction': _w_D_subtraction,
-        'masking': _w_D_masking,
-    }[pathomechanism_method]
-    w_D = build_w_D(w_P_raw, w_N_anchor)
-
     log_fP_raw = density_utils.mixture_pdf(score_range, params, w_P_raw, multivariate=multivariate)
-    log_fD = (density_utils.mixture_pdf(score_range, params, w_D, multivariate=multivariate)
-              if w_D is not None else None)
+
+    if pathomechanism_method == 'boundary':
+        if labeled_scores is None:
+            raise ValueError("labeled_scores is required when pathomechanism_method='boundary'")
+        f_N_at_labeled = density_utils.joint_densities(
+            labeled_scores, params, w_N_anchor, multivariate=multivariate).sum(axis=0)
+        f_Praw_at_labeled = density_utils.joint_densities(
+            labeled_scores, params, w_P_raw, multivariate=multivariate).sum(axis=0)
+        match_frac = _pathomechanism_boundary_match_frac(f_N_at_labeled, f_Praw_at_labeled)
+        log_fD = None
+        # match_frac == 1 is legitimate here (see
+        # _pathomechanism_boundary_match_frac's docstring) -- <= 1, not < 1.
+        if np.isfinite(match_frac) and 0 < match_frac <= 1:
+            f_N_at_range = np.exp(density_utils.mixture_pdf(
+                score_range, params, w_N_anchor, multivariate=multivariate))
+            if match_frac < _PATHOMECHANISM_MATCH_FRAC_FLOOR:
+                # f_D not estimable at this scale (see
+                # _PATHOMECHANISM_MATCH_FRAC_FLOOR) -- rather than divide by
+                # match_frac and amplify numerator noise into a corrupted,
+                # non-monotonic curve, fall back to log_fD == the anchor
+                # density itself. This makes lrD = log_fD - log_fN_pathogenic
+                # exactly 0 everywhere below (log_fN_pathogenic reduces to
+                # the same anchor density here too: unmixing pop_linear
+                # against a "positive" density equal to pop_linear itself is
+                # a no-op, f_negative = pop_linear regardless of prior) --
+                # i.e. no pathogenic-direction evidence, in both PN and PU
+                # mode, instead of a meaningless one.
+                log_fD = np.log(f_N_at_range)
+            else:
+                fd_linear = _unmix_density(np.exp(log_fP_raw), 1 - match_frac, f_N_at_range)
+                log_fD = np.log(fd_linear)
+    else:
+        build_w_D = {
+            'subtraction': _w_D_subtraction,
+            'masking': _w_D_masking,
+        }[pathomechanism_method]
+        w_D = build_w_D(w_P_raw, w_N_anchor)
+        log_fD = (density_utils.mixture_pdf(score_range, params, w_D, multivariate=multivariate)
+                  if w_D is not None else None)
 
     if not is_pu:
         log_fN = density_utils.mixture_pdf(score_range, params, w_N_anchor, multivariate=multivariate)
@@ -1028,7 +1216,7 @@ def apply_pathomechanism_correction(pathomechanism_method, labeled_scores, popul
                                      params, w_P_raw, w_N, multivariate=False, **kwargs):
     """Shared method-dispatch entry point for the pathomechanism prior
     correction, used by both the univariate (get_fit_prior, above) and
-    multivariate (test/analyze_mv_results.py) prior-EM paths so the two never
+    multivariate (src/assay_calibration/multivariate_analysis/mv_calibration.py) prior-EM paths so the two never
     drift out of sync on which f_D construction "subtraction"/"masking" maps
     to, or on the off/None contract.
 
@@ -1037,10 +1225,20 @@ def apply_pathomechanism_correction(pathomechanism_method, labeled_scores, popul
     contract, so callers can treat "off" and "degenerate excess/mask" the
     same way downstream).
 
-    Returns (pathogenic_density_at_population_points_or_None, gamma_hat).
+    'boundary' takes no mechanism_match_frac_init/max_em_steps/tolerance
+    kwargs (its estimate is closed-form, not iterative) -- callers must omit
+    these in **kwargs when pathomechanism_method='boundary' (passing them
+    raises a TypeError, since compute_pathomechanism_pathogenic_density_boundary
+    has no **kwargs catch-all); see get_fit_prior's conditional kwarg
+    construction for the pattern.
+
+    Returns (pathogenic_density_at_population_points_or_None, mechanism_match_frac_hat).
     """
     if pathomechanism_method is None:
         return None, np.nan
+    if pathomechanism_method == 'boundary':
+        return compute_pathomechanism_pathogenic_density_boundary(
+            labeled_scores, population, params, w_P_raw, w_N, multivariate=multivariate)
     density_fn = {
         'subtraction': compute_pathomechanism_pathogenic_density,
         'masking': compute_pathomechanism_pathogenic_density_masked,
@@ -1106,7 +1304,7 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
     # compute_pathomechanism_pathogenic_density's docstring). Mutually
     # exclusive with pathogenic_row_mask.
     pathomechanism_method = kwargs.get("pathomechanism_method", None)
-    gamma_hat = np.nan
+    mechanism_match_frac_hat = np.nan
     pathomechanism_no_pu_support = False
     if pathomechanism_method is not None and pathogenic_idx is not None and pathogenic_row_mask is not None:
         raise ValueError(
@@ -1145,12 +1343,17 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
         is_pu = len(benign_density) == 0
         w_N_anchor = weights[gnomad_idx] if is_pu else w_b
         labeled_scores = scores[sa[:, pathogenic_idx].astype(bool)]
-        corrected, gamma_hat = apply_pathomechanism_correction(
+        pathomechanism_kwargs = {}
+        if pathomechanism_method != "boundary":
+            # 'boundary' is closed-form -- no EM init/steps/tolerance to pass.
+            pathomechanism_kwargs = dict(
+                mechanism_match_frac_init=kwargs.get("pathomechanism_match_frac_init", 0.5),
+                max_em_steps=kwargs.get("pathomechanism_max_em_steps", 10000),
+                tolerance=kwargs.get("pathomechanism_tolerance", 1e-8),
+            )
+        corrected, mechanism_match_frac_hat = apply_pathomechanism_correction(
             pathomechanism_method, labeled_scores, population, params,
-            weights[pathogenic_idx], w_N_anchor,
-            gamma_init=kwargs.get("pathomechanism_gamma_init", 0.5),
-            max_em_steps=kwargs.get("pathomechanism_max_em_steps", 10000),
-            tolerance=kwargs.get("pathomechanism_tolerance", 1e-8),
+            weights[pathogenic_idx], w_N_anchor, **pathomechanism_kwargs,
         )
         if corrected is None:
             # No assay-relevant excess anywhere (w_P_raw <= w_N on every
@@ -1168,12 +1371,28 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
             # back to raw-density prior estimation for the whole combo.
             return np.nan, np.nan
         pathogenic_density = corrected
+
+        # For 'boundary' in the default "product" joint-prior mode, the
+        # caller (visualize.py) computes P(Y=1,M=1) as P(Y=1)*P(M=1|Y=1)
+        # and never reads this function's own prior_estimate return value at
+        # all -- so skip the standard/PU/NU EM below entirely rather than
+        # run a full iterative re-derivation against f_D on every bootstrap
+        # fit just to discard it. Only "boundary" has a meaningfully
+        # skippable direct re-derivation here; subtraction/masking's EM
+        # (_mechanism_match_em, already run inside apply_pathomechanism_
+        # correction above) is the SAME computation that produces
+        # mechanism_match_frac_hat, not a separate one, so there's nothing
+        # extra to skip for them.
+        if (pathomechanism_method == "boundary"
+                and kwargs.get("pathomechanism_boundary_joint_prior", "product") == "product"):
+            return np.nan, mechanism_match_frac_hat
+
         if is_pu:
             # With a typically small gnomAD sample, "zero density
             # everywhere the population lands" means f_D's isolated
             # disease-relevant component(s) have no detectable trace in
             # gnomAD -- itself the boundary estimator's floor signal
-            # (pi -> 0), not an absence of information. Confirmed on
+            # (P(Y=1) -> 0), not an absence of information. Confirmed on
             # TARDBP_Bolognesi_Faure_2019 (68 gnomAD points): treating
             # this as "no info" and discarding/defaulting to 0.1 (the
             # generic PU fallback below) reproduced a selection-biased
@@ -1205,7 +1424,7 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
     
     if mode == 'standard':
         # Standard EM -- see estimate_prior_from_class_densities for the shared
-        # implementation (also used by test/analyze_mv_results.py).
+        # implementation (also used by src/assay_calibration/multivariate_analysis/mv_calibration.py).
         prior_estimate = estimate_prior_from_class_densities(
             pathogenic_density, benign_density, mode='standard',
             max_em_steps=kwargs.get("max_em_steps", 10000),
@@ -1217,27 +1436,28 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
         # fits' curves feed the final LR+ plot for datasets that never had a
         # saturation problem to begin with. Keep the original behavior.
         if prior_estimate <= 0.001 or prior_estimate >= 0.999:
-            return np.nan, gamma_hat
-        return prior_estimate, gamma_hat
+            return np.nan, mechanism_match_frac_hat
+        return prior_estimate, mechanism_match_frac_hat
 
     # Boundary/"unmixing" estimator (Blanchard, Lee & Scott 2010; Scott 2015),
     # evaluated at the gnomAD/population sample points (pop_density,
     # pathogenic_density, benign_density are already computed there above):
-    #   f_pop(x) = alpha*f_labeled(x) + (1-alpha)*f_other(x), f_other(x) >= 0
-    #   everywhere requires alpha <= f_pop(x)/f_labeled(x) pointwise, so the
-    #   tightest identifiable alpha is inf_x [f_pop(x) / f_labeled(x)].
-    # More intuitive than mean-matching for PU/NU (formerly used here):
-    # mean-matching's ratio of *averages* collapses toward 0 whenever
-    # there's little population mass near the labeled class -- a
-    # data-sparsity artifact, not evidence of a low prior -- whereas
-    # unmixing asks "what's the largest alpha consistent with a
-    # non-negative residual population density everywhere", the direct
-    # generalization of the standard PN joint-EM logic (above) to the
-    # one-labeled-class case. Floor/discard (0.01 / >=0.99) is applied inside
+    #   f_pop(x) = P(Y=1)*f_labeled(x) + (1-P(Y=1))*f_other(x), f_other(x) >= 0
+    #   everywhere requires P(Y=1) <= f_pop(x)/f_labeled(x) pointwise, so the
+    #   tightest identifiable P(Y=1) is inf_x [f_pop(x) / f_labeled(x)].
+    # More intuitive than mean-matching for PU/NU (formerly used here, and
+    # confirmed empirically non-functional: its iterative update is a
+    # tautology -- its fixed point doesn't depend on the current estimate --
+    # so in finite samples it diverges geometrically to 0 or 1 depending only
+    # on per-fit noise, not signal). The boundary/unmixing estimator instead asks
+    # "what's the largest P(Y=1) consistent with a non-negative residual
+    # population density everywhere", the direct generalization of the
+    # standard PN joint-EM logic (above) to the one-labeled-class case.
+    # Floor/discard (0.01 / >=0.99) is applied inside
     # estimate_prior_from_class_densities -- identical policy shared with MV.
     if mode == 'negative_unlabeled':
         return estimate_prior_from_class_densities(
-            benign_density, pop_density, mode='negative_unlabeled'), gamma_hat
+            benign_density, pop_density, mode='negative_unlabeled'), mechanism_match_frac_hat
 
     # positive_unlabeled. See pathomechanism_no_pu_support comment above:
     # distinguish "pathomechanism correction found no population support at
@@ -1246,7 +1466,7 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
     no_signal_prior = 0.01 if pathomechanism_no_pu_support else 0.1
     return estimate_prior_from_class_densities(
         pathogenic_density, pop_density, mode='positive_unlabeled',
-        no_signal_prior=no_signal_prior), gamma_hat
+        no_signal_prior=no_signal_prior), mechanism_match_frac_hat
 
 def get_bootstrap_score_ranges(fitIdx, fit, fp, fb, score_range, fit_priors, point_values,
                                 acmg_mapping_method="tavtigian", acmg_bayes_targets=None,
@@ -1301,8 +1521,8 @@ def get_bootstrap_score_ranges_dual(fitIdx, fit, log_fD, log_fN_benign, log_fP_r
                                      log_fN_pathogenic=None):
     """Dual-(prior, LR)-pair sibling of get_bootstrap_score_ranges for the
     pathomechanism two-LR/two-prior PS3/BS3 scheme: pathogenic-direction
-    thresholds are derived from (rho, log_fD - log_fN_pathogenic), benign-
-    direction thresholds from (pi, log_fP_raw - log_fN_benign) -- see
+    thresholds are derived from (P(Y=1,M=1), log_fD - log_fN_pathogenic),
+    benign-direction thresholds from (P(Y=1), log_fP_raw - log_fN_benign) -- see
     compute_pathomechanism_lr_curves and calculate_score_ranges_dual.
 
     log_fN_benign and log_fN_pathogenic are the SAME array in PN mode (no
@@ -1347,8 +1567,8 @@ def get_bootstrap_score_ranges_dual(fitIdx, fit, log_fD, log_fN_benign, log_fP_r
     lrPB = log_fP_raw_local[mask] - log_fN_benign_local[mask]
     s = score_range[mask]
 
-    rho = fit_priors_pathogenic[fitIdx]
-    pi = fit_priors_benign[fitIdx]
+    prior_pathomechanism = fit_priors_pathogenic[fitIdx]  # P(Y=1, M=1)
+    prior_raw = fit_priors_benign[fitIdx]  # P(Y=1)
 
     if log_fD is not None:
         log_fD_local = _masked(log_fD)
@@ -1358,18 +1578,36 @@ def get_bootstrap_score_ranges_dual(fitIdx, fit, log_fD, log_fN_benign, log_fP_r
         lrD = np.full_like(s, np.nan, dtype=float)
 
     ranges_p, ranges_b, C_p, C_b = calculate_score_ranges_dual(
-        lrD, lrPB, rho, pi, s, point_values,
+        lrD, lrPB, prior_pathomechanism, prior_raw, s, point_values,
         acmg_mapping_method=acmg_mapping_method,
     )
 
-    if log_fD is None or prior_invalid(rho):
+    if log_fD is None or prior_invalid(prior_pathomechanism):
         log_fD_local = np.full_like(log_fN_benign, np.nan, dtype=float)
         log_fN_pathogenic_local = np.full_like(log_fN_benign, np.nan, dtype=float)
         for key in ranges_p:
             ranges_p[key] = []
         C_p = np.nan
+    elif prior_pathomechanism < _PATHOMECHANISM_MATCH_FRAC_FLOOR:
+        # log_fD already exists as a flat, no-evidence curve here (this
+        # fit's own match_frac was below the same floor, so
+        # compute_pathomechanism_lr_curves' own gate already built log_fD
+        # as the anchor density rather than unmixing -- see
+        # _PATHOMECHANISM_MATCH_FRAC_FLOOR) -- keep that curve for display
+        # (log_fD_local/log_fN_pathogenic_local untouched; lrD is already
+        # ~0 everywhere, so this changes no evidence assignment on its
+        # own), but discard only the point-range/C computation above: an
+        # unfloored prior this tiny degenerates get_tavtigian_constant's
+        # C-search into C=1 (no C in its search range can satisfy any ACMG
+        # posterior target against such a small prior), making every
+        # threshold trivially satisfied by any LR -- including this fit's
+        # own flat LR=1 curve, which would otherwise spuriously fill every
+        # tier up to the maximum rather than contributing no evidence.
+        for key in ranges_p:
+            ranges_p[key] = []
+        C_p = np.nan
 
-    if prior_invalid(pi):
+    if prior_invalid(prior_raw):
         log_fP_raw_local = np.full_like(log_fN_benign, np.nan, dtype=float)
         log_fN_benign_local = np.full_like(log_fN_benign, np.nan, dtype=float)
         for key in ranges_b:
@@ -1610,33 +1848,25 @@ import pandas as pd
 def make_variant_id(v):
     return f"{v.ID}_{v.Gene}_{v.Chrom}_{v.hgvs_c}"
 
-def flatten_point_ranges(point_ranges):
-    """Flatten 2D arrays in point_ranges to 1D, asserting only one or zero arrays."""
-    flattened = {}
-    for key, ranges in point_ranges.items():
-        if len(ranges) == 0:
-            flattened[key] = []
-        elif len(ranges) == 1:
-            assert len(ranges[0]) == 2, f"Expected 2 values in range for key {key}, got {ranges[0]}"
-            flattened[key] = ranges[0]
-        else:
-            raise AssertionError(f"Expected 0 or 1 range for key {key}, got {len(ranges)}")
-    return flattened
-
 def assign_points(assay_score, point_ranges):
-    """Assign points based on which range the assay_score falls into."""
+    """Assign points based on which sub-range the assay_score falls into.
+
+    `point_ranges` is the raw {key: [[lo, hi], ...]} structure -- a point
+    value may have zero, one, or multiple disjoint sub-ranges (e.g. from
+    bidirectional postprocessing), so every sub-range is checked directly
+    rather than pre-flattening to a single bounding interval.
+    """
     if assay_score is None or pd.isna(assay_score):
         return None
-    
-    matched_points = []
-    for point_str, range_vals in point_ranges.items():
-        if len(range_vals) == 2:
-            low, high = range_vals
+
+    for point_str, ranges in point_ranges.items():
+        if not ranges:
+            continue
+        subranges = ranges if isinstance(ranges[0], (list, tuple)) else [ranges]
+        for low, high in subranges:
             if low <= assay_score <= high:
-                matched_points.append(int(point_str))
-    
-    assert len(matched_points) <= 1, f"Score {assay_score} matched multiple ranges: {matched_points}, point ranges: {point_ranges}"
-    return matched_points[0] if matched_points else 0
+                return int(point_str)
+    return 0
 
 
 
@@ -2034,8 +2264,7 @@ def _assign_oob_points_from_lr_percentiles(
             scoreset_flipped=scoreset_flipped, liberal=liberal, log_f=None,
         )
 
-        flattened = flatten_point_ranges(point_ranges)
-        return assign_points(variant_score, flattened)
+        return assign_points(variant_score, point_ranges)
 
     except (NotImplementedError, AssertionError):
         return None

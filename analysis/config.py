@@ -22,7 +22,7 @@ def _env(name: str, default: str) -> str:
 # *_calibration.json, *_lr_values.json.gz written by run_igvf_batch.py.
 OUTPUT_DIR = _env(
     "EXCALIBR_OUTPUT_DIR",
-    "/data/ross/assay_calibration/explorer_jobs_pp_revisions_calib",
+    "/data/ross/assay_calibration/exc_pp_clinvar2025_calib",
 )
 
 # Master integrated variant-effect dataframe (all datasets, one row per
@@ -47,7 +47,7 @@ DATASET_CONFIGS = _env(
 # cartoon/schematic figures, Figure 4 panels) rather than just the LR+ curve.
 PRECOMPUTED_FITS = _env(
     "EXCALIBR_PRECOMPUTED_FITS",
-    "/data/ross/assay_calibration/explorer_jobs_pp_merged_89datasets_bootstrap_results.json.gz",
+    "/data/ross/assay_calibration/pp_final_clinvar2025_bootstraps/final_clinvar2025_bootstrap_results.json.gz",
 )
 
 # Where generated figures are written by default.
@@ -135,14 +135,17 @@ ACMGSCALER_OUTPUT_DIR = _env("EXCALIBR_ACMGSCALER_OUTPUT_DIR", "/data/ross/assay
 # Simple 2-component GMM baseline -- a full ExCALIBR-pipeline-shaped output
 # tree (same {dataset}/{dataset}_{comp}_variants.csv/calibration.json/
 # lr_values.json.gz/visualization.png layout as run_igvf_batch.py's own
-# output, just with "comp" = "plp_blb" (P/LP + B/LB pool) or "plp_blb_synon"
-# (P/LP + [B/LB union Synonymous] pool) instead of an (n_c, benign_method)
-# token -- see analysis.comparison_methods.load_comparison_variants and
-# GMM_BASELINE_VARIANTS below. Assumes prior=0.1 for both variants.
+# output, just with "comp" = "plp_blb" (P/LP + B/LB pool), "plp_blb_synon"
+# (P/LP + [B/LB union Synonymous] pool), or the "all_"-prefixed counterpart of
+# either (same pooling for the mixing weights, but the GMM's component
+# parameters are fit on every variant's score in the dataset, not just the
+# labeled pool) instead of an (n_c, benign_method) token -- see
+# analysis.comparison_methods.load_comparison_variants and
+# GMM_BASELINE_VARIANTS below. Assumes prior=0.1 for all variants.
 GMM_BASELINE_OUTPUT_DIR = _env(
     "EXCALIBR_GMM_BASELINE_OUTPUT_DIR", "/data/ross/assay_calibration/simple_gmm_baseline"
 )
-GMM_BASELINE_VARIANTS = ("plp_blb", "plp_blb_synon")
+GMM_BASELINE_VARIANTS = ("plp_blb", "plp_blb_synon", "all_plp_blb", "all_plp_blb_synon")
 
 # Older bare-JSON output (hpc/simple_gmm_baseline.py run standalone,
 # without the wrapper that produces the full GMM_BASELINE_OUTPUT_DIR tree

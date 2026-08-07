@@ -7,8 +7,12 @@ Sub-commands
   default       Univariate Scoreset from integrated TSV (ClinVar-versioned)
   mavedb        Univariate Scoreset.from_mavedb (MaveDB / label-seq CSV)
   basicscoreset Univariate BasicScoreset from CSV with sample_assignments column
-  multivariate  MultiScoreset for multi-assay genes
+  multivariate  MultiScoreset for multi-assay genes (--gene-set selects the
+                ingestion source: integrated [default] / fgfr / tp53 /
+                labelseq / card11 / combined)
   predictor-mv  BasicMultiScoreset for predictor-score data
+  mv_all        Merge FGFR/TP53/LABEL-seq/CARD11/predictor-mv/combined (--pipelines
+                selects which, in priority order) into ONE job array/manifest
 
 Usage
 -----
@@ -17,6 +21,7 @@ Usage
   python hpc/prepare.py basicscoreset --output-dir DIR [--dataframe F | --data-dir D]
   python hpc/prepare.py multivariate  --output-dir DIR [options]
   python hpc/prepare.py predictor-mv  --output-dir DIR --data-dir D [options]
+  python hpc/prepare.py mv_all        --output-dir DIR [--pipelines ... ] [options]
 
 After running, submit with:
   bash hpc/submit_array.sh <output_dir>
@@ -671,42 +676,25 @@ def _discover_gene_groups(df, max_dimensions=None, manual_groups=None):
     return result
 
 
-def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
-                                clinvar_release, component_range, constraint_modes,
-                                latent_q, init_strategy, population_type):
-    from src.assay_calibration.data_utils.dataset import Scoreset, MultiScoreset
+def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
+                                  component_range, constraint_modes, latent_q, init_strategy,
+                                  min_overlap_rows=30, sample_balance_beta=None,
+                                  extra_cjob_fields=None):
+    """Shared bootstrap x component x constraint job-generation loop, backed
+    by Fit.generate_fit_jobs. Used by every multivariate pipeline in this
+    file: the integrated-dataframe multi-assay genes (BRCA1/PTEN/MSH2/
+    pillar-project), predictor-mv, and the FGFR/TP53/LABEL-seq/CARD11/
+    combined gene-sets -- the only per-pipeline difference is how ``ms`` was
+    built (see multivariate_data/*.py), not how jobs are generated from it.
+
+    ``min_overlap_rows`` defaults to Fit.generate_fit_jobs's own default (30,
+    i.e. unchanged behavior for the pre-existing integrated-dataframe
+    pipeline). Callers standardizing on pattern_stratified_bootstrap's
+    guarantee against sparse-dimension signal loss (FGFR/TP53/LABEL-seq/
+    CARD11/predictor-mv/combined, per the consolidation plan) should pass
+    ``min_overlap_rows=1`` explicitly.
+    """
     from src.assay_calibration.fit_utils.fit import Fit
-
-    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
-    save_dir = os.path.join(output_dir, gene_label)
-
-    scoresets, valid_names = [], []
-    for ds_name in datasets:
-        try:
-            kw = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
-            if population_type:
-                kw["population_type"] = population_type
-            ds = Scoreset(df_gene[df_gene["Dataset"] == ds_name], **kw)
-            if sum(1 for _ in ds.samples) < 2:
-                print(f"  {ds_name}: skipping (< 2 samples)")
-                continue
-            scoresets.append(ds)
-            valid_names.append(ds_name)
-        except (ValueError, KeyError) as e:
-            print(f"  {ds_name}: skipping ({e})")
-
-    if len(scoresets) < 2:
-        print(f"  {gene}: fewer than 2 valid datasets, skipping")
-        return None
-
-    try:
-        ms = MultiScoreset(scoresets, dataset_names=valid_names)
-    except (ValueError, KeyError) as e:
-        print(f"  {gene}: MultiScoreset failed ({e})")
-        return None
-
-    print(f"  {gene_label}: {ms.n_variants} variants, {ms.n_assays}D, "
-          f"missing={ms.missing.mean()*100:.1f}%")
 
     constrained_flags = []
     if "con" in constraint_modes:
@@ -724,10 +712,13 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
                 mode_key = f"jobs_{nc}c_{'con' if constrained else 'unc'}"
                 fit_kwargs = {
                     "latent_q": latent_q, "init_strategy": init_strategy,
-                    "log_prefix": f"  {gene_label}: ",
+                    "min_overlap_rows": min_overlap_rows,
+                    "log_prefix": f"  {dataset_label}: ",
                     "verbose_overlap": bs == 0 and nc == component_range[0]
                                        and constrained == constrained_flags[0],
                 }
+                if sample_balance_beta is not None:
+                    fit_kwargs["sample_balance_beta"] = sample_balance_beta
                 if NUM_FITS is not None:
                     fit_kwargs["num_fits"] = NUM_FITS
                 try:
@@ -735,7 +726,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
                         component_range=[nc], bootstrap_seed=bs,
                         check_monotonic=constrained, **fit_kwargs)
                 except Exception as e:
-                    print(f"  {gene_label} bs={bs} {mode_key}: {e}")
+                    print(f"  {dataset_label} bs={bs} {mode_key}: {e}")
                     jobs = []
                 minimal = [{**_strip_minimal(j), "multivariate": True} for j in jobs]
                 jobs_by_key[mode_key] = minimal
@@ -747,9 +738,8 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
             continue
 
         cjob = {
-            "dataset_name": gene_label,
+            "dataset_name": dataset_label,
             "gene": gene,
-            "assay_datasets": valid_names,
             "n_dimensions": ms.n_assays,
             "save_dir": save_dir,
             "bootstrap_seed": bs,
@@ -757,13 +747,210 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
             "multivariate": True,
             "num_fits_total": sum(len(v) for v in jobs_by_key.values()),
         }
+        if extra_cjob_fields:
+            cjob.update(extra_cjob_fields)
         cjob.update(jobs_by_key)
         all_jobs.append(cjob)
 
     return all_jobs
 
 
-def run_multivariate(args):
+def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
+                                clinvar_release, component_range, constraint_modes,
+                                latent_q, init_strategy, population_type):
+    from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
+
+    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
+    save_dir = os.path.join(output_dir, gene_label)
+
+    scoreset_kwargs = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
+    if population_type:
+        scoreset_kwargs["population_type"] = population_type
+
+    ms = build_multiscoreset_from_long_dataframe(
+        df_gene, gene, datasets, scoreset_kwargs=scoreset_kwargs,
+    )
+    if ms is None:
+        print(f"  {gene}: fewer than 2 valid datasets, skipping")
+        return None
+
+    print(f"  {gene_label}: {ms.n_variants} variants, {ms.n_assays}D, "
+          f"missing={ms.missing.mean()*100:.1f}%")
+
+    return _generate_bootstrap_fit_jobs(
+        ms, gene_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
+        component_range, constraint_modes, latent_q, init_strategy,
+        extra_cjob_fields={"assay_datasets": list(ms.dataset_names)},
+    )
+
+
+def _build_gene_set_ms_map(gene_set, args):
+    """Dispatch to the gene-set-specific ingestion module for
+    ``--gene-set`` values other than "integrated" (the pre-existing,
+    untouched BRCA1/PTEN/MSH2/pillar-project path in run_multivariate).
+    Returns {gene: MultiScoreset/BasicMultiScoreset}.
+    """
+    if gene_set == "fgfr":
+        from src.assay_calibration.multivariate_data.fgfr import build_fgfr_multiscoresets
+        return build_fgfr_multiscoresets(
+            genes=args.genes, exclude_genes=args.exclude_genes,
+            combine_genes=not getattr(args, "fgfr_separate", False),
+        )
+
+    if gene_set == "tp53":
+        from src.assay_calibration.multivariate_data.tp53 import build_tp53_multiscoreset
+        return {"TP53": build_tp53_multiscoreset(
+            RPVS_ALL=args.rpvs_all, kawoligo_seed=args.kawoligo_seed,
+            kawoligo_jitter_sigma=args.kawoligo_jitter_sigma,
+        )}
+
+    if gene_set == "labelseq":
+        from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
+        return build_labelseq_multiscoresets()
+
+    if gene_set == "card11":
+        from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset
+        return {"CARD11": build_card11_multiscoreset()}
+
+    if gene_set == "combined":
+        from src.assay_calibration.multivariate_data.combined import (
+            build_functional_scoresets, build_combined_multiscoreset,
+            get_functionally_assayed_protein_variants, DEFAULT_INTEGRATED_DATAFRAME,
+        )
+        from src.assay_calibration.multivariate_data.predictors import DEFAULT_GENES
+        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+
+        df_path = args.dataframe or DEFAULT_INTEGRATED_DATAFRAME
+        sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
+        df = pd.read_csv(df_path, sep=sep, low_memory=False)
+        genes = args.genes if args.genes else list(DEFAULT_GENES)
+
+        result = {}
+        for gene in genes:
+            datasets = sorted(df[df["Gene"] == gene]["Dataset"].unique())
+            if not datasets:
+                print(f"  {gene}: no functional datasets in {df_path}, skipping")
+                continue
+            # Same ClinVar-release convention as the 'integrated' gene-set
+            # (BRCA1/MSH2/PTEN/TP53 use 2018, matching their published
+            # calibration) -- this used to default to "2026" unconditionally
+            # here, silently diverging from 'integrated' for the 3 of these
+            # 4 genes that are also predictor-mv DEFAULT_GENES.
+            functional_scoresets = build_functional_scoresets(
+                df, gene, datasets, clinvar_release=resolve_clinvar_release(gene),
+            )
+            # Variants with functional data must use the functional side's
+            # ClinVar label (fixed at that release); predictor CSVs carry
+            # their own, unversioned ClinVar label that would otherwise
+            # leak a different vintage into the P/LP/B/LB control set for
+            # any variant the functional assay also measured. Predictor-
+            # only variants are unaffected and keep their own label.
+            functionally_assayed = get_functionally_assayed_protein_variants(df, gene, datasets)
+            ms = build_combined_multiscoreset(
+                gene, functional_scoresets, datasets, args.predictor_data_dir,
+                functionally_assayed_variants=functionally_assayed,
+            )
+            if ms is None:
+                print(f"  {gene}: no predictor CSVs under {args.predictor_data_dir}, skipping")
+                continue
+            result[gene] = ms
+        return result
+
+    raise ValueError(f"Unknown --gene-set {gene_set!r}")
+
+
+def _load_and_filter_gene_ms_map(gene_set, args):
+    """Build + filter + print {gene: ms} for one --gene-set value. Split out
+    of run_multivariate_gene_set so `all` (below) can build several
+    gene-sets' ms maps without duplicating the filtering/printing logic.
+    """
+    gene_ms_map = _build_gene_set_ms_map(gene_set, args)
+
+    # 'combined' and 'fgfr' already filter by --genes at the ingestion source
+    # above (fgfr's combine_genes=True default returns one "FGFR_combined"
+    # key, not gene-named, so this dict-key filter wouldn't even apply
+    # correctly to it).
+    if args.genes and gene_set not in ("combined", "fgfr"):
+        upper = {g.upper(): g for g in args.genes}
+        gene_ms_map = {g: ms for g, ms in gene_ms_map.items() if g.upper() in upper}
+    if args.exclude_genes and gene_set != "fgfr":  # fgfr applies exclude_genes at the source too
+        excluded = {g.upper() for g in args.exclude_genes}
+        gene_ms_map = {g: ms for g, ms in gene_ms_map.items() if g.upper() not in excluded}
+
+    print(f"\n[{gene_set}] {len(gene_ms_map)} genes:")
+    for gene, ms in sorted(gene_ms_map.items()):
+        print(f"  {gene}: {ms.n_variants} variants, {ms.n_assays}D, "
+              f"sample_names={ms.sample_names}")
+    return gene_ms_map
+
+
+def _generate_jobs_for_gene_ms_map(gene_set, gene_ms_map, args):
+    """Job-generation loop only (ms map already built/filtered/printed by
+    _load_and_filter_gene_ms_map) -- shared between run_multivariate_gene_set
+    (one gene-set, own output_dir/manifest) and run_mv_all (many gene-sets,
+    one shared output_dir/manifest). Reuses the exact same
+    _generate_bootstrap_fit_jobs loop as the integrated-dataframe path and
+    predictor-mv, with min_overlap_rows=1 and pattern_stratified_bootstrap
+    (via Fit.generate_fit_jobs's own mv=True default) standardized across
+    all of them, per the consolidation plan.
+
+    Returns (all_jobs, extra_index_fields).
+    """
+    from src.assay_calibration.multivariate_data.common import gene_set_dataset_label
+
+    output_dir = args.output_dir
+    N_BOOTSTRAPS = args.n_bootstraps
+    NUM_FITS = args.num_fits
+    component_range = args.components
+    constraint_modes = _resolve_constraints(args.constraints)
+    latent_q = 2
+
+    def process_one(gene, ms):
+        label = gene_set_dataset_label(gene, gene_set)
+        save_dir = os.path.join(output_dir, label)
+        print(f"  {label}: {ms.n_variants} variants, {ms.n_assays}D, "
+              f"missing={ms.missing.mean()*100:.1f}%")
+        return _generate_bootstrap_fit_jobs(
+            ms, label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
+            component_range, constraint_modes, latent_q, args.init_strategy,
+            min_overlap_rows=1,  # pattern_stratified_bootstrap already guards sparse dims
+            extra_cjob_fields={"gene_set": gene_set, "assay_datasets": list(ms.dataset_names)},
+        )
+
+    results = Parallel(n_jobs=args.n_jobs, verbose=5)(
+        delayed(process_one)(gene, ms) for gene, ms in gene_ms_map.items()
+    )
+
+    all_jobs = [j for r in results if r for j in r]
+    extra = {"gene_set": gene_set, "genes": sorted(gene_ms_map.keys())}
+    return all_jobs, extra
+
+
+def run_multivariate_gene_set(args):
+    gene_set = args.gene_set
+    gene_ms_map = _load_and_filter_gene_ms_map(gene_set, args)
+
+    if args.list_only:
+        return
+
+    output_dir = args.output_dir
+    os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
+
+    all_jobs, extra = _generate_jobs_for_gene_ms_map(gene_set, gene_ms_map, args)
+    extra.update({
+        "component_range": args.components,
+        "constraint_modes": _resolve_constraints(args.constraints),
+    })
+    total_jobs, num_arrays = _save_manifest(
+        output_dir, all_jobs, args.target_array_size, args.n_bootstraps, extra)
+    _print_next_steps(output_dir, total_jobs, num_arrays)
+
+
+def _load_and_filter_gene_groups(args):
+    """Load the integrated dataframe + discover/filter multi-assay gene
+    groups. Split out of run_multivariate so `all` (below) can build the
+    integrated pipeline's jobs alongside other pipelines' in one manifest.
+    """
     df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
     df = pd.read_csv(df_path, sep=sep)
@@ -786,19 +973,23 @@ def run_multivariate(args):
     print(f"\nFound {len(gene_groups)} gene groups:")
     for g, ds in sorted(gene_groups.items()):
         print(f"  {g} ({len(ds)} assays): {ds}")
+    return df, gene_groups
 
-    if args.list_only:
-        return
+
+def _generate_integrated_jobs(df, gene_groups, args):
+    """Job-generation loop only (gene groups already built/filtered/printed
+    by _load_and_filter_gene_groups) -- shared between run_multivariate
+    (own output_dir/manifest) and run_mv_all (one shared output_dir/manifest).
+    Returns (all_jobs, extra_index_fields).
+    """
+    from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
 
     output_dir = args.output_dir
-    os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
-
     N_BOOTSTRAPS = args.n_bootstraps
     NUM_FITS = args.num_fits
     component_range = args.components
     constraint_modes = _resolve_constraints(args.constraints)
     latent_q = 2
-    genes_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}
 
     # Pass only the rows relevant to each gene group
     gene_partitions = {
@@ -809,7 +1000,7 @@ def run_multivariate(args):
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_multivariate_gene)(
             gene_partitions[gene], gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
-            clinvar_release="2018" if gene in genes_2018 else "2026",
+            clinvar_release=resolve_clinvar_release(gene),
             component_range=component_range,
             constraint_modes=constraint_modes,
             latent_q=latent_q,
@@ -820,12 +1011,29 @@ def run_multivariate(args):
     )
 
     all_jobs = [j for r in results if r for j in r]
-    extra = {
-        "component_range": component_range,
-        "constraint_modes": constraint_modes,
-        "gene_groups": {g: ds for g, ds in gene_groups.items()},
-    }
-    total_jobs, num_arrays = _save_manifest(output_dir, all_jobs, args.target_array_size, N_BOOTSTRAPS, extra)
+    extra = {"gene_groups": {g: ds for g, ds in gene_groups.items()}}
+    return all_jobs, extra
+
+
+def run_multivariate(args):
+    if getattr(args, "gene_set", "integrated") != "integrated":
+        return run_multivariate_gene_set(args)
+
+    df, gene_groups = _load_and_filter_gene_groups(args)
+
+    if args.list_only:
+        return
+
+    output_dir = args.output_dir
+    os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
+
+    all_jobs, extra = _generate_integrated_jobs(df, gene_groups, args)
+    extra.update({
+        "component_range": args.components,
+        "constraint_modes": _resolve_constraints(args.constraints),
+    })
+    total_jobs, num_arrays = _save_manifest(
+        output_dir, all_jobs, args.target_array_size, args.n_bootstraps, extra)
     _print_next_steps(output_dir, total_jobs, num_arrays)
 
 
@@ -833,17 +1041,35 @@ def run_multivariate(args):
 # Mode: predictor-mv  (BasicMultiScoreset from predictor CSVs)
 # =============================================================================
 
-def run_predictor_mv(args):
-    try:
-        from predictor_mv_utils import (
-            PREDICTORS, load_predictor_data, build_basic_multi_scoreset,
-            predictor_dataset_label,
-        )
-    except ImportError:
-        print("Error: predictor_mv_utils.py not found. "
-              "It should be in the same directory as prepare.py (hpc/).")
-        sys.exit(1)
-    from src.assay_calibration.fit_utils.fit import Fit
+def _resolve_predictor_data_dir(args):
+    """predictor-mv's own subcommand uses --data-dir (required there);
+    `all` uses --predictor-data-dir (shared with 'combined'). Prefer
+    whichever is actually set so both call sites work unmodified.
+    """
+    return getattr(args, "data_dir", None) or getattr(args, "predictor_data_dir", None)
+
+
+def _load_predictor_mv_by_gene(args):
+    from src.assay_calibration.multivariate_data.predictors import load_predictor_data
+
+    data_dir = _resolve_predictor_data_dir(args)
+    print(f"Loading predictor CSVs from {data_dir}...")
+    by_gene = load_predictor_data(data_dir, genes=args.genes)
+    if args.exclude_genes:
+        excluded = {g.upper() for g in args.exclude_genes}
+        by_gene = {g: v for g, v in by_gene.items() if g.upper() not in excluded}
+    return by_gene
+
+
+def _generate_predictor_mv_jobs(by_gene, args):
+    """Job-generation loop only (by_gene already loaded/filtered by
+    _load_predictor_mv_by_gene) -- shared between run_predictor_mv (own
+    output_dir/manifest) and run_mv_all (one shared output_dir/manifest).
+    Returns (all_jobs, extra_index_fields).
+    """
+    from src.assay_calibration.multivariate_data.predictors import (
+        PREDICTORS, build_basic_multi_scoreset, predictor_dataset_label,
+    )
 
     N_BOOTSTRAPS = args.n_bootstraps
     NUM_FITS = args.num_fits
@@ -851,79 +1077,22 @@ def run_predictor_mv(args):
     component_range = args.components
     constraint_modes = _resolve_constraints(args.constraints)
     latent_q = 2
-    os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
-
-    print(f"Loading predictor CSVs from {args.data_dir}...")
-    by_gene = load_predictor_data(args.data_dir, genes=args.genes)
-    if args.exclude_genes:
-        excluded = {g.upper() for g in args.exclude_genes}
-        by_gene = {g: v for g, v in by_gene.items() if g.upper() not in excluded}
-    if not by_gene:
-        print("No predictor data found. Exiting.")
-        return
-
-    constrained_flags = []
-    if "con" in constraint_modes:
-        constrained_flags.append(True)
-    if "unc" in constraint_modes:
-        constrained_flags.append(False)
 
     def process_one(gene, predictor_dfs):
-        save_dir = os.path.join(output_dir, predictor_dataset_label(gene))
+        label = predictor_dataset_label(gene)
+        save_dir = os.path.join(output_dir, label)
         ms, info = build_basic_multi_scoreset(gene, predictor_dfs)
         if ms is None:
             print(f"  {gene}: skipping — {info}")
             return None
-        print(f"  {predictor_dataset_label(gene)}: {ms.n_variants} variants, {ms.n_assays}D")
+        print(f"  {label}: {ms.n_variants} variants, {ms.n_assays}D")
 
-        fitter = Fit(ms)
-        all_jobs = []
-        for bs in range(N_BOOTSTRAPS):
-            jobs_by_key = {}
-            ref_jobs = None
-            for nc in component_range:
-                for constrained in constrained_flags:
-                    mode_key = f"jobs_{nc}c_{'con' if constrained else 'unc'}"
-                    fit_kwargs = {
-                        "latent_q": latent_q,
-                        "init_strategy": args.init_strategy,
-                        "sample_balance_beta": args.sample_balance_beta,
-                        "log_prefix": f"  {predictor_dataset_label(gene)}: ",
-                        "verbose_overlap": bs == 0 and nc == component_range[0]
-                                           and constrained == constrained_flags[0],
-                    }
-                    if NUM_FITS is not None:
-                        fit_kwargs["num_fits"] = NUM_FITS
-                    try:
-                        jobs = fitter.generate_fit_jobs(
-                            component_range=[nc], bootstrap_seed=bs,
-                            check_monotonic=constrained, **fit_kwargs)
-                    except Exception as e:
-                        print(f"  {gene} bs={bs} {mode_key}: {e}")
-                        jobs = []
-                    minimal = [{**_strip_minimal(j), "multivariate": True} for j in jobs]
-                    jobs_by_key[mode_key] = minimal
-                    if ref_jobs is None and jobs:
-                        ref_jobs = jobs
-
-            shared = _shared_data(ref_jobs or [])
-            if shared is None:
-                continue
-
-            cjob = {
-                "dataset_name": predictor_dataset_label(gene),
-                "gene": gene,
-                "n_dimensions": ms.n_assays,
-                "save_dir": save_dir,
-                "bootstrap_seed": bs,
-                "shared_data": shared,
-                "multivariate": True,
-                "num_fits_total": sum(len(v) for v in jobs_by_key.values()),
-            }
-            cjob.update(jobs_by_key)
-            all_jobs.append(cjob)
-
-        return all_jobs
+        return _generate_bootstrap_fit_jobs(
+            ms, label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
+            component_range, constraint_modes, latent_q, args.init_strategy,
+            min_overlap_rows=1,  # pattern_stratified_bootstrap already guards sparse dims
+            sample_balance_beta=args.sample_balance_beta,
+        )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(process_one)(gene, predictor_dfs)
@@ -931,13 +1100,96 @@ def run_predictor_mv(args):
     )
 
     all_jobs = [j for r in results if r for j in r]
-    extra = {
-        "component_range": component_range,
-        "constraint_modes": constraint_modes,
-        "predictors": list(PREDICTORS),
-    }
-    total_jobs, num_arrays = _save_manifest(output_dir, all_jobs, args.target_array_size, N_BOOTSTRAPS, extra)
+    extra = {"predictors": list(PREDICTORS)}
+    return all_jobs, extra
+
+
+def run_predictor_mv(args):
+    output_dir = args.output_dir
+    os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
+
+    by_gene = _load_predictor_mv_by_gene(args)
+    if not by_gene:
+        print("No predictor data found. Exiting.")
+        return
+
+    all_jobs, extra = _generate_predictor_mv_jobs(by_gene, args)
+    extra.update({
+        "component_range": args.components,
+        "constraint_modes": _resolve_constraints(args.constraints),
+    })
+    total_jobs, num_arrays = _save_manifest(
+        output_dir, all_jobs, args.target_array_size, args.n_bootstraps, extra)
     _print_next_steps(output_dir, total_jobs, num_arrays)
+
+
+# =============================================================================
+# Mode: all  (merge every new multivariate pipeline into ONE job array,
+# in priority order)
+# =============================================================================
+
+_MV_ALL_PIPELINE_CHOICES = ["integrated", "fgfr", "tp53", "labelseq", "card11", "predictor-mv", "combined"]
+_MV_ALL_GENE_SET_PIPELINES = {"fgfr", "tp53", "labelseq", "card11", "combined"}
+
+
+def run_mv_all(args):
+    """Build jobs for every pipeline in --pipelines (default order:
+    labelseq tp53 card11 fgfr predictor-mv combined) and merge them into
+    ONE _save_manifest call for a single output_dir.
+
+    Ordering: _save_manifest chunks `all_jobs` into array files preserving
+    list order, so whichever pipeline's jobs are concatenated first occupy
+    the lowest array indices. Combined with MAX_CONCURRENT (SLURM) or
+    a bounded xargs -P concurrency (run_local_array.sh), earlier-listed
+    pipelines' jobs tend to be scheduled and finish first -- a soft
+    priority bias, not a hard dependency (nothing blocks a later
+    pipeline's jobs from starting before an earlier one finishes; for a
+    hard sequential guarantee, run separate `multivariate --gene-set X`
+    manifests and chain them with SLURM --dependency, or invoke
+    run_local_array.sh once per gene-set's own output_dir in sequence).
+    """
+    output_dir = args.output_dir
+    os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
+
+    all_jobs = []
+    per_pipeline = {}
+
+    for pipeline in args.pipelines:
+        print(f"\n{'=' * 80}\nPipeline: {pipeline}  (array indices will start at job #{len(all_jobs)})\n{'=' * 80}")
+
+        if pipeline == "integrated":
+            df, gene_groups = _load_and_filter_gene_groups(args)
+            jobs, pextra = _generate_integrated_jobs(df, gene_groups, args)
+        elif pipeline == "predictor-mv":
+            by_gene = _load_predictor_mv_by_gene(args)
+            if not by_gene:
+                print("  No predictor data found, skipping.")
+                jobs, pextra = [], {}
+            else:
+                jobs, pextra = _generate_predictor_mv_jobs(by_gene, args)
+        elif pipeline in _MV_ALL_GENE_SET_PIPELINES:
+            gene_ms_map = _load_and_filter_gene_ms_map(pipeline, args)
+            jobs, pextra = _generate_jobs_for_gene_ms_map(pipeline, gene_ms_map, args)
+        else:
+            raise ValueError(f"Unknown pipeline {pipeline!r}")
+
+        print(f"  {pipeline}: {len(jobs)} jobs")
+        per_pipeline[pipeline] = {**pextra, "n_jobs": len(jobs),
+                                   "job_index_range": [len(all_jobs), len(all_jobs) + len(jobs)]}
+        all_jobs.extend(jobs)
+
+    extra = {
+        "component_range": args.components,
+        "constraint_modes": _resolve_constraints(args.constraints),
+        "pipeline_order": list(args.pipelines),
+        "per_pipeline": per_pipeline,
+    }
+    total_jobs, num_arrays = _save_manifest(
+        output_dir, all_jobs, args.target_array_size, args.n_bootstraps, extra)
+    _print_next_steps(output_dir, total_jobs, num_arrays)
+    print(f"\nPriority order: {args.pipelines} -- earlier pipelines occupy lower array "
+          f"indices, so they're scheduled/tend to finish first under bounded concurrency "
+          f"(MAX_CONCURRENT for SLURM, or the concurrency arg to run_local_array.sh).")
 
 
 # =============================================================================
@@ -1073,6 +1325,30 @@ def main():
                          help="Override dynamic NUM_FITS (default: 100)")
     p_multi.add_argument("--list-only", action="store_true",
                          help="Print gene groups and exit")
+    p_multi.add_argument("--gene-set", default="integrated",
+                         choices=["integrated", "fgfr", "tp53", "labelseq", "card11", "combined"],
+                         help="Ingestion source (default: integrated, the pre-existing "
+                              "BRCA1/PTEN/MSH2/pillar-project path via --dataframe/--datasets). "
+                              "Other values use the pluggable multivariate_data/*.py ingestion "
+                              "modules and standardize on min_overlap_rows=1.")
+    p_multi.add_argument("--rpvs-all", action="store_true",
+                         help="[--gene-set tp53] Use the full RPV list instead of the "
+                              "high-confidence subset (default: high-confidence only)")
+    p_multi.add_argument("--kawoligo-seed", type=int, default=0,
+                         help="[--gene-set tp53] Seed for KawOligo's jitter (default: 0)")
+    p_multi.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,
+                         help="[--gene-set tp53] Gaussian jitter sigma for KawOligo's "
+                              "{Tetramer,Dimer,Monomer} -> {0,0.5,1} encoding (default: 0.1)")
+    p_multi.add_argument("--fgfr-separate", action="store_true",
+                         help="[--gene-set fgfr] Fit FGFR1/2/3/4 as separate MultiScoresets "
+                              "(one per gene) instead of the default: pooling all target "
+                              "genes' P/LP/B/LB/gnomAD/Synonymous variants into one combined "
+                              "MultiScoreset")
+    p_multi.add_argument("--predictor-data-dir",
+                         default="/data/ross/assay_calibration/predictor_calibrations/"
+                                 "single_gene_calibration_data",
+                         help="[--gene-set combined] Directory containing "
+                              "{gene}/{gene}_{predictor}.csv.gz")
     p_multi.set_defaults(func=run_multivariate)
 
     # ── predictor-mv ─────────────────────────────────────────────────────────
@@ -1093,6 +1369,56 @@ def main():
     p_pred.add_argument("--sample-balance-beta", type=float, default=0,
                         help="Sample-balanced M-step β ∈ [0,1] (default: 0)")
     p_pred.set_defaults(func=run_predictor_mv)
+
+    # ── mv_all ───────────────────────────────────────────────────────────────
+    p_mv_all = sub.add_parser(
+        "mv_all",
+        help="Merge FGFR/TP53/LABEL-seq/CARD11/predictor-mv/combined (and, "
+             "opt-in, the integrated pillar-project path) into ONE job array, "
+             "in priority order",
+    )
+    _add_common_args(p_mv_all)
+    p_mv_all.add_argument("--pipelines", nargs="+", choices=_MV_ALL_PIPELINE_CHOICES,
+                       default=["labelseq", "tp53", "card11", "fgfr", "predictor-mv", "combined"],
+                       help="Priority order -- earlier pipelines get lower array indices "
+                            "(default: labelseq tp53 card11 fgfr predictor-mv combined). "
+                            "'integrated' (BRCA1/PTEN/MSH2/pillar-project) is opt-in.")
+    p_mv_all.add_argument("--dataframe", default=None,
+                       help="Integrated variant-effect TSV/CSV, used by the 'integrated' "
+                            "and 'combined' pipelines")
+    p_mv_all.add_argument("--predictor-data-dir",
+                       default="/data/ross/assay_calibration/predictor_calibrations/"
+                               "single_gene_calibration_data",
+                       help="Directory containing {gene}/{gene}_{predictor}.csv.gz, used "
+                            "by 'predictor-mv' and 'combined'")
+    p_mv_all.add_argument("--genes", nargs="+", default=None,
+                       help="Restrict every pipeline to these genes (default: each "
+                            "pipeline's own full gene set)")
+    p_mv_all.add_argument("--exclude-genes", nargs="+", default=None)
+    p_mv_all.add_argument("--components", nargs="+", type=int, default=[4])
+    p_mv_all.add_argument("--constraints", nargs="+",
+                       choices=["con", "unc", "both"], default=["unc"])
+    p_mv_all.add_argument("--init-strategy", default="kmeans",
+                       choices=["kmeans", "anchored"])
+    p_mv_all.add_argument("--n-bootstraps", type=int, default=1000)
+    p_mv_all.add_argument("--num-fits", type=int, default=100)
+    p_mv_all.add_argument("--sample-balance-beta", type=float, default=0,
+                       help="[predictor-mv] Sample-balanced M-step β ∈ [0,1] (default: 0)")
+    p_mv_all.add_argument("--max-dimensions", type=int, default=None,
+                       help="['integrated' pipeline only] skip genes with more datasets than this")
+    p_mv_all.add_argument("--population-type", default=None,
+                       help="['integrated' pipeline only]")
+    p_mv_all.add_argument("--rpvs-all", action="store_true",
+                       help="[tp53] use the full RPV list instead of the high-confidence subset")
+    p_mv_all.add_argument("--kawoligo-seed", type=int, default=0,
+                       help="[tp53] seed for KawOligo's jitter (default: 0)")
+    p_mv_all.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,
+                       help="[tp53] Gaussian jitter sigma for KawOligo's "
+                            "{Tetramer,Dimer,Monomer} -> {0,0.5,1} encoding (default: 0.1)")
+    p_mv_all.add_argument("--fgfr-separate", action="store_true",
+                       help="[fgfr] fit FGFR1/2/3/4 as separate MultiScoresets instead of "
+                            "the default: one pooled MultiScoreset across all target genes")
+    p_mv_all.set_defaults(func=run_mv_all)
 
     args = parser.parse_args()
 

@@ -452,7 +452,15 @@ def run_gpu(fit_specs, use_gpu_init=True, max_em_iters=None):
         truncated — parity tests should use max_em_iters=2000.
     """
     out = []
-    for is_mv, chunk in group_fit_specs(fit_specs):
+    chunks = group_fit_specs(fit_specs)
+    total_fits = len(fit_specs)
+    n_chunks = len(chunks)
+    for i, (is_mv, chunk) in enumerate(chunks, start=1):
         fn = _run_cfusn_chunk if is_mv else _run_univariate_chunk
         out.extend(fn(chunk, use_gpu_init=use_gpu_init, max_em_iters=max_em_iters))
+        # No joblib here to report progress for us (unlike the CPU path in
+        # fit_bootstrap.py), so print our own cumulative counter -- one line
+        # per chunk, not per fit, since a chunk is already a single batched
+        # GPU call (up to MAX_BATCH_UNIVARIATE/MAX_BATCH_CFUSN fits at once).
+        print(f"  [GPU] chunk {i}/{n_chunks} done -- {len(out)}/{total_fits} fits complete", flush=True)
     return out

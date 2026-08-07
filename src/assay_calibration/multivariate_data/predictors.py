@@ -1,14 +1,12 @@
 """
 Shared helpers for the multivariate predictor calibration flow.
 
-Used by both prepare_batch_jobs_single_predictor_multivariate.py (job
-generation) and the analysis side (analyze_mv_results.py / notebooks)
-so the on-disk layout, ID alignment, and sample-column convention stay
-in one place.
+Used by both hpc/prepare.py's predictor-mv job generation and the analysis
+side (src/assay_calibration/multivariate_analysis/predictors.py) so the
+on-disk layout, ID alignment, and sample-column convention stay in one place.
 """
 
 import os
-import sys
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -16,12 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Make src/ importable regardless of cwd
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-from src.assay_calibration.data_utils.dataset import (
+from ..data_utils.dataset import (
     BasicScoreset,
     BasicMultiScoreset,
 )

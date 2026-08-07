@@ -51,8 +51,15 @@ class BootstrapRunner:
         print(f"  Samples: {n_samples}")
         print(f"  Variants: {n_variants}")
         
-        if n_samples < 3:
-            raise ValueError(f"Insufficient samples: {n_samples} < 3")
+        # 2 is the minimum viable sample count: gnomAD/population plus at
+        # least one of Pathogenic/LP or Benign/LB (or Synonymous) -- this is
+        # exactly the PU/NU case (see docs/input-formats.md#pnpunu-modes-
+        # missing-class-inference), which fit_utils/point_ranges.py already
+        # supports via density unmixing. Matches the `< 2` threshold used
+        # elsewhere for the same check (hpc/prepare.py, multivariate_data/
+        # combined.py, multivariate_data/common.py).
+        if n_samples < 2:
+            raise ValueError(f"Insufficient samples: {n_samples} < 2")
         
         self.fitter = Fit(self.dataset)
 
@@ -98,9 +105,18 @@ class BootstrapRunner:
             flat_results = self._execute_flat_tasks_gpu(flat_tasks)
         else:
             print(f"  Jobs: {self.config.n_jobs if self.config.n_jobs > 0 else 'all CPUs'}")
-            # Run all fits; return_as="generator" is joblib >=1.2.0 only so we
-            # collect as a plain list and accept that per-fit progress is coarser.
-            flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=0)(
+            # Run all fits; return_as="generator" would let progress stream in
+            # as each fit finishes, but isn't available in the pinned joblib
+            # (checked: no `return_as` param as of 1.2.0), so this still
+            # blocks until every fit completes and we accept that per-fit
+            # progress is coarser than true streaming. verbose=51 (just above
+            # joblib's own >50 stdout threshold -- below that it writes to
+            # stderr instead) prints ~50 evenly-spaced "Done X out of Y |
+            # elapsed ... remaining ..." lines regardless of how many total
+            # fits there are (frequency scales with the verbose value, see
+            # joblib.Parallel.print_progress), so this doesn't get spammier
+            # on --preset xl/finest's much larger fit counts.
+            flat_results = Parallel(n_jobs=self.config.n_jobs, verbose=51)(
                 delayed(BootstrapRunner._execute_single_fit)(
                     minimal_job, shared_data, self.config.dataset_name
                 )

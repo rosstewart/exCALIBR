@@ -29,6 +29,20 @@ CPUS_PER_TASK=$(( TOTAL_CPUS / CONCURRENCY ))
 if [ "$CPUS_PER_TASK" -lt 1 ]; then CPUS_PER_TASK=1; fi
 export SLURM_CPUS_PER_TASK="$CPUS_PER_TASK"
 
+# run_array_task.py parallelizes across fits itself, via a
+# ProcessPoolExecutor sized to SLURM_CPUS_PER_TASK -- each of those worker
+# processes must stay single-threaded internally, or its own BLAS/OpenMP
+# pool (unset OMP_NUM_THREADS etc. defaults to using every visible core)
+# multiplies against the outer process count: CPUS_PER_TASK workers x
+# CPUS_PER_TASK BLAS threads each can demand far more OS threads than
+# `ulimit -u` allows, failing with "libgomp: Thread creation failed:
+# Resource temporarily unavailable".
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
 LOG_DIR="${OUTPUT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 
@@ -37,7 +51,8 @@ echo "  concurrency: ${CONCURRENCY}  cpus/task: ${CPUS_PER_TASK}  (of ${TOTAL_CP
 echo "  logs: ${LOG_DIR}/array_NNNN.log"
 
 seq "$START" "$END" | xargs -P "$CONCURRENCY" -I IDX \
-    bash -c "python '${SCRIPT_DIR}/run_array_task.py' '${OUTPUT_DIR}' IDX \
-             2>&1 | tee '${LOG_DIR}/array_\$(printf \"%04d\" IDX).log'"
+    bash -c "PADDED=\$(printf '%04d' IDX); \
+             python '${SCRIPT_DIR}/run_array_task.py' '${OUTPUT_DIR}' IDX \
+             2>&1 | tee '${LOG_DIR}'/array_\${PADDED}.log"
 
 echo "Done: indices ${START}-${END} on $(hostname)"

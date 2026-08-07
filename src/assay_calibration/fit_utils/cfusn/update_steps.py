@@ -41,6 +41,36 @@ from scipy.stats import norm
 # Truncated-normal moments — scalar (q=1, unchanged)
 # ══════════════════════════════════════════════
 
+def _psd_floor_or_reject(Gamma_cand, floor=1e-8):
+    """Enforce positive-definiteness of a candidate Gamma, or signal that
+    the candidate is unusable.
+
+    Returns (Gamma_fixed, ok). ok=False means Gamma_cand is degenerate
+    (non-finite, or LAPACK's eigensolver itself failed to converge on it --
+    both observed in practice on ill-conditioned M-step candidates, e.g.
+    from a near-zero-responsibility component) and the caller should reject
+    this candidate and keep the component's previous parameters, rather
+    than propagate garbage (or an uncaught LinAlgError) forward.
+
+    np.linalg.eigvalsh does NOT reliably raise on bad input -- e.g. an
+    all-Inf matrix returns [nan, nan] silently rather than raising, which a
+    bare `except LinAlgError` would miss (`nan < floor` is False, so the
+    ridge-fix below wouldn't even trigger) -- hence the explicit
+    isfinite checks before AND after the eigendecomposition.
+    """
+    if not np.all(np.isfinite(Gamma_cand)):
+        return Gamma_cand, False
+    try:
+        eigvals = np.linalg.eigvalsh(Gamma_cand)
+    except np.linalg.LinAlgError:
+        return Gamma_cand, False
+    if not np.all(np.isfinite(eigvals)):
+        return Gamma_cand, False
+    if eigvals.min() < floor:
+        Gamma_cand = Gamma_cand + (floor - eigvals.min()) * np.eye(Gamma_cand.shape[0])
+    return Gamma_cand, True
+
+
 def trunc_norm_moments(mu, sigma):
     """Moments of TN(mu, sigma^2, R+). mu, sigma are arrays (N,)."""
     ratio = mu / sigma
@@ -1241,14 +1271,18 @@ def _em_update_multivariate(
     """
     sample_weights = kwargs.get("sample_weights", None)
     stabilize = kwargs.get("_stabilize_separation", False)
-    min_mass = separation.min_component_mass(**kwargs) if stabilize else 0.0
+    # Low-mass freeze: independently togglable from the separation/tempering
+    # stabilizers above (`stabilize`) -- experimental, default off to match
+    # existing committed behavior. See low_mass_freeze usage below.
+    low_mass_freeze = stabilize or kwargs.get("low_mass_freeze", False)
+    min_mass = separation.min_component_mass(**kwargs) if low_mass_freeze else 0.0
     updated = [None] * K
     for c in range(K):
         z = responsibilities[c]
         mu_old, Delta_old, Gamma_old = current_component_params[c]
 
         # Low-mass freeze (see _em_update_cfusn).
-        if stabilize:
+        if low_mass_freeze:
             z_mass = float((z if sample_weights is None else z * sample_weights).sum())
             if z_mass < min_mass:
                 updated[c] = (mu_old, Delta_old, Gamma_old)
@@ -1266,9 +1300,19 @@ def _em_update_multivariate(
         if stabilize:
             Gamma_cand = separation.regularize_gamma(Gamma_cand, xlims, **kwargs)
 
-        eigvals = np.linalg.eigvalsh(Gamma_cand)
-        if eigvals.min() < 1e-8:
-            Gamma_cand += (1e-8 - eigvals.min()) * np.eye(Gamma_cand.shape[0])
+        # Enforce positive-definiteness of Gamma. Unconditional (not gated
+        # behind `stabilize`, which only ever turns on for constrained
+        # multivariate fits -- see resolve_separation_config): an
+        # ill-conditioned/degenerate M-step candidate (e.g. from a
+        # near-zero-responsibility component) can make LAPACK's eigensolver
+        # itself fail to converge, not just return small/negative
+        # eigenvalues. Unconstrained multivariate fits (this pipeline's
+        # default everywhere) had zero protection against this -- one
+        # non-convergent candidate used to kill the entire tryToFit attempt.
+        Gamma_cand, gamma_ok = _psd_floor_or_reject(Gamma_cand)
+        if not gamma_ok:
+            updated[c] = (mu_old, Delta_old, Gamma_old)
+            continue
 
         # Sanity guard against Δ blowups (see _em_update_cfusn).
         if stabilize and not separation.params_sane(
@@ -1329,7 +1373,11 @@ def _em_update_cfusn(
     n_mc = kwargs.get("n_mc_truncated", 500)
     sample_weights = kwargs.get("sample_weights", None)
     stabilize = kwargs.get("_stabilize_separation", False)
-    min_mass = separation.min_component_mass(**kwargs) if stabilize else 0.0
+    # Low-mass freeze: independently togglable from the separation/tempering
+    # stabilizers above (`stabilize`) -- experimental, default off to match
+    # existing committed behavior. See low_mass_freeze usage below.
+    low_mass_freeze = stabilize or kwargs.get("low_mass_freeze", False)
+    min_mass = separation.min_component_mass(**kwargs) if low_mass_freeze else 0.0
     updated = [None] * K
 
     for c in range(K):
@@ -1340,7 +1388,7 @@ def _em_update_cfusn(
         # Low-mass freeze: a component that has lost (almost) all of its
         # responsibility mass has an ill-defined mean — keep it put rather than
         # letting the M-step send it to a degenerate spike outside the data.
-        if stabilize:
+        if low_mass_freeze:
             z_mass = float((z if sample_weights is None else z * sample_weights).sum())
             if z_mass < min_mass:
                 updated[c] = (mu_old, Delta_old, Gamma_old)
@@ -1368,10 +1416,19 @@ def _em_update_cfusn(
         if stabilize:
             Gamma_cand = separation.regularize_gamma(Gamma_cand, xlims, **kwargs)
 
-        # Enforce positive-definiteness of Gamma
-        eigvals = np.linalg.eigvalsh(Gamma_cand)
-        if eigvals.min() < 1e-8:
-            Gamma_cand += (1e-8 - eigvals.min()) * np.eye(Gamma_cand.shape[0])
+        # Enforce positive-definiteness of Gamma. Unconditional (not gated
+        # behind `stabilize`, which only turns on for constrained
+        # multivariate fits -- see resolve_separation_config): an
+        # ill-conditioned/degenerate M-step candidate can make LAPACK's
+        # eigensolver itself fail to converge, not just return small/
+        # negative eigenvalues. Unconstrained multivariate fits (this
+        # pipeline's default everywhere) had zero protection against this --
+        # one non-convergent candidate used to kill the entire tryToFit
+        # attempt.
+        Gamma_cand, gamma_ok = _psd_floor_or_reject(Gamma_cand)
+        if not gamma_ok:
+            updated[c] = (mu_old, Delta_old, Gamma_old)
+            continue
 
         # Sanity guard: a degenerate per-component moment matrix can drive the
         # Δ solve to extreme values (centroid flung to ~1e9). Reject such a

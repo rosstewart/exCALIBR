@@ -104,7 +104,7 @@ def recompute_points_from_calibration(
     analysis.robustness to apply a robustness condition's point_ranges to the
     reference (unperturbed) dataset's own variant scores.
     """
-    from src.assay_calibration.plot_utils.utils import flatten_point_ranges, assign_points
+    from src.assay_calibration.plot_utils.utils import assign_points
 
     with open(calibration_path) as f:
         cal = json.load(f)
@@ -112,11 +112,9 @@ def recompute_points_from_calibration(
     if cal.get("point_ranges") is None:
         raise ValueError(f"No point_ranges in {calibration_path}")
 
-    point_ranges = flatten_point_ranges(cal["point_ranges"])
-
     df = df.copy()
     scores = df["score"].values
-    df["standard_points"] = [assign_points(s, point_ranges) for s in scores]
+    df["standard_points"] = [assign_points(s, cal["point_ranges"]) for s in scores]
     if "oob_points" in df.columns:
         df = df.drop(columns=["oob_points", "oob_n_boots", "oob_prior"],
                      errors="ignore")
@@ -349,7 +347,7 @@ def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_pat
     with open(cal_path) as f:
         calibration = json.load(f)
 
-    clinvar_release = "2018" if calibration.get("clinvar_2018") else "2026"
+    clinvar_release = "2018" if calibration.get("clinvar_2018") else "2025"
     pcfg = PipelineConfig(
         dataset_csv="", dataset_name=dataset, output_dir="/tmp",
         clinvar_release=clinvar_release,
@@ -588,7 +586,7 @@ def recompute_points_with_prior_overrides(
     """
     import numpy as np
     from src.assay_calibration.fit_utils.fit import calculate_score_ranges
-    from src.assay_calibration.plot_utils.utils import flatten_point_ranges, assign_points
+    from src.assay_calibration.plot_utils.utils import assign_points
     from analysis.calibration_plots import load_lr_values
 
     POINT_VALUES = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -634,10 +632,10 @@ def recompute_points_with_prior_overrides(
                 print(f"  Prior override: calculate_score_ranges failed for {dataset}/{method}: {e}")
                 continue
 
-            flat = flatten_point_ranges({**pr_p, **pr_b})
+            pr = {**pr_p, **pr_b}
 
             scores = df.loc[ds_mask, "score"].values
-            df.loc[ds_mask, "standard_points"] = [assign_points(s, flat) for s in scores]
+            df.loc[ds_mask, "standard_points"] = [assign_points(s, pr) for s in scores]
             if "oob_points" in df.columns:
                 df.loc[ds_mask, "oob_points"] = np.nan
 

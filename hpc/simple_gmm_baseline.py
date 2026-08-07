@@ -16,10 +16,20 @@ raw output: no enforce_monotonicity_point_ranges, no extend_points_to_xlims:
 
 sample_num convention: 0 = P/LP, 1 = B/LB, 2 = gnomAD/population, 3 = Synonymous.
 
-Two pooling variants per dataset (mirrors plot_four_datasets_gmm_scores(mode=
-'plp_blb') in src/assay_calibration/plot_utils/utils.py):
-  plp_blb        P/LP (0) + B/LB (1)
-  plp_blb_synon  P/LP (0) + [B/LB (1) UNION Synonymous (3)]
+Four variants per dataset — two pooling schemes (mirrors
+plot_four_datasets_gmm_scores(mode='plp_blb') in
+src/assay_calibration/plot_utils/utils.py) x two GMM fit scopes:
+  plp_blb            P/LP (0) + B/LB (1)
+  plp_blb_synon      P/LP (0) + [B/LB (1) UNION Synonymous (3)]
+  all_plp_blb        same pooling as plp_blb, but the GMM's component
+                     parameters are fit on every variant's score in the
+                     dataset (all samples, unlabeled included), not just
+                     the pooled P/LP + B/LB scores
+  all_plp_blb_synon  same idea, pooling scheme of plp_blb_synon
+
+For the "all_"-prefixed variants, only the initial component-parameter fit's
+input changes; the per-sample mixing weights (P/LP, B/LB[/Synon]) are still
+computed from just the labeled samples, as always.
 
 Neither variant uses a gnomAD/population sample, so there is no population-based
 prior estimation here (see get_fit_prior in fit_utils/point_ranges.py, which
@@ -76,12 +86,19 @@ def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
     synon_col = _col_idx_for_sample_num(scoreset, SAMPLE_NUM_SYNON)
     plp_scores = scoreset.scores[scoreset.sample_assignments[:, plp_col]]
 
-    if variant == "plp_blb":
+    # "all_"-prefixed variants fit the GMM's component parameters on every
+    # variant's score in the dataset (regardless of sample membership),
+    # rather than only the pooled P/LP + benign scores; the pooling scheme
+    # for benign_scores/weights below is unaffected by this prefix.
+    fit_scope = "all" if variant.startswith("all_") else "labeled"
+    pooling = variant[len("all_"):] if fit_scope == "all" else variant
+
+    if pooling == "plp_blb":
         if blb_col is None:
             return {"dataset_name": dataset_name, "variant": variant,
                      "status": "skipped", "reason": "no B/LB sample"}
         benign_scores = scoreset.scores[scoreset.sample_assignments[:, blb_col]]
-    elif variant == "plp_blb_synon":
+    elif pooling == "plp_blb_synon":
         parts = []
         if blb_col is not None:
             parts.append(scoreset.scores[scoreset.sample_assignments[:, blb_col]])
@@ -95,7 +112,12 @@ def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
         raise ValueError(f"Unknown variant: {variant}")
 
     # --- Single deterministic 2-component GMM fit (no bootstrap, no restarts) ---
-    combined = np.concatenate([plp_scores, benign_scores]).reshape(-1, 1)
+    if fit_scope == "all":
+        fit_scores = scoreset.scores
+        fit_scores = fit_scores[~np.isnan(fit_scores)]
+    else:
+        fit_scores = np.concatenate([plp_scores, benign_scores])
+    combined = fit_scores.reshape(-1, 1)
     gmm = GaussianMixture(n_components=2, covariance_type="full",
                            random_state=42, n_init=10)
     gmm.fit(combined)
@@ -134,15 +156,21 @@ def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
     # observed score range — same bounds as score_range — rather than the pooled
     # P/LP+benign fitting range, or samples like gnomAD that extend beyond it
     # (which never entered the fit) would get masked out of their own panel.
-    observed_scores = scoreset.scores[scoreset.sample_assignments.any(1)]
-    fit_xlims = (float(observed_scores.min()), float(observed_scores.max()))
+    # For fit_scope == "all", base this on fit_scores instead, since the fit
+    # saw the whole dataset's score distribution rather than just the labeled
+    # samples.
+    if fit_scope == "all":
+        range_scores = fit_scores
+    else:
+        range_scores = scoreset.scores[scoreset.sample_assignments.any(1)]
+    fit_xlims = (float(range_scores.min()), float(range_scores.max()))
     single_fit_obj = {"fit": {
         "component_params": params,
         "weights": per_sample_weights,
         "xlims": fit_xlims,
     }}
 
-    score_range = np.linspace(observed_scores.min(), observed_scores.max(),
+    score_range = np.linspace(range_scores.min(), range_scores.max(),
                                score_range_points)
 
     log_fp = mixture_pdf(score_range, params, w_plp)
@@ -264,12 +292,13 @@ def _save_variant_result(result, scoreset, output_dir, generate_viz):
     os.makedirs(ds_output_dir, exist_ok=True)
     logger = setup_logging(ds_output_dir, f"{dataset_name}_{variant}")
 
+    pooling = variant[len("all_"):] if variant.startswith("all_") else variant
     config = PipelineConfig(
         dataset_csv="",
         dataset_name=dataset_name,
         output_dir=ds_output_dir,
         components=[2],
-        benign_method=("benign" if variant == "plp_blb" else "avg"),
+        benign_method=("benign" if pooling == "plp_blb" else "avg"),
         compute_oob=False,
         acmg_mapping_method=calibration["acmg_mapping_method"],
     )
@@ -298,7 +327,7 @@ def _process_dataset(df_ds, dataset, clinvar_release, population_type,
     from src.assay_calibration.data_utils.dataset import Scoreset
 
     dataset_name = dataset if clinvar_release == "2026" else f"{dataset}_clinvar_{clinvar_release}"
-    variants = ("plp_blb", "plp_blb_synon")
+    variants = ("plp_blb", "plp_blb_synon", "all_plp_blb", "all_plp_blb_synon")
     try:
         kw = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
         if population_type:

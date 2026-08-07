@@ -8,7 +8,7 @@ Detection is automatic: if Delta in component params is 2-D, the CFUSN
 density path is used; otherwise the original q=1 MSN path is used.
 
 Usage:
-    from analyze_mv_results import MVCalibrationAnalysis
+    from src.assay_calibration.multivariate_analysis.mv_calibration import MVCalibrationAnalysis
     analysis = MVCalibrationAnalysis(ms, results_path)
     analysis.run()
     analysis.plot_comparison()
@@ -29,18 +29,12 @@ import warnings
 import os
 from joblib import Parallel, delayed
 
-# Make canonical src/ importable so this module reuses the production
-# density and threshold helpers instead of maintaining parallel copies.
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
-from src.assay_calibration.fit_utils.cfusn.density_utils import (
+from ..fit_utils.evidence_thresholds import get_tavtigian_constant
+from ..fit_utils.cfusn.density_utils import (
     _single_component_logpdf,
     get_q,
 )
-from src.assay_calibration.fit_utils.point_ranges import (
+from ..fit_utils.point_ranges import (
     estimate_prior_from_class_densities,
     apply_pathomechanism_correction,
     _get_benign_reference_weights,
@@ -72,12 +66,72 @@ CONFIG_LABELS = {
 # Parallel worker (module-level for joblib pickling)
 # ──────────────────────────────────────
 
+def _largest_supported_subset(obs_key, supports_fn):
+    """Largest non-empty subset S of ``obs_key`` for which ``supports_fn(S)``
+    is True. Tries decreasing subset sizes (obs_key is a single variant's
+    observed-dimension pattern, typically small, so this is cheap). Returns
+    None if not even a single dimension is supported.
+    """
+    from itertools import combinations
+    dims = sorted(obs_key)
+    for size in range(len(dims), 0, -1):
+        for subset in combinations(dims, size):
+            key = frozenset(subset)
+            if supports_fn(key):
+                return key
+    return None
+
+
+# Four ways to handle a (P vs B) pattern where the pathogenic and/or the
+# benign/synonymous reference lacks joint coverage of a variant's observed
+# dimensions -- see the mv_calibration consolidation discussion this was
+# designed from:
+#   "gate"           : historical behavior, kept byte-faithful on purpose so
+#                      it's a meaningful baseline for the other three modes.
+#                      ASYMMETRIC: only benign/synonymous is pattern-checked
+#                      (drop/NaN the variant if unsupported); pathogenic was
+#                      NEVER gated historically -- weights[eff_p] is always
+#                      used regardless of whether pathogenic itself has
+#                      joint coverage of the pattern.
+#   "trust_global"   : always use the single, globally-fit mixing-weight
+#                      vector for BOTH sides regardless of per-pattern
+#                      coverage -- trusts the joint model's shared component
+#                      structure to extrapolate correctly to every pattern.
+#                      Symmetric (unlike "gate").
+#   "project"        : project the variant down to the largest sub-pattern
+#                      jointly covered by BOTH the pathogenic side and the
+#                      benign/synonymous side, evaluating LR+ using only
+#                      those (trustworthy) dimensions -- the untrustworthy
+#                      dimension(s) still inform the joint fit (via other
+#                      classes' data) but contribute nothing to THIS
+#                      variant's evidence. Falls back to trust_global if no
+#                      non-empty subset has both sides' coverage. Symmetric.
+#   "local_unmixing" : when one side is unsupported for the pattern but the
+#                      other side and population both are, derive that
+#                      side's pattern-local density via population unmixing
+#                      (e.g. fb = (fpop - prior*fp)/(1-prior)), the same
+#                      math NU/PU mode uses gene-wide but scoped to just
+#                      this pattern -- an in-between of trust_global (full
+#                      extrapolation) and project (full conservatism). Falls
+#                      back to trust_global if population itself lacks
+#                      coverage, or if BOTH sides lack coverage (nothing to
+#                      unmix against). Symmetric.
+_PARTIAL_PATTERN_MODES = ("gate", "trust_global", "project", "local_unmixing")
+
+
 def _bootstrap_job(fit_raw, scores, sa,
                    p_idx, b_idx, g_idx, s_idx, benign_method,
                    partial_patterns, reestimate_marginal_weights,
-                   extra_p_indices=None, pathomechanism_method=None):
+                   extra_p_indices=None, pathomechanism_method=None,
+                   partial_pattern_mode="gate"):
     """Process one bootstrap fit.  Standalone so joblib loky workers don't
-    need to pickle the full MVCalibrationAnalysis object."""
+    need to pickle the full MVCalibrationAnalysis object.
+
+    ``partial_pattern_mode`` only affects the standard (PN) branch's P-vs-B
+    comparison -- NU/PU mode's population-unmixing math and the reestimated-
+    weights branch are unchanged regardless of this parameter (see
+    _PARTIAL_PATTERN_MODES for what each mode does).
+    """
     if fit_raw is None:
         return None, "fit_raw is None"
     inner = fit_raw.get('fit', fit_raw)
@@ -233,17 +287,52 @@ def _bootstrap_job(fit_raw, scores, sa,
                     log_f2[jdx] = logsumexp([np.log(w_pop[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
                                              for c in range(K)], axis=0)
                 else:
-                    # Standard: pathogenic vs benign
+                    # Standard: pathogenic vs benign. Same partial_pattern_mode
+                    # dispatch as the LR computation, EXCEPT "local_unmixing"
+                    # is treated as "trust_global" here specifically: its
+                    # formula needs `prior`, which is exactly what this block
+                    # is computing -- can't unmix against a prior that doesn't
+                    # exist yet. Symmetric in "project" (jointly requires
+                    # pathogenic+benign coverage of the projected subset), same
+                    # as the LR computation.
                     b_sup = _sample_supports(eff_b, obs_key)
                     s_sup = _sample_supports(eff_s, obs_key)
-                    w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                    p_sup = _sample_supports(eff_p, obs_key)
+                    b_side_ok = b_sup or s_sup
+                    x_eval = x_sub
+
+                    if partial_pattern_mode == "gate":
+                        if not b_side_ok:
+                            continue
+                        w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                    elif partial_pattern_mode in ("trust_global", "local_unmixing"):
+                        w_b = _benign_w(weights, b_sup=True, s_sup=True)
+                    elif partial_pattern_mode == "project":
+                        if b_side_ok and p_sup:
+                            w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                        else:
+                            proj = _largest_supported_subset(
+                                obs_key,
+                                lambda s: (_sample_supports(eff_b, s) or _sample_supports(eff_s, s))
+                                          and _sample_supports(eff_p, s),
+                            )
+                            if proj is None:
+                                w_b = _benign_w(weights, b_sup=True, s_sup=True)
+                            else:
+                                x_eval = x_sub.copy()
+                                x_eval[:, [d for d in obs_key if d not in proj]] = np.nan
+                                w_b = _benign_w(weights, b_sup=_sample_supports(eff_b, proj),
+                                                s_sup=_sample_supports(eff_s, proj))
+                    else:
+                        w_b = None
                     if w_b is None:
                         continue
+
                     if f1_full is None:
                         w_p = weights[eff_p]
-                        log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                        log_f1[jdx] = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_eval, *params[c])
                                                  for c in range(K)], axis=0)
-                    log_f2[jdx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                    log_f2[jdx] = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_eval, *params[c])
                                              for c in range(K)], axis=0)
 
             # When the pathomechanism correction ran, f1 comes from the
@@ -342,6 +431,113 @@ def _bootstrap_job(fit_raw, scores, sa,
         all_dims = frozenset(range(D))
 
         K = len(params)
+
+        def _lfp_lfb_standard(x_sub, obs_key, weight_source, w_p=None, p_idx_for_support=None):
+            """(lfp, lfb) for the standard P-vs-B comparison.
+
+            "gate" mode is a byte-faithful replica of the historical
+            behavior: only benign/synonymous is pattern-checked -- the
+            pathogenic side was NEVER gated (weights[eff_p] was always used
+            unconditionally, regardless of whether pathogenic itself had
+            joint coverage of obs_key). Kept asymmetric on purpose so "gate"
+            remains a meaningful baseline to compare the other modes against.
+
+            The other three modes (trust_global/project/local_unmixing) are
+            fully SYMMETRIC: both the pathogenic side and the benign/
+            synonymous side get the same treatment when either lacks joint
+            coverage of obs_key -- there's no principled reason the two
+            sides should be handled differently once you stop trusting the
+            gate's asymmetric historical behavior.
+
+            ``w_p``/``p_idx_for_support`` default to the primary pathogenic
+            weight vector/index; pass an auxiliary pathogenic sample's (e.g.
+            RPV/BENTA/CADINS) to reuse this for the aux LR computation.
+            """
+            if p_idx_for_support is None:
+                p_idx_for_support = eff_p
+            if w_p is None:
+                w_p = weight_source[p_idx_for_support]
+
+            def _b_supported(key):
+                return _sample_supports(eff_b, key) or _sample_supports(eff_s, key)
+
+            def _p_supported(key):
+                return _sample_supports(p_idx_for_support, key)
+
+            b_ok = _b_supported(obs_key)
+            p_ok = _p_supported(obs_key)
+            x_eval = x_sub
+
+            if partial_pattern_mode == "gate":
+                if not b_ok:
+                    return None, None
+                w_b = _benign_w(weight_source, b_sup=_sample_supports(eff_b, obs_key),
+                                 s_sup=_sample_supports(eff_s, obs_key))
+                if w_b is None:
+                    return None, None
+
+            elif partial_pattern_mode == "trust_global":
+                w_b = _benign_w(weight_source, b_sup=True, s_sup=True)
+                # w_p is already the global vector -- nothing else to do.
+
+            elif partial_pattern_mode == "project":
+                if b_ok and p_ok:
+                    w_b = _benign_w(weight_source, b_sup=_sample_supports(eff_b, obs_key),
+                                     s_sup=_sample_supports(eff_s, obs_key))
+                else:
+                    proj = _largest_supported_subset(
+                        obs_key, lambda s: _b_supported(s) and _p_supported(s))
+                    if proj is None:
+                        w_b = _benign_w(weight_source, b_sup=True, s_sup=True)
+                    else:
+                        x_eval = x_sub.copy()
+                        x_eval[:, [d for d in obs_key if d not in proj]] = np.nan
+                        w_b = _benign_w(weight_source, b_sup=_sample_supports(eff_b, proj),
+                                        s_sup=_sample_supports(eff_s, proj))
+
+            elif partial_pattern_mode == "local_unmixing":
+                if b_ok and p_ok:
+                    w_b = _benign_w(weight_source, b_sup=_sample_supports(eff_b, obs_key),
+                                     s_sup=_sample_supports(eff_s, obs_key))
+                else:
+                    pop_ok = eff_g is not None and _sample_supports(eff_g, obs_key)
+                    if not pop_ok:
+                        # nothing to unmix against either -- last resort: trust
+                        # the global vector for whichever side lacks support.
+                        w_b = _benign_w(weight_source, b_sup=True, s_sup=True)
+                    else:
+                        w_pop_local = weight_source[eff_g]
+                        lfpop0 = logsumexp([np.log(w_pop_local[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                            for c in range(K)], axis=0)
+                        if p_ok and not b_ok:
+                            lfp0 = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                              for c in range(K)], axis=0)
+                            fb_local = np.maximum(
+                                (np.exp(lfpop0) - prior * np.exp(lfp0)) / (1 - prior),
+                                np.exp(lfpop0) * 1e-10)
+                            return lfp0, np.log(fb_local)
+                        elif b_ok and not p_ok:
+                            w_b_known = _benign_w(weight_source, b_sup=_sample_supports(eff_b, obs_key),
+                                                   s_sup=_sample_supports(eff_s, obs_key))
+                            lfb0 = logsumexp([np.log(w_b_known[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
+                                              for c in range(K)], axis=0)
+                            fp_local = np.maximum(
+                                (np.exp(lfpop0) - (1 - prior) * np.exp(lfb0)) / prior,
+                                np.exp(lfpop0) * 1e-10)
+                            return np.log(fp_local), lfb0
+                        else:
+                            # neither side supported even by population --
+                            # truly degenerate; trust the global vector.
+                            w_b = _benign_w(weight_source, b_sup=True, s_sup=True)
+            else:
+                raise ValueError(f"Unknown partial_pattern_mode {partial_pattern_mode!r}")
+
+            lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_eval, *params[c])
+                             for c in range(K)], axis=0)
+            lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_eval, *params[c])
+                             for c in range(K)], axis=0)
+            return lfp, lfb
+
         if reestimate_marginal_weights and partial_patterns:
             S = weights.shape[0]
             marginal_w = {}
@@ -400,16 +596,9 @@ def _bootstrap_job(fit_raw, scores, sa,
                                     np.exp(lfpop) * 1e-10)
                     log_lr[idx] = lfp - np.log(fb)
                 else:
-                    b_sup = _sample_supports(eff_b, obs_key)
-                    s_sup = _sample_supports(eff_s, obs_key)
-                    w_b = _benign_w(w, b_sup=b_sup, s_sup=s_sup)
-                    if w_b is None:
+                    lfp, lfb = _lfp_lfb_standard(x_sub, obs_key, w)
+                    if lfp is None:
                         continue
-                    w_p = w[eff_p]
-                    lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                     for c in range(K)], axis=0)
-                    lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                     for c in range(K)], axis=0)
                     log_lr[idx] = lfp - lfb
             lr = log_lr
         else:
@@ -446,16 +635,9 @@ def _bootstrap_job(fit_raw, scores, sa,
                                     np.exp(lfpop) * 1e-10)
                     log_lr[idx] = lfp - np.log(fb)
                 else:
-                    b_sup = _sample_supports(eff_b, obs_key)
-                    s_sup = _sample_supports(eff_s, obs_key)
-                    w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
-                    if w_b is None:
+                    lfp, lfb = _lfp_lfb_standard(x_sub, obs_key, weights)
+                    if lfp is None:
                         continue
-                    w_p = weights[eff_p]
-                    lfp = logsumexp([np.log(w_p[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                     for c in range(K)], axis=0)
-                    lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                     for c in range(K)], axis=0)
                     log_lr[idx] = lfp - lfb
             lr = log_lr
 
@@ -467,16 +649,11 @@ def _bootstrap_job(fit_raw, scores, sa,
                 if not obs_key:
                     continue
                 idx = np.array(indices)
-                b_sup = _sample_supports(eff_b, obs_key)
-                s_sup = _sample_supports(eff_s, obs_key)
-                w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
-                if w_b is None:
-                    continue
                 x_sub = scores[idx]
-                lfp = logsumexp([np.log(w_p_aux[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                 for c in range(K)], axis=0)
-                lfb = logsumexp([np.log(w_b[c] + 1e-300) + _sn_logpdf(x_sub, *params[c])
-                                 for c in range(K)], axis=0)
+                lfp, lfb = _lfp_lfb_standard(
+                    x_sub, obs_key, weights, w_p=w_p_aux, p_idx_for_support=aux_eff_p)
+                if lfp is None:
+                    continue
                 aux_log_lr[idx] = lfp - lfb
             aux_lrs[aux_eff_p] = {
                 'lr':     aux_log_lr,
@@ -1198,6 +1375,7 @@ class MVCalibrationAnalysis:
             enforce_marginal_monotonicity=True,
             liberal_marginal_monotonicity=True,
             pathomechanism_method=None,
+            partial_pattern_mode="gate",
             n_jobs=-1):
         """Run analysis for all configs.
 
@@ -1211,7 +1389,20 @@ class MVCalibrationAnalysis:
             correction in the univariate pipeline
             (src/assay_calibration/fit_utils/point_ranges.py), dispatched
             through the same shared apply_pathomechanism_correction helper.
+        partial_pattern_mode : {"gate", "trust_global", "project", "local_unmixing"}
+            How to handle a variant's observation pattern when the
+            pathogenic and/or benign/synonymous reference lacks joint
+            coverage of it, in the standard (non-NU/non-PU) branch only.
+            Default "gate" reproduces the historical (asymmetric) behavior.
+            See the module-level comment above _PARTIAL_PATTERN_MODES for
+            what each mode does, and compare_partial_pattern_modes() for
+            running/comparing several modes against the same bootstrap fits.
         """
+        if partial_pattern_mode not in _PARTIAL_PATTERN_MODES:
+            raise ValueError(
+                f"partial_pattern_mode must be one of {_PARTIAL_PATTERN_MODES}, "
+                f"got {partial_pattern_mode!r}"
+            )
         self.pathomechanism_method = pathomechanism_method
         ben_percentile = 100 - path_percentile
         _aux_path_pct = aux_path_percentile if aux_path_percentile is not None else path_percentile
@@ -1265,6 +1456,7 @@ class MVCalibrationAnalysis:
                     reestimate_marginal_weights,
                     extra_p_indices=aux_eff_indices,
                     pathomechanism_method=pathomechanism_method,
+                    partial_pattern_mode=partial_pattern_mode,
                 )
                 for _, bd in boot_items
             )
@@ -1619,6 +1811,58 @@ class MVCalibrationAnalysis:
                 }
             self.results[config]['aux_results'] = aux_results
 
+    def compare_partial_pattern_modes(
+        self, modes=_PARTIAL_PATTERN_MODES, **run_kwargs
+    ) -> dict:
+        """Run .run() once per partial_pattern_mode and return
+        {mode: deep-copied self.results}, so the effect of "gate" (historical)
+        vs "trust_global"/"project"/"local_unmixing" can be compared directly
+        against the exact same already-fitted bootstrap params -- no
+        refitting happens here, only the LR/points aggregation step is
+        re-run per mode.
+
+        Pass any other run() kwargs (path_percentile, min_valid_boots, etc.)
+        through **run_kwargs; they're held fixed across all modes so the
+        comparison isolates partial_pattern_mode's effect specifically.
+        """
+        import copy
+        all_results = {}
+        for mode in modes:
+            self.run(partial_pattern_mode=mode, **run_kwargs)
+            all_results[mode] = copy.deepcopy(self.results)
+        return all_results
+
+    def summarize_partial_pattern_mode_comparison(self, all_results: dict, config: str) -> pd.DataFrame:
+        """Pairwise comparison table of ``points`` assignments across the
+        modes in ``all_results`` (see compare_partial_pattern_modes), for
+        one config -- how many variants get a different point value, and by
+        how much, between each pair of modes.
+        """
+        points_by_mode = {}
+        for mode, results in all_results.items():
+            r = results.get(config)
+            points_by_mode[mode] = r['points'] if r else None
+
+        modes = list(points_by_mode.keys())
+        rows = []
+        for i, mode_a in enumerate(modes):
+            for mode_b in modes[i + 1:]:
+                p1, p2 = points_by_mode[mode_a], points_by_mode[mode_b]
+                if p1 is None or p2 is None:
+                    rows.append({'mode_a': mode_a, 'mode_b': mode_b, 'status': 'missing config'})
+                    continue
+                diff = p1 != p2
+                rows.append({
+                    'mode_a': mode_a,
+                    'mode_b': mode_b,
+                    'n_variants': len(p1),
+                    'n_diff': int(diff.sum()),
+                    'pct_diff': float(diff.mean() * 100),
+                    'mean_abs_point_diff': float(np.abs(p1 - p2).mean()),
+                    'max_abs_point_diff': int(np.abs(p1 - p2).max()),
+                })
+        return pd.DataFrame(rows)
+
     def summary_table(self):
         """Return a pandas DataFrame summarizing all configs."""
         rows = []
@@ -1893,7 +2137,7 @@ class MVCalibrationAnalysis:
         visualize_fit.render_mv_plot_data) repeatedly without redoing
         the parallel bootstrap sweeps.
         """
-        from visualize_fit import precompute_mv_plot_data
+        from .visualize_fit import precompute_mv_plot_data
         return precompute_mv_plot_data(self, config, n_grid=n_grid)
 
     def render_plot_data(self, precomputed, figsize=None, contour_levels=6,
@@ -1902,7 +2146,7 @@ class MVCalibrationAnalysis:
 
         Cheap — only runs matplotlib drawing, no bootstrap computation.
         """
-        from visualize_fit import render_mv_plot_data
+        from .visualize_fit import render_mv_plot_data
         return render_mv_plot_data(precomputed, figsize=figsize,
                                    contour_levels=contour_levels,
                                    first_row_only=first_row_only,
@@ -1923,7 +2167,7 @@ class MVCalibrationAnalysis:
             D>2 layout.  Defaults to 10.  All C(D,2) pairs are shown in order
             of (dim_i, dim_j), not just pairs anchored to dim 0.
         """
-        from visualize_fit import plot_mv_calibration
+        from .visualize_fit import plot_mv_calibration
         return plot_mv_calibration(self, config, figsize=figsize,
                                    n_grid=n_grid, contour_levels=contour_levels,
                                    first_row_only=first_row_only,

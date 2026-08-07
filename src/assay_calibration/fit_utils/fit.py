@@ -40,6 +40,26 @@ logging.root.setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 
+def _unstandardize_component_params(component_params, mean, std):
+    """Map (mu, Delta, Gamma) tuples fit in standardized space back to raw
+    units: X_raw = mean + std ⊙ X_std, an exact affine transform for the
+    skew-normal/CFUSN family (mu -> mu*std + mean, each row d of Delta
+    scaled by std[d], Gamma -> diag(std) @ Gamma @ diag(std)).
+    """
+    mean = np.asarray(mean, dtype=float)
+    std = np.asarray(std, dtype=float)
+    unscaled = []
+    for mu, Delta, Gamma in component_params:
+        mu = np.asarray(mu, dtype=float)
+        Delta = np.asarray(Delta, dtype=float)
+        Gamma = np.asarray(Gamma, dtype=float)
+        mu_raw = mu * std + mean
+        Delta_raw = Delta * std if Delta.ndim == 1 else Delta * std[:, None]
+        Gamma_raw = Gamma * np.outer(std, std)
+        unscaled.append((mu_raw, Delta_raw, Gamma_raw))
+    return unscaled
+
+
 def tryToFit(observations, sample_indicators, num_components, constrained,
              init_method, init_constraint_adjustment, multivariate=False, **kwargs):
     try:
@@ -512,18 +532,31 @@ class Fit:
 
     @staticmethod
     def _select_calibration_dims(observations, min_overlap_rows=30):
-        """Find the largest subset of assay dimensions with sufficient pairwise overlap.
+        """Find the largest connected component of assay dimensions under
+        pairwise-overlap adjacency.
 
-        Two dimensions overlap if at least ``min_overlap_rows`` variants have
-        non-NaN scores in both assays simultaneously.
+        Two dimensions are adjacent if at least ``min_overlap_rows`` variants
+        have non-NaN scores in both assays simultaneously. A dimension only
+        needs to overlap with AT LEAST ONE other dimension in the selected
+        group to be included — full pairwise (clique) overlap across every
+        dimension is NOT required. The marginal-likelihood EM this fitter
+        uses (cfusn/msn "_alternate_missing" density functions) already
+        estimates cross-dimension structure through per-variant missingness,
+        so a dimension can be jointly informative via a third, shared
+        dimension even with zero rows directly shared with some other
+        member of the group (e.g. TP53's KawOligo shares no rows with
+        Funk_RFS/Kotler_RFS directly, but shares rows with every other
+        assay, and those in turn overlap Funk_RFS/Kotler_RFS — one
+        connected 16D component, not an isolated dimension).
 
         Returns
         -------
         list of int
-            Column indices to use.  Empty list means no pair has sufficient
-            overlap — caller should fall back to per-assay 1-D calibration.
+            Column indices to use (the largest connected component, sorted).
+            Empty list means every dimension is fully isolated (no pair
+            anywhere meets ``min_overlap_rows``) — caller should fall back
+            to per-assay 1-D calibration.
         """
-        from itertools import combinations
         D = observations.shape[1]
         if D == 1:
             return [0]
@@ -538,17 +571,30 @@ class Fit:
         adj = overlap >= min_overlap_rows
         np.fill_diagonal(adj, True)
 
-        all_dims = list(range(D))
-        if all(adj[i, j] for i in all_dims for j in all_dims):
-            return all_dims
+        seen: set = set()
+        components = []
+        for start in range(D):
+            if start in seen:
+                continue
+            comp = {start}
+            stack = [start]
+            while stack:
+                node = stack.pop()
+                for nb in np.flatnonzero(adj[node]):
+                    nb = int(nb)
+                    if nb not in comp:
+                        comp.add(nb)
+                        stack.append(nb)
+            seen |= comp
+            components.append(comp)
 
-        # Find largest clique (brute force; fine for D <= ~10)
-        for size in range(D - 1, 1, -1):
-            for subset in combinations(range(D), size):
-                if all(adj[i, j] for i in subset for j in subset):
-                    return list(subset)
+        # A component of size 1 is a dimension with no qualifying overlap
+        # to anything else — not a usable multivariate group on its own.
+        multi_dim_components = [c for c in components if len(c) > 1]
+        if not multi_dim_components:
+            return []
 
-        return []  # no pair has sufficient overlap
+        return sorted(max(multi_dim_components, key=len))
 
     # ──────────────────────────────────────
     # Job generation for distributed fitting
@@ -608,8 +654,9 @@ class Fit:
                 excluded = sorted(set(range(observations.shape[1])) - set(calibrated_dims))
                 if verbose_overlap:
                     print(
-                        f"{log_prefix}[OVERLAP] Assay dim(s) {excluded} lack ≥{min_overlap} "
-                        f"shared rows with the rest. Running {len(calibrated_dims)}D "
+                        f"{log_prefix}[OVERLAP] Assay dim(s) {excluded} aren't connected "
+                        f"(≥{min_overlap} shared rows, directly or transitively) to the "
+                        f"largest jointly-calibratable group. Running {len(calibrated_dims)}D "
                         f"calibration on dims {calibrated_dims}; use existing 1D "
                         f"calibrations for dim(s) {excluded}."
                     )
@@ -621,6 +668,32 @@ class Fit:
                 observations = observations[valid]
                 sample_assignments = sample_assignments[valid]
             kwargs["calibrated_dims"] = calibrated_dims
+
+            # ── Per-dimension standardization ────────────────────────────
+            # k-means init (kmeans_init_mv) clusters on raw Euclidean
+            # distance, and the constrained-mode separation features
+            # (gamma_ridge/params_sane/repulsion step-size, cfusn/
+            # separation.py) all summarize "scale" as a single number
+            # pooled across every dimension. Assay dimensions in this
+            # pipeline can differ in raw scale by 100x or more (e.g. a raw
+            # reporter-assay score in the hundreds vs. a z-scored ratio
+            # score around -5..5) -- left unstandardized, those pooled/
+            # Euclidean computations are dominated entirely by the
+            # largest-scale dimensions, and small-scale dimensions
+            # contribute essentially nothing to clustering or separation
+            # regardless of how much real structure they carry. Standardize
+            # here (once, on the full non-bootstrap observations, so it's
+            # stable across bootstrap replicates of the same config) and
+            # un-standardize the fitted component params back to raw units
+            # in Fit.execute_fit_job, so every downstream consumer (val_ll
+            # scoring here, and all analysis/plotting code) keeps operating
+            # in raw units transparently.
+            scale_mean = np.nanmean(observations, axis=0)
+            scale_std = np.nanstd(observations, axis=0)
+            scale_std = np.where(scale_std < 1e-8, 1.0, scale_std)
+            observations = (observations - scale_mean) / scale_std
+            kwargs["_scale_mean"] = scale_mean
+            kwargs["_scale_std"] = scale_std
 
         train_indices = np.arange(len(observations))
         val_indices = np.array([], dtype=int)
@@ -731,6 +804,19 @@ class Fit:
                     result["weights"],
                     mv,
                     job.get("kwargs", {}),
+                )
+
+            # Undo generate_fit_jobs's per-dimension standardization (if any)
+            # now that fitting/scoring -- both of which needed component
+            # params and observations in the same, standardized space -- are
+            # done. Everything from here on (aggregate_results.py, analysis,
+            # plotting) sees raw-unit parameters, unchanged from before
+            # standardization was introduced.
+            scale_mean = job.get("kwargs", {}).get("_scale_mean")
+            scale_std = job.get("kwargs", {}).get("_scale_std")
+            if scale_mean is not None and scale_std is not None:
+                result["component_params"] = _unstandardize_component_params(
+                    result["component_params"], scale_mean, scale_std,
                 )
 
             return {
@@ -857,8 +943,8 @@ def calculate_score_ranges_dual(log_lr_pathogenic, log_lr_benign, prior_pathogen
                                  scores, point_values, acmg_mapping_method="tavtigian", **kwargs):
     """Dual-prior sibling of calculate_score_ranges for the pathomechanism
     two-LR/two-prior PS3/BS3 scheme: pathogenic-direction tier thresholds are
-    derived from prior_pathogenic (rho) alone, benign-direction thresholds
-    from prior_benign (pi) alone -- two independent calls to
+    derived from prior_pathogenic (P(Y=1,M=1)) alone, benign-direction
+    thresholds from prior_benign (P(Y=1)) alone -- two independent calls to
     thresholds_from_prior, each contributing only its own direction's half.
 
     This is a deliberate deviation from strict Tavtigian-2018, where a single
@@ -871,7 +957,7 @@ def calculate_score_ranges_dual(log_lr_pathogenic, log_lr_benign, prior_pathogen
     benign/likely-benign halves are used, via lrB/tauB). This is accepted as
     the necessary cost of having two independently-meaningful priors for the
     two evidence directions (see module-level pathomechanism plan/docs for
-    the rho vs pi derivation) -- PS3 and BS3 are separate ACMG evidence codes
+    the P(Y=1,M=1) vs P(Y=1) derivation) -- PS3 and BS3 are separate ACMG evidence codes
     with separately awarded points in this pipeline already, not combined
     into one continuous score, so calibrating them under two different
     constants does not break anything downstream that assumed a single C.

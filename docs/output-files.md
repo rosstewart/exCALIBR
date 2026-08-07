@@ -32,11 +32,12 @@ For each run, `run_pipeline.py` and `run_igvf_batch.py` produce:
   "liberal_monotonicity": 1,
   "pathomechanism_prior": null,
   "pathomechanism_method": null,
+  "PLP_frac_pathomechanism_measured": null,
   "uncalibratable_reason": null,
   "model_selected": null
 }
 ```
 - `prior` — the estimated prior probability of pathogenicity (pi), used to derive the ACMG evidence-tier thresholds.
 - `point_ranges` — score intervals mapped to signed ACMG point values (positive = pathogenic-direction, negative = benign-direction; `point_ranges["0"]` covers indeterminate/no-evidence).
-- `pathomechanism_prior` / `pathomechanism_method` — only populated when `--pathomechanism-prior` is used (see [Pathomechanism prior](configuration.md#pathomechanism-prior-advanced)); `null` otherwise.
+- `pathomechanism_prior` / `pathomechanism_method` / `PLP_frac_pathomechanism_measured` — only populated when `--pathomechanism-prior` is used (see [Pathomechanism prior](configuration.md#pathomechanism-prior-advanced)); `null` otherwise. Each has a matching `*_unstable` flag (also `prior_unstable`/`pct_pathogenic_rows_kept`); `lr_values.json.gz` carries the paired `log_lr_pathogenic_p5/p50/p95`/`prior_pathogenic_pct` curve alongside the usual `log_lr_plus_*`.
 - `model_selected` — which component count (`2c`/`3c`) was preferred by model selection, only set when both were fit and compared.

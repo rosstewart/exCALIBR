@@ -69,7 +69,7 @@ See the [Batch HPC Workflow](docs/batch-hpc-workflow.md).
 
 Three formats are supported — see [docs/input-formats.md](docs/input-formats.md) for full details and example commands:
 
-1. **BasicScoreset** (start here) — just a `score` column and a `sample_assignments` column you fill in yourself, marking which variants are Pathogenic/Benign/gnomAD/Synonymous controls. No ClinVar metadata needed. Example: `example/brca_findlay_example.csv`.
+1. **BasicScoreset** (start here) — just a `score` column and a `sample_assignments` column you fill in yourself, marking which variants are Pathogenic/Benign/gnomAD/Synonymous controls. No ClinVar metadata needed. Example: `example/brca_findlay_example.csv`. PU/NU-mode examples: `example/brca_findlay_PU_example.csv`, `example/brca_findlay_NU_example.csv`.
 2. **IGVF / PillarProject format** — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
 3. **MaveDB format** — MaveDB-style CSV with functional classification columns.
 

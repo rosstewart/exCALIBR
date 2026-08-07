@@ -176,7 +176,7 @@ def build_clingen_confusion(
             continue
         df_ds["Dataset"] = dataset
 
-        clinvar_release = "2018" if "_clinvar_2018" in dataset else "2026"
+        clinvar_release = "2018" if "_clinvar_2018" in dataset else "2025"
         pcfg = PipelineConfig(
             dataset_csv=str(dataset_tsv), dataset_name=dataset,
             output_dir="/tmp", clinvar_release=clinvar_release,

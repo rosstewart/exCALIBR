@@ -579,20 +579,20 @@ if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis
     print(f"Discovered {len(robustness_bases)} base dataset(s) with robustness conditions: {robustness_bases}")
 
     # Reference (unperturbed) population for every base dataset comes from
-    # the MAIN pipeline output (section 1's own tree/model_selections/
-    # calibrations) -- pass those in directly instead of letting
-    # load_reference_variants re-walk the whole ~89-dataset OUTPUT_DIR tree
-    # once per base dataset. The perturbed downsample/discordance conditions
-    # themselves (robustness_all.csv) are never loaded here -- only their
-    # already-computed calibration.json/lr_values.json.gz outputs under
-    # ROBUSTNESS_OUTPUT_DIR are used, via compute_robustness_confusion_matrices
-    # / run_config_summary_plots_batch below.
+    # each base dataset's own "_control" condition under ROBUSTNESS_OUTPUT_DIR
+    # -- fit at the SAME xl (1000 bootstraps x 8 fits) budget as every
+    # perturbed condition, not the main pipeline's own (typically higher,
+    # e.g. "finest"/100 fits) budget -- see analysis.robustness's module
+    # docstring (REFERENCE SOURCE) for why a higher-budget baseline would
+    # bias every comparison. tree/model_selections/calibrations (section 1's
+    # own main-pipeline discovery) are no longer needed here as a result.
     robustness_summaries = {}
     config_summary_jobs = []
     for base_ds in robustness_bases:
         try:
             reference_df, ref_cal_path = load_reference_variants(
-                base_ds, tree=tree, model_selections=model_selections, calibrations=calibrations,
+                base_ds, reference_source="robustness_control",
+                robustness_output_dir=config.ROBUSTNESS_OUTPUT_DIR,
             )
         except FileNotFoundError as e:
             print(f"  SKIP {base_ds}: {e}")

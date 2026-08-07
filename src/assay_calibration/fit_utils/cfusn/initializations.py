@@ -18,6 +18,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 import scipy.stats as sps
 import itertools
+import warnings
 
 
 # ══════════════════════════════════════════════
@@ -200,6 +201,85 @@ def fix_to_satisfy_density_constraint(component_parameters, xlims, **kwargs):
 # Multivariate initialization — unified for q=1 and q>1
 # ══════════════════════════════════════════════
 
+def _partial_distance_sq(X, centers):
+    """(N, K) squared partial-distance from each row of X to each center,
+    using only that row's observed dimensions, normalized by how many of
+    them there are (so rows with different missingness patterns remain
+    comparable). Reduces to ordinary squared Euclidean distance (up to a
+    constant per-row scale that doesn't affect argmin) when X has no
+    missing values.
+    """
+    N, p = X.shape
+    K = centers.shape[0]
+    obs = ~np.isnan(X)
+    X_fill = np.where(obs, X, 0.0)
+    n_obs = np.maximum(obs.sum(axis=1), 1)
+    dist = np.empty((N, K))
+    for k in range(K):
+        diff = (X_fill - centers[k][None, :]) * obs
+        dist[:, k] = (diff ** 2).sum(axis=1) / n_obs
+    return dist
+
+
+def partial_distance_kmeans_labels(X, n_clusters, rng, max_iter=100, n_init=5):
+    """Lloyd's-algorithm k-means using partial (available-case) distance.
+
+    Unlike the previous approach (cluster on fully-observed rows only, or --
+    when too few of those exist -- replace every missing entry with its
+    column's global mean for every row before clustering), this natively
+    supports NaN: every pairwise point-to-center distance uses only the
+    dimensions that point actually has observed. A highly-missing dimension
+    (e.g. TP53's KawOligo, ~1-15% coverage) still contributes proportionally
+    to its real information for whichever comparisons happen to have it,
+    rather than being either fully used post-hoc or fully erased by
+    global-mean imputation once complete rows run out -- the latter was
+    empirically shown (tests/cfusn_simulations/sim_kmeans_missingness_init.py)
+    to degrade sharply (and in one case produce a ~1e16-scale numerical
+    blowup) past ~85-90% missingness, while partial distance degrades
+    gracefully.
+
+    Only cluster *centers* get column-mean-filled where a cluster has zero
+    real observations in some dimension (needed so later steps have a
+    number, not NaN); the distance computation itself is imputation-free.
+
+    Returns (labels, centers) for the best (lowest total partial-distance)
+    of n_init random restarts.
+    """
+    N, p = X.shape
+    col_means = np.nanmean(X, axis=0)
+    best = None
+
+    for _ in range(n_init):
+        idx = rng.choice(N, size=n_clusters, replace=False)
+        centers = np.where(np.isnan(X[idx]), col_means[None, :], X[idx])
+        labels = None
+        for _ in range(max_iter):
+            dist = _partial_distance_sq(X, centers)
+            new_labels = np.argmin(dist, axis=1)
+            if labels is not None and np.array_equal(new_labels, labels):
+                break
+            labels = new_labels
+            new_centers = centers.copy()
+            for k in range(n_clusters):
+                mask = labels == k
+                if not mask.any():
+                    continue
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    cm = np.nanmean(X[mask], axis=0)
+                missing = np.isnan(cm)
+                cm[missing] = col_means[missing]
+                new_centers[k] = cm
+            centers = new_centers
+
+        dist = _partial_distance_sq(X, centers)
+        inertia = float(dist[np.arange(N), labels].sum())
+        if best is None or inertia < best[2]:
+            best = (labels, centers, inertia)
+
+    return best[0], best[1]
+
+
 def kmeans_init_mv(X, **kwargs):
     """K-means based initialization for multivariate skew-normal mixtures.
 
@@ -220,7 +300,9 @@ def kmeans_init_mv(X, **kwargs):
     -------
     component_parameters : list of (mu, Delta, Gamma) tuples
         Delta is (p,) for q=1, (p, q) for q>1
-    kmeans : fitted KMeans object
+    kmeans : (labels, centers) from partial_distance_kmeans_labels (stands
+        in for the historical fitted-sklearn-KMeans return value; unused
+        downstream except as init metadata)
     """
     rng = kwargs.get("rng") or np.random.RandomState()
     n_clusters = kwargs.get("n_clusters", 2)
@@ -230,25 +312,15 @@ def kmeans_init_mv(X, **kwargs):
     n_sign_per_cluster = 2 ** latent_q  # 4 for q=2
     N, K_dim = X.shape
 
-    complete_mask = ~np.isnan(X).any(axis=1)
-    X_complete = X[complete_mask]
-    min_needed = n_clusters * max(10, K_dim + 2)
-    if len(X_complete) < min_needed:
-        # No fully-complete rows (e.g. dims from non-overlapping experiments).
-        # Impute column means for k-means seeding only.
-        col_means = np.nanmean(X, axis=0)
-        X_complete = np.where(np.isnan(X), col_means[None, :], X)
-        complete_mask = np.ones(N, dtype=bool)
-
     # Fallback covariance computed once — used when a cluster is too small
-    # to estimate its own covariance reliably.
+    # to estimate its own covariance reliably. Computed directly from the
+    # raw (possibly NaN) X via pairwise-observed masking.
     global_cov = np.zeros((K_dim, K_dim))
     for d1 in range(K_dim):
         for d2 in range(d1, K_dim):
-            both = ~np.isnan(X_complete[:, d1]) & ~np.isnan(X_complete[:, d2])
+            both = ~np.isnan(X[:, d1]) & ~np.isnan(X[:, d2])
             if both.sum() >= 2:
-                global_cov[d1, d2] = np.cov(X_complete[both, d1],
-                                             X_complete[both, d2])[0, 1]
+                global_cov[d1, d2] = np.cov(X[both, d1], X[both, d2])[0, 1]
             global_cov[d2, d1] = global_cov[d1, d2]
     global_cov += 1e-6 * np.eye(K_dim)
     _ev = np.linalg.eigvalsh(global_cov)
@@ -258,33 +330,34 @@ def kmeans_init_mv(X, **kwargs):
     last_error = None
     for attempt in range(100):
         try:
-            kmeans = KMeans(
-                n_clusters=n_clusters,
-                init=kwargs.get("kmeans_init", "random"),
-                n_init=1,
-                random_state=rng,
-            )
-            kmeans.fit(X_complete)
-            labels = np.full(N, -1, dtype=int)
-            labels[complete_mask] = kmeans.predict(X_complete)
-            centers = kmeans.cluster_centers_
-
-            for j in np.where(~complete_mask)[0]:
-                obs = ~np.isnan(X[j])
-                if not obs.any():
-                    labels[j] = rng.randint(n_clusters)
-                else:
-                    labels[j] = np.argmin([
-                        np.sum((X[j, obs] - centers[c, obs])**2)
-                        for c in range(n_clusters)
-                    ])
+            labels, centers = partial_distance_kmeans_labels(X, n_clusters, rng)
+            kmeans = (labels, centers)
 
             component_parameters = []
             for c in range(n_clusters):
                 Xc = X[labels == c]
                 small_cluster = len(Xc) < max(10, K_dim + 2)
 
-                mu = np.nanmean(Xc, axis=0) if len(Xc) > 0 else np.nanmean(X, axis=0)
+                if len(Xc) > 0:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", category=RuntimeWarning)
+                        mu = np.nanmean(Xc, axis=0)
+                    # A sparse dimension (e.g. an assay with real coverage on
+                    # only a small fraction of variants -- TP53's KawOligo is
+                    # ~2% of variants) can easily have ZERO non-missing
+                    # entries among the specific rows k-means assigned to
+                    # this cluster, even though the cluster itself is
+                    # non-empty. np.nanmean silently returns NaN for that
+                    # column (hence the warning) -- and a NaN component mean
+                    # poisons every downstream EM computation for this
+                    # component, not just this initialization. Fall back to
+                    # that dimension's GLOBAL mean instead of leaving NaN.
+                    missing_dims = np.isnan(mu)
+                    if missing_dims.any():
+                        global_mu = np.nanmean(X, axis=0)
+                        mu[missing_dims] = global_mu[missing_dims]
+                else:
+                    mu = np.nanmean(X, axis=0)
 
                 if small_cluster:
                     # Too few points for a reliable per-cluster covariance —
@@ -864,17 +937,21 @@ def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=None):
     # Add small random perturbation
     Delta += rng.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
 
-    # Verify Gamma = cov - Delta @ Delta.T is PD; shrink Delta if needed
+    # Verify Gamma = cov - Delta @ Delta.T is PD; shrink Delta if needed.
+    # Fixed per-retry decay (not compounding -- `shrink *= 0.5` here used to
+    # make the cumulative multiplier 0.5*0.25*0.125*... i.e. doubly-
+    # exponential, annihilating Delta to ~1e-60 within a handful of retries
+    # whenever the first attempt or two didn't succeed. Worst case now:
+    # 0.9**20 ~= 0.12, so Delta always retains a meaningful fraction of its
+    # original scale even after the full retry budget.
     Gamma = cov - Delta @ Delta.T
     eigvals_G = np.linalg.eigvalsh(Gamma)
     if eigvals_G.min() < 1e-6:
-        shrink = 0.5
         for _ in range(20):
-            Delta *= shrink
+            Delta *= 0.9
             Gamma = cov - Delta @ Delta.T
             if np.linalg.eigvalsh(Gamma).min() > 1e-6:
                 break
-            shrink *= 0.5
 
     return Delta
 

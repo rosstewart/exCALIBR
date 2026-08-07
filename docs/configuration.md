@@ -104,6 +104,8 @@ python run_pipeline.py --dataset my.csv --name MyGene --manual-prior 0.001  # su
 
 `--manual-prior` takes a probability in (0, 1) and is used for every bootstrap fit's thresholds instead of a per-fit estimate. Use it if you have an external prevalence estimate or too few controls for a reliable data-driven estimate.
 
+If your dataset is missing Pathogenic or Benign/Synonymous controls entirely, prior estimation switches to a different mode (PU/NU) with its own assumptions — see [PN/PU/NU modes](input-formats.md#pnpunu-modes-missing-class-inference).
+
 #### Pathomechanism prior (advanced)
 
 For assays that only detect one of several disease mechanisms (e.g. an assay measuring loss-of-function won't flag a dominant-negative pathogenic variant as abnormal). This dilutes the pathogenic sample with variants the assay can't detect, understating pathogenic-direction evidence strength.
@@ -112,7 +114,7 @@ For assays that only detect one of several disease mechanisms (e.g. an assay mea
 python run_pipeline.py --dataset my.csv --name MyGene --pathomechanism-prior
 ```
 
-Estimates the fraction of ClinVar pathogenic variants the assay actually detects, and computes a separate pathogenic-direction prior/evidence pair from just that subset (benign-direction evidence is untouched). PN/PU mode only; mutually exclusive with `--filter-pathogenic-sample-by-lr`. Reported as `PLP_frac_pathomechanism_measured` and `pathomechanism_prior` in the output JSON.
+Estimates the fraction of ClinVar pathogenic variants the assay actually detects (`P(M=1|Y=1)`), by default via the same closed-form boundary/mixture-proportion estimator (Blanchard, Lee & Scott 2010; Scott 2015) used for the [PN/PU/NU prior](input-formats.md#pnpunu-modes-missing-class-inference), and computes a separate pathogenic-direction prior (`P(Y=1,M=1)`) and evidence pair from just that subset (benign-direction evidence, `P(Y=1)`, is untouched). [PN/PU](input-formats.md#pnpunu-modes-missing-class-inference) mode only; mutually exclusive with `--filter-pathogenic-sample-by-lr`. Reported as `PLP_frac_pathomechanism_measured` and `pathomechanism_prior` in the output JSON.
 
 ### Benign sample method
 

@@ -22,7 +22,7 @@ def _clinvar_release_for(dataset: str) -> str:
     gene = dataset.split("_")[0]
     if gene in genes_2018:
         return "2018"
-    return "2026"
+    return "2025"
 
 
 def load_name_mapping(dataset_tsv: str) -> Tuple[Dict[str, str], Dict[str, str]]:

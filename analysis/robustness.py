@@ -36,6 +36,23 @@ condition's own tiny confusion matrix". Confusion matrices, summary metrics,
 and LR+ curves in this module are therefore always computed against the
 reference population; only the point_ranges/LR+ curve shape comes from the
 perturbed condition.
+
+REFERENCE SOURCE: every perturbed condition here is fit at a fixed "xl"
+budget (1000 bootstraps x 8 fits/bootstrap, see
+analysis/build_robustness_dataset.py). The main pipeline's own output
+(analysis.config.OUTPUT_DIR, what `load_reference_variants` uses by default)
+is typically fit at a HIGHER budget (e.g. "finest" = 100 fits/bootstrap) --
+using it as "reference" would conflate "how much did this perturbation shift
+the calibration" with "how much did the extra fit budget itself shift the
+calibration", biasing every comparison in the perturbed conditions' favor
+(they'd look artificially worse purely from having a smaller fit budget, not
+from the perturbation). `analysis/build_robustness_dataset.py` therefore also
+emits one unperturbed "{base_dataset}_control" condition per base dataset --
+same population, same xl fit budget, zero perturbation -- and
+`load_reference_variants(..., reference_source="robustness_control")` (the
+default `run_robustness_analysis` now uses) reads that instead, giving a
+like-for-like, equal-budget baseline. Pass reference_source="main_pipeline"
+to opt back into the old (higher-budget, apples-to-oranges) behavior.
 """
 from __future__ import annotations
 
@@ -81,6 +98,12 @@ _COND_RE = re.compile(
     r"^(?P<base>.+)_(?:ds(?P<n>\d+)|disc(?P<pct>\d+\.\d+))_s(?P<seed>\d+)(?:_clinvar_2018)?$"
 )
 
+# The unperturbed "control" condition per base dataset (see module docstring
+# above) -- no downsample/discordance level, no seed (deterministic, single
+# fit at the same xl budget). Same optional trailing "_clinvar_2018" as
+# _COND_RE, for the same GENES_2018 reason.
+_CONTROL_RE = re.compile(r"^(?P<base>.+)_control(?:_clinvar_2018)?$")
+
 # Extracts the "{n_c}[_{benign_method}]" component token from a
 # *_calibration.json filename, e.g. "..._3c_avg_calibration.json" -> "3c_avg".
 _COMP_RE = re.compile(r"_(?P<comp>(?:2c|3c)(?:_[A-Za-z]+)?)_calibration\.json$")
@@ -101,26 +124,37 @@ def _infer_component(calibration_path: Path) -> str:
 def parse_condition_dirname(dirname: str) -> Optional[dict]:
     """Parse one robustness condition directory name.
 
-    Returns {"base_dataset", "perturbation_type": "downsample"|"discordance",
-    "level": int|float, "seed": int}, or None if dirname doesn't match either
-    pattern (e.g. the sibling 'logs/' directory) -- callers skip cleanly.
+    Returns {"base_dataset", "perturbation_type": "downsample"|"discordance"|
+    "control", "level": int|float, "seed": int}, or None if dirname doesn't
+    match any pattern (e.g. the sibling 'logs/' directory) -- callers skip
+    cleanly. "control" conditions (see module docstring) have no real
+    level/seed; both are reported as 0 for uniformity with the
+    (perturbation_type, level, seed) tuple keys used elsewhere in this module.
     """
     m = _COND_RE.match(dirname)
-    if m is None:
-        return None
-    if m.group("n") is not None:
+    if m is not None:
+        if m.group("n") is not None:
+            return {
+                "base_dataset": m.group("base"),
+                "perturbation_type": "downsample",
+                "level": int(m.group("n")),
+                "seed": int(m.group("seed")),
+            }
         return {
             "base_dataset": m.group("base"),
-            "perturbation_type": "downsample",
-            "level": int(m.group("n")),
+            "perturbation_type": "discordance",
+            "level": float(m.group("pct")),
             "seed": int(m.group("seed")),
         }
-    return {
-        "base_dataset": m.group("base"),
-        "perturbation_type": "discordance",
-        "level": float(m.group("pct")),
-        "seed": int(m.group("seed")),
-    }
+    m = _CONTROL_RE.match(dirname)
+    if m is not None:
+        return {
+            "base_dataset": m.group("base"),
+            "perturbation_type": "control",
+            "level": 0,
+            "seed": 0,
+        }
+    return None
 
 
 def discover_robustness_conditions(
@@ -187,9 +221,53 @@ def find_condition_lr_values(condition_dir: Path, component: Optional[str] = Non
     return lr_path if lr_path.exists() else None
 
 
+def find_condition_variants_csv(condition_dir: Path, component: Optional[str] = None) -> Optional[Path]:
+    """The *_variants.csv inside one condition dir matching `component`,
+    mirroring find_condition_calibration/find_condition_lr_values."""
+    if component:
+        candidate = condition_dir / f"{condition_dir.name}_{component}_variants.csv"
+        if candidate.exists():
+            return candidate
+    matches = sorted(condition_dir.glob("*_variants.csv"))
+    return matches[0] if matches else None
+
+
 # ---------------------------------------------------------------------------
 # Reference (unperturbed) dataset loading
 # ---------------------------------------------------------------------------
+
+def load_control_reference_variants(
+    base_dataset: str, robustness_output_dir: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Path]:
+    """Load base_dataset's own unperturbed "_control" condition (see module
+    docstring) -- same population as load_reference_variants, but fit at the
+    SAME xl (1000 bootstraps x 8 fits) budget as every perturbed condition,
+    instead of whatever (typically higher) budget the main pipeline used.
+    Returns the same (variants_df, calibration_path) shape as
+    load_reference_variants, so it's a drop-in alternative reference source.
+
+    Raises FileNotFoundError if no "_control" condition dir, or no
+    calibration.json/variants.csv inside it, is found on disk.
+    """
+    conditions = [
+        c for c in discover_robustness_conditions(base_dataset, robustness_output_dir)
+        if c["perturbation_type"] == "control"
+    ]
+    if not conditions:
+        raise FileNotFoundError(
+            f"No '_control' condition found for '{base_dataset}' under "
+            f"{robustness_output_dir or cfg.ROBUSTNESS_OUTPUT_DIR}"
+        )
+    condition_dir = conditions[0]["dir"]
+    cal_path = find_condition_calibration(condition_dir)
+    if cal_path is None:
+        raise FileNotFoundError(f"No calibration.json in control condition dir {condition_dir}")
+    component = _infer_component(cal_path)
+    csv_path = find_condition_variants_csv(condition_dir, component)
+    if csv_path is None:
+        raise FileNotFoundError(f"No variants.csv in control condition dir {condition_dir}")
+    return pd.read_csv(csv_path), cal_path
+
 
 def load_reference_variants(
     base_dataset: str,
@@ -199,18 +277,28 @@ def load_reference_variants(
     tree: Optional[Dict] = None,
     model_selections: Optional[Dict] = None,
     calibrations: Optional[Dict] = None,
+    reference_source: str = "main_pipeline",
+    robustness_output_dir: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Path]:
     """Load the reference (full, unperturbed) dataset's variants (score +
     sample [+ standard_points] columns) plus its own resolved
     calibration.json path -- every robustness condition's point_ranges get
     applied to this same fixed population.
 
-    Preferred: base_dataset's (or f"{base_dataset}_clinvar_2018" for genes
-    in GENES_2018) *_variants.csv from the MAIN pipeline output_dir (default
-    cfg.OUTPUT_DIR) -- the same variants/config every other notebook section
-    already uses.
-    Fallback: build fresh from the master dataframe via
-    analysis.legacy_fits.load_scoreset_and_fits +
+    reference_source : "main_pipeline" (default here; see
+        run_robustness_analysis for the robustness-workflow default) reads
+        base_dataset's (or f"{base_dataset}_clinvar_2018" for genes in
+        GENES_2018) *_variants.csv from the MAIN pipeline output_dir (default
+        cfg.OUTPUT_DIR) -- the same variants/config every other notebook
+        section already uses, but NOT fit at the same budget as the
+        perturbed conditions (see module docstring's REFERENCE SOURCE
+        section). "robustness_control" instead delegates to
+        load_control_reference_variants -- base_dataset's own unperturbed
+        condition, fit at the identical xl budget as every perturbed
+        condition; the correct choice for isolating perturbation effects
+        from fit-budget effects.
+    Fallback (reference_source="main_pipeline" only): build fresh from the
+    master dataframe via analysis.legacy_fits.load_scoreset_and_fits +
     analysis.comparison_methods.build_variants_df_from_scoreset, if nothing
     is found in output_dir.
 
@@ -220,10 +308,17 @@ def load_reference_variants(
     (~89-dataset) output_dir tree on every call -- callers looping over
     several robustness base datasets would otherwise re-discover the whole
     main pipeline output from scratch once per base dataset. Falls back to
-    discovering it here (as before) if not given.
+    discovering it here (as before) if not given. Unused when
+    reference_source="robustness_control".
 
-    Raises FileNotFoundError if neither path succeeds.
+    Raises FileNotFoundError if the requested reference_source's path(s) all fail.
     """
+    if reference_source == "robustness_control":
+        return load_control_reference_variants(base_dataset, robustness_output_dir)
+    if reference_source != "main_pipeline":
+        raise ValueError(f"Unknown reference_source {reference_source!r} (expected "
+                          f"'main_pipeline' or 'robustness_control')")
+
     output_dir = Path(output_dir or cfg.OUTPUT_DIR)
     dataset_configs_path = dataset_configs_path or cfg.DATASET_CONFIGS
 
@@ -315,6 +410,12 @@ def compute_robustness_confusion_matrices(
         matrices[("reference", 0, 0)] = ref_mat
 
     for cond in discover_robustness_conditions(base_dataset, robustness_output_dir):
+        if cond["perturbation_type"] == "control":
+            # Already represented by the ("reference", 0, 0) row above when
+            # reference_source="robustness_control" (reference_df/
+            # reference_calibration_path ARE this same condition's own
+            # output) -- re-scoring it here would just duplicate that row.
+            continue
         cal_path = find_condition_calibration(cond["dir"], component)
         if cal_path is None:
             print(f"  SKIP {cond['dir'].name}: no calibration.json")
@@ -355,15 +456,26 @@ def run_robustness_analysis(
     robustness_output_dir: Optional[str] = None,
     dataset_tsv: Optional[str] = None,
     dataset_configs_path: Optional[str] = None,
+    reference_source: str = "robustness_control",
 ) -> Optional[pd.DataFrame]:
     """Convenience wrapper: load_reference_variants ->
     compute_robustness_confusion_matrices -> robustness_confusion_matrices_to_metrics.
     Returns None (prints a SKIP reason) if reference loading fails or no
-    conditions were found on disk."""
+    conditions were found on disk.
+
+    reference_source defaults to "robustness_control" (base_dataset's own
+    equal-fit-budget "_control" condition, see module docstring's REFERENCE
+    SOURCE section) rather than load_reference_variants's own default of
+    "main_pipeline" -- for this robustness workflow specifically, comparing
+    against a like-for-like control is what we want, not a (typically
+    higher-fit-budget) main-pipeline baseline. Pass "main_pipeline" to opt
+    back into the old behavior.
+    """
     try:
         reference_df, ref_cal_path = load_reference_variants(
             base_dataset, output_dir=output_dir, dataset_tsv=dataset_tsv,
             dataset_configs_path=dataset_configs_path,
+            reference_source=reference_source, robustness_output_dir=robustness_output_dir,
         )
     except FileNotFoundError as e:
         print(f"  SKIP {base_dataset}: {e}")

@@ -248,6 +248,54 @@ def add_thresholds(tauP, tauB, ax):
         ax.axhline(tb,color='blue',linestyle='--',alpha=0.5)
 
 
+def plot_dual_lr_plus_panel(ax, score_range, llr_pathogenic_p5, llr_benign_p95,
+                             prior_pathogenic, prior_benign, point_values):
+    """Extracted from test/plot_pathomechanism_pn.py's plot_lr_plus_panel --
+    the two curves that actually determine point_ranges when
+    pathomechanism_method is active (see
+    fit_utils/fit.py::calculate_score_ranges_dual): the pathogenic-direction
+    5th-percentile curve (log_lr_pathogenic), thresholded against
+    prior_pathogenic (P(Y=1,M=1)), and the benign-direction 95th-percentile
+    curve (log_lr_plus), thresholded against prior_benign (P(Y=1)). These
+    are NOT two percentiles of one curve -- point_ranges is pathogenic_ranges
+    (from log_lr_pathogenic vs. tauP) merged with benign_ranges (from
+    log_lr_plus vs. tauB), each using its own prior's thresholds.
+
+    Deliberately does NOT plot a median curve -- point_ranges/C never depend
+    on a median, only these two conservative percentiles, so a median line
+    here would suggest a significance it doesn't have. Also deliberately
+    does not replicate plot_scoreset_best_config's single-curve insufficient-
+    evidence/non-monotonic dotted-line logic -- point_ranges for the dual
+    scheme come from two independently-thresholded curves, so those crossing
+    heuristics (built for a single shared-threshold curve) don't carry over
+    cleanly; this panel favors showing both curves and thresholds plainly.
+    """
+    from ..fit_utils.fit import thresholds_from_prior
+    lrP, _, C_p = thresholds_from_prior(prior_pathogenic, point_values)
+    _, lrB, C_b = thresholds_from_prior(prior_benign, point_values)
+    tauP, tauB = np.log(lrP), np.log(lrB)
+
+    ax.plot(score_range, llr_pathogenic_p5, color='red',
+            label='Pathogenic (5th %ile of LR_D, vs. P(Y=1,M=1))', linewidth=2)
+    ax.plot(score_range, llr_benign_p95, color='blue',
+            label='Benign (95th %ile of LR_PB, vs. P(Y=1))', linewidth=2)
+
+    step_p = np.log(C_p) / len(point_values)
+    step_b = np.log(C_b) / len(point_values)
+    ylim_top = tauP[-1] + 2 * step_p
+    ylim_bottom = tauB[-1] - 2 * step_b
+
+    ax.set_title(f"Log LR+\npathogenic prior P(Y=1,M=1): {prior_pathogenic:.3f}, C_p: {C_p}\n"
+                 f"benign prior P(Y=1): {prior_benign:.3f}, C_b: {C_b}", fontsize=11)
+    add_thresholds(tauP, tauB, ax)
+    ax.set_xlabel("Score")
+    ax.set_ylabel("Log LR+")
+    ax.legend(fontsize=8, loc='best')
+    ax.set_xlim(score_range[0], score_range[-1])
+    ax.set_ylim([ylim_bottom, ylim_top])
+    ax.grid(linewidth=0.5, alpha=0.3)
+
+
 def plot_initial_vs_final_skew(dataset_name, observations, initial_params, final_params,
                                 initial_weights=None, final_weights=None,
                                 sample_assignments=None, ax=None, annotate_params=True):
@@ -572,6 +620,30 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
             llr_curves = np.asarray(log_lr_pct)
         else:
             llr_curves = np.nanpercentile(np.array(log_lr_plus),[pathogenic_percentile,50,benign_percentile],axis=0)
+
+        # Pathomechanism (--pathomechanism-prior) dual-curve scheme: draw
+        # this sample's Row 2 panel via plot_dual_lr_plus_panel instead of
+        # the single-curve logic below, whenever the calibration actually
+        # has a mechanism-specific curve/prior to show (None for every
+        # non-pathomechanism run, so this is a no-op then). Mirrors the
+        # log_lr_pct override pattern above: prefer a precomputed
+        # [p5,p50,p95] pathogenic-direction array when the caller provides
+        # one (disk-reload path), else re-derive from the raw per-bootstrap
+        # log_lr_pathogenic matrix.
+        pathomechanism_prior = indv_summary.get('pathomechanism_prior')
+        log_lr_pathogenic = indv_summary.get('log_lr_pathogenic')
+        log_lr_pathogenic_pct = indv_summary.get('log_lr_pathogenic_pct')
+        if pathomechanism_prior is not None and (log_lr_pathogenic is not None or log_lr_pathogenic_pct is not None):
+            if log_lr_pathogenic_pct is not None and np.asarray(log_lr_pathogenic_pct).shape[0] == 3:
+                llr_pathogenic_p5 = np.asarray(log_lr_pathogenic_pct)[0]
+            else:
+                llr_pathogenic_p5 = np.nanpercentile(np.array(log_lr_pathogenic), pathogenic_percentile, axis=0)
+            plot_dual_lr_plus_panel(
+                ax_lr, score_range, llr_pathogenic_p5, llr_curves[2],
+                pathomechanism_prior, indv_summary['prior'], point_values_all,
+            )
+            continue
+
         labels = [f'{pathogenic_percentile:g}th percentile','Median',f'{benign_percentile:g}th percentile']
         colors = ['red','black','blue']
 
@@ -1260,19 +1332,6 @@ def plot_scoreset_calibration_comparison(dataset, scoreset, indv_summary, fits, 
     
     return fig
 
-def flatten_point_ranges(point_ranges):
-    """Flatten 2D arrays in point_ranges to 1D, asserting only one or zero arrays."""
-    flattened = {}
-    for key, ranges in point_ranges.items():
-        if len(ranges) == 0:
-            flattened[key] = []
-        elif len(ranges) == 1:
-            assert len(ranges[0]) == 2, f"Expected 2 values in range for key {key}, got {ranges[0]}"
-            flattened[key] = ranges[0]
-        else:
-            raise AssertionError(f"Expected 0 or 1 range for key {key}, got {len(ranges)}")
-    return flattened
-
 def create_variant_id_spdi(entry):
     """Create variant ID in SPDI format: Chrom:Position:Reference:Alternate."""
     chrom = entry.get("Chrom")
@@ -1293,21 +1352,24 @@ def create_variant_id_spdi(entry):
     return f"{chrom}:{pos}:{ref}:{alt}"
 
 def assign_points(assay_score, point_ranges):
-    """Assign points based on which range the assay_score falls into."""
+    """Assign points based on which sub-range the assay_score falls into.
+
+    `point_ranges` is the raw {key: [[lo, hi], ...]} structure -- a point
+    value may have zero, one, or multiple disjoint sub-ranges (e.g. from
+    bidirectional postprocessing), so every sub-range is checked directly
+    rather than pre-flattening to a single bounding interval.
+    """
     if assay_score is None or pd.isna(assay_score):
         return None
-    
-    matched_points = []
-    for point_str, range_vals in point_ranges.items():
-        if len(range_vals) == 2:
-            low, high = range_vals
+
+    for point_str, ranges in point_ranges.items():
+        if not ranges:
+            continue
+        subranges = ranges if isinstance(ranges[0], (list, tuple)) else [ranges]
+        for low, high in subranges:
             if low <= assay_score <= high:
-                matched_points.append(int(point_str))
-    
-    # Assert only one or no ranges matched
-    assert len(matched_points) <= 1, f"Score {assay_score} matched multiple ranges: {matched_points}, point ranges: {point_ranges}"
-    
-    return matched_points[0] if matched_points else 0
+                return int(point_str)
+    return 0
 
 def is_empty(value):
     """Check if value is None, NaN, or empty string"""
@@ -1333,7 +1395,7 @@ def calculate_confusion_mat(dataset, scoreset, calibration_f, verbose=True):#, i
         raise ValueError(f"  ERROR: Dataset was uncalibratable {calibration_f}")
         return None, None
     
-    point_ranges = flatten_point_ranges(calibration_data["point_ranges"])
+    point_ranges = calibration_data["point_ranges"]
     
     # Assume first two samples are P/LP and B/LB
     plp_scores = scoreset.scores[scoreset.sample_assignments[:, 0]]
@@ -4275,7 +4337,7 @@ def load_all_variant_assignments(dataset_names, dataset_configs, keep_old_list, 
                     print(f"  {dataset}: uncalibratable, skipping")
                 continue
             
-            point_ranges = flatten_point_ranges(calibration_data["point_ranges"])
+            point_ranges = calibration_data["point_ranges"]
             
             # Load scoreset
             genes_2018 = ["BRCA1", "MSH2", "PTEN", "TP53"]
@@ -4424,7 +4486,7 @@ def _process_single_dataset_assignments(dataset, dataset_configs, keep_old_list,
         if calibration_data["point_ranges"] is None:
             return sort_idx, None
         
-        point_ranges = flatten_point_ranges(calibration_data["point_ranges"])
+        point_ranges = calibration_data["point_ranges"]
         
         # Get OOB dict
         genes_2018 = ["BRCA1", "MSH2", "PTEN", "TP53"]
@@ -5373,8 +5435,6 @@ def insert_evidence_into_dataframe(
         Dataset configuration dictionary
     assign_points : callable
         Function to assign points based on score and point_ranges
-    flatten_point_ranges : callable
-        Function to flatten point_ranges dictionary
     internal_dataset_aliases : dict, optional
         Mapping of dataset names to aliases
     calibration_dir : str or Path
@@ -5445,7 +5505,7 @@ def insert_evidence_into_dataframe(
                 print(f"  Skipping {dataset_name} - no point_ranges in calibration")
             continue
         
-        point_ranges = flatten_point_ranges(calibration_data["point_ranges"])
+        point_ranges = calibration_data["point_ranges"]
         
         # Get OOB dict for this dataset
         genes_2018 = ["BRCA1", "MSH2", "PTEN", "TP53"]

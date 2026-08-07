@@ -9,6 +9,10 @@ Detection is automatic based on Delta shape in component params.
 All evidence points displayed come directly from analysis.results[config]['points'].
 """
 
+import hashlib
+import os
+import pickle
+
 import numpy as np
 import pandas as pd
 import warnings
@@ -22,7 +26,7 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal as mvn, norm
 from scipy.ndimage import uniform_filter1d
 from joblib import Parallel, delayed
-from src.assay_calibration.fit_utils.cfusn.density_utils import get_q
+from ..fit_utils.cfusn.density_utils import get_q
 
 
 # ──────────────────────────────────────
@@ -214,9 +218,11 @@ def _reconstitute_fit_dict(fit_raw):
             Delta = Delta.ravel()
         params.append((mu, Delta, Gamma))
     weights = np.array(inner['weights'], dtype=float)
+    val_ll = fit_raw.get('val_ll')
     return {'component_params': params, 'weights': weights,
             'xlims': inner.get('xlims'),
-            'latent_q': inner.get('latent_q', get_q(params))}
+            'latent_q': inner.get('latent_q', get_q(params)),
+            'val_ll': val_ll if val_ll is not None else -np.inf}
 
 
 def _collect_valid_fits(analysis, config):
@@ -895,17 +901,27 @@ def _compute_all_marginals(analysis, config, x_grids, p_idx_override=None):
     return marginal_data
 
 
-def _aggregate_marginal_dim(dim_results, x_grid, path_pctile, ben_pctile, S):
-    """Aggregate per-bootstrap marginal results for one dim into a marginal_data dict."""
+def _aggregate_marginal_dim(dim_results, x_grid, path_pctile, ben_pctile, S,
+                            best_fit_idx=None):
+    """Aggregate per-bootstrap marginal results for one dim into a marginal_data dict.
+
+    best_fit_idx : index into dim_results of the single highest-val_ll bootstrap
+        fit. Component curves ('components') are taken directly from that one
+        fit rather than averaged across all bootstraps -- component identity
+        isn't consistent across bootstrap replicates (mixture-model label
+        switching: EM's component ordering is arbitrary per fit, and the
+        init-time sort by dim-0's location only canonicalizes ordering along
+        that one axis), so positionally averaging "component c" across
+        bootstraps blends together curves that may not correspond to the same
+        underlying cluster, washing them into near-identical, uninformative
+        shapes. A single fit's components are internally consistent by
+        construction (no cross-fit identity problem), at the cost of not
+        showing bootstrap uncertainty on the individual component curves --
+        the aggregate ('sample') mixture density is unaffected and is still
+        averaged across every bootstrap as before.
+    """
     lr_list = [r[0] for r in dim_results]
     sample_logs    = {s: [r[1][s] for r in dim_results if r[1][s] is not None] for s in range(S)}
-    component_logs = {s: {} for s in range(S)}
-    for r in dim_results:
-        for s in range(S):
-            if r[2][s] is None:
-                continue
-            for c, clog in enumerate(r[2][s]):
-                component_logs[s].setdefault(c, []).append(clog)
 
     lr_arr = np.array(lr_list)
     lr_percentiles = {
@@ -924,15 +940,30 @@ def _aggregate_marginal_dim(dim_results, x_grid, path_pctile, ben_pctile, S):
         sample_marginals[s] = {'mean': np.exp(mean_log), 'std': np.std(np.exp(arr), axis=0)}
 
     component_marginals = {}
-    for s in range(S):
-        if not component_logs[s]:
-            component_marginals[s] = None
-            continue
-        component_marginals[s] = []
-        for c in range(len(component_logs[s])):
-            arr = np.array(component_logs[s][c])
-            mean_log = logsumexp(arr, axis=0) - np.log(arr.shape[0])
-            component_marginals[s].append({'mean': np.exp(mean_log)})
+    if best_fit_idx is not None and 0 <= best_fit_idx < len(dim_results):
+        best_comp_logs = dim_results[best_fit_idx][2]
+        for s in range(S):
+            if best_comp_logs[s] is None:
+                component_marginals[s] = None
+                continue
+            component_marginals[s] = [{'mean': np.exp(clog)} for clog in best_comp_logs[s]]
+    else:
+        component_logs = {s: {} for s in range(S)}
+        for r in dim_results:
+            for s in range(S):
+                if r[2][s] is None:
+                    continue
+                for c, clog in enumerate(r[2][s]):
+                    component_logs[s].setdefault(c, []).append(clog)
+        for s in range(S):
+            if not component_logs[s]:
+                component_marginals[s] = None
+                continue
+            component_marginals[s] = []
+            for c in range(len(component_logs[s])):
+                arr = np.array(component_logs[s][c])
+                mean_log = logsumexp(arr, axis=0) - np.log(arr.shape[0])
+                component_marginals[s].append({'mean': np.exp(mean_log)})
 
     return {'x': x_grid, 'lr': lr_percentiles,
             'sample': sample_marginals, 'components': component_marginals,
@@ -973,11 +1004,19 @@ def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
     )
     # all_results[boot][pi][dim] = (lr_1d, sample_logs, comp_logs)
 
+    # Component curves come from a single highest-val_ll bootstrap fit, not
+    # an average across all of them -- see _aggregate_marginal_dim's
+    # best_fit_idx docstring for why (mixture-model label switching makes
+    # positional cross-bootstrap averaging of components meaningless).
+    val_lls = [f.get('val_ll', -np.inf) for f in all_fits]
+    best_fit_idx = int(np.nanargmax(val_lls)) if any(np.isfinite(v) for v in val_lls) else 0
+
     return [
         [
             _aggregate_marginal_dim(
                 [all_results[b][pi][dim] for b in range(n_used)],
                 x_grids[dim], path_pctile, ben_pctile, S,
+                best_fit_idx=best_fit_idx,
             )
             for dim in range(D)
         ]
@@ -1270,7 +1309,7 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
                 sys.modules['importlib.metadata'] = _meta
             import umap as umap_lib
 
-            from src.assay_calibration.data_utils.dataset import BasicMultiScoreset
+            from ..data_utils.dataset import BasicMultiScoreset
 
             if isinstance(ms, BasicMultiScoreset):
                 # BasicMultiScoreset already exposes the full score matrix as
@@ -1400,6 +1439,64 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
         'n_grid':                       n_grid,
         'pad':                          pad,
     }
+
+
+def precompute_mv_plot_data_cached(analysis, config, cache_dir, n_grid=120, pad=0.5,
+                                   n_jobs=-1, projection='umap',
+                                   pivot_dim='activity_No_treatment',
+                                   force_recompute=False):
+    """Cached wrapper around precompute_mv_plot_data.
+
+    This is the expensive step (per-dimension bootstrap marginal sweeps,
+    pairwise/LR+ grids, sample density grids) -- caching it means replotting
+    after tweaking render_mv_plot_data's aesthetics (figsize, contour
+    levels, colors, ...) doesn't require rerunning any of the underlying
+    bootstrap computation. Cache key covers every parameter that affects
+    the result, including the config's percentiles/latent_q/n_valid (so a
+    differently-run analysis -- e.g. a different partial_pattern_mode --
+    doesn't reuse another mode's stale cache entry) plus n_grid/pad/
+    projection/pivot_dim.
+
+    The returned dict's ``'analysis'`` entry is never pickled (it embeds
+    the whole MultiScoreset + all configs' results, which is both large and
+    already available at the call site) -- it's stripped before caching and
+    re-injected as the live ``analysis`` object on every call, cached or not.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    gene = getattr(analysis.ms, 'scoreset_name', 'gene')
+    r = analysis.results.get(config, {}) or {}
+    key_material = repr({
+        'gene': gene,
+        'config': config,
+        'n_grid': n_grid,
+        'pad': pad,
+        'projection': projection,
+        'pivot_dim': pivot_dim,
+        'path_percentile': r.get('path_percentile'),
+        'ben_percentile': r.get('ben_percentile'),
+        'latent_q': r.get('latent_q'),
+        'n_valid': r.get('n_valid'),
+        'median_prior': r.get('median_prior'),
+    })
+    key = hashlib.sha1(key_material.encode()).hexdigest()[:16]
+    cache_path = os.path.join(cache_dir, f"{gene}_{config}_precomp_{key}.pkl")
+
+    if not force_recompute and os.path.exists(cache_path):
+        print(f"  Loading cached precomputed plot data: {cache_path}")
+        with open(cache_path, "rb") as f:
+            cached = pickle.load(f)
+        cached['analysis'] = analysis
+        return cached
+
+    precomputed = precompute_mv_plot_data(
+        analysis, config, n_grid=n_grid, pad=pad, n_jobs=n_jobs,
+        projection=projection, pivot_dim=pivot_dim,
+    )
+    to_cache = {k: v for k, v in precomputed.items() if k != 'analysis'}
+    with open(cache_path, "wb") as f:
+        pickle.dump(to_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"  Cached precomputed plot data: {cache_path}")
+    return precomputed
 
 
 def render_mv_plot_data(precomputed, figsize=None, contour_levels=6,
@@ -1542,6 +1639,117 @@ def plot_mv_calibration(analysis, config, figsize=None, n_grid=120,
                                contour_levels=contour_levels,
                                first_row_only=first_row_only,
                                max_lr_pairs=max_lr_pairs)
+
+
+def plot_component_densities(precomputed, sample_names=None, sample_style=None,
+                             ncols=4, figsize=None):
+    """Standalone per-dimension figures of each sample's fitted mixture density.
+
+    For each observed dimension, returns one figure with S subplots (one per
+    sample) showing that sample's fitted total mixture density (solid) and
+    each component's individual density (dashed), overlaid on its observed-
+    score histogram. Reuses ``precomputed['marginal_data']`` -- the same
+    per-dimension density curves already computed for the composite
+    mv_calibration plot's marginal rows -- so nothing is recomputed here;
+    this only draws them as separate figures instead of embedding them.
+
+    Returns
+    -------
+    {dim: (fig, axes)}
+    """
+    analysis = precomputed['analysis']
+    config = precomputed['config']
+    n_boots_used = precomputed.get('n_boots_used', '?')
+    ms = analysis.ms
+    scores = ms.scores
+    sa = ms.sample_assignments
+    N, D = scores.shape
+    S = sa.shape[1]
+    dataset_names = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
+    marginal_data = precomputed['marginal_data']
+    gene = getattr(ms, 'scoreset_name', '')
+
+    if sample_names is None:
+        _sn_raw = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+        sample_names = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}' for i in range(S)]
+    _sc = sample_style['colors'] if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
+
+    figs = {}
+    for dim in range(D):
+        md = marginal_data.get(dim)
+        if md is None:
+            continue
+        x_marg = md['x']
+        nc = min(S, ncols)
+        nr = int(np.ceil(S / nc))
+        fig, axes = plt.subplots(nr, nc, figsize=figsize or (4.2 * nc, 3.2 * nr), squeeze=False)
+
+        for s_idx in range(S):
+            ax = axes[s_idx // nc][s_idx % nc]
+            color = _sc[s_idx]
+
+            obs = scores[sa[:, s_idx], dim]
+            obs = obs[~np.isnan(obs)]
+            # Scale the y-axis off the observed histogram, not the fitted
+            # curve -- a component fit to a handful of points can have an
+            # arbitrarily tall, narrow peak that would otherwise swamp the
+            # axis and flatten the histogram to invisibility. The histogram
+            # itself must also be binned over the *shared* x-range (not its
+            # own min/max) -- otherwise a small, tightly-clustered sample
+            # (e.g. CARD11's n=6 BENTA) gets ultra-narrow auto-ranged bins
+            # that spike to an equally insane height.
+            hist_range = (x_marg[0], x_marg[-1])
+            hist_ymax = None
+            if len(obs) > 0:
+                bin_counts, _ = np.histogram(obs, bins=40, range=hist_range, density=True)
+                hist_ymax = bin_counts.max() if len(bin_counts) else None
+                ax.hist(obs, bins=40, range=hist_range, density=True, alpha=0.2, color=color,
+                        edgecolor='white', linewidth=0.3)
+
+            s_data = md['sample'][s_idx] if md['sample'] is not None else None
+            curve_ymax = None
+            if s_data is not None:
+                total_mean = s_data['mean']
+                total_std = s_data['std']
+                curve_ymax = float(np.nanmax(total_mean)) if len(total_mean) else None
+                ax.plot(x_marg, total_mean, color=color, lw=1.8, zorder=3, label='Mixture')
+                ax.fill_between(x_marg, np.maximum(total_mean - total_std, 0),
+                                total_mean + total_std, color=color, alpha=0.1)
+                c_data = md['components'][s_idx] if md['components'] is not None else None
+                if c_data is not None:
+                    n_comp = len(c_data)
+                    comp_colors = plt.cm.Set2(np.linspace(0, 1, max(n_comp, 3)))
+                    for c in range(n_comp):
+                        c_mean = c_data[c]['mean']
+                        if c_mean.max() < total_mean.max() * 0.005:
+                            continue
+                        ax.plot(x_marg, c_mean, color=comp_colors[c], lw=1.1, ls='--',
+                                alpha=0.8, label=f'Component {c + 1}')
+
+            if hist_ymax is not None and hist_ymax > 0:
+                ax.set_ylim(0, hist_ymax * 1.25)
+            elif curve_ymax is not None and curve_ymax > 0:
+                ax.set_ylim(0, curve_ymax * 1.15)
+
+            n_s = int(sa[:, s_idx].sum())
+            ax.set_title(f'{sample_names[s_idx]} (n={n_s})', fontsize=9,
+                        fontweight='bold', color=color)
+            ax.set_xlabel(dataset_names[dim], fontsize=8)
+            ax.set_ylabel('Density', fontsize=8)
+            ax.legend(fontsize=6, framealpha=0.6)
+            ax.grid(lw=0.2, alpha=0.2)
+
+        for j in range(S, nr * nc):
+            axes[j // nc][j % nc].axis('off')
+
+        fig.suptitle(f'{gene} — {dataset_names[dim]} component densities ({config})\n'
+                    f'Mixture: averaged over {n_boots_used} bootstraps. '
+                    f'Components: single best-fit bootstrap (val_ll-selected).',
+                    fontsize=11, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        figs[dim] = (fig, axes)
+
+    return figs
 
 
 def plot_variant_evidence_heatmap(precomputed, sample_idx=0,
@@ -1973,6 +2181,7 @@ def plot_rpv_quadrant(precomputed, fixed_idx=None,
                       xlim=None,
                       ylim=None,
                       sample_names=None,
+                      class_label=None,
                       gvsr=None,
                       gvsr_log=True,
                       figsize=None, ax=None):
@@ -1980,9 +2189,9 @@ def plot_rpv_quadrant(precomputed, fixed_idx=None,
 
     Quadrant interpretation
     -----------------------
-    top-right    (aux_vs_B > 0, aux_vs_P ≈ 0 / positive)  → true RPV, reduced penetrance
+    top-right    (aux_vs_B > 0, aux_vs_P ≈ 0 / positive)  → true low-penetrance signal
     bottom-right (aux_vs_B > 0, aux_vs_P << 0)            → PLP-like, high penetrance
-    left         (aux_vs_B ≤ 0)                           → benign-like, no RPV signal
+    left         (aux_vs_B ≤ 0)                           → benign-like, no low-pen signal
 
     Parameters
     ----------
@@ -1992,9 +2201,13 @@ def plot_rpv_quadrant(precomputed, fixed_idx=None,
     samples        : list of raw sample indices to include; None = all
     label_variants : list of variant IDs to annotate
     tau_lines      : draw Tavtigian threshold lines on both axes
-    show_classes   : shade classification regions (low_pen_rpv / plp_like / benign_like)
+    show_classes   : shade classification regions (low_pen / plp_like / benign_like)
                      using the first Tavtigian threshold on each axis as the boundary
     pad            : fractional padding around the data range for axis limits
+    class_label    : name of the aux sample's class used in titles/legend text
+                     (e.g. 'BENTA', 'CADINS'); defaults to the aux sample's own
+                     name from ``ms.sample_names`` -- 'RPV' is only the
+                     historical TP53-specific name, not universal.
     gvsr           : pd.Series or dict mapping variant ID → GVSr value.
                      When provided, only aux-sample (fixed_idx) variants with a
                      GVSr value are plotted; color encodes GVSr magnitude.
@@ -2154,7 +2367,7 @@ def plot_rpv_quadrant(precomputed, fixed_idx=None,
             color='#2c7bb6', alpha=0.07, zorder=0, linewidth=0))
 
         _class_legend_patches = [
-            mpatches.Patch(color='#3cb371', alpha=0.5, label='low-pen RPV'),
+            mpatches.Patch(color='#3cb371', alpha=0.5, label=f'low-pen {class_label or "aux"}'),
             mpatches.Patch(color='#e05c00', alpha=0.5, label='PLP-like'),
             mpatches.Patch(color='#2c7bb6', alpha=0.5, label='benign-like'),
         ]
@@ -2178,17 +2391,19 @@ def plot_rpv_quadrant(precomputed, fixed_idx=None,
         ax.text(fx, fy, text, ha=ha, va=va, fontsize=7, color='#333333',
                 fontstyle='italic', alpha=0.70, transform=ax.transAxes)
 
-    _qlabel(0.52, 0.97, 'RPV\n(reduced pen.)',  ha='left',  va='top')
+    aux_name = (_sn_raw[fixed_idx] if fixed_idx < len(_sn_raw) else f'Sample {fixed_idx}')
+    _class_label = class_label or aux_name
+
+    _qlabel(0.52, 0.97, f'{_class_label}\n(reduced pen.)', ha='left',  va='top')
     _qlabel(0.52, 0.03, 'PLP-like\n(high pen.)', ha='left', va='bottom')
     _qlabel(0.02, 0.97, 'benign-like',           ha='left',  va='top')
 
     # ── Labels ────────────────────────────────────────────────────────────
-    aux_name = (_sn_raw[fixed_idx] if fixed_idx < len(_sn_raw) else f'Sample {fixed_idx}')
     p_name   = (_sn_raw[analysis.p_idx] if analysis.p_idx is not None
                 and analysis.p_idx < len(_sn_raw) else 'P/LP')
     ax.set_xlabel(f'log LR⁺  {aux_name} vs B  ({pctile})', fontsize=9)
     ax.set_ylabel(f'log LR⁺  {aux_name} vs {p_name}  ({pctile})', fontsize=9)
-    ax.set_title(f'RPV quadrant — {aux_name}', fontsize=10)
+    ax.set_title(f'{_class_label} quadrant — {aux_name}', fontsize=10)
 
     if label_variants:
         for vid in label_variants:
@@ -2494,10 +2709,29 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
         ax = fig.add_subplot(gs[row, s_idx])
         color = _sc[s_idx]
 
+        obs = scores[sa[:, s_idx], dim]
+        obs = obs[~np.isnan(obs)]
+        # Scale the y-axis off the observed histogram, not the fitted curve
+        # -- a component fit to a handful of points can have an arbitrarily
+        # tall, narrow peak that would otherwise swamp the axis and flatten
+        # the histogram to invisibility. The histogram itself must also be
+        # binned over the *shared* x-range (not its own min/max) -- otherwise
+        # a small, tightly-clustered sample gets ultra-narrow auto-ranged
+        # bins that spike to an equally insane height.
+        hist_range = (x_marg[0], x_marg[-1])
+        hist_ymax = None
+        if len(obs) > 0:
+            bin_counts, _ = np.histogram(obs, bins=40, range=hist_range, density=True)
+            hist_ymax = bin_counts.max() if len(bin_counts) else None
+            ax.hist(obs, bins=40, range=hist_range, density=True, alpha=0.2, color=color,
+                    edgecolor='white', linewidth=0.3)
+
         s_data = md['sample'][s_idx] if md['sample'] is not None else None
+        curve_ymax = None
         if s_data is not None:
             total_mean = s_data['mean']
             total_std  = s_data['std']
+            curve_ymax = float(np.nanmax(total_mean)) if len(total_mean) else None
             ax.plot(x_marg, total_mean, color=color, lw=1.5, zorder=3)
             ax.fill_between(x_marg,
                             np.maximum(total_mean - total_std, 0),
@@ -2512,11 +2746,10 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
                         continue
                     ax.plot(x_marg, c_mean, color=comp_colors[c], lw=0.8, ls='--', alpha=0.7)
 
-        obs = scores[sa[:, s_idx], dim]
-        obs = obs[~np.isnan(obs)]
-        if len(obs) > 0:
-            ax.hist(obs, bins=40, density=True, alpha=0.2, color=color,
-                    edgecolor='white', linewidth=0.3)
+        if hist_ymax is not None and hist_ymax > 0:
+            ax.set_ylim(0, hist_ymax * 1.25)
+        elif curve_ymax is not None and curve_ymax > 0:
+            ax.set_ylim(0, curve_ymax * 1.15)
 
         n_s_dim = (~np.isnan(scores[sa[:, s_idx], dim])).sum()
         ax.set_xlabel(dataset_names[dim], fontsize=7)

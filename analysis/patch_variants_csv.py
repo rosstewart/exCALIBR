@@ -182,7 +182,7 @@ def main():
         variant_csvs = sorted(ds_dir.glob(f"{dataset}_*_variants.csv"))
         if not variant_csvs:
             continue
-        clinvar_release = "2018" if dataset.endswith("_clinvar_2018") else "2026"
+        clinvar_release = "2018" if dataset.endswith("_clinvar_2018") else "2025"
         try:
             sample_map, auth_label_map, is_vus_map = build_patch_maps(dataset, source_dfs, clinvar_release)
         except Exception as e:

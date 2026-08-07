@@ -32,7 +32,7 @@ compute_gene_uv_agg(ms, gene, uv_calib_dir=DEFAULT_UV_CALIB_DIR)
 
 build_agg_uv_comparison(gene_ms, mv_points_by_gene, uv_calib_dir=DEFAULT_UV_CALIB_DIR)
     -> agg dict keyed by method ('MV', 'UV non-conflicting', 'UV max'),
-       usable directly with mv_eval_plot_utils.plot_confusion_matrices /
+       usable directly with eval_plot_utils.plot_confusion_matrices /
        print_latex_table.
 """
 
@@ -42,7 +42,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from mv_eval_plot_utils import _accumulate_into
+from .eval_plot_utils import _accumulate_into
 
 DEFAULT_UV_CALIB_DIR = "/data/ross/assay_calibration/labelseq_uv_calib"
 
@@ -263,7 +263,7 @@ def build_agg_uv_comparison(gene_ms, mv_points_by_gene, df_labelseq,
     Returns
     -------
     agg : defaultdict keyed by method string, compatible with
-        mv_eval_plot_utils.plot_confusion_matrices / print_latex_table.
+        eval_plot_utils.plot_confusion_matrices / print_latex_table.
     """
     from collections import defaultdict
     agg = defaultdict(lambda: defaultdict(int))

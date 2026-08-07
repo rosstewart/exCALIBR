@@ -143,7 +143,7 @@ def load_scoreset_and_fits(
     controls which on-disk pipeline output (calibration/LR/fits) is loaded —
     pass this separately when the two diverge, e.g. genes that were only ever
     run through the pipeline under their "_clinvar_2018" name (BRCA1/MSH2/
-    PTEN/TP53) but where you want a Scoreset built with clinvar_release="2026"
+    PTEN/TP53) but where you want a Scoreset built with clinvar_release="2025"
     for a "current ClinVar" panel reusing that same fit.
 
     Returns
@@ -205,7 +205,7 @@ def load_scoreset_and_fits(
     df_ds["Dataset"] = dataset
 
     if clinvar_release is None:
-        clinvar_release = "2018" if "_clinvar_2018" in dataset else "2026"
+        clinvar_release = "2018" if "_clinvar_2018" in dataset else "2025"
     pcfg = PipelineConfig(
         dataset_csv=str(dataset_tsv),
         dataset_name=dataset,

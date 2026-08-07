@@ -8,7 +8,7 @@
     "benign_method": "avg"
   },
   "BAP1_Waters_2024": {
-    "n_c": "2c",
+    "n_c": "3c",
     "benign_method": "avg"
   },
   "BARD1_IGVF": {
@@ -101,8 +101,7 @@
   },
   "DDX3X_Radford_2023": {
     "n_c": "3c",
-    "benign_method": "avg",
-    "liberal_monotonicity": false
+    "benign_method": "benign"
   },
   "F9_Popp_2025_carboxy_F9_specific": {
     "n_c": "3c",
@@ -111,7 +110,8 @@
   },
   "F9_Popp_2025_carboxy_gla_motif": {
     "n_c": "2c",
-    "benign_method": "avg"
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "F9_Popp_2025_heavy_chain": {
     "n_c": "2c",
@@ -120,7 +120,8 @@
   },
   "F9_Popp_2025_light_chain": {
     "n_c": "2c",
-    "benign_method": "avg"
+    "benign_method": "avg",
+    "liberal_monotonicity": false
   },
   "F9_Popp_2025_strep_2": {
     "n_c": "3c",
@@ -185,7 +186,7 @@
     "benign_method": "avg"
   },
   "KCNQ4_Zheng_2022_current_homozygous": {
-    "n_c": "2c",
+    "n_c": "3c",
     "benign_method": "avg"
   },
   "KCNQ4_Zheng_2022_v12_homozygous": {
@@ -196,12 +197,17 @@
     "n_c": "3c",
     "benign_method": "avg"
   },
-  "LDLR_Tabet_2025_LDLR_cell_surface_abundance": {
+  "LDLR_Tabet_2025_abundance": {
     "n_c": "3c",
     "benign_method": "avg"
   },
-  "LDLR_Tabet_2025_LDL_uptake": {
+  "LDLR_Tabet_2025_uptake": {
     "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": false
+  },
+  "LDLR_Tabet_2025_presence_VLDL": {
+    "n_c": "2c",
     "benign_method": "avg",
     "liberal_monotonicity": false
   },
@@ -215,11 +221,14 @@
   },
   "OTC_Lo_2023": {
     "n_c": "3c",
-    "benign_method": "avg",
-    "liberal_monotonicity": false
+    "benign_method": "avg"
   },
   "PALB2_Boonen_2026": {
     "n_c": "3c",
+    "benign_method": "avg"
+  },
+  "PALB2_Boonen_2026_SGE": {
+    "n_c": "2c",
     "benign_method": "avg"
   },
   "PALB2_IGVF": {

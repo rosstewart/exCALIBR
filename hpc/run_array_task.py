@@ -35,6 +35,12 @@ from pathlib import Path
 
 import numpy as np
 
+# Force line-buffered stdout/stderr so progress messages show up promptly in
+# SLURM's array_<JOB>_<TASK>.out logs instead of sitting in Python's default
+# block-buffer (used whenever stdout isn't a TTY) until the process exits.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # Allow running from any directory as long as the repo root is on the path.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -176,7 +182,7 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
         val_ll = (result.get("val_ll", -np.inf) if result else -np.inf)
         sort_key = (val_ll, -(fit_idx if fit_idx is not None else 0))
         key = (bs_seed, label, save_dir)
-        if sort_key > best.get(key, (-np.inf, None, None))[:2]:
+        if sort_key > best.get(key, (-np.inf, -np.inf, None))[:2]:
             best[key] = (val_ll, -(fit_idx if fit_idx is not None else 0), result)
 
         if result and result.get("hit_cap", False):

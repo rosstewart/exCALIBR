@@ -62,7 +62,7 @@ def _process_dataset(
         acmgscaler_variants_path,
     )
 
-    clinvar_release = "2018" if not no_clinvar_2018 and _gene_of(dataset) in GENES_2018 else "2026"
+    clinvar_release = "2018" if not no_clinvar_2018 and _gene_of(dataset) in GENES_2018 else "2025"
     effective_name = dataset if clinvar_release != "2018" else f"{dataset}_clinvar_2018"
     df_ds = df_ds.copy()
     df_ds["Dataset"] = effective_name

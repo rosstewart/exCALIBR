@@ -296,9 +296,10 @@ def load_comparison_variants(dataset: str, comp: str, output_dir) -> Optional[pd
     ExCALIBR's own pipeline output -- {output_dir}/{dataset}/{dataset}_{comp}_variants.csv
     -- with the same sample/standard_points columns, so
     analysis.confusion.build_confusion_matrix works on the result completely
-    unchanged. Used for the GMM baseline (comp="plp_blb"/"plp_blb_synon",
-    see analysis.config.GMM_BASELINE_VARIANTS) and would work identically for
-    any future comparison method saved in this same shape.
+    unchanged. Used for the GMM baseline (comp="plp_blb"/"plp_blb_synon"/
+    "all_plp_blb"/"all_plp_blb_synon", see analysis.config.GMM_BASELINE_VARIANTS)
+    and would work identically for any future comparison method saved in this
+    same shape.
 
     Returns None if no such file exists (e.g. that dataset/comp combo was
     skipped -- too few controls, same as ExCALIBR's own calibration would be).

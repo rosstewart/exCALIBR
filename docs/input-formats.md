@@ -16,7 +16,7 @@ score,sample_assignments
 
 - `score` — per-variant numeric score (direction auto-detected).
 - `sample_assignments` — integer (`0`,`1`,`2`,`3`,...) or comma-separated for multi-group rows (e.g. `"1,2"`). Convention: `0`=Pathogenic/LP, `1`=Benign/LB, `2`=gnomAD/population, `3`=Synonymous. Unlabeled/out-of-range rows are treated as VUS (still scored, don't inform the fit). Override with `--sample-names`.
-- Requires at least Pathogenic + (Benign or Synonymous).
+- `gnomAD`/population is **always required**, in every mode. Beyond that, requires at least Pathogenic OR (Benign or Synonymous) — see [PN/PU/NU modes](#pnpunu-modes-missing-class-inference) below for what changes when only one of Pathogenic/Benign is available.
 
 ```bash
 python run_pipeline.py \
@@ -43,6 +43,22 @@ Sample groups are derived automatically (not assigned by hand) from:
 - `Flag` — rows with `Flag == "*"` are dropped.
 
 Requires Benign or Synonymous after filtering. All other columns are optional context for specific downstream features.
+
+### PN/PU/NU modes (missing-class inference)
+
+Examples: `example/brca_findlay_PU_example.csv`, `example/brca_findlay_NU_example.csv`.
+
+Which mode a dataset runs in is determined automatically by which control samples survive filtering — gnomAD/population is required in every mode; only Pathogenic/LP and Benign/LB (or Synonymous) are optional (at least one of the two is required):
+
+- **PN** (standard): both Pathogenic/LP and Benign/LB (or Synonymous) present. Prior and evidence come from a joint EM fit between the two labeled classes directly.
+- **PU** (positive-unlabeled): only Pathogenic/LP present, no Benign/LB or Synonymous. The real pathogenic density is used as-is; the missing benign-direction density is instead *reconstructed* by unmixing gnomAD/population against it (see below) — gnomAD isn't compared against directly, it's the raw material used to recover an artificial benign density.
+- **NU** (negative-unlabeled): only Benign/LB (or Synonymous) present, no Pathogenic/LP. Mirrors PU: the real benign/synonymous density is used as-is; the missing pathogenic-direction density is reconstructed by unmixing gnomAD against it.
+
+**Unmixing.** Both directions rely on the same idea (`compute_single_fit_log_densities`, `fit_utils/point_ranges.py`): gnomAD/population is modeled as a `prior`-weighted mixture of the pathogenic and benign densities, `f_pop = prior * f_pathogenic + (1 - prior) * f_benign`. Whichever side is actually labeled is plugged in directly; the missing side is solved for algebraically from that equation (e.g. in NU mode, `f_pathogenic = (f_pop - (1 - prior) * f_benign) / prior`) — an artificial density standing in for the missing class, built from gnomAD plus the real labeled density, not from gnomAD alone.
+
+**NU evidence direction.** Evidence (LR+) is still computed as usual — real benign/synonymous density vs. the reconstructed artificial pathogenic density — so functional-abnormality evidence in NU mode is measured *relative to the Benign/LB or Synonymous sample*, not relative to gnomAD itself; gnomAD only supplies the population mixture the artificial pathogenic density is unmixed out of. Because that artificial density was never directly observed in a labeled pathogenic sample, pathogenic-direction evidence in NU mode should be read as *functional abnormality*, not as evidence of clinical pathogenicity — nothing in NU mode establishes that assay abnormality in that direction is disease-relevant; that link has to come from outside knowledge of the assay/gene, not from the calibration itself.
+
+**Non-overlap assumption.** The scalar prior that both the Bayes-factor thresholds and the unmixing formula above depend on is itself estimated with a mixture-proportion ("unmixing") boundary estimator (Blanchard, Lee & Scott 2010; Scott 2015 — `estimate_prior_from_class_densities` in `fit_utils/point_ranges.py`): `f_pop(x) = alpha * f_labeled(x) + (1 - alpha) * f_missing(x)`, and the tightest recoverable `alpha` is `inf_x [f_pop(x) / f_labeled(x)]`. This only recovers the *true* prior — rather than a biased underestimate — if some region of score space has (near-)zero density under the missing class, i.e. the missing class's distribution doesn't fully overlap with the labeled class's. A biased prior here doesn't just skew the Bayes-factor thresholds — it's plugged directly into the unmixing formula above, so it also distorts the reconstructed artificial density itself.
 
 ### 3. MaveDB format
 

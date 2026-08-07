@@ -462,7 +462,7 @@ class Scoreset:
             output_path.parent.mkdir(parents=True, exist_ok=True)
         self.dataframe.to_json(output_path, orient="records", lines=True)
 
-    def to_csv(self, output_path: Union[Path, str]):
+    def to_csv(self, output_path: Union[Path, str], **kwargs):
         """
         Save the scoreset to a simple output CSV.
 
@@ -485,9 +485,10 @@ class Scoreset:
             for i in range(self.sample_assignments.shape[0])
         ]
 
-        output_df = pd.DataFrame({"score": self.scores, "sample": sample_assignments_str})
+        output_df = pd.DataFrame({"score": self.scores, "sample_assignments": sample_assignments_str})
+        compression = kwargs.get("compression", None)
         
-        output_df.to_csv(output_path, index=False)
+        output_df.to_csv(output_path, index=False, compression=compression)
 
     @classmethod
     def from_dataframe(cls, dataframe: pd.DataFrame, **kwargs):
@@ -2593,6 +2594,124 @@ class BasicMultiScoreset:
 
     def __len__(self):
         return self.n_variants
+
+
+class PredictorScoreset(BasicScoreset):
+    """One predictor's per-gene scores, aligned by ``protein_variant``.
+
+    Matches the on-disk layout ``multivariate_data/predictors.py`` reads
+    (columns ``protein_variant``/``score``/``sample_assignments``, with
+    sample columns ``"0","1","2"`` = P/LP, B/LB, gnomAD). Also provides
+    ``from_functional_scoreset`` to adapt an existing functional
+    ``Scoreset``/``BasicScoreset`` onto the same ``protein_variant``/
+    ``hgvs_p`` identifier, so predictor and functional dimensions can be
+    combined into one ``MultiPredictorFunctionalScoreset``.
+    """
+
+    SAMPLE_COLUMNS = ["0", "1", "2"]
+
+    @classmethod
+    def from_dataframe(cls, df, dataset_name, id_col="protein_variant",
+                        score_col="score", sample_assignments_col="sample_assignments"):
+        df = df.dropna(subset=[score_col, id_col, sample_assignments_col]).copy()
+        onehot = (
+            df[sample_assignments_col]
+            .astype(str)
+            .str.get_dummies(sep=",")
+            .reindex(columns=cls.SAMPLE_COLUMNS, fill_value=0)
+            .astype(bool)
+            .to_numpy()
+        )
+        keep = onehot.any(axis=1)
+        if not keep.all():
+            df = df.loc[keep].reset_index(drop=True)
+            onehot = onehot[keep]
+        return cls(
+            scores=df[score_col].to_numpy(dtype=float),
+            sample_assignments=onehot,
+            ids=df[id_col].astype(str).to_numpy(),
+            scoreset_name=dataset_name,
+        )
+
+    @classmethod
+    def from_functional_scoreset(cls, scoreset, dataset_name=None):
+        """Adapt a functional Scoreset/BasicScoreset onto the protein_variant
+        identifier, so it lines up with predictor dimensions for joining.
+
+        ``scoreset.aa_subs`` (present on ``Scoreset``) is the "A119T"-style
+        protein-change string aligned 1:1 with ``scoreset.scores``/
+        ``scoreset.sample_assignments`` -- the same format predictor CSVs key
+        on via ``protein_variant``. Falls back to ``scoreset._ids`` for a
+        ``BasicScoreset`` already keyed on ``hgvs_p``/protein_variant.
+        """
+        if hasattr(scoreset, "aa_subs"):
+            ids = np.asarray(scoreset.aa_subs)
+        elif getattr(scoreset, "_ids", None) is not None:
+            ids = np.asarray(scoreset._ids)
+        else:
+            raise ValueError(
+                "scoreset has neither aa_subs nor ids; cannot join on "
+                "protein_variant/hgvs_p"
+            )
+        valid = np.array([str(v) not in ("", "nan", "None") for v in ids])
+
+        extra = {}
+        if getattr(scoreset, "sample_names", None) is not None:
+            extra["sample_names"] = list(scoreset.sample_names)
+
+        return cls(
+            scores=np.asarray(scoreset.scores)[valid],
+            sample_assignments=np.asarray(scoreset._sample_assignments)[valid],
+            ids=ids[valid],
+            scoreset_name=dataset_name or getattr(scoreset, "scoreset_name", "functional"),
+            **extra,
+        )
+
+
+class MultiPredictorFunctionalScoreset(BasicMultiScoreset):
+    """Combined predictor + functional multivariate container.
+
+    Joins N predictor dimensions (``PredictorScoreset``, keyed on
+    ``protein_variant``) with M functional dimensions (any
+    ``Scoreset``/``BasicScoreset``, adapted via
+    ``PredictorScoreset.from_functional_scoreset``) on the shared
+    ``protein_variant``/``hgvs_p`` identifier -- reusing
+    ``BasicMultiScoreset``'s existing ID-alignment/union/OR-sample-assignment
+    logic for the actual combination.
+
+    Predictor-only combination doesn't need this class: ``BasicMultiScoreset``
+    already works directly on a list of ``PredictorScoreset``s.
+    """
+
+    @classmethod
+    def from_predictor_and_functional(
+        cls, predictor_scoresets, functional_scoresets,
+        predictor_names=None, functional_names=None, **kwargs,
+    ):
+        functional_as_predictor = [
+            fs if isinstance(fs, PredictorScoreset)
+            else PredictorScoreset.from_functional_scoreset(
+                fs,
+                dataset_name=(functional_names[i] if functional_names else None),
+            )
+            for i, fs in enumerate(functional_scoresets)
+        ]
+
+        dataset_names = None
+        if predictor_names is not None or functional_names is not None:
+            dataset_names = (
+                list(predictor_names) if predictor_names is not None
+                else [s.scoreset_name for s in predictor_scoresets]
+            ) + (
+                list(functional_names) if functional_names is not None
+                else [s.scoreset_name for s in functional_as_predictor]
+            )
+
+        return cls(
+            list(predictor_scoresets) + functional_as_predictor,
+            dataset_names=dataset_names,
+            **kwargs,
+        )
 
 
 if __name__ == "__main__":

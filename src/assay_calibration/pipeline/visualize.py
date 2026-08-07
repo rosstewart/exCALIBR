@@ -34,6 +34,7 @@ from ..fit_utils.point_ranges import (
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
     BIDIRECTIONAL_VOTE_THRESHOLD,
+    _PATHOMECHANISM_MATCH_FRAC_FLOOR,
 )
 from ..data_utils.dataset import Scoreset, BasicScoreset
 from ..fit_utils.utils import serialize_dict
@@ -331,10 +332,10 @@ def process_component_fits(
     # EXPERIMENTAL, opt-in alternative to filter_flag: pathomechanism-corrected
     # f_D (see get_fit_prior / compute_pathomechanism_pathogenic_density[_masked]
     # in fit_utils/point_ranges.py) feeding a genuinely separate
-    # pathogenic-direction (PS3) prior+LR+ pair (rho, LR_D), paired with a
-    # mechanism-agnostic benign-direction (BS3) prior+LR+ pair (pi, LR_PB)
+    # pathogenic-direction (PS3) prior+LR+ pair (P(Y=1,M=1), LR_D), paired with a
+    # mechanism-agnostic benign-direction (BS3) prior+LR+ pair (P(Y=1), LR_PB)
     # that always stays raw/uncorrected -- see PipelineConfig.pathomechanism_method's
-    # docstring for the rho/pi derivation and why this pairing (not e.g. pi
+    # docstring for the P(Y=1,M=1)/P(Y=1) derivation and why this pairing (not e.g. P(Y=1)
     # with the mechanism-specific curve) is the mathematically consistent one.
     # Needs a pathogenic-labeled sample; anchors against benign/synonymous
     # when present (PN/standard mode) or raw gnomAD directly (PU-only mode).
@@ -342,8 +343,8 @@ def process_component_fits(
     # PipelineConfig construction, re-checked here for callers that mutate
     # config post-construction).
     pathomechanism_method = getattr(config, "pathomechanism_method", None)
-    gamma_flag = pathomechanism_method is not None
-    if gamma_flag:
+    mechanism_flag = pathomechanism_method is not None
+    if mechanism_flag:
         if filter_flag:
             raise ValueError(
                 "pathomechanism_method and filter_pathogenic_sample_by_lr are mutually "
@@ -364,7 +365,7 @@ def process_component_fits(
         if pathogenic_idx is None:
             logger.warning("  pathomechanism_method has no effect (no pathogenic-labeled "
                             "sample for this dataset/combo); computing prior normally")
-            gamma_flag = False
+            mechanism_flag = False
             pathomechanism_method = None
         if config.manual_prior is not None:
             logger.warning("  pathomechanism_method is ignored because manual_prior is set")
@@ -376,23 +377,23 @@ def process_component_fits(
         pathogenic_idx is not None and (benign_idx is not None or synonymous_idx is not None)
     )
     prior_unstable = False
-    prior_pathogenic_unstable = False  # rho instability -- only meaningful when gamma_flag
-    gamma_hat = np.nan
-    gamma_unstable = False
+    prior_pathogenic_unstable = False  # P(Y=1,M=1) instability -- only meaningful when mechanism_flag
+    mechanism_match_frac_hat = np.nan
+    mechanism_match_frac_unstable = False
     pct_pathogenic_rows_kept = None  # LR-filter row-level retention (filter_flag only)
     pct_bootstraps_kept = None  # fraction of bootstrap fits used for LR+/prior computation
 
     if config.manual_prior is not None:
         # Use manually specified prior — skip estimation. Both directions
         # collapse to the same manual value (dual pathomechanism curves never
-        # trigger below since gamma_flag stays whatever it resolved to above,
+        # trigger below since mechanism_flag stays whatever it resolved to above,
         # but this whole branch bypasses get_fit_prior/curve-building
         # entirely, so there's nothing for it to act on).
         prior = config.manual_prior
         prior_pathogenic = config.manual_prior
         fit_priors = np.full(len(fits), prior)
         fit_priors_pathogenic = fit_priors
-        fit_gammas = np.full(len(fits), np.nan)
+        fit_mechanism_match_fracs = np.full(len(fits), np.nan)
         valid_bootstrap_seeds = bootstrap_seeds  # no filtering
         valid_mask = np.ones(len(fits), dtype=bool)
         pct_bootstraps_kept = 1.0
@@ -436,30 +437,59 @@ def process_component_fits(
                         sample_assignments=sa_arr,
                         pathogenic_row_mask=pathogenic_row_mask,
                         pathomechanism_method=method,
+                        pathomechanism_boundary_joint_prior=getattr(
+                            config, "pathomechanism_boundary_joint_prior", "product"
+                        ),
                     )
                     for fit in fits
                 )
 
-            # Benign-direction / mechanism-agnostic prior (pi): always the raw,
+            # Benign-direction / mechanism-agnostic prior (P(Y=1)): always the raw,
             # uncorrected estimate -- this is today's existing single-prior
             # computation, unchanged in meaning regardless of pathomechanism_method
             # (see PipelineConfig.pathomechanism_method's docstring).
-            prior_gamma_results_benign = _run_get_fit_prior(None)
-            fit_priors_benign = np.array([r[0] for r in prior_gamma_results_benign])
-            fit_gammas_benign = np.array([r[1] for r in prior_gamma_results_benign])  # always nan
+            prior_match_frac_results_benign = _run_get_fit_prior(None)
+            fit_priors_benign = np.array([r[0] for r in prior_match_frac_results_benign])
+            fit_mechanism_match_fracs_benign = np.array([r[1] for r in prior_match_frac_results_benign])  # always nan
 
-            if gamma_flag:
-                # Pathogenic-direction / mechanism-specific prior (rho).
-                prior_gamma_results_path = _run_get_fit_prior(pathomechanism_method)
-                fit_priors_pathogenic = np.array([r[0] for r in prior_gamma_results_path])
-                fit_gammas = np.array([r[1] for r in prior_gamma_results_path])
+            if mechanism_flag:
+                # Pathogenic-direction / mechanism-specific prior (P(Y=1,M=1)).
+                prior_match_frac_results_path = _run_get_fit_prior(pathomechanism_method)
+                fit_priors_pathogenic_direct = np.array([r[0] for r in prior_match_frac_results_path])
+                fit_mechanism_match_fracs = np.array([r[1] for r in prior_match_frac_results_path])
+
+                # See PipelineConfig.pathomechanism_boundary_joint_prior's
+                # docstring: for 'boundary' (default "product"), P(Y=1,M=1) is
+                # the product of the two already-computed quantities rather
+                # than a third re-derivation against the population --
+                # validated to match the direct re-derivation almost exactly
+                # whenever there's enough data, and more sensible in
+                # degenerate/PU cases where that third derivation just adds
+                # its own noise on top. get_fit_prior itself already skips
+                # computing fit_priors_pathogenic_direct in this mode (it's
+                # always nan here, not just unused) -- see its own
+                # short-circuit return right after apply_pathomechanism_
+                # correction -- so there's no redundant per-fit EM/boundary
+                # re-derivation happening underneath this, only the cheap
+                # closed-form match_frac computation. The product is nan
+                # under the exact same degeneracy condition the (skipped)
+                # direct result would have been, since both would come from
+                # the same underlying correction call.
+                use_product = (
+                    pathomechanism_method == "boundary"
+                    and getattr(config, "pathomechanism_boundary_joint_prior", "product") == "product"
+                )
+                if use_product:
+                    fit_priors_pathogenic = fit_priors_benign * fit_mechanism_match_fracs
+                else:
+                    fit_priors_pathogenic = fit_priors_pathogenic_direct
 
                 # pathomechanism_method discards (rather than silently falls back
                 # on) any individual bootstrap fit whose excess/mask is degenerate
                 # everywhere (see compute_pathomechanism_pathogenic_density[_masked]).
                 # If that wipes out every fit for this combo, there's no
                 # pathogenic-direction correction to apply at all -- fall back to
-                # the benign-direction's already-computed raw estimate for rho too
+                # the benign-direction's already-computed raw estimate for P(Y=1,M=1) too
                 # (degrades both directions to the raw baseline for this combo)
                 # rather than discarding it outright.
                 if not np.any(np.isfinite(fit_priors_pathogenic)):
@@ -471,15 +501,15 @@ def process_component_fits(
                         n_fits_prefilter,
                     )
                     fit_priors_pathogenic = fit_priors_benign.copy()
-                    fit_gammas = fit_gammas_benign.copy()
+                    fit_mechanism_match_fracs = fit_mechanism_match_fracs_benign.copy()
                     prior_unstable = True
                     prior_pathogenic_unstable = True
-                    gamma_unstable = True
+                    mechanism_match_frac_unstable = True
             else:
                 fit_priors_pathogenic = fit_priors_benign
-                fit_gammas = fit_gammas_benign
+                fit_mechanism_match_fracs = fit_mechanism_match_fracs_benign
 
-            # 'fit_priors'/'prior' stay benign-direction (pi) throughout this
+            # 'fit_priors'/'prior' stay benign-direction (P(Y=1)) throughout this
             # function for backward compatibility -- see PipelineConfig.pathomechanism_method.
             fit_priors = fit_priors_benign
         else:
@@ -511,11 +541,11 @@ def process_component_fits(
                     fit_priors.append(prior_equation_2c(w_p, w_b, w_g))
 
             fit_priors = np.array(fit_priors)
-            fit_gammas = np.full(len(fits), np.nan)
+            fit_mechanism_match_fracs = np.full(len(fits), np.nan)
             fit_priors_pathogenic = fit_priors  # 2c-equation path never supports pathomechanism_method
 
         # Filter invalid priors. A fit only contributes downstream if BOTH
-        # directions produced a valid prior for it (when gamma_flag is off,
+        # directions produced a valid prior for it (when mechanism_flag is off,
         # fit_priors_pathogenic is the exact same array as fit_priors, so this
         # intersection reduces to the original single-array condition with no
         # behavior change). Fits invalid in only one direction are dropped
@@ -528,7 +558,7 @@ def process_component_fits(
         )
         fit_priors = fit_priors[valid_mask]
         fit_priors_pathogenic = fit_priors_pathogenic[valid_mask]
-        fit_gammas = fit_gammas[valid_mask]
+        fit_mechanism_match_fracs = fit_mechanism_match_fracs[valid_mask]
         fits = np.array(fits)[valid_mask].tolist()
         valid_bootstrap_seeds = bootstrap_seeds[valid_mask] if bootstrap_seeds is not None else np.array([])
 
@@ -541,14 +571,14 @@ def process_component_fits(
             logger.warning(f"  No valid priors; skipping {component_key}")
             return None
 
-        # Compute prior(s). 'prior' (pi, benign-direction) is unchanged in
-        # meaning/name for backward compatibility; 'prior_pathogenic' (rho) is
-        # new, only meaningful when gamma_flag.
+        # Compute prior(s). 'prior' (P(Y=1), benign-direction) is unchanged in
+        # meaning/name for backward compatibility; 'prior_pathogenic' (P(Y=1,M=1)) is
+        # new, only meaningful when mechanism_flag.
         prior = np.nanmedian(fit_priors)
-        prior_pathogenic = np.nanmedian(fit_priors_pathogenic) if gamma_flag else np.nan
-        logger.info(f"  Prior (benign-direction, pi): {prior:.6f}")
-        if gamma_flag:
-            logger.info(f"  Prior (pathogenic-direction, rho): {prior_pathogenic:.6f}")
+        prior_pathogenic = np.nanmedian(fit_priors_pathogenic) if mechanism_flag else np.nan
+        logger.info(f"  Prior (benign-direction, P(Y=1)): {prior:.6f}")
+        if mechanism_flag:
+            logger.info(f"  Prior (pathogenic-direction, P(Y=1,M=1)): {prior_pathogenic:.6f}")
 
         # PU/NU unmixing floors saturating-low fits at 0.01 (get_fit_prior)
         # rather than discarding them (see its mode-gated saturation handling).
@@ -557,25 +587,25 @@ def process_component_fits(
         # real prior.
         if used_get_fit_prior and unmixing_mode and np.isclose(prior, 0.01):
             prior_unstable = True
-        if used_get_fit_prior and unmixing_mode and gamma_flag and np.isclose(prior_pathogenic, 0.01):
+        if used_get_fit_prior and unmixing_mode and mechanism_flag and np.isclose(prior_pathogenic, 0.01):
             prior_pathogenic_unstable = True
 
-        # gamma_hat: median assay-mechanistic-coverage estimate across bootstrap
+        # mechanism_match_frac_hat: median assay-mechanistic-coverage estimate across bootstrap
         # fits (mirrors how `prior` itself is a nanmedian over fit_priors).
-        # Unstable when no bootstrap fit produced a finite gamma at all -- no
-        # arbitrary threshold here, just "did the EM produce anything usable".
-        if gamma_flag:
-            finite_gammas = fit_gammas[np.isfinite(fit_gammas)]
-            if len(finite_gammas) > 0:
-                gamma_hat = float(np.nanmedian(finite_gammas))
+        # Unstable when no bootstrap fit produced a finite estimate at all --
+        # no arbitrary threshold here, just "did the EM produce anything usable".
+        if mechanism_flag:
+            finite_mechanism_match_fracs = fit_mechanism_match_fracs[np.isfinite(fit_mechanism_match_fracs)]
+            if len(finite_mechanism_match_fracs) > 0:
+                mechanism_match_frac_hat = float(np.nanmedian(finite_mechanism_match_fracs))
                 logger.info(
-                    f"  PLP_frac_pathomechanism_measured: {gamma_hat:.6f} (estimated "
+                    f"  PLP_frac_pathomechanism_measured: {mechanism_match_frac_hat:.6f} (estimated "
                     "fraction of PLP-labeled variants with the disease mechanism this "
                     "assay measures)"
                 )
             else:
-                gamma_unstable = True
-                logger.warning("  PLP_frac_pathomechanism_measured: no finite gamma "
+                mechanism_match_frac_unstable = True
+                logger.warning("  PLP_frac_pathomechanism_measured: no finite "
                                "estimates across bootstrap fits")
 
     # Indices into all_fits_prefilter that survived prior filtering
@@ -610,18 +640,18 @@ def process_component_fits(
 
     acmg_mapping_method = getattr(config, "acmg_mapping_method", "tavtigian")
 
-    log_lr_pathogenic = None  # set below only when gamma_flag; stays None otherwise
+    log_lr_pathogenic = None  # set below only when mechanism_flag; stays None otherwise
     C_pathogenic = np.array([np.nan, np.nan])
 
-    if gamma_flag:
+    if mechanism_flag:
         # Two-LR/two-prior pathomechanism scheme: pathogenic-direction (PS3)
-        # curves/ranges from (rho, LR_D = log_fD - log_fN_pathogenic);
-        # benign-direction (BS3) from (pi, LR_PB = log_fP_raw - log_fN_benign)
+        # curves/ranges from (P(Y=1,M=1), LR_D = log_fD - log_fN_pathogenic);
+        # benign-direction (BS3) from (P(Y=1), LR_PB = log_fP_raw - log_fN_benign)
         # -- see compute_pathomechanism_lr_curves, get_bootstrap_score_ranges_dual.
         # PN mode: log_fN_benign == log_fN_pathogenic (no unmixing, one shared
         # anchor). PU mode: population is a mixture itself, so each direction
         # is unmixed separately against its own native (prior, density) pair
-        # (pi/f_P_raw for benign, rho/f_D for pathogenic) -- sharing one raw,
+        # (P(Y=1)/f_P_raw for benign, P(Y=1,M=1)/f_D for pathogenic) -- sharing one raw,
         # unpurified anchor between both (this function's earlier behavior)
         # understated both LRs; confirmed on PTEN_Mighell_2018_clinvar_2018.
         anchors_is_pu = [
@@ -630,11 +660,20 @@ def process_component_fits(
             )
             for fit in fits
         ]
+        # Only 'boundary' needs the pathogenic-labeled sample's own raw score
+        # points (see compute_pathomechanism_lr_curves' labeled_scores param);
+        # computed once via scoreset directly rather than scores_arr/sa_arr,
+        # which are only defined in the (non-manual-prior) branch above.
+        lr_curve_labeled_scores = (
+            scoreset.scores[np.asarray(scoreset.sample_assignments)[:, pathogenic_idx].astype(bool)]
+            if pathomechanism_method == "boundary" else None
+        )
         results_dual_curves = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
             delayed(compute_pathomechanism_lr_curves)(
                 fit, score_range, fit['fit']['weights'][pathogenic_idx], w_N_anchor,
                 pathomechanism_method, is_pu=is_pu,
                 prior_pathogenic=fit_priors_pathogenic[i], prior_benign=fit_priors_benign[i],
+                labeled_scores=lr_curve_labeled_scores,
             )
             for i, (fit, (w_N_anchor, is_pu)) in enumerate(zip(fits, anchors_is_pu))
         )
@@ -670,7 +709,7 @@ def process_component_fits(
         log_lr_pathogenic = log_fD_arr - log_fN_pathogenic_arr
         # Backward-compat aliases: 'log_fp'/'log_fb'/'log_lr_plus' (and the
         # result dict's 'prior'/'C') always represent the benign-direction
-        # (pi, mechanism-agnostic) curve, matching 'prior'=pi.
+        # (P(Y=1), mechanism-agnostic) curve, matching 'prior'=P(Y=1).
         log_fp = log_fPraw_arr
         log_fb = log_fN_arr
         log_lr_plus = log_fp - log_fb
@@ -806,9 +845,9 @@ def process_component_fits(
     if config.use_median_prior:
         # Use median prior for unified thresholds
         logger.info(f"  Using median prior for unified thresholds (method={acmg_mapping_method})")
-        if gamma_flag:
+        if mechanism_flag:
             # acmg_mapping_method == "acmg_bayes" is already rejected together
-            # with gamma_flag at flag-validation time above (no dual-prior
+            # with mechanism_flag at flag-validation time above (no dual-prior
             # sibling for calculate_classification_ranges yet), so only the
             # tavtigian path is reachable here.
             point_ranges_pathogenic, point_ranges_benign, C_p_dual, C_b_dual = calculate_score_ranges_dual(
@@ -820,13 +859,26 @@ def process_component_fits(
                 acmg_mapping_method=acmg_mapping_method,
             )
             point_ranges = {**point_ranges_pathogenic, **point_ranges_benign}
-            if not np.isfinite(prior_pathogenic) or prior_pathogenic <= 0 or prior_pathogenic >= 1:
+            # prior_pathogenic < _PATHOMECHANISM_MATCH_FRAC_FLOOR (not just
+            # <= 0) -- an unfloored prior this tiny degenerates
+            # get_tavtigian_constant's C-search into C=1 (see
+            # _PATHOMECHANISM_MATCH_FRAC_FLOOR's docstring in
+            # point_ranges.py), making every LR threshold trivially
+            # satisfied by any LR, including the flat LR=1 curve
+            # compute_pathomechanism_lr_curves already falls back to at
+            # this same floor -- so calculate_score_ranges_dual's own
+            # thresholds above are already degenerate garbage here and must
+            # be discarded, the same way an outright invalid prior already
+            # was. Doesn't touch prior_pathogenic itself (still reported
+            # raw/unfloored in the output JSON) or fits/valid_mask -- only
+            # the resulting point ranges.
+            if not np.isfinite(prior_pathogenic) or prior_pathogenic < _PATHOMECHANISM_MATCH_FRAC_FLOOR or prior_pathogenic >= 1:
                 for point in point_ranges_pathogenic:
                     point_ranges[point] = []
             if prior <= 0 or prior >= 1:
                 for point in point_ranges_benign:
                     point_ranges[point] = []
-            C = C_b_dual  # backward-compat: 'C' stays benign-direction, matches 'prior'=pi
+            C = C_b_dual  # backward-compat: 'C' stays benign-direction, matches 'prior'=P(Y=1)
             C_pathogenic = C_p_dual
         elif acmg_mapping_method == "acmg_bayes":
             from ..fit_utils.fit import calculate_classification_ranges
@@ -1067,27 +1119,27 @@ def process_component_fits(
     
     # Serialize and return
     result = {
-        # 'prior' (pi) and every legacy field below stay benign-direction /
+        # 'prior' (P(Y=1)) and every legacy field below stay benign-direction /
         # mechanism-agnostic for backward compatibility -- see
         # PipelineConfig.pathomechanism_method's docstring. 'pathomechanism_prior'
-        # (rho) is the new pathogenic-direction/mechanism-specific prior,
+        # (P(Y=1,M=1)) is the new pathogenic-direction/mechanism-specific prior,
         # populated only when pathomechanism_method is active.
         'prior': prior,
         'prior_unstable': bool(prior_unstable),
-        'pathomechanism_prior': prior_pathogenic if gamma_flag else None,
-        'pathomechanism_prior_unstable': bool(prior_pathogenic_unstable) if gamma_flag else False,
+        'pathomechanism_prior': prior_pathogenic if mechanism_flag else None,
+        'pathomechanism_prior_unstable': bool(prior_pathogenic_unstable) if mechanism_flag else False,
         'pathomechanism_method': pathomechanism_method,
-        # PLP_frac_pathomechanism_measured (a.k.a. gamma_hat): estimated fraction
+        # PLP_frac_pathomechanism_measured (a.k.a. mechanism_match_frac_hat): estimated fraction
         # of PLP-labeled variants whose disease mechanism this assay actually
         # measures (a 0-1 fraction, median over bootstrap fits).
-        'PLP_frac_pathomechanism_measured': gamma_hat,
+        'PLP_frac_pathomechanism_measured': mechanism_match_frac_hat,
         'PLP_frac_pathomechanism_measured_description': (
             'estimated fraction (0-1) of PLP-labeled variants with the disease '
             'mechanism this assay measures'),
-        'PLP_frac_pathomechanism_measured_unstable': bool(gamma_unstable),
-        'PLP_frac_pathomechanism_measured_per_fit': fit_gammas,
+        'PLP_frac_pathomechanism_measured_unstable': bool(mechanism_match_frac_unstable),
+        'PLP_frac_pathomechanism_measured_per_fit': fit_mechanism_match_fracs,
         'priors': fit_priors,
-        'priors_pathogenic': fit_priors_pathogenic if gamma_flag else None,
+        'priors_pathogenic': fit_priors_pathogenic if mechanism_flag else None,
         'pct_bootstraps_kept': pct_bootstraps_kept,
         'pct_pathogenic_rows_kept': pct_pathogenic_rows_kept,
         'valid_bootstrap_seeds': valid_bootstrap_seeds,

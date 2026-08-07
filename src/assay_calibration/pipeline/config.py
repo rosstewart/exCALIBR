@@ -85,26 +85,44 @@ class PipelineConfig:
     # EXPERIMENTAL, opt-in alternative to filter_pathogenic_sample_by_lr's
     # ad-hoc row filter, for any dataset with a pathogenic-labeled sample.
     # Decomposes the pathogenic-labeled sample's score density as
-    #   f_pathogenic_labeled(x) = gamma * f_D(x) + (1 - gamma) * f_N(x)
+    #   f_pathogenic_labeled(x) = P(M=1|Y=1) * f_D(x) + (1 - P(M=1|Y=1)) * f_N(x)
     # where f_D ("disease-mechanism-captured"/assay-relevant density), f_N is
-    # FIXED to an anchor density (anchored -- no label-switching), and gamma
-    # is then estimated via a plain two-fixed-densities mixture-proportion EM
-    # (confirmed init-robust, unlike an earlier free-weight-vector version --
-    # see fit_utils/point_ranges.py). gamma is the estimated fraction of
-    # PLP-labeled variants whose mechanism this assay captures (reported as
-    # PLP_frac_pathomechanism_measured in the output calibration JSON).
+    # FIXED to an anchor density (anchored -- no label-switching), and
+    # P(M=1|Y=1) (M = mechanism-detectable indicator) is the estimated
+    # fraction of PLP-labeled variants whose mechanism this assay captures
+    # (reported as PLP_frac_pathomechanism_measured in the output
+    # calibration JSON).
     #
     # pathomechanism_method selects how f_D is built from the raw pathogenic
-    # weights w_P and the anchor weights w_N:
-    #   "subtraction" (default): max(0, w_P - w_N), renormalized -- N gets
-    #     priority on any overlap, D only gets credit for a clear excess, a
-    #     deliberate conservative choice. See
+    # weights w_P/density f_P_raw and the anchor weights w_N/density f_N:
+    #   "subtraction" (default): w_D = max(0, w_P - w_N), renormalized -- N
+    #     gets priority on any overlap, D only gets credit for a clear
+    #     excess, a deliberate conservative choice. P(M=1|Y=1) is then
+    #     estimated via a two-fixed-densities mixture-proportion EM
+    #     (confirmed init-robust, unlike an earlier free-weight-vector
+    #     version -- see fit_utils/point_ranges.py). See
     #     compute_pathomechanism_pathogenic_density.
     #   "masking": keep w_P[k] wherever w_P[k] > w_N[k], zero elsewhere,
     #     renormalized -- more generous toward borderline-overlapping
     #     components than subtraction (keeps the FULL raw weight, not just
     #     the excess), at the cost of a harder transition right at the
-    #     w_P==w_N boundary. See compute_pathomechanism_pathogenic_density_masked.
+    #     w_P==w_N boundary. Same EM core as subtraction. See
+    #     compute_pathomechanism_pathogenic_density_masked.
+    #   "boundary": operates on DENSITIES directly rather than the fitted
+    #     mixture's per-component weights, sidestepping subtraction/masking's
+    #     implicit assumption that f_D lies in the span of the same shared
+    #     components fit to the (biased) labeled sample -- not guaranteed
+    #     with only 2-3 components. Reuses the same Blanchard-Lee-Scott
+    #     boundary/min-ratio identity already underlying this codebase's
+    #     PU/NU prior estimator (estimate_prior_from_class_densities), just
+    #     pointed at the pathogenic-labeled sample in place of the population
+    #     sample: P(M=1|Y=1) = 1 - min_{s in labeled sample}[f_P_raw(s)/f_N(s)],
+    #     evaluated only at the pathogenic-labeled sample's own real score
+    #     points. Closed-form, no EM. Validated empirically against
+    #     subtraction on 4 PN datasets (pathogenic-direction prior agreement
+    #     within ~0.001-0.0015) and against DistCurve (Zeiberg/Jain/Radivojac
+    #     2020) on ASPA toxicity (independent P(M=1|Y=1) agreement, ~0.75).
+    #     See compute_pathomechanism_pathogenic_density_boundary.
     #   None: disabled -- no correction anywhere (raw baseline).
     #
     # The anchor is the benign/synonymous density when a benign/synonymous
@@ -113,35 +131,69 @@ class PipelineConfig:
     # filter_pathogenic_sample_by_lr's own PU fallback already uses
     # (log_fp - log_f_population), just formalized as a generative mixture.
     # No unmixing of gnomAD's own (typically small) disease-variant content
-    # is attempted first: both f_D constructions are provably invariant to
-    # it, at the cost of gamma_hat itself being a mildly conservative
-    # (downward-biased) estimate of true mechanistic coverage when gnomAD
-    # does carry real disease-relevant mass (see the docstring in
-    # point_ranges.py for the derivation). For PU-only datasets, when the
-    # corrected f_D has zero density everywhere in the (often small)
-    # population sample, the prior for that bootstrap fit is floored to
-    # 0.01 rather than discarded -- with few gnomAD points, finding no trace
-    # of the disease-relevant component there is itself evidence of a
-    # near-zero prior, not an absence of information.
+    # is attempted first: both subtraction/masking's f_D constructions are
+    # provably invariant to it, at the cost of the P(M=1|Y=1) estimate
+    # itself being a mildly conservative (downward-biased) estimate of true
+    # mechanistic coverage when gnomAD does carry real disease-relevant mass
+    # (see the docstring in point_ranges.py for the derivation). For PU-only
+    # datasets, when the corrected f_D has zero density everywhere in the
+    # (often small) population sample, the prior for that bootstrap fit is
+    # floored to 0.01 rather than discarded -- with few gnomAD points,
+    # finding no trace of the disease-relevant component there is itself
+    # evidence of a near-zero prior, not an absence of information.
     #
     # Unlike filter_pathogenic_sample_by_lr's prior-only substitution, f_D
     # ALSO drives a genuinely separate pathogenic-direction (PS3) LR+ curve
     # now, paired with the pathomechanism-corrected prior (reported as
-    # pathomechanism_prior, i.e. rho = P(pathogenic AND mechanism-detectable)
-    # in the output calibration JSON). The benign-direction (BS3) LR+ curve
-    # and its prior (reported as prior, i.e. pi = P(pathogenic, any
-    # mechanism)) always stay raw/uncorrected, mechanism-agnostic -- this
-    # correctly discounts BS3 credit by phenocopy prevalence rather than
-    # overstating benign evidence for a variant that just has an unmeasured
-    # mechanism. See the pathomechanism plan doc for the full rho/pi
-    # derivation and why this pairing (not e.g. pi with the mechanism-
-    # specific curve) is the mathematically consistent one.
+    # pathomechanism_prior, i.e. P(Y=1, M=1) = P(pathogenic AND
+    # mechanism-detectable) in the output calibration JSON). The
+    # benign-direction (BS3) LR+ curve and its prior (reported as prior,
+    # i.e. P(Y=1) = P(pathogenic, any mechanism)) always stay
+    # raw/uncorrected, mechanism-agnostic -- this correctly discounts BS3
+    # credit by phenocopy prevalence rather than overstating benign evidence
+    # for a variant that just has an unmeasured mechanism. See the
+    # pathomechanism plan doc for the full P(Y=1,M=1)/P(Y=1) derivation and
+    # why this pairing (not e.g. P(Y=1) with the mechanism-specific curve)
+    # is the mathematically consistent one.
     #
     # Mutually exclusive with filter_pathogenic_sample_by_lr. None (disabled,
     # raw single LR+/prior) is the default; pass pathomechanism_method=
     # "subtraction" (CLI --pathomechanism-prior) to opt into the dual-prior
-    # correction, or "masking" for the alternative construction.
-    pathomechanism_method: Optional[Literal["subtraction", "masking"]] = None
+    # correction, or "masking"/"boundary" for the alternative constructions.
+    pathomechanism_method: Optional[Literal["subtraction", "masking", "boundary"]] = None
+
+    # Only meaningful when pathomechanism_method == "boundary" (ignored for
+    # "subtraction"/"masking", which keep their own direct re-derivation
+    # unconditionally -- that design predates this option and is not part of
+    # it). Controls how P(Y=1,M=1) is computed for the boundary method:
+    #   "product" (default): P(Y=1,M=1) = P(Y=1) * P(M=1|Y=1), the two
+    #     already-computed quantities multiplied together, instead of a
+    #     third re-derivation step (evaluating f_D against the population
+    #     sample). Validated empirically (see the pathomechanism plan doc) to
+    #     match the direct re-derivation almost exactly -- often to 3+
+    #     decimal places -- whenever P(Y=1) and P(M=1|Y=1) are themselves
+    #     well-estimated (i.e. there's enough data), while being more
+    #     sensible than either extreme when they aren't: on
+    #     TARDBP_Bolognesi_Faure_2019 (PU mode, 12 PLP-labeled points), the
+    #     direct re-derivation swings wildly (0.01, floored, for
+    #     subtraction; 0.35 for boundary itself) because it evaluates the
+    #     already-twice-derived f_D against a sparse 68-point gnomAD sample
+    #     in whatever narrow region f_D concentrates -- compounding a THIRD
+    #     source of estimation noise on top of two already-uncertain inputs
+    #     -- whereas the product (~0.15) only carries the two inputs' own,
+    #     independently-estimated uncertainty. No attempt is made to treat
+    #     PU mode specially (e.g. falling back to "direct" only when
+    #     P(M=1|Y=1) is deemed "unreliable"): PU mode's P(M=1|Y=1) already
+    #     rests on using the raw population sample as a stand-in for f_N
+    #     throughout its own estimation (see resolve_pathomechanism_anchor),
+    #     so there is no clean, separate reliability condition to gate on --
+    #     "product" is applied uniformly whenever pathomechanism_method ==
+    #     "boundary", not as a conditional fallback.
+    #   "direct": re-derive P(Y=1,M=1) from scratch by evaluating f_D
+    #     against the population/benign density (get_fit_prior's 'standard'/
+    #     'positive_unlabeled'/'negative_unlabeled' branches) -- the
+    #     pre-existing behavior, kept available for comparison.
+    pathomechanism_boundary_joint_prior: Literal["product", "direct"] = "product"
 
     # Per-dataset overrides (used in IGVF batch mode)
     scoreset_flipped_override: Optional[bool] = None  # Force flip state
@@ -265,11 +317,21 @@ class PipelineConfig:
             )
 
         # Validate pathomechanism_method
-        valid_pm_methods = {None, "subtraction", "masking"}
+        valid_pm_methods = {None, "subtraction", "masking", "boundary"}
         if self.pathomechanism_method not in valid_pm_methods:
             raise ValueError(
                 f"pathomechanism_method must be one of {valid_pm_methods}, "
                 f"got {self.pathomechanism_method!r}"
+            )
+
+        # Validate pathomechanism_boundary_joint_prior (only meaningful for
+        # pathomechanism_method == "boundary", but validated regardless so a
+        # typo doesn't silently no-op for a run that later flips methods).
+        valid_joint_prior_modes = {"product", "direct"}
+        if self.pathomechanism_boundary_joint_prior not in valid_joint_prior_modes:
+            raise ValueError(
+                f"pathomechanism_boundary_joint_prior must be one of "
+                f"{valid_joint_prior_modes}, got {self.pathomechanism_boundary_joint_prior!r}"
             )
 
         # pathomechanism_method and filter_pathogenic_sample_by_lr are mutually
@@ -293,20 +355,21 @@ def resolve_prior_mode(filter_flag, pathomechanism_method_flag):
     """Resolve the two mutually-exclusive pathogenic-sample-cleaning flags.
 
     ``filter_flag`` (bool|None) is the experimental LR-row-filter flag.
-    ``pathomechanism_method_flag`` (None|"off"|"subtraction"|"masking") is the
-    already-resolved pathomechanism-method selection (the caller combines its
-    own visible on/off toggle with the hidden subtraction/masking sub-choice
-    before calling this function -- see run_pipeline.py/run_igvf_batch.py),
-    where "off" means "explicitly disabled" (distinct from None, "unset").
-    The default mode is raw/off (LR filter off, pathomechanism off).
-    Specifying just one flag implicitly clears the other, so the experimental
-    ``--filter-pathogenic-sample-by-lr`` can be used on its own without also
-    having to pass pathomechanism="off". Setting both explicitly is left to
-    PipelineConfig's mutual-exclusion validation to reject.
+    ``pathomechanism_method_flag`` (None|"off"|"subtraction"|"masking"|"boundary")
+    is the already-resolved pathomechanism-method selection (the caller
+    combines its own visible on/off toggle with the hidden
+    subtraction/masking/boundary sub-choice before calling this function --
+    see run_pipeline.py/run_igvf_batch.py), where "off" means "explicitly
+    disabled" (distinct from None, "unset"). The default mode is raw/off
+    (LR filter off, pathomechanism off). Specifying just one flag implicitly
+    clears the other, so the experimental ``--filter-pathogenic-sample-by-lr``
+    can be used on its own without also having to pass pathomechanism="off".
+    Setting both explicitly is left to PipelineConfig's mutual-exclusion
+    validation to reject.
 
     Returns a ``(filter_pathogenic_sample_by_lr, pathomechanism_method)`` tuple,
-    where pathomechanism_method is None|"subtraction"|"masking" (never the
-    string "off" -- that's resolved to None here).
+    where pathomechanism_method is None|"subtraction"|"masking"|"boundary"
+    (never the string "off" -- that's resolved to None here).
     """
     f, m = filter_flag, pathomechanism_method_flag
     if f is None and m is None:

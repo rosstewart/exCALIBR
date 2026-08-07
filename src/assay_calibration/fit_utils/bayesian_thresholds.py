@@ -536,3 +536,161 @@ def continuous_classify(lr_plus: ArrayLike,
     if np.ndim(lr_plus) == 0:
         return str(out[0])
     return out
+
+
+# ── Fixed-Reference ACMG-Bayes: single global slope, prior injected as its
+#    own point term ──────────────────────────────────────────────────────────
+#
+# Unlike piecewise_log_lr/piecewise_display_points (whose knots -- and hence
+# whose points<->log(LR+) conversion -- are recomputed fresh at whatever
+# prior is passed in), this construction fixes ONE global slope
+# log(LR+) = alpha*T, calibrated once at a reference prior (0.5 by default,
+# where logit(0.5)=0), and never re-derived per gene. Because there is only
+# one slope for every T (no piecewise segments), raw point totals are
+# genuinely, linearly additive: alpha*(T_1+T_2+...) = log(LR_1)+log(LR_2)+...
+# exactly, with zero combination error -- unlike piecewise_display_points,
+# whose docstring explicitly forbids using its output as a combination
+# operand (different segments have different slopes, so raw point sums pick
+# up real error whenever a sum crosses a segment boundary; see the Su_B
+# worked example in the report).
+#
+# The prior is injected as its own point-equivalent term,
+# fixed_reference_prior_points(prior, alpha) = logit(prior)/alpha (at the
+# default reference_prior=0.5), so the grand total
+# T_evidence + T_prior(prior) sits in exactly the same units as every
+# evidence code and can be summed directly. Classifying that grand total
+# against the fixed boundary points is then exactly equivalent to comparing
+# the true posterior against the true target, at every real prior -- not
+# merely at the reference prior -- because
+#   alpha*(T_evidence + T_prior(p)) = log(LR_evidence) + logit(p) = logit(posterior)
+# is an identity (Bayes' rule in log-odds form), for any p. See the report's
+# Methods subsection for the full theorem/proof and the numerical
+# verification (additivity + exactness) this module's callers run.
+#
+# Only evaluated at STANDARD targets (LB=0.10, B=0.01): standard targets are
+# exact complements of LP/P (LB=1-LP, B=1-P), which is what makes a SINGLE
+# slope exact on both the pathogenic and benign sides at once (gap=12 between
+# LP and P gives LP/LB=+-11, P/B=+-23). The paper's corrected LB/B targets
+# (0.01/0.001) break that complement symmetry -- the benign-direction odds
+# ratio no longer matches the pathogenic-direction one, so a single slope
+# can't hit clean integers on both sides -- and are deliberately not
+# evaluated here (see report discussion).
+
+def fixed_reference_slope(gap: int = 12, targets: Dict[str, float] = None) -> float:
+    """Single global slope alpha for log(LR+) = alpha*T.
+
+    Calibrated so that, at reference prior 0.5, the P:LP posterior-odds ratio
+    compounds exactly over `gap` points: alpha = ln(ratio)/gap, where
+    ratio = odds(P)/odds(LP). Default gap=12 is the clean-integer solution
+    for the standard targets (LP/LB=+-11, P/B=+-23) -- see
+    ``_best_clean_gap``.
+    """
+    targets = {**DEFAULT_TARGETS, **(targets or {})}
+    odds_lp = targets["LP"] / (1.0 - targets["LP"])
+    odds_p  = targets["P"]  / (1.0 - targets["P"])
+    ratio = odds_p / odds_lp
+    return float(np.log(ratio)) / float(gap)
+
+
+def _best_clean_gap(targets: Dict[str, float] = None,
+                     min_gap: int = 4, max_gap: int = 60) -> int:
+    """Search integer gaps in [min_gap, max_gap] for the one that puts the LP
+    boundary's exact (fractional) point position just *below* a whole number
+    -- i.e. using that whole number as the integer LP threshold is always
+    conservative (requires at least as much evidence as the exact
+    construction, never less).
+
+    Reproduces the continued-fraction search done by hand in conversation:
+    for gap g, the exact LP position is x_LP = g * c where
+    c = ln(odds(LP)) / ln(ratio); good gaps are the ones for which g*c sits
+    just under an integer (small ``ceil(g*c) - g*c``). For the standard
+    targets this returns 12 (x_LP = 10.996, i.e. LP=11 is conservative by
+    only ~0.004 points).
+    """
+    targets = {**DEFAULT_TARGETS, **(targets or {})}
+    odds_lp = targets["LP"] / (1.0 - targets["LP"])
+    odds_p  = targets["P"]  / (1.0 - targets["P"])
+    ratio = odds_p / odds_lp
+    c = float(np.log(odds_lp) / np.log(ratio))
+
+    best_gap, best_dist = None, np.inf
+    for g in range(min_gap, max_gap + 1):
+        x = g * c
+        dist = np.ceil(x) - x
+        if dist < best_dist:
+            best_dist = dist
+            best_gap = g
+    return int(best_gap)
+
+
+def fixed_reference_boundary_points(alpha: float,
+                                     targets: Dict[str, float] = None) -> Dict[str, float]:
+    """Exact (generally fractional) T-position of each boundary target under
+    a single global slope `alpha`, at reference prior 0.5."""
+    targets = {**DEFAULT_TARGETS, **(targets or {})}
+    return {name: float(np.log(q / (1.0 - q)) / alpha) for name, q in targets.items()}
+
+
+def fixed_reference_log_lr(T: ArrayLike, alpha: float) -> ArrayLike:
+    """Fixed, prior-independent log(LR+) for point total T: alpha*T.
+
+    Unlike ``piecewise_log_lr``, this does not take a prior argument -- a
+    given T means the same LR+ everywhere, by construction.
+    """
+    return alpha * np.asarray(T, dtype=float)
+
+
+def fixed_reference_prior_points(prior: ArrayLike, alpha: float,
+                                  reference_prior: float = 0.5) -> ArrayLike:
+    """Point-equivalent of the gap between `prior` and `reference_prior`, in
+    the same units as evidence points (so it can be added directly to an
+    evidence point total)."""
+    p = np.asarray(prior, dtype=float)
+    lpo_ref = float(_log_prior_odds(reference_prior))
+    return (_log_prior_odds(p) - lpo_ref) / alpha
+
+
+def fixed_reference_total_points(T_evidence: ArrayLike, prior: ArrayLike, alpha: float,
+                                  reference_prior: float = 0.5) -> ArrayLike:
+    """The actual combination operand: evidence points plus the prior's own
+    point-equivalent. Safe to sum directly (see module-level docstring) --
+    unlike ``piecewise_display_points``, this is not a display-only value."""
+    return np.asarray(T_evidence, dtype=float) + fixed_reference_prior_points(
+        prior, alpha, reference_prior)
+
+
+def fixed_reference_posterior(T_total: ArrayLike, alpha: float,
+                               reference_prior: float = 0.5) -> ArrayLike:
+    """Posterior implied by a grand total T_total (already includes the
+    prior's point-equivalent, i.e. the output of
+    ``fixed_reference_total_points``)."""
+    lpo_ref = float(_log_prior_odds(reference_prior))
+    logit_post = alpha * np.asarray(T_total, dtype=float) + lpo_ref
+    return 1.0 / (1.0 + np.exp(-logit_post))
+
+
+def fixed_reference_classify(T_total: ArrayLike, alpha: float,
+                              targets: Dict[str, float] = None,
+                              reference_prior: float = 0.5) -> Union[str, np.ndarray]:
+    """P/LP/VUS/LB/B classification from a grand total point value (evidence
+    points plus the prior's point-equivalent -- see
+    ``fixed_reference_total_points``).
+
+    Comparing T_total against the fixed boundary points
+    (``fixed_reference_boundary_points``) is exactly equivalent to comparing
+    the true posterior against the true target, at every real prior, not
+    merely at `reference_prior` -- see module-level docstring for the proof
+    sketch.
+    """
+    targets = {**DEFAULT_TARGETS, **(targets or {})}
+    post = fixed_reference_posterior(T_total, alpha, reference_prior)
+    post = np.atleast_1d(np.asarray(post, dtype=float))
+    out = np.empty(post.shape, dtype=object)
+    out[:] = "VUS"
+    out[post >= targets["P"]]  = "P"
+    out[(post >= targets["LP"]) & (post < targets["P"])]  = "LP"
+    out[(post >  targets["B"]) & (post <= targets["LB"])] = "LB"
+    out[post <= targets["B"]]  = "B"
+    if np.ndim(T_total) == 0:
+        return str(out[0])
+    return out

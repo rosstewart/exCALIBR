@@ -143,7 +143,7 @@ def run_single_dataset(
     elif "clinvar_2018" in dataset_name and "not_clinvar_2018" not in dataset_name:
         clinvar_release = "2018"
     else:
-        clinvar_release = getattr(args, "clinvar_release", "2026")
+        clinvar_release = getattr(args, "clinvar_release", None) or "2026"
 
     # Build component list
     if n_c == "all":
@@ -171,6 +171,9 @@ def run_single_dataset(
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=getattr(args, "filter_pathogenic_sample_by_lr", False),
         pathomechanism_method=getattr(args, "pathomechanism_method", None),
+        pathomechanism_boundary_joint_prior=getattr(
+            args, "pathomechanism_boundary_joint_prior", "product"
+        ),
         compute_oob=args.oob,
         oob_min_samples=args.oob_min_samples,
         n_jobs=args.n_jobs_inner,
@@ -411,6 +414,21 @@ def _load_calibration_from_disk(calib_path: Path, lr_path: Path):
         priors_pct = [lr.get("prior")] * 3
         log_lr_plus_full = llr
 
+    # Pathomechanism (--pathomechanism-prior) dual-curve fields, mirroring
+    # the log_lr_plus/log_lr_pct loading above -- see
+    # pipeline/utils.py::save_results for where these get written
+    # ('log_lr_pathogenic_p5/p50/p95', 'prior_pathogenic_pct' in the compact
+    # lr_values.json.gz; 'pathomechanism_prior' in the calibration JSON).
+    # None for every non-pathomechanism run, matching
+    # plot_dual_lr_plus_panel's own None-check no-op.
+    log_lr_pathogenic_pct = None
+    if "log_lr_pathogenic_p5" in lr:
+        log_lr_pathogenic_pct = np.array(
+            [lr["log_lr_pathogenic_p5"], lr["log_lr_pathogenic_p50"], lr["log_lr_pathogenic_p95"]]
+        )
+    elif "log_lr_pathogenic" in lr:
+        log_lr_pathogenic_pct = np.nanpercentile(np.asarray(lr["log_lr_pathogenic"]), [5, 50, 95], axis=0)
+
     return {
         "prior": c["prior"],
         "priors_pct": priors_pct,
@@ -419,6 +437,8 @@ def _load_calibration_from_disk(calib_path: Path, lr_path: Path):
         "point_ranges": {int(k): v for k, v in c["point_ranges"].items()},
         "score_range": lr["score_range"],
         "log_lr_pct": log_lr_pct,   # shape (3, n_score_points): p5, p50, p95
+        "pathomechanism_prior": c.get("pathomechanism_prior"),
+        "log_lr_pathogenic_pct": log_lr_pathogenic_pct,
         "C": None,
         "scoreset_flipped": c.get("scoreset_flipped", False),
     }
@@ -480,6 +500,9 @@ def _run_one_combo(
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
         pathomechanism_method=pathomechanism_method,
+        pathomechanism_boundary_joint_prior=getattr(
+            args, "pathomechanism_boundary_joint_prior", "product"
+        ),
         auto_bidirectional=getattr(args, "auto_bidirectional", True),
     )
 
@@ -534,7 +557,7 @@ def run_all_configs_for_dataset(
         print(f"  SKIP {dataset_name}: no rows in CSV")
         return
 
-    clinvar_release = "2018" if clinvar_mode == "2018" else getattr(args, "clinvar_release", "2026")
+    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2026")
 
     # Extract fits by n_c once in the parent process
     fits_by_nc: Dict[str, list] = {}
@@ -626,7 +649,7 @@ def _compute_all_configs_metrics(
       pts == 0 → IR
       pts > 0  → Abnormal (pathogenic evidence)
     """
-    from src.assay_calibration.plot_utils.utils import flatten_point_ranges, assign_points
+    from src.assay_calibration.plot_utils.utils import assign_points
 
     sample_names = [s[1] for s in scoreset.samples]
     if ("Pathogenic/Likely Pathogenic" not in sample_names
@@ -647,8 +670,7 @@ def _compute_all_configs_metrics(
             if not cal.get("point_ranges"):
                 continue
 
-            point_ranges_flat = flatten_point_ranges(cal["point_ranges"])
-            points = np.array([assign_points(s, point_ranges_flat) for s in raw_scores])
+            points = np.array([assign_points(s, cal["point_ranges"]) for s in raw_scores])
 
             plp_pts = points[plp_mask]
             blb_pts = points[blb_mask]
@@ -701,7 +723,7 @@ def generate_all_configs_viz(
     output_dir = Path(args.output_dir) / dataset_name
     logger = setup_logging(str(output_dir), dataset_name)
 
-    clinvar_release = "2018" if clinvar_mode == "2018" else getattr(args, "clinvar_release", "2026")
+    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2026")
 
     csv_name = dataset_name.replace("_clinvar_2018", "")
     dataset_df = df[df["Dataset"] == csv_name].copy()
@@ -903,7 +925,12 @@ def main():
                             "historical unseeded behavior.")
 
     # ClinVar
-    parser.add_argument("--clinvar-release", default="2026", choices=["2026", "2025", "2018"])
+    parser.add_argument("--clinvar-release", default=None, choices=["2026", "2025", "2018"],
+                       help="ClinVar release to use. Mandatory when --dataset is IGVF-formatted "
+                            "(i.e. has an 'auth_reported_score' column and therefore loads as a "
+                            "Scoreset, whose preprocessing is ClinVar-release-aware); optional and "
+                            "unused for plain score/sample_assignments datasets, which load as a "
+                            "BasicScoreset and have no ClinVar-release-dependent behavior.")
     parser.add_argument("--min-clinvar-star", type=int, default=1)
     parser.add_argument("--population-type", default="gnomAD",
                        choices=["all_variants", "all_nsSNV", "all_missense_nsSNV",
@@ -969,17 +996,18 @@ def main():
                        dest="pathomechanism_prior_enabled", action="store_true", default=None,
                        help="[PN/PU mode only] Enable the dual LR+/prior pathomechanism "
                             "approach: decompose the pathogenic-labeled sample's score "
-                            "density into gamma*f_D(x) + (1-gamma)*f_N(x), where f_N is FIXED to "
+                            "density into P(M=1|Y=1)*f_D(x) + (1-P(M=1|Y=1))*f_N(x), where f_N is FIXED to "
                             "an anchor density (benign/synonymous blend in PN mode, raw gnomAD in "
-                            "PU mode -- anchored, no label-switching), gamma is the estimated "
-                            "fraction of PLP-labeled variants whose disease mechanism this assay "
-                            "actually measures, and f_D ('assay-relevant pathogenic' density) "
+                            "PU mode -- anchored, no label-switching), P(M=1|Y=1) (M = mechanism-"
+                            "detectable indicator) is the estimated fraction of PLP-labeled "
+                            "variants whose disease mechanism this assay actually measures, and "
+                            "f_D ('assay-relevant pathogenic' density) "
                             "feeds a genuinely separate pathogenic-direction (PS3) prior+LR+ pair "
-                            "(reported as pathomechanism_prior, i.e. rho = P(pathogenic AND "
+                            "(reported as pathomechanism_prior, i.e. P(Y=1,M=1) = P(pathogenic AND "
                             "mechanism-detectable)) in the calibration JSON. The benign-direction "
-                            "(BS3) prior+LR+ pair (reported as prior, i.e. pi = P(pathogenic, any "
+                            "(BS3) prior+LR+ pair (reported as prior, i.e. P(Y=1) = P(pathogenic, any "
                             "mechanism)) always stays raw/mechanism-agnostic. "
-                            "PLP_frac_pathomechanism_measured (the gamma estimate) and stability "
+                            "PLP_frac_pathomechanism_measured (the P(M=1|Y=1) estimate) and stability "
                             "flags are reported in the calibration JSON. Mutually exclusive with "
                             "--filter-pathogenic-sample-by-lr. Global, batch-wide flag applied to "
                             "every dataset in the run -- it cannot be set per-dataset via "
@@ -989,13 +1017,13 @@ def main():
                        help=argparse.SUPPRESS)
     # EXPERIMENTAL, hidden: which f_D construction --pathomechanism-prior uses.
     # Only meaningful when --pathomechanism-prior is enabled; defaults to
-    # 'subtraction' (per-component excess max(0, w_P - w_N), renormalized) when
-    # unset. 'masking' keeps w_P wherever it exceeds w_N, zero elsewhere,
-    # renormalized -- more generous toward borderline components, less smooth
-    # at the w_P==w_N boundary. Kept hidden: an advanced tuning knob, not a
-    # top-level user-facing choice. Global, batch-wide.
+    # 'boundary' (Blanchard-Lee-Scott boundary/min-ratio estimator, closed-form,
+    # operates on densities directly -- see PipelineConfig.pathomechanism_method's
+    # docstring) when unset. 'subtraction'/'masking' (older, weight-vector-based
+    # constructions) are kept only for dev/debugging comparison against
+    # 'boundary', not a top-level user-facing choice. Global, batch-wide.
     parser.add_argument("--pathomechanism-method",
-                       dest="pathomechanism_method", choices=["off", "subtraction", "masking"],
+                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary"],
                        default=None,
                        help=argparse.SUPPRESS)
     parser.add_argument("--no-postprocess", action="store_true",
@@ -1060,9 +1088,9 @@ def main():
 
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode
-    # expects, defaulting the sub-choice to "subtraction" when enabled.
+    # expects, defaulting the sub-choice to "boundary" when enabled.
     if args.pathomechanism_prior_enabled:
-        pm_flag = args.pathomechanism_method or "subtraction"
+        pm_flag = args.pathomechanism_method or "boundary"
     elif args.pathomechanism_prior_enabled is False:
         pm_flag = "off"
     else:
@@ -1104,6 +1132,17 @@ def main():
     print(f"\nLoading dataset CSV from {args.dataset}...")
     df = pd.read_csv(args.dataset, sep=sep)
     print(f"Loaded {len(df)} rows")
+
+    # load_dataset_from_df (pipeline/utils.py) builds a Scoreset -- not a
+    # BasicScoreset -- iff the dataframe has "auth_reported_score" (IGVF
+    # format); only Scoreset's preprocessing is ClinVar-release-aware, so
+    # only that case requires --clinvar-release to have been passed.
+    if "auth_reported_score" in df.columns and args.clinvar_release is None:
+        parser.error(
+            "--clinvar-release is required: --dataset is IGVF-formatted "
+            "(has an 'auth_reported_score' column), so it loads as a Scoreset, "
+            "whose preprocessing depends on the ClinVar release."
+        )
 
     # Load splits if provided
     all_splits = None

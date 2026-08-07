@@ -14,6 +14,7 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 
 from src.assay_calibration.plot_utils.utils import (
@@ -21,12 +22,6 @@ from src.assay_calibration.plot_utils.utils import (
     compute_classification_metrics,
 )
 from analysis.plot_common import effective_points as _effective_points, sample_matches
-
-try:
-    import seaborn as sns
-    _HAS_SNS = True
-except ImportError:
-    _HAS_SNS = False
 
 import matplotlib.pyplot as plt
 
@@ -125,6 +120,8 @@ def make_confusion_figure(
     tag: str = "",
     xlabel: Optional[str] = None,
     xticklabels: Optional[List[str]] = None,
+    title1: Optional[str] = None,
+    title2: Optional[str] = None,
 ):
     """Aggregate confusion heatmap comparing two sets of per-dataset matrices.
 
@@ -139,14 +136,21 @@ def make_confusion_figure(
     aren't the Normal/IR/Abnormal evidence-direction convention (e.g. a
     points-sign family, where the columns are Negative/Indeterminate/
     Positive rather than a ClinVar-style label).
+
+    *title1*/*title2*, if given, override the panel title text shown on the
+    image itself, independent of *label1*/*label2* (which still control the
+    output filename) -- for callers that want a different display name (e.g.
+    "Posterior-exact") than the identifier used elsewhere for file naming.
     """
     fig, _, _ = plot_aggregate_confusion_matrices(
         danzs_m1, danzs_m2, dataset_names, letters=True
     )
     axes = [ax for ax in fig.get_axes() if hasattr(ax, "get_title")]
     if len(axes) >= 2:
-        axes[0].set_title(_pretty(label1), fontsize=18, fontweight="bold", pad=10)
-        axes[1].set_title(_pretty(label2), fontsize=18, fontweight="bold", pad=10)
+        axes[0].set_title(title1 if title1 is not None else _pretty(label1),
+                           fontsize=18, fontweight="bold", pad=10)
+        axes[1].set_title(title2 if title2 is not None else _pretty(label2),
+                           fontsize=18, fontweight="bold", pad=10)
     if xlabel is not None or xticklabels is not None:
         for ax in axes[:2]:
             if xlabel is not None:
@@ -158,6 +162,62 @@ def make_confusion_figure(
     _save(fig, figure_dir / f"confusion_heatmap_{label1}_vs_{label2}{tag_suffix}.png")
 
 
+# Diverging Blue(Benign)/Gray(Indeterminate)/Red(Pathogenic) row-normalized
+# color scheme, column-keyed -- extracted from
+# plot_aggregate_confusion_matrices's letters=True branch (the two-panel
+# ExCALIBR-vs-author comparison figure's style) so single-panel figures
+# match it too, instead of the flat purple gradient used previously.
+_BLUE_CMAP = LinearSegmentedColormap.from_list(
+    "blue_gradient", ['#F0F8FC', '#99C8DC', '#7AB5D1', '#4B91A6', '#2E6B7E'])
+_RED_CMAP = LinearSegmentedColormap.from_list(
+    "red_gradient", ['#FCF0F2', '#E6B1B8', '#D68F99', '#B85C6B', '#943744'])
+_GRAY_CMAP = LinearSegmentedColormap.from_list(
+    "gray_gradient", ['#F5F5F5', '#CCCCCC', '#999999', '#666666'])
+
+
+def _column_cmap(col_name: str) -> LinearSegmentedColormap:
+    name = str(col_name)
+    if any(tag in name for tag in ("Benign", "Normal", "BLB", "B/LB")):
+        return _BLUE_CMAP
+    if any(tag in name for tag in ("Pathogenic", "Abnormal", "PLP", "P/LP")):
+        return _RED_CMAP
+    return _GRAY_CMAP  # IR/Indeterminate, and any other column
+
+
+def draw_diverging_confusion_heatmap(ax, aggregate: pd.DataFrame, fontsize: int = 14):
+    """Draw one row-normalized diverging confusion heatmap into `ax`.
+
+    Same color logic as plot_aggregate_confusion_matrices's letters=True
+    heatmap (src/assay_calibration/plot_utils/utils.py), generalized to a
+    single matrix/axis so it can be reused both for single-panel figures
+    (make_single_confusion_figure) and multi-panel grids
+    (analysis/path_percentile_confusion.py) without duplicating the color
+    logic. Caller is responsible for ticks/labels/title/caption -- this only
+    draws the cells.
+    """
+    n_rows, n_cols = len(aggregate), len(aggregate.columns)
+    for i in range(n_rows):
+        row_max = aggregate.iloc[i].max()
+        for j, col_name in enumerate(aggregate.columns):
+            value = aggregate.iloc[i, j]
+            normalized = value / row_max if row_max > 0 else 0
+            facecolor = _column_cmap(col_name)(normalized)
+            ax.add_patch(mpatches.Rectangle(
+                (j, i), 1, 1, facecolor=facecolor, edgecolor="white", linewidth=2.5,
+            ))
+            text_color = "white" if (row_max > 0 and value / row_max > 0.45) else "black"
+            if "IR" in str(col_name) or "Indeterminate" in str(col_name):
+                text_color = "black"
+            ax.text(j + 0.5, i + 0.5, f"{value:,}", ha="center", va="center",
+                     fontsize=fontsize, color=text_color)
+
+    ax.set_xlim(0, n_cols)
+    ax.set_ylim(0, n_rows)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.set_facecolor("#F9F9F9")
+
+
 def make_single_confusion_figure(
     matrices: List,
     dataset_names: List[str],
@@ -167,10 +227,11 @@ def make_single_confusion_figure(
 ):
     """Single-panel aggregate confusion heatmap (ClinVar rows x evidence-direction columns).
 
-    Reproduces the same visual idiom as plot_aggregate_confusion_matrices's
-    letters=False single-panel branch (purple gradient + DOR/coverage caption),
-    for the case where there's no second matrix (author labels / other method)
-    to compare against.
+    Uses the diverging Blue/Gray/Red row-normalized style (see
+    draw_diverging_confusion_heatmap) -- the same idiom
+    plot_aggregate_confusion_matrices uses for its two-panel
+    ExCALIBR-vs-author comparison -- for the case where there's no second
+    matrix (author labels / other method) to compare against.
     """
     aggregate = None
     n_datasets = 0
@@ -191,30 +252,16 @@ def make_single_confusion_figure(
     xlabels = [label_map.get(str(c), str(c)) for c in aggregate.columns]
     ylabels = [label_map.get(str(r), str(r)) for r in aggregate.index]
 
-    colors = ["whitesmoke", "purple"]
-    cmap = LinearSegmentedColormap.from_list("nature_purple", colors)
-
-    max_val = aggregate.values.max()
-    annot = aggregate.astype(str)
-    for row in range(len(aggregate)):
-        for col in range(len(aggregate.columns)):
-            annot.iloc[row, col] = f"{aggregate.iloc[row, col]:,}"
-
     fig, ax = plt.subplots(figsize=(5, 4.2))
-    sns.heatmap(
-        aggregate, annot=annot, fmt="", cmap=cmap, vmin=0, vmax=max_val,
-        ax=ax, cbar_kws={"label": "Count"}, linewidths=2.5, linecolor="white",
-        annot_kws={"fontsize": 13, "ha": "center", "va": "center"},
-    )
-    for text_obj in ax.texts:
-        x, y = text_obj.get_position()
-        row, col = int(y), int(x)
-        if row < len(aggregate) and col < len(aggregate.columns):
-            value = aggregate.iloc[row, col]
-            text_obj.set_color("white" if value / max_val > 0.45 else "black")
+    draw_diverging_confusion_heatmap(ax, aggregate, fontsize=13)
 
+    ax.set_xticks(np.arange(len(xlabels)) + 0.5)
+    ax.set_yticks(np.arange(len(ylabels)) + 0.5)
     ax.set_xticklabels(xlabels, rotation=0, fontsize=11)
     ax.set_yticklabels(ylabels, rotation=0, fontsize=11)
+    ax.tick_params(length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     ax.set_xlabel("Evidence Direction", fontsize=12)
     ax.set_ylabel("ClinVar Classification", fontsize=12)
     ax.set_title(f"{_pretty(label)} ({n_datasets} datasets)", fontsize=14, fontweight="bold", pad=10)

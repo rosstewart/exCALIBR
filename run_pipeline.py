@@ -25,6 +25,14 @@ import warnings
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
+# Force line-buffered stdout/stderr so progress messages (joblib's bootstrap-
+# fitting progress below, plus every existing print()/logger line) show up
+# promptly under `nohup ... > file.log 2>&1 &` instead of sitting in Python's
+# default block-buffer (used whenever stdout isn't a TTY) until the process
+# exits or the buffer fills.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # (n_bootstraps, fits_per_bootstrap) shorthands -- see docs/configuration.md#quality-vs-speed-presets
 BOOTSTRAP_PRESETS = {
     "light": (20, 8),
@@ -216,17 +224,18 @@ Examples:
                        dest="pathomechanism_prior_enabled", action="store_true", default=None,
                        help="[PN/PU mode only] Enable the dual LR+/prior pathomechanism "
                             "approach: decompose the pathogenic-labeled sample's score "
-                            "density into gamma*f_D(x) + (1-gamma)*f_N(x), where f_N is FIXED to "
+                            "density into P(M=1|Y=1)*f_D(x) + (1-P(M=1|Y=1))*f_N(x), where f_N is FIXED to "
                             "an anchor density (benign/synonymous blend in PN mode, raw gnomAD in "
-                            "PU mode -- anchored, no label-switching), gamma is the estimated "
-                            "fraction of PLP-labeled variants whose disease mechanism this assay "
-                            "actually measures, and f_D ('assay-relevant pathogenic' density) "
+                            "PU mode -- anchored, no label-switching), P(M=1|Y=1) (M = mechanism-"
+                            "detectable indicator) is the estimated fraction of PLP-labeled "
+                            "variants whose disease mechanism this assay actually measures, and "
+                            "f_D ('assay-relevant pathogenic' density) "
                             "feeds a genuinely separate pathogenic-direction (PS3) prior+LR+ pair "
-                            "(reported as pathomechanism_prior, i.e. rho = P(pathogenic AND "
+                            "(reported as pathomechanism_prior, i.e. P(Y=1,M=1) = P(pathogenic AND "
                             "mechanism-detectable)) in the calibration JSON. The benign-direction "
-                            "(BS3) prior+LR+ pair (reported as prior, i.e. pi = P(pathogenic, any "
+                            "(BS3) prior+LR+ pair (reported as prior, i.e. P(Y=1) = P(pathogenic, any "
                             "mechanism)) always stays raw/mechanism-agnostic. "
-                            "PLP_frac_pathomechanism_measured (the gamma estimate) and stability "
+                            "PLP_frac_pathomechanism_measured (the P(M=1|Y=1) estimate) and stability "
                             "flags are reported in the calibration JSON. Mutually exclusive with "
                             "--filter-pathogenic-sample-by-lr. Default: off (raw single LR+/prior).")
     parser.add_argument("--no-pathomechanism-prior",
@@ -243,14 +252,23 @@ Examples:
                        help=argparse.SUPPRESS)
     # EXPERIMENTAL, hidden: which f_D construction --pathomechanism-prior uses.
     # Only meaningful when --pathomechanism-prior is enabled; defaults to
-    # 'subtraction' (per-component excess max(0, w_P - w_N), renormalized) when
-    # unset. 'masking' keeps w_P wherever it exceeds w_N, zero elsewhere,
-    # renormalized -- more generous toward borderline components, less smooth
-    # at the w_P==w_N boundary. Kept hidden: an advanced tuning knob, not a
-    # top-level user-facing choice.
+    # 'boundary' (Blanchard-Lee-Scott boundary/min-ratio estimator, closed-form,
+    # operates on densities directly -- see PipelineConfig.pathomechanism_method's
+    # docstring) when unset. 'subtraction'/'masking' (older, weight-vector-based
+    # constructions) are kept only for dev/debugging comparison against
+    # 'boundary', not a top-level user-facing choice.
     parser.add_argument("--pathomechanism-method",
-                       dest="pathomechanism_method", choices=["off", "subtraction", "masking"],
+                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary"],
                        default=None,
+                       help=argparse.SUPPRESS)
+    # EXPERIMENTAL, hidden: only meaningful when --pathomechanism-method
+    # boundary is selected. "product" (default) computes P(Y=1,M=1) as
+    # P(Y=1)*P(M=1|Y=1); "direct" re-derives it against the population
+    # sample instead -- see PipelineConfig.pathomechanism_boundary_joint_prior's
+    # docstring.
+    parser.add_argument("--pathomechanism-boundary-joint-prior",
+                       dest="pathomechanism_boundary_joint_prior", choices=["product", "direct"],
+                       default="product",
                        help=argparse.SUPPRESS)
 
     # Model selection (only relevant when fitting multiple --components)
@@ -329,9 +347,9 @@ Examples:
 
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode
-    # expects, defaulting the sub-choice to "subtraction" when enabled.
+    # expects, defaulting the sub-choice to "boundary" when enabled.
     if args.pathomechanism_prior_enabled:
-        pm_flag = args.pathomechanism_method or "subtraction"
+        pm_flag = args.pathomechanism_method or "boundary"
     elif args.pathomechanism_prior_enabled is False:
         pm_flag = "off"
     else:
@@ -386,6 +404,7 @@ Examples:
         benign_percentile=args.benign_percentile,
         filter_pathogenic_sample_by_lr=args.filter_pathogenic_sample_by_lr,
         pathomechanism_method=args.pathomechanism_method,
+        pathomechanism_boundary_joint_prior=args.pathomechanism_boundary_joint_prior,
         acmg_mapping_method=(args.acmg_mapping_method
                               if args.acmg_mapping_method != "all" else "tavtigian"),
         acmg_bayes_targets=args.acmg_bayes_targets,
