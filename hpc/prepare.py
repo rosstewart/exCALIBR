@@ -159,7 +159,7 @@ def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
     os.makedirs(jobs_dir, exist_ok=True)
 
     total_jobs = len(all_jobs)
-    jobs_per_array = max(1, total_jobs // target_array_size)
+    jobs_per_array = max(1, -(-total_jobs // target_array_size))
     num_arrays = (total_jobs + jobs_per_array - 1) // jobs_per_array
 
     print(f"\nOptimal arrangement:")

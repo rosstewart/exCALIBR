@@ -880,8 +880,9 @@ if not config.warn_if_missing(config.PATHOMECHANISM_OUTPUT_DIR, "pathomechanism 
 # %%
 from analysis.robustness import (
     discover_robustness_base_datasets, load_reference_variants,
-    compute_robustness_confusion_matrices, robustness_confusion_matrices_to_metrics,
-    run_config_summary_plots_batch,
+    compute_robustness_confusion_matrices, compute_robustness_max_strengths,
+    robustness_confusion_matrices_to_metrics, run_config_summary_plots_batch,
+    plot_robustness_confusion_matrix_grid,
 )
 
 if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis"):
@@ -897,6 +898,8 @@ if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis
     # bias every comparison. tree/model_selections/calibrations (section 1's
     # own main-pipeline discovery) are no longer needed here as a result.
     robustness_summaries = {}
+    robustness_matrices = {}
+    robustness_max_strengths = {}
     config_summary_jobs = []
     for base_ds in robustness_bases:
         try:
@@ -913,6 +916,10 @@ if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis
         )
         if matrices:
             robustness_summaries[base_ds] = robustness_confusion_matrices_to_metrics(matrices, base_ds)
+            robustness_matrices[base_ds] = matrices
+            robustness_max_strengths[base_ds] = compute_robustness_max_strengths(
+                base_ds, reference_df, ref_cal_path, config.ROBUSTNESS_OUTPUT_DIR,
+            )
 
         config_summary_jobs.append((base_ds, reference_df, ref_cal_path))
 
@@ -923,6 +930,21 @@ if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis
     run_config_summary_plots_batch(
         config_summary_jobs, figure_dir=FIGURE_DIR, robustness_output_dir=config.ROBUSTNESS_OUTPUT_DIR,
     )
+
+    # Confusion-matrix grids: 4 columns (one per robustness base dataset) x
+    # one row per condition level (control first, then descending downsample
+    # N / ascending discordance fraction) -- the same diverging Blue/Gray/Red
+    # style used everywhere else, plus each cell's strongest pathogenic/
+    # benign evidence point ("Max strengths: +X, -Y").
+    if robustness_matrices:
+        plot_robustness_confusion_matrix_grid(
+            robustness_matrices, robustness_max_strengths, "downsample",
+            base_datasets=list(robustness_matrices.keys()), figure_dir=FIGURE_DIR,
+        )
+        plot_robustness_confusion_matrix_grid(
+            robustness_matrices, robustness_max_strengths, "discordance",
+            base_datasets=list(robustness_matrices.keys()), figure_dir=FIGURE_DIR,
+        )
 
 # %% [markdown]
 # ### 3a6. Bootstrap-count-reduction analysis

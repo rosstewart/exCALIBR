@@ -70,7 +70,10 @@ from analysis import config as cfg
 from analysis.discovery import (
     discover_outputs, resolve_component, recompute_points_from_calibration,
 )
-from analysis.confusion import build_confusion_matrix, make_single_confusion_figure
+from analysis.confusion import (
+    build_confusion_matrix, make_single_confusion_figure,
+    draw_diverging_confusion_heatmap,
+)
 from analysis.plot_common import save_and_show, sample_matches, is_notebook
 
 # Genes whose main-pipeline output is only ever saved under a
@@ -387,6 +390,44 @@ def load_reference_variants(
 # Confusion matrices + scalar metrics
 # ---------------------------------------------------------------------------
 
+def _iter_robustness_scored(
+    base_dataset: str,
+    reference_df: pd.DataFrame,
+    reference_calibration_path: Path,
+    robustness_output_dir: Optional[str] = None,
+):
+    """Yields (key, df_scored) for the ("reference", 0, 0) baseline (the
+    reference dataset's own point_ranges applied to itself) and every
+    non-control condition's point_ranges applied to reference_df -- the
+    shared scoring loop compute_robustness_confusion_matrices and
+    compute_robustness_max_strengths both build on, so a base dataset's
+    conditions are only discovered/recomputed once per caller rather than
+    once per statistic. `df_scored` always carries a fresh 'standard_points'
+    column (see recompute_points_from_calibration); control conditions are
+    skipped since they're already represented by the ("reference", 0, 0) row
+    when reference_source="robustness_control" (reference_df/
+    reference_calibration_path ARE that same condition's own output).
+    """
+    component = _infer_component(reference_calibration_path)
+
+    ref_scored = recompute_points_from_calibration(reference_df, reference_calibration_path)
+    yield ("reference", 0, 0), ref_scored
+
+    for cond in discover_robustness_conditions(base_dataset, robustness_output_dir):
+        if cond["perturbation_type"] == "control":
+            continue
+        cal_path = find_condition_calibration(cond["dir"], component)
+        if cal_path is None:
+            print(f"  SKIP {cond['dir'].name}: no calibration.json")
+            continue
+        try:
+            df_scored = recompute_points_from_calibration(reference_df, cal_path)
+        except ValueError as e:
+            print(f"  SKIP {cond['dir'].name}: {e}")
+            continue
+        yield (cond["perturbation_type"], cond["level"], cond["seed"]), df_scored
+
+
 def compute_robustness_confusion_matrices(
     base_dataset: str,
     reference_df: pd.DataFrame,
@@ -402,35 +443,44 @@ def compute_robustness_confusion_matrices(
     artifact of comparing OOB-scored vs freshly-assigned standard_points.
     """
     matrices: Dict[Tuple[str, float, int], pd.DataFrame] = {}
-    component = _infer_component(reference_calibration_path)
-
-    ref_scored = recompute_points_from_calibration(reference_df, reference_calibration_path)
-    ref_mat = build_confusion_matrix(ref_scored, use_oob=False, label=f"{base_dataset}/reference")
-    if ref_mat is not None:
-        matrices[("reference", 0, 0)] = ref_mat
-
-    for cond in discover_robustness_conditions(base_dataset, robustness_output_dir):
-        if cond["perturbation_type"] == "control":
-            # Already represented by the ("reference", 0, 0) row above when
-            # reference_source="robustness_control" (reference_df/
-            # reference_calibration_path ARE this same condition's own
-            # output) -- re-scoring it here would just duplicate that row.
-            continue
-        cal_path = find_condition_calibration(cond["dir"], component)
-        if cal_path is None:
-            print(f"  SKIP {cond['dir'].name}: no calibration.json")
-            continue
-        try:
-            df_scored = recompute_points_from_calibration(reference_df, cal_path)
-        except ValueError as e:
-            print(f"  SKIP {cond['dir'].name}: {e}")
-            continue
-        label = f"{base_dataset}/{cond['perturbation_type']}={cond['level']}/seed={cond['seed']}"
+    for key, df_scored in _iter_robustness_scored(
+        base_dataset, reference_df, reference_calibration_path, robustness_output_dir,
+    ):
+        ptype, level, seed = key
+        label = (
+            f"{base_dataset}/reference" if ptype == "reference"
+            else f"{base_dataset}/{ptype}={level}/seed={seed}"
+        )
         mat = build_confusion_matrix(df_scored, use_oob=False, label=label)
         if mat is not None:
-            matrices[(cond["perturbation_type"], cond["level"], cond["seed"])] = mat
+            matrices[key] = mat
 
     return matrices
+
+
+def compute_robustness_max_strengths(
+    base_dataset: str,
+    reference_df: pd.DataFrame,
+    reference_calibration_path: Path,
+    robustness_output_dir: Optional[str] = None,
+) -> Dict[Tuple[str, float, int], Tuple[int, int]]:
+    """Per condition (same keys as compute_robustness_confusion_matrices):
+    (max_pathogenic_point, max_benign_point) -- the strongest positive and
+    strongest (most negative) standard_points value reached among the
+    reference population under that condition's point_ranges. 0 for a
+    direction with no points reached in that direction, mirroring
+    build_confusion_matrix's own "0 count" convention for an empty side.
+    """
+    strengths: Dict[Tuple[str, float, int], Tuple[int, int]] = {}
+    for key, df_scored in _iter_robustness_scored(
+        base_dataset, reference_df, reference_calibration_path, robustness_output_dir,
+    ):
+        pts = df_scored["standard_points"]
+        max_path = int(pts[pts > 0].max()) if (pts > 0).any() else 0
+        max_benign = int(pts[pts < 0].min()) if (pts < 0).any() else 0
+        strengths[key] = (max_path, max_benign)
+
+    return strengths
 
 
 def robustness_confusion_matrices_to_metrics(
@@ -1137,6 +1187,229 @@ def plot_robustness_confusion_grid(
             mats, [f"seed{i}" for i in range(len(mats))],
             label=base_dataset, figure_dir=out_dir, tag=f"{ptype}_{level}",
         )
+
+
+_GRID_LEVEL_LABELS = {"downsample": lambda level: f"N={level}", "discordance": lambda level: f"{level:.0%} noise"}
+
+
+def _finite_percentiles(vals) -> Tuple[float, float, float]:
+    """(p25, median, p75) over the finite entries of `vals` only -- e.g.
+    dor_standard is +inf whenever a seed's confusion matrix has zero FP or
+    FN (perfect separation on that seed), and np.percentile mixing finite
+    values with inf produces NaN via inf-inf subtraction during
+    interpolation. Dropping non-finite values before percentiling mirrors
+    the existing convention in plot_downsample_robustness_curve /
+    plot_discordance_robustness_distribution. All-infinite input reports
+    (inf, inf, inf) rather than NaN."""
+    arr = np.asarray(vals, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if len(finite) == 0:
+        return float("inf"), float("inf"), float("inf")
+    p25, p50, p75 = np.percentile(finite, [25, 50, 75])
+    return p25, p50, p75
+
+
+def _seed_matrix_percentiles(mats: List[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Elementwise (p25, median, p75) DataFrames across a list of same-shape
+    confusion matrices -- one seed's own count per cell is the unit being
+    percentiled, not a pooled/summed count, so a level's displayed cell
+    reflects "what a typical seed's confusion matrix looks like" plus its
+    seed-to-seed spread rather than a seed-count-weighted total."""
+    stacked = np.stack([m.values for m in mats])  # (n_seeds, n_index, n_cols)
+    p25, p50, p75 = np.percentile(stacked, [25, 50, 75], axis=0)
+    template = mats[0]
+    to_df = lambda arr: pd.DataFrame(arr, index=template.index, columns=template.columns)
+    return to_df(p25), to_df(p50), to_df(p75)
+
+
+def plot_robustness_confusion_matrix_grid(
+    per_dataset_matrices: Dict[str, Dict[Tuple[str, float, int], pd.DataFrame]],
+    per_dataset_strengths: Dict[str, Dict[Tuple[str, float, int], Tuple[int, int]]],
+    perturbation_type: str,
+    base_datasets: List[str],
+    figure_dir: Path,
+    filename: str = "confusion_grid.png",
+):
+    """4-column (one per base dataset) x N-row (control, then every
+    discovered level of `perturbation_type`) confusion-matrix grid, in the
+    same diverging Blue/Gray/Red row-normalized style as every other
+    confusion figure (draw_diverging_confusion_heatmap).
+
+    `per_dataset_matrices`/`per_dataset_strengths` : {base_dataset: {(ptype,
+    level, seed): matrix-or-(max_pathogenic, max_benign)}}, i.e. exactly what
+    compute_robustness_confusion_matrices/compute_robustness_max_strengths
+    already return, one dict per base dataset -- each seed's own matrix
+    already applies that seed's own point_ranges to the SAME fixed reference
+    population (see this module's docstring), so seeds are directly
+    comparable cell-for-cell and metric-for-metric, not just summable counts.
+
+    Each (dataset, level>control) cell is a per-SEED statistic (that seed's
+    own cell count / DOR / coverage / max-strength), summarized as the
+    seed-to-seed median with a [p25, p75] spread -- NOT a sum/max across
+    seeds, which would conflate "how big is a typical seed's confusion
+    matrix" with "how many seeds landed at this level". The control row has
+    exactly one condition (no seeds), so it's shown as a single point value
+    with no spread.
+
+    Row order: control first, then levels descending for "downsample" (64
+    down to 1) or ascending for "discordance" (0.01, 0.10) -- control is
+    always the reference condition, the other levels read as "how far from
+    control" in the direction that matters for that perturbation type.
+
+    A (dataset, level) cell with no seed matrices (e.g. that condition's
+    calibration failed to load) is left blank rather than failing the whole
+    grid.
+    """
+    from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+
+    levels = sorted({
+        level for matrices in per_dataset_matrices.values()
+        for (ptype, level, _seed) in matrices if ptype == perturbation_type
+    })
+    row_keys = ["control"] + (levels if perturbation_type == "discordance" else list(reversed(levels)))
+    row_labels = ["Control"] + [_GRID_LEVEL_LABELS[perturbation_type](level) for level in
+                                 (levels if perturbation_type == "discordance" else list(reversed(levels)))]
+
+    n_rows, n_cols = len(row_keys), len(base_datasets)
+    total_height_in = 3.0 * n_rows
+    # top/bottom pinned by an ABSOLUTE inch budget rather than a fixed
+    # fraction -- matplotlib's own default top=0.88/bottom=0.11 (and a fixed
+    # fraction generally) is fine for a figure of roughly constant size, but
+    # this grid's height varies ~3x between a 3-row discordance grid and an
+    # 8-row downsample grid. A fixed fraction either leaves several inches of
+    # dead space above row 0 on the tall grid, or (if sized for the tall
+    # grid) too little room for the suptitle + column titles to avoid
+    # overlapping on the short one. ~0.9in reserved for the suptitle +
+    # column-header row is enough regardless of n_rows.
+    top = max(0.85, min(0.97, 1 - 0.9 / total_height_in))
+    # bottom is nominal only -- the caption/"Evidence Direction" text below
+    # each row is placed via fig.text at an absolute-inch offset from that
+    # row's actual rendered bbox (see below), which savefig(bbox_inches=
+    # "tight") automatically expands the canvas to include, so this doesn't
+    # need to pre-reserve real estate the way `top` does for the suptitle.
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.6 * n_cols, total_height_in), squeeze=False,
+                              gridspec_kw={"hspace": 0.42, "wspace": 0.15, "top": top, "bottom": 0.02})
+
+    label_map = {"PLP": "P/LP", "BLB": "B/LB", "IR": "Indeterminate",
+                 "Normal": "Benign", "Abnormal": "Pathogenic"}
+
+    def _fmt_point(v, is_pct=False, signed=False):
+        if signed:
+            return f"{v:+.0f}"
+        return f"{v:.1f}{'%' if is_pct else ''}"
+
+    def _fmt_spread(lo, hi, is_pct=False, signed=False):
+        if signed:
+            return f"[{lo:+.0f}, {hi:+.0f}]"
+        suffix = "%" if is_pct else ""
+        return f"[{lo:.1f}{suffix}, {hi:.1f}{suffix}]"
+
+    for row, (row_key, row_label) in enumerate(zip(row_keys, row_labels)):
+        for col, dataset in enumerate(base_datasets):
+            ax = axes[row, col]
+            matrices = per_dataset_matrices.get(dataset, {})
+            strengths = per_dataset_strengths.get(dataset, {})
+
+            if row_key == "control":
+                cell_keys = [k for k in matrices if k[0] == "reference"]
+            else:
+                cell_keys = [k for k in matrices if k[0] == perturbation_type and k[1] == row_key]
+
+            seed_mats = [matrices[k] for k in cell_keys if k in matrices]
+            if not seed_mats:
+                ax.axis("off")
+                continue
+
+            is_control = row_key == "control"
+            if is_control:
+                display_mat = seed_mats[0].round(0)
+                dor_vals = [compute_classification_metrics(seed_mats[0])["dor_standard"]]
+                cov_vals = [100 * compute_classification_metrics(seed_mats[0])["coverage"]]
+            else:
+                p25_mat, display_mat, p75_mat = _seed_matrix_percentiles(seed_mats)
+                dor_vals = [compute_classification_metrics(m)["dor_standard"] for m in seed_mats]
+                cov_vals = [100 * compute_classification_metrics(m)["coverage"] for m in seed_mats]
+            display_mat_int = display_mat.round(0).astype(int)
+
+            strength_pairs = [strengths[k] for k in cell_keys if k in strengths]
+            maxp_vals = [s[0] for s in strength_pairs]
+            maxb_vals = [s[1] for s in strength_pairs]
+
+            draw_diverging_confusion_heatmap(ax, display_mat_int, fontsize=11)
+            if not is_control:
+                for i in range(display_mat_int.shape[0]):
+                    for j in range(display_mat_int.shape[1]):
+                        ax.text(
+                            j + 0.5, i + 0.78,
+                            f"[{p25_mat.iloc[i, j]:.0f}, {p75_mat.iloc[i, j]:.0f}]",
+                            ha="center", va="center", fontsize=6.5, color="black",
+                            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.65),
+                        )
+
+            xlabels = [label_map.get(str(c), str(c)) for c in display_mat_int.columns]
+            ylabels = [label_map.get(str(r), str(r)) for r in display_mat_int.index]
+            ax.set_xticks(np.arange(len(xlabels)) + 0.5)
+            ax.set_yticks(np.arange(len(ylabels)) + 0.5)
+            ax.set_xticklabels(xlabels, rotation=0, fontsize=9)
+            ax.set_yticklabels(ylabels, rotation=0, fontsize=9)
+            ax.tick_params(length=0)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+
+            if row == 0:
+                ax.set_title(dataset, fontsize=12, fontweight="bold", pad=10)
+            if col == 0:
+                ax.set_ylabel(f"{row_label}\nClinVar Classification", fontsize=10)
+
+            dor_p25, dor_p50, dor_p75 = _finite_percentiles(dor_vals)
+            cov_p25, cov_p50, cov_p75 = np.percentile(cov_vals, [25, 50, 75])
+            maxp_p25, maxp_p50, maxp_p75 = np.percentile(maxp_vals, [25, 50, 75])
+            maxb_p25, maxb_p50, maxb_p75 = np.percentile(maxb_vals, [25, 50, 75])
+
+            if is_control:
+                caption = (
+                    f"DOR: {_fmt_point(dor_p50)}\n"
+                    f"Determinate: Controls {_fmt_point(cov_p50, is_pct=True)}\n"
+                    f"Max strengths: {_fmt_point(maxp_p50, signed=True)}, {_fmt_point(maxb_p50, signed=True)}"
+                )
+            else:
+                caption = (
+                    f"DOR: {_fmt_point(dor_p50)} {_fmt_spread(dor_p25, dor_p75)}\n"
+                    f"Determinate: Controls {_fmt_point(cov_p50, is_pct=True)} {_fmt_spread(cov_p25, cov_p75, is_pct=True)}\n"
+                    f"Max strengths: {_fmt_point(maxp_p50, signed=True)} {_fmt_spread(maxp_p25, maxp_p75, signed=True)}, "
+                    f"{_fmt_point(maxb_p50, signed=True)} {_fmt_spread(maxb_p25, maxb_p75, signed=True)}"
+                )
+            # Placed in FIGURE (not axes) coordinates, offset from this cell's
+            # actual rendered bbox by a fixed absolute number of inches --
+            # ax.transAxes offsets scale with that row's own axes height,
+            # which (via the hspace/top/bottom tuning above) differs enough
+            # between an 8-row and a 3-row grid that a fraction tuned for one
+            # either wastes space or collides with the next element on the
+            # other. An absolute inch offset looks the same regardless of
+            # n_rows.
+            bbox = ax.get_position()
+            cx = bbox.x0 + bbox.width / 2
+            # bbox.y0 is the axes' DATA rectangle bottom edge -- the x tick
+            # labels (category names) render entirely below that, in the
+            # padding matplotlib reserves outside the returned bbox, so the
+            # caption needs to clear that tick-label height too, not just a
+            # small gap from bbox.y0 itself.
+            tick_label_height_in = 0.22
+            caption_top = bbox.y0 - (tick_label_height_in + 0.06) / total_height_in
+            fig.text(cx, caption_top, caption, ha="center", va="top", fontsize=7,
+                      color="#555555", linespacing=1.3)
+            if row == n_rows - 1:
+                caption_lines = caption.count("\n") + 1
+                line_height_in = 7 * 1.3 / 72
+                xlabel_y = caption_top - (caption_lines * line_height_in + 0.10) / total_height_in
+                fig.text(cx, xlabel_y, "Evidence Direction", ha="center", va="top", fontsize=10)
+
+    perturbation_title = "Downsampling" if perturbation_type == "downsample" else "Label discordance"
+    fig.suptitle(f"Robustness: {perturbation_title} confusion matrices (median [IQR] across seeds)",
+                 fontsize=14, fontweight="bold")
+    out_dir = Path(figure_dir) / ("robustness_downsampling" if perturbation_type == "downsample" else "robustness_label_noise")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_and_show(fig, out_dir / filename)
 
 
 # ---------------------------------------------------------------------------

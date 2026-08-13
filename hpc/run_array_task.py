@@ -111,8 +111,13 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
             continue
 
         # Derive save_dir from output_dir + dataset_name — ignores the baked-in
-        # path so that jobs are portable across filesystem mounts.
-        save_dir = output_dir / dataset_name
+        # path so that jobs are portable across filesystem mounts. A "condition"
+        # tag (set when multiple sweep conditions share one merged job array,
+        # e.g. analysis/build_splice_ablation_jobs.py --merge-jobs) routes
+        # results to <output_dir>/<condition>/<dataset_name> instead, matching
+        # the per-condition tree hpc/aggregate_results.py expects.
+        condition = cjob.get("condition")
+        save_dir = output_dir / condition / dataset_name if condition else output_dir / dataset_name
         bs_seed = cjob["bootstrap_seed"]
         shared = cjob["shared_data"]
         is_mv = cjob.get("multivariate", False)
