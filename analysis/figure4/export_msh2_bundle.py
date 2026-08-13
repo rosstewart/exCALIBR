@@ -13,22 +13,24 @@ pipeline-wide confusion matrices change.
 
 Writes, under --bundle-dir:
     calibration/MSH2_Jia_2021_clinvar_2018_<comp>_calibration.json
-    calibration/MSH2_Jia_2021_clinvar_2018_<comp>_lr_values.json.gz
-    dataset.tsv.gz            (master TSV, MSH2_Jia_2021 rows only)
+    calibration/MSH2_Jia_2021_clinvar_2018_<comp>_lr_values.json.gz (trimmed)
+    scoreset_2018.csv.gz (+ scoreset_2018_snv.csv.gz)  -- panel a's Scoreset,
+                                see analysis.figure4.scoreset_io
+    scoreset_2025.csv.gz (+ scoreset_2025_snv.csv.gz)  -- panel b/e's Scoreset
     dataset_configs.json      ({"MSH2_Jia_2021_clinvar_2018": {...}} only)
     bootstrap_fits.json.gz    (precomputed fits, MSH2_Jia_2021_clinvar_2018 key only)
     revel/                    (the 4 REVEL files _build_panel_ef_data reads)
     panel_c.json              (precomputed cross-dataset confusion aggregate --
                                 see analysis.figure4.panel_c_io -- the one thing
                                 Figure 4 needs that genuinely isn't MSH2-specific)
+    dataset.tsv.gz            (MSH2_Jia_2021 rows of the master TSV -- only
+                                written with --include-dataset-tsv; the
+                                scoreset_*.csv.gz files above already cover
+                                what driver.py needs from it, at a fraction
+                                of the size, so most bundles can skip it)
 
 Reproduce with:
-    python -m analysis.figure4.driver \\
-        --output-dir bundle/calibration --dataset-tsv bundle/dataset.tsv.gz \\
-        --dataset-configs bundle/dataset_configs.json \\
-        --precomputed-fits bundle/bootstrap_fits.json.gz \\
-        --revel-dir bundle/revel --panel-c-data bundle/panel_c.json \\
-        --figure-dir out/
+    python -m analysis.figure4.driver --bundle bundle/ --figure-dir out/
 """
 from __future__ import annotations
 
@@ -103,6 +105,10 @@ def _export_calibration_files(output_dir: str, dataset_configs_path: str, bundle
 
 
 def _export_dataset_tsv(dataset_tsv: str, bundle_dir: Path) -> None:
+    """Only needed as a fallback for driver.py's dataset_tsv-based Scoreset
+    reconstruction -- skipped by default (see --include-dataset-tsv) now that
+    _export_scoresets below covers what panels a/b/e actually need from it,
+    at a small fraction of the size."""
     sep = "\t" if str(dataset_tsv).endswith((".tsv", ".tsv.gz")) else ","
     df_full = pd.read_csv(dataset_tsv, sep=sep, low_memory=False)
     df_msh2 = df_full[df_full["Dataset"] == MSH2_DATASET]
@@ -111,6 +117,39 @@ def _export_dataset_tsv(dataset_tsv: str, bundle_dir: Path) -> None:
     out_path = bundle_dir / "dataset.tsv.gz"
     df_msh2.to_csv(out_path, sep="\t", index=False)
     print(f"  Wrote {out_path} ({len(df_msh2):,} rows, vs. {len(df_full):,} in the full TSV)")
+
+
+def _export_scoresets(
+    output_dir: str, dataset_tsv: str, precomputed_fits: str, dataset_configs_path: str, bundle_dir: Path,
+) -> None:
+    """Build both MSH2 Scoresets (2018-ClinVar-release for panel a's mixture
+    fit, current-release for panel b/e's "All SNVs" distribution) the same
+    way driver.py itself would, then cache just the 4 attributes
+    analysis.figure4.panels actually reads off each -- see
+    analysis.figure4.scoreset_io's docstring -- instead of the recipient
+    needing the full master TSV + rerunning this same pipeline-dataframe
+    construction (splice filtering, ClinVar-release parsing, ...) themselves.
+    """
+    from analysis.legacy_fits import load_scoreset_and_fits
+    from analysis.figure4.scoreset_io import save_scoreset_bundle
+
+    scoreset_2018, _, _, _, n_c, _, _ = load_scoreset_and_fits(
+        MSH2_DATASET, output_dir=output_dir, dataset_tsv=dataset_tsv,
+        precomputed_fits=precomputed_fits, dataset_configs_path=dataset_configs_path,
+        pipeline_dataset=MSH2_PIPELINE_KEY, clinvar_release="2018",
+    )
+    scoreset, *_ = load_scoreset_and_fits(
+        MSH2_DATASET, output_dir=output_dir, dataset_tsv=dataset_tsv,
+        precomputed_fits=precomputed_fits, dataset_configs_path=dataset_configs_path,
+        pipeline_dataset=MSH2_PIPELINE_KEY, clinvar_release="2025", n_c=n_c,
+    )
+
+    path_2018 = bundle_dir / "scoreset_2018.csv.gz"
+    path_2025 = bundle_dir / "scoreset_2025.csv.gz"
+    save_scoreset_bundle(path_2018, scoreset_2018)
+    save_scoreset_bundle(path_2025, scoreset)
+    size_kb = sum(p.stat().st_size for p in bundle_dir.glob("scoreset_*.csv.gz")) / 1e3
+    print(f"  Wrote {path_2018.name}, {path_2025.name} (+ their _snv siblings), {size_kb:.0f} KB total")
 
 
 def _export_dataset_configs(dataset_configs_path: str, bundle_dir: Path) -> None:
@@ -218,6 +257,11 @@ def main():
     parser.add_argument("--dataset-configs", default=None, help="Full dataset-configs JSON. Defaults to analysis.config.DATASET_CONFIGS.")
     parser.add_argument("--precomputed-fits", default=None, help="Full bootstrap-fits JSON. Defaults to analysis.config.PRECOMPUTED_FITS.")
     parser.add_argument("--revel-dir", default=None, help="Full REVEL data directory. Defaults to analysis.config.YILE_DIR.")
+    parser.add_argument("--include-dataset-tsv", action="store_true",
+                         help="Also write dataset.tsv.gz (MSH2 rows of the master TSV). Off by "
+                              "default: analysis.figure4.driver only falls back to it if the "
+                              "scoreset_2018.csv.gz/scoreset_2025.csv.gz files this script always "
+                              "writes are missing, so most bundles don't need it.")
     args = parser.parse_args()
 
     output_dir = args.output_dir or cfg.OUTPUT_DIR
@@ -231,7 +275,9 @@ def main():
 
     print(f"Exporting MSH2-only Figure 4 bundle to {bundle_dir} ...")
     _export_calibration_files(output_dir, dataset_configs_path, bundle_dir)
-    _export_dataset_tsv(dataset_tsv, bundle_dir)
+    _export_scoresets(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path, bundle_dir)
+    if args.include_dataset_tsv:
+        _export_dataset_tsv(dataset_tsv, bundle_dir)
     _export_dataset_configs(dataset_configs_path, bundle_dir)
     _export_bootstrap_fits(precomputed_fits, bundle_dir)
     _export_revel_files(revel_dir, bundle_dir)

@@ -80,6 +80,7 @@ from analysis.figure4.panels import plot_figure4_unified
 from analysis.plot_common import is_notebook
 
 MSH2_DATASET = "MSH2_Jia_2021"
+MSH2_PIPELINE_KEY = f"{MSH2_DATASET}_clinvar_2018"
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +97,7 @@ def _load_msh2_calibration(output_dir, dataset_tsv, precomputed_fits, dataset_co
     pattern already used for this exact dataset in
     `analysis/analyze_pipeline_output.py`.
     """
-    msh2_pipeline_key = f"{MSH2_DATASET}_clinvar_2018"
+    msh2_pipeline_key = MSH2_PIPELINE_KEY
     scoreset_2018, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped = load_scoreset_and_fits(
         MSH2_DATASET,
         output_dir=output_dir,
@@ -116,6 +117,64 @@ def _load_msh2_calibration(output_dir, dataset_tsv, precomputed_fits, dataset_co
         clinvar_release="2025",
         n_c=n_c,
     )
+    return scoreset_2018, scoreset, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped
+
+
+def _load_msh2_calibration_from_scoresets(
+    output_dir, dataset_configs_path, precomputed_fits, scoreset_2018_path, scoreset_path,
+):
+    """Same return shape as `_load_msh2_calibration`, but builds the two
+    Scoreset objects from `analysis.figure4.scoreset_io`'s small prebuilt
+    arrays instead of the master TSV + pipeline dataframe-to-Scoreset
+    construction -- so `dataset_tsv` isn't needed at all in this path (a
+    minimal reproduction bundle can then skip shipping the ~54K-row MSH2
+    slice of the master TSV entirely). Only preserves what
+    `analysis.figure4.panels` actually reads off a Scoreset -- see
+    `analysis.figure4.scoreset_io`'s docstring.
+
+    Duplicates `analysis.legacy_fits.load_scoreset_and_fits`'s calibration/LR
+    path-resolution and precomputed-fits lookup (rather than reusing that
+    function directly) since that function's Scoreset-building half is
+    unconditional -- there's no way to call it and skip needing
+    `dataset_tsv`.
+    """
+    from analysis.legacy_fits import resolve_component_for, _load_calibration_and_lr
+    from src.assay_calibration.pipeline.visualize import load_precomputed_fits
+    from analysis.figure4.scoreset_io import load_scoreset_bundle
+
+    n_c, benign_method = resolve_component_for(MSH2_PIPELINE_KEY, str(output_dir), dataset_configs_path)
+    comp = f"{n_c}_{benign_method}"
+    ds_output_dir = Path(output_dir) / MSH2_PIPELINE_KEY
+    if not ds_output_dir.exists():
+        ds_output_dir = Path(output_dir)  # flat layout fallback
+
+    calib_path = ds_output_dir / f"{MSH2_PIPELINE_KEY}_{comp}_calibration.json"
+    lr_path = ds_output_dir / f"{MSH2_PIPELINE_KEY}_{comp}_lr_values.json.gz"
+    if not calib_path.exists():
+        # older naming convention -- bare n_c, no benign_method suffix
+        calib_path = ds_output_dir / f"{MSH2_PIPELINE_KEY}_{n_c}_calibration.json"
+        lr_path = ds_output_dir / f"{MSH2_PIPELINE_KEY}_{n_c}_lr_values.json.gz"
+    if not calib_path.exists() or not lr_path.exists():
+        raise FileNotFoundError(
+            f"Calibration/LR files not found for {MSH2_PIPELINE_KEY} ({comp}) under {ds_output_dir}"
+        )
+
+    indv_summary = _load_calibration_and_lr(calib_path, lr_path)
+    score_range = np.asarray(indv_summary["score_range"])
+    scoreset_flipped = bool(indv_summary.get("scoreset_flipped", False))
+
+    bootstrap_results = load_precomputed_fits(precomputed_fits, MSH2_PIPELINE_KEY)
+    fits = [
+        seed_results[n_c] for seed_results in bootstrap_results.values()
+        if isinstance(seed_results, dict) and seed_results.get(n_c) is not None
+    ]
+    if not fits:
+        raise KeyError(f"No '{n_c}' fits found for '{MSH2_PIPELINE_KEY}' in {precomputed_fits}")
+
+    scoreset_2018 = load_scoreset_bundle(scoreset_2018_path)
+    scoreset = load_scoreset_bundle(scoreset_path)
+    n_samples = int((scoreset_2018.sample_counts > 0).sum())
+
     return scoreset_2018, scoreset, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped
 
 
@@ -316,6 +375,8 @@ def build_figure4(
     dataset_configs_path=None,
     revel_dir=None,
     panel_c_data=None,
+    scoreset_2018_data=None,
+    scoreset_data=None,
     danzs_oob=None,
     auths_oob=None,
     dataset_names=None,
@@ -341,6 +402,19 @@ def build_figure4(
     rebuilding *every* dataset under `output_dir`, not just MSH2, since panel
     c's matrices are an aggregate across the whole pipeline run, not an
     MSH2-specific quantity.
+
+    `scoreset_2018_data`/`scoreset_data`, if BOTH given, are paths written by
+    `analysis.figure4.export_msh2_bundle` / `analysis.figure4.scoreset_io.
+    save_scoreset_bundle`: the two small (.scores/.sample_assignments/
+    .snv_scores) arrays panels a/b/e actually read off a Scoreset, cached
+    once instead of re-deriving them from the full master TSV + pipeline
+    dataframe-to-Scoreset construction (splice filtering, ClinVar-release
+    parsing, ...) -- meaning `dataset_tsv` isn't needed at all when both are
+    given, on top of `panel_c_data` already making `output_dir` not need
+    every other dataset. If only one is given, or either path doesn't exist,
+    falls back to the normal `dataset_tsv`-based reconstruction for both
+    (silently, since a bundle without these is just an older/plainer one,
+    not an error).
 
     `panel_c_data`, if given, is a path written by
     `analysis.figure4.export_msh2_bundle` / `analysis.figure4.panel_c_io.
@@ -383,10 +457,21 @@ def build_figure4(
 
     print("Building Figure 4...")
 
+    use_scoreset_bundle = (
+        scoreset_2018_data is not None and scoreset_data is not None
+        and Path(scoreset_2018_data).exists() and Path(scoreset_data).exists()
+    )
     try:
-        (
-            scoreset_2018, scoreset, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped,
-        ) = _load_msh2_calibration(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path)
+        if use_scoreset_bundle:
+            (
+                scoreset_2018, scoreset, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped,
+            ) = _load_msh2_calibration_from_scoresets(
+                output_dir, dataset_configs_path, precomputed_fits, scoreset_2018_data, scoreset_data,
+            )
+        else:
+            (
+                scoreset_2018, scoreset, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped,
+            ) = _load_msh2_calibration(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path)
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"  SKIP Figure 4: could not load MSH2 calibration data ({e})")
         return
@@ -440,6 +525,16 @@ def _main():
                     "overridable via the matching EXCALIBR_* env var). Nothing is "
                     "required from analysis.config unless you omit the flag for it.",
     )
+    parser.add_argument("--bundle", default=None,
+                         help="Convenience shortcut for a bundle directory written by "
+                              "analysis.figure4.export_msh2_bundle: fills in --output-dir, "
+                              "--dataset-tsv, --dataset-configs, --precomputed-fits, --revel-dir, "
+                              "--panel-c-data, --scoreset-2018-data, and --scoreset-data from "
+                              "BUNDLE/{calibration,dataset.tsv.gz,dataset_configs.json,"
+                              "bootstrap_fits.json.gz,revel,panel_c.json,scoreset_2018.csv.gz,"
+                              "scoreset_2025.csv.gz} -- any of those flags passed explicitly still "
+                              "takes priority over the bundle's own path for that one input, and "
+                              "--dataset-tsv is simply unused if the scoreset files are both present.")
     parser.add_argument("--output-dir", default=None,
                          help="run_igvf_batch.py output tree. "
                               "Falls back to EXCALIBR_OUTPUT_DIR / analysis.config.OUTPUT_DIR.")
@@ -469,15 +564,27 @@ def _main():
                               "walking --output-dir for every dataset just to rebuild panel c -- "
                               "the one piece of Figure 4 that isn't MSH2-specific, needed for a "
                               "minimal MSH2-only reproduction bundle.")
+    parser.add_argument("--scoreset-2018-data", default=None,
+                         help="Precomputed 2018-ClinVar-release MSH2 scoreset, written by "
+                              "analysis.figure4.export_msh2_bundle / "
+                              "analysis.figure4.scoreset_io.save_scoreset_bundle. If given together "
+                              "with --scoreset-data, skips needing --dataset-tsv at all.")
+    parser.add_argument("--scoreset-data", default=None,
+                         help="Precomputed current-ClinVar-release MSH2 scoreset -- see "
+                              "--scoreset-2018-data.")
     args = parser.parse_args()
+
+    bundle = Path(args.bundle) if args.bundle else None
     build_figure4(
-        output_dir=args.output_dir,
+        output_dir=args.output_dir or (str(bundle / "calibration") if bundle else None),
         figure_dir=args.figure_dir,
-        dataset_tsv=args.dataset_tsv,
-        precomputed_fits=args.precomputed_fits,
-        dataset_configs_path=args.dataset_configs,
-        revel_dir=args.revel_dir,
-        panel_c_data=args.panel_c_data,
+        dataset_tsv=args.dataset_tsv or (str(bundle / "dataset.tsv.gz") if bundle else None),
+        precomputed_fits=args.precomputed_fits or (str(bundle / "bootstrap_fits.json.gz") if bundle else None),
+        dataset_configs_path=args.dataset_configs or (str(bundle / "dataset_configs.json") if bundle else None),
+        revel_dir=args.revel_dir or (str(bundle / "revel") if bundle else None),
+        panel_c_data=args.panel_c_data or (str(bundle / "panel_c.json") if bundle else None),
+        scoreset_2018_data=args.scoreset_2018_data or (str(bundle / "scoreset_2018.csv.gz") if bundle else None),
+        scoreset_data=args.scoreset_data or (str(bundle / "scoreset_2025.csv.gz") if bundle else None),
     )
 
 
