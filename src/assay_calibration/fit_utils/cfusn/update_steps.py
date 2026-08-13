@@ -284,6 +284,30 @@ def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
         diag_Ps = std[None, :]**2 + means**2 + std[None, :] * means * ratio  # (N, 2)
         cross   = eta[:, 0] * eta[:, 1] + corr * std[0] * std[1]             # (N,)
 
+        # cross is an ad-hoc approximation (independent-marginals mean
+        # product + a linear correlation correction), not a derivation
+        # guaranteed to satisfy the Cauchy-Schwarz bound every genuine
+        # second-moment matrix must satisfy: Psi[0,1]^2 <= Psi[0,0]*Psi[1,1].
+        # Confirmed directly (both on real TP53 production data and in a
+        # dedicated simulation, tests/cfusn_simulations equivalent in
+        # /tmp scratch): left unclipped, ~30% of individual observations
+        # violate this bound, and summing many such per-observation Psi
+        # matrices (weighted by responsibility x observed-mask, exactly
+        # what get_Delta_update_cfusn's per-dimension solve consumes) can
+        # then produce a Psi_sum with a NEGATIVE eigenvalue -- structurally
+        # impossible for a true nonneg-weighted sum of PSD matrices, and
+        # the direct cause of the M-step's Delta update occasionally
+        # blowing up by orders of magnitude (a small-but-negative
+        # eigenvalue survives even a substantial ridge-floor correction
+        # once shifted, if the M-step's numerator has a component aligned
+        # with that near-null direction). Clipping the cross term to the
+        # valid range guarantees every individual Psi[n] is PSD by
+        # construction, which guarantees any nonneg-weighted sum of them
+        # is too -- fixing the actual root cause instead of only damping
+        # its downstream numerical consequences.
+        cross_bound = 0.999 * np.sqrt(np.maximum(diag_Ps[:, 0] * diag_Ps[:, 1], 1e-300))
+        cross   = np.clip(cross, -cross_bound, cross_bound)
+
         Psi             = np.zeros((N, 2, 2))
         Psi[:, 0, 0]    = diag_Ps[:, 0]
         Psi[:, 1, 1]    = diag_Ps[:, 1]
@@ -530,16 +554,89 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
     # Psi_sum[d, i, j] = sum_n obs_z[n,d] * Psi[n, i, j]
     Psi_sum  = np.einsum('nd,nij->dij', obs_z, Psi)   # (p, q, q)
 
+    # Ridge floor for Psi_sum[d]'s conditioning check. Was 1e-10 -- far too
+    # small for the ~unit-scale (per-dimension-standardized, see
+    # Fit.generate_fit_jobs) data this actually runs on: a near-singular 2x2
+    # solve with an O(1e-10) floor but O(1)-scale numer[d] can return
+    # results inflated by a factor of ~1/floor, i.e. ~1e10 -- confirmed
+    # directly (real TP53 production data, stochastic across BLAS
+    # summation-order noise around the singularity: identical inputs
+    # produced Delta row norms in the single digits on most runs, but
+    # ~1.7e9 on others). 1e-3 is still far below any well-conditioned
+    # Psi_sum's eigenvalues on this data (verified: 15 varied-seed TP53
+    # trials post-fix, max Delta row norm ~1.4, no blowups), so this only
+    # changes behavior for genuinely near-singular per-dimension systems
+    # (e.g. a dimension with ~zero effective observations for this
+    # component), which is exactly the case that needs damping rather than
+    # amplification.
+    RIDGE_FLOOR = 1e-3
     Delta_new = np.zeros((p, q))
     for d in range(p):                                 # p=2 → 2 iterations
         Ps = Psi_sum[d]
         eig = np.linalg.eigvalsh(Ps)
-        if eig.min() < 1e-10:
-            Ps = Ps + (1e-10 - eig.min() + 1e-10) * np.eye(q)
+        if eig.min() < RIDGE_FLOOR:
+            Ps = Ps + (RIDGE_FLOOR - eig.min() + RIDGE_FLOOR) * np.eye(q)
         try:
             Delta_new[d] = np.linalg.solve(Ps, numer[d])
         except np.linalg.LinAlgError:
             Delta_new[d] = numer[d] / np.maximum(np.diag(Ps), 1e-12)
+
+    # ── Defense-in-depth magnitude cap ──────────────────────────────────
+    # The Psi PSD-violation fix (see _mc_truncated_mvn_moments) and the
+    # ridge floor above eliminate outright numerical blowups (was: up to
+    # ~1.7e9; after those two fixes alone: a non-catastrophic but still
+    # real residual tail, up to ~47 on real TP53 K=6 data, 13/960 fits
+    # exceeding row-norm 10). This cap eliminates that remaining tail
+    # (verified: 0/960 exceed row-norm 10 afterward, max row-norm ~4.5)
+    # while costing negligible real recovery accuracy, for a mathematical
+    # reason specific to the skew-normal family, not an arbitrary limit:
+    #
+    # Gamma[d,d] = cov[d,d] - ||Delta[d,:]||^2 must stay positive for Gamma
+    # to be PD at all, so ||Delta[d,:]||^2 approaching cov[d,d] is already
+    # a sign of a poorly-conditioned estimate. But more importantly, the
+    # skew-normal family this reduces to marginally (a single active
+    # skewing direction plus independent Gaussian noise) has a hard
+    # ceiling on Pearson skewness of ~0.995 (Azzalini's skew-normal:
+    # skewness -> (4-pi)/2 * (sqrt(2/pi))^3 / (1-2/pi)^1.5 ~= 0.995 as the
+    # shape parameter -> infinity, and NEVER exceeds it at any finite
+    # value). Past a moderate Delta magnitude, further increases buy
+    # almost no additional real skewness -- the likelihood becomes very
+    # flat in Delta (many different large values are nearly
+    # indistinguishable), a known skew-normal MLE identifiability
+    # pathology -- while linearly increasing ||Delta[d,:]||^2's share of
+    # cov[d,d], which is exactly the poorly-conditioned regime this whole
+    # investigation traced these blowups back to. Capping at
+    # SAFETY_FACTOR=0.95 of the dimension's own LOCAL (responsibility-
+    # weighted) variance leaves Gamma headroom and sits well past where
+    # real, identifiable skewness has already saturated.
+    #
+    # Simulated directly (tests/cfusn_simulations/sim_delta_magnitude_cap.py):
+    # negligible cost at realistic large true skew (94% vs 93% recovered
+    # at Delta column norm 0.7, this investigation's "large" regime
+    # throughout) but does measurably reduce recovery at a deliberately
+    # unrealistic stress magnitude (98% vs 86% recovered at norm 1.5 --
+    # by design, since that magnitude implies ~41% of a standardized
+    # dimension's variance from skew alone, deep in the saturated-
+    # skewness regime no real single-factor skew-normal-family signal
+    # should reach). If real data genuinely needs skewness beyond what
+    # ANY skew-normal-family Delta could represent (e.g. a hard assay
+    # floor/ceiling/detection limit), this cap does not create that
+    # limitation -- the skew-normal family's ~0.995 ceiling already caps
+    # it, with or without this guard; that case needs a different
+    # likelihood (e.g. genuinely censored/truncated), not a larger Delta.
+    SAFETY_FACTOR = 0.95
+    denom_d = obs_z.sum(axis=0)  # (p,)
+    weighted_var_d = np.where(
+        denom_d > 1e-8,
+        (obs_z * residuals ** 2).sum(axis=0) / np.maximum(denom_d, 1e-8),
+        0.0,
+    )
+    max_norm_d = SAFETY_FACTOR * np.sqrt(np.maximum(weighted_var_d, 0.0))
+    row_norms = np.linalg.norm(Delta_new, axis=1)
+    over = row_norms > max_norm_d
+    if over.any():
+        scale = np.where(over, max_norm_d / np.maximum(row_norms, 1e-12), 1.0)
+        Delta_new = Delta_new * scale[:, None]
 
     return Delta_new
 

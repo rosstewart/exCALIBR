@@ -951,9 +951,14 @@ def plot_robustness_config_summary(
     )
     fig.tight_layout()
     if figure_dir is not None:
-        out_dir = Path(figure_dir) / base_dataset
+        # Routed into a separate top-level folder per perturbation type
+        # (robustness_downsampling vs. robustness_label_noise) rather than
+        # one shared "robustness" folder, so the two ablations are easy to
+        # find/reference independently.
+        subfolder = "robustness_downsampling" if perturbation_type == "downsample" else "robustness_label_noise"
+        out_dir = Path(figure_dir) / subfolder / base_dataset
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"robustness_config_{base_dataset}_{perturbation_type}_{level}.png"
+        out_path = out_dir / f"{perturbation_type}_{level}.png"
         if show:
             save_and_show(fig, out_path)
         else:
@@ -1017,9 +1022,9 @@ def _run_config_summary_job(
     len(fits) x len(score_range) x n_components x n_samples (~100s/figure
     per its own docstring)."""
     key = (base_dataset, perturbation_type, level)
+    subfolder = "robustness_downsampling" if perturbation_type == "downsample" else "robustness_label_noise"
     out_path = (
-        Path(figure_dir) / base_dataset
-        / f"robustness_config_{base_dataset}_{perturbation_type}_{level}.png"
+        Path(figure_dir) / subfolder / base_dataset / f"{perturbation_type}_{level}.png"
     ) if figure_dir is not None else None
     try:
         plot_robustness_config_summary(
@@ -1328,9 +1333,9 @@ def plot_bootstrap_reduction_config_summary(
                  fontsize=13, fontweight="bold")
     fig.tight_layout()
     if figure_dir is not None:
-        out_dir = Path(figure_dir)
+        out_dir = Path(figure_dir) / "bootstrap_reduction"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"bootstrap_reduction_config_{dataset_name}.png"
+        out_path = out_dir / f"{dataset_name}.png"
         if show:
             save_and_show(fig, out_path)
         else:
@@ -1467,9 +1472,9 @@ def plot_fit_number_comparison_curve(
     fig.tight_layout()
 
     if figure_dir is not None:
-        out_dir = Path(figure_dir)
+        out_dir = Path(figure_dir) / "fit_number_comparison"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"fit_number_comparison_{label}.png"
+        out_path = out_dir / f"{label}.png"
         save_and_show(fig, out_path)
         print(f"  Saved: {out_path}")
     return fig

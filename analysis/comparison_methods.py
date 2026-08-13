@@ -376,11 +376,40 @@ def _point_ranges_from_acmgscaler_thresholds(thresholds: pd.DataFrame) -> dict:
     Direction-agnostic: the 8 boundary values may increase or decrease along
     _ACMGSCALER_TIER_ORDER depending on whether higher scores are more or
     less pathogenic for this dataset -- inferred by comparing the first and
-    last boundary rather than assumed.
+    last *finite* boundary rather than assumed (see below for why not just
+    the first/last).
+
+    acmgscaler leaves a boundary NaN when its fitted LR curve never reaches
+    that tier's threshold within the observed score range (e.g. no
+    "VeryStrong" evidence exists for this dataset) -- that NaN would
+    otherwise land as a literal edge on both tiers bordering it (the
+    unresolved tier itself, which then never gets rendered at all, and its
+    inner neighbor, which gets truncated at NaN instead of extending to the
+    open end of the domain, even though real variants are classified into
+    that neighbor tier). Leading/trailing NaNs are filled with the
+    direction-appropriate outer sentinel before building edges so the
+    unresolved tier collapses to a zero-width (invisible) range instead of
+    silently killing its neighbor's outer edge.
     """
     boundary_vals = thresholds["value"].tolist()
-    increasing = boundary_vals[0] < boundary_vals[-1]
-    edges = ([-np.inf] if increasing else [np.inf]) + boundary_vals + ([np.inf] if increasing else [-np.inf])
+    finite_vals = [v for v in boundary_vals if not np.isnan(v)]
+    if len(finite_vals) < 2:
+        return {}
+    increasing = finite_vals[0] < finite_vals[-1]
+    outer_lo, outer_hi = (-np.inf, np.inf) if increasing else (np.inf, -np.inf)
+
+    filled = list(boundary_vals)
+    for i in range(len(filled)):
+        if np.isnan(filled[i]):
+            filled[i] = outer_lo
+        else:
+            break
+    for i in range(len(filled) - 1, -1, -1):
+        if np.isnan(filled[i]):
+            filled[i] = outer_hi
+        else:
+            break
+    edges = [outer_lo] + filled + [outer_hi]
 
     point_ranges = {}
     for i, tier in enumerate(_ACMGSCALER_TIER_ORDER):

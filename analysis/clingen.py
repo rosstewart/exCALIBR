@@ -29,6 +29,7 @@ from matplotlib.colors import LinearSegmentedColormap
 
 from analysis.acmg_evidence_codes import classify_acmg
 from analysis.discovery import load_master_df
+from analysis.multi_scoreset import genomic_variant_key, _merge_points, _merge_author_labels
 from analysis.plot_common import effective_points, save_and_show
 
 # Functional-assay ACMG codes stripped before reclassifying — keeping these
@@ -40,15 +41,26 @@ REMOVE_CODES = {
 }
 
 
-def filter_and_recalculate(evidence_string: Optional[str]) -> Tuple[str, str]:
-    """Strip PS3/BS3 codes from a comma-separated ACMG evidence-code string
-    and reclassify with the remainder. Returns (updated_classification,
-    filtered_evidence_string)."""
+def filter_and_recalculate(
+    evidence_string: Optional[str], strip_functional_evidence: bool = True,
+) -> Tuple[str, str]:
+    """Reclassify a comma-separated ACMG evidence-code string, optionally
+    stripping PS3/BS3 codes first. Returns (updated_classification,
+    filtered_evidence_string).
+
+    `strip_functional_evidence=False` skips the PS3/BS3 removal (keeping
+    ClinGen's classification exactly as applied, functional evidence and
+    all) -- useful as a circularity-check comparison against the default
+    stripped behavior, since PS3/BS3 are themselves the kind of
+    functional-assay evidence ExCALIBR is being evaluated against."""
     if pd.isna(evidence_string):
         return "VUS", ""
 
     evidence_list = [code.strip() for code in evidence_string.split(",")]
-    filtered_evidence = [code for code in evidence_list if code not in REMOVE_CODES]
+    filtered_evidence = (
+        [code for code in evidence_list if code not in REMOVE_CODES]
+        if strip_functional_evidence else evidence_list
+    )
     filtered_evidence_string = ",".join(filtered_evidence)
     updated_classification = classify_acmg(filtered_evidence) if filtered_evidence else "VUS"
     return updated_classification, filtered_evidence_string
@@ -73,7 +85,8 @@ def build_clingen_confusion(
     tree: Optional[Dict] = None,
     model_selections: Optional[Dict] = None,
     calibrations: Optional[Dict] = None,
-) -> Tuple[Dict[str, np.ndarray], Set[str]]:
+    strip_functional_evidence: bool = True,
+) -> Tuple[Dict[str, np.ndarray], Set[str], pd.DataFrame]:
     """Build ExCALIBR-vs-ClinGen and Author-vs-ClinGen 3x2 confusion matrices.
 
     Rows: 0=Pathogenic, 1=Indeterminate, 2=Benign (ExCALIBR sign / author call)
@@ -104,12 +117,27 @@ def build_clingen_confusion(
     (old_classification --> filtered/updated_classification) as the legacy
     script did — off by default since it's extremely verbose across all
     datasets; turn on to audit a specific dataset.
+
+    `strip_functional_evidence` (default True) controls whether PS3/BS3
+    codes are removed before reclassifying ClinGen's ground-truth call --
+    see `filter_and_recalculate`. Set False to see how the confusion
+    matrices look with ClinGen's classification taken as-applied (functional
+    evidence and all), as a circularity-check comparison.
+
+    Returns (confusion, seen_genes, records) where `records` is a DataFrame
+    with one row per kept, ClinGen-labeled variant (columns: dataset, gene,
+    variant_key [genomic_variant_key(vid, gene), assay-independent], clingen_label,
+    points [raw effective points, presign], auth_label [raw author string or
+    None]) -- lets a caller merge duplicate genomic variants across a gene's
+    assays (see `analysis.multi_scoreset.build_gene_deduped_variants` for the
+    analogous ClinVar-ground-truth version) before re-tallying the confusion
+    matrices, e.g. via `build_gene_deduped_clingen_confusion`.
     """
     from src.assay_calibration.pipeline.config import PipelineConfig
     from src.assay_calibration.pipeline.utils import load_dataset_from_df
     from src.assay_calibration.pipeline.variant_evidence import _get_variant_ids
     from analysis.author_labels import load_name_mapping
-    from analysis.discovery import build_variants_from_scoreset, resolve_component
+    from analysis.discovery import build_variants_from_scoreset, resolve_component, resolve_dataset_tsv_name
 
     confusion = {
         "auth": np.zeros((3, 2), dtype=int),
@@ -117,6 +145,7 @@ def build_clingen_confusion(
     }
     seen_ids: Set[str] = set()
     seen_genes: Set[str] = set()
+    records: List[dict] = []
 
     sep = "\t" if str(dataset_tsv).endswith((".tsv", ".tsv.gz")) else ","
     evidence_col = "Applied Evidence Codes (Met)_ClinGen_repo"
@@ -127,7 +156,7 @@ def build_clingen_confusion(
     header_cols = pd.read_csv(dataset_tsv, sep=sep, nrows=0).columns
     if evidence_col not in header_cols:
         print(f"  SKIP ClinGen confusion: '{evidence_col}' not found in {dataset_tsv}")
-        return confusion, seen_genes
+        return confusion, seen_genes, pd.DataFrame(records)
 
     df_full = load_master_df(dataset_tsv)
     old_to_new, _ = load_name_mapping(str(dataset_tsv))
@@ -166,14 +195,11 @@ def build_clingen_confusion(
         )
 
         csv_name = dataset.replace("_clinvar_2018", "")
-        df_ds = df_full[df_full["Dataset"] == csv_name].copy()
-        if df_ds.empty:
-            alt = old_to_new.get(csv_name)
-            if alt:
-                df_ds = df_full[df_full["Dataset"] == alt].copy()
-        if df_ds.empty:
+        resolved_name = resolve_dataset_tsv_name(csv_name, df_full, dataset_tsv, old_to_new=old_to_new)
+        if resolved_name is None:
             print(f"  SKIP {dataset}: not found in {dataset_tsv}")
             continue
+        df_ds = df_full[df_full["Dataset"] == resolved_name].copy()
         df_ds["Dataset"] = dataset
 
         clinvar_release = "2018" if "_clinvar_2018" in dataset else "2025"
@@ -200,7 +226,7 @@ def build_clingen_confusion(
             kept += 1
 
             evidence_str = v0.row.get(evidence_col)
-            clingen_class, filtered_str = filter_and_recalculate(evidence_str)
+            clingen_class, filtered_str = filter_and_recalculate(evidence_str, strip_functional_evidence)
             if verbose_recode and not pd.isna(evidence_str):
                 print(f"  [{dataset}] {evidence_str} --> {filtered_str} ({clingen_class})")
 
@@ -231,8 +257,70 @@ def build_clingen_confusion(
 
             confusion["auth"][_to_row(auth_label), _to_col(clingen_label)] += 1
             confusion["excalibr"][_to_row(excalibr_label), _to_col(clingen_label)] += 1
+            records.append({
+                "dataset": dataset,
+                "gene": gene,
+                "variant_key": genomic_variant_key(vid, gene),
+                "clingen_label": clingen_label,
+                "points": points,
+                "auth_label": auth_class if isinstance(auth_class, str) else None,
+            })
 
     print(f"{len(seen_genes)} gene(s) retained ClinGen evidence: {sorted(seen_genes)}")
+    return confusion, seen_genes, pd.DataFrame(records)
+
+
+def build_gene_deduped_clingen_confusion(records: pd.DataFrame) -> Tuple[Dict[str, np.ndarray], Set[str]]:
+    """Re-tally the ExCALIBR-vs-ClinGen and Author-vs-ClinGen 3x2 confusion
+    matrices (same shape/convention as `build_clingen_confusion`'s) from
+    `records` (its third return value), merging duplicate genomic variants
+    across a gene's assays first -- the ClinGen analogue of
+    `analysis.multi_scoreset.build_gene_deduped_variants`/
+    `build_deduped_confusion_matrix` for the ClinVar-ground-truth panels.
+
+    Merge rule per (gene, variant_key) group: `points` via `_merge_points`
+    (abs-max across assays if they agree in sign, else 0), `auth_label` via
+    `_merge_author_labels` (conflicting Normal/Abnormal across assays ->
+    indeterminate). `clingen_label` (the ground truth for this physical
+    variant) should already agree across every assay that scored it --
+    groups where it doesn't are dropped (a data inconsistency, not a real
+    dedup case) rather than silently picking one side.
+    """
+    confusion = {
+        "auth": np.zeros((3, 2), dtype=int),
+        "excalibr": np.zeros((3, 2), dtype=int),
+    }
+    seen_genes: Set[str] = set()
+    if records.empty:
+        return confusion, seen_genes
+
+    n_dropped_conflicts = 0
+    for (gene, _vkey), grp in records.groupby(["gene", "variant_key"], sort=False):
+        if grp["clingen_label"].nunique() != 1:
+            n_dropped_conflicts += 1
+            continue
+        clingen_label = int(grp["clingen_label"].iloc[0])
+
+        points = _merge_points(grp["points"].to_numpy())
+        excalibr_label = int(np.sign(points))
+
+        merged_auth = _merge_author_labels(grp["auth_label"]) if "auth_label" in grp.columns else None
+        auth_label = 0
+        if isinstance(merged_auth, str):
+            upper = merged_auth.upper()
+            if upper == "ABNORMAL":
+                auth_label = 1
+            elif upper == "NORMAL":
+                auth_label = -1
+
+        seen_genes.add(gene)
+        confusion["auth"][_to_row(auth_label), _to_col(clingen_label)] += 1
+        confusion["excalibr"][_to_row(excalibr_label), _to_col(clingen_label)] += 1
+
+    if n_dropped_conflicts:
+        print(f"  gene-deduped ClinGen confusion: dropped {n_dropped_conflicts} variant-key group(s) "
+              f"with conflicting ClinGen ground-truth calls across assays")
+    print(f"{len(seen_genes)} gene(s) retained ClinGen evidence (gene-deduped): {sorted(seen_genes)}")
     return confusion, seen_genes
 
 

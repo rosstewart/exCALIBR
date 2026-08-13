@@ -71,7 +71,12 @@ def enforce_monotonicity_point_ranges(point_ranges, point_values, score_range, s
         if abs(point) == 1 and len(point_ranges[point]) != 0 and len(point_ranges[point+1]) == 0: # highest evidence at 1
             l,h = point_ranges[point][0][0], point_ranges[point][-1][-1] # could be more than one range
 
-            if l != score_range[0] and h != score_range[-1]: # evidence not at min or max, evidence goes back to 0. remove
+            # A prior extend_points_to_xlims(inf=True) pass may have already
+            # pushed l/h out to -inf/+inf rather than the finite score_range
+            # edge -- that still counts as "touching the edge", not as
+            # evidence that dipped back to nothing in the interior.
+            if (l != score_range[0] and not np.isneginf(l)) and \
+               (h != score_range[-1] and not np.isposinf(h)): # evidence not at min or max, evidence goes back to 0. remove
                 print(f'supporting evidence ({point}) goes back to no evidence. removing...', file=log_f)
                 max_path_points = point
 
@@ -108,7 +113,8 @@ def enforce_monotonicity_point_ranges(point_ranges, point_values, score_range, s
         if abs(point) == 1 and len(point_ranges[point]) != 0 and len(point_ranges[point-1]) == 0: # highest evidence at -1
             l,h = point_ranges[point][0][0], point_ranges[point][-1][-1] # could be more than one range
 
-            if l != score_range[0] and h != score_range[-1]: # evidence not at min or max, evidence goes back to 0. remove
+            if (l != score_range[0] and not np.isneginf(l)) and \
+               (h != score_range[-1] and not np.isposinf(h)): # evidence not at min or max, evidence goes back to 0. remove
                 print(f'supporting evidence ({point}) goes back to no evidence. removing...', file=log_f)
                 max_ben_points = point
 

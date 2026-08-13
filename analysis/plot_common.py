@@ -21,7 +21,19 @@ def sample_matches(df: pd.DataFrame, category: str) -> pd.Series:
     `==` directly, since that only ever matches single-label rows and
     silently drops every multi-label variant from both sides of the
     comparison.
+
+    Explicit empty-input guard: `.apply()` on an empty Series can't infer a
+    dtype and returns `object` instead of `bool`, and an object-dtype mask
+    makes `df[mask]` fall back to label-based column selection instead of
+    boolean row filtering -- silently producing a same-shaped-looking but
+    zero-*column* DataFrame downstream (e.g. inside build_confusion_matrix,
+    surfacing as a `KeyError: 'standard_points'` several calls later) rather
+    than the expected zero-row one. Always return a real bool Series so an
+    empty `df` (e.g. a dataset filtered down to nothing upstream) filters to
+    zero rows with columns intact.
     """
+    if df.empty:
+        return pd.Series([], index=df.index, dtype=bool)
     return df["sample"].str.split("|").apply(lambda cats: category in cats)
 
 
@@ -63,6 +75,8 @@ def pretty_method(method: str) -> str:
         "continuous": "Continuous [legacy]",
         "strict_additive": "Strict Additive [legacy]",
         "default": "ExCALIBR",
+        "skew_locked": "Skew-locked ExCALIBR",
+        "manual prior=0.1": "manual prior=0.1",
     }.get(method, method.replace("_", " ").title())
 
 
@@ -72,9 +86,22 @@ def save_and_show(fig, path: Path, dpi: int = 300):
     post-cell display hook only picks up figures that are still open, so
     saving-then-closing immediately, as this used to do, meant nothing ever
     rendered in Jupyter even though the PNG was written correctly to disk)."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     print(f"  Saved: {path}")
     if is_notebook():
         plt.show()
     else:
         plt.close(fig)
+
+
+def save_latex_table(latex: str, path: Path):
+    """Write a LaTeX table string (as already built/printed by
+    analysis.manuscript_stats.latex_performance_table_clinvar/clingen or
+    src.assay_calibration.plot_utils.utils.compute_genewise_evidence_table)
+    to `path` as raw table source -- no caption/label/document wrapper, just
+    the table content itself, ready to \\input{} or copy-paste into the
+    manuscript."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(latex)
+    print(f"  Saved: {path}")

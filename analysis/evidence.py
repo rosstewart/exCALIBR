@@ -174,6 +174,7 @@ def make_evidence_figure(
     all_clinvar: np.ndarray,
     label: str,
     figure_dir: Path,
+    filename: Optional[str] = None,
 ):
     """Combined two-panel evidence distribution figure for one method.
 
@@ -182,6 +183,9 @@ def make_evidence_figure(
 
     When author labels are unavailable (all_author is None), falls back to a
     single-panel ClinVar/sample figure.
+
+    *filename*, if given, overrides the auto-built
+    "evidence_distribution_{label}.png" name.
     """
     has_author = (
         all_author is not None
@@ -203,7 +207,7 @@ def make_evidence_figure(
         _pretty(label), fontsize=14, fontweight="bold",
         y=1.01 if has_author else 1.02,
     )
-    _save(fig, figure_dir / f"evidence_distribution_{label}.png")
+    _save(fig, figure_dir / (filename or f"evidence_distribution_{label}.png"))
 
 
 def make_combined_evidence_figure(
@@ -213,6 +217,7 @@ def make_combined_evidence_figure(
     clinvar_classes: np.ndarray,
     label: str,
     figure_dir: Path,
+    filename: Optional[str] = None,
 ):
     """Combined author + ClinVar evidence-distribution figure, matching
     test/plot_author_calibration_confusion.py's true call:
@@ -235,4 +240,4 @@ def make_combined_evidence_figure(
         clinvar_classes=clinvar_classes,
     )
     fig.suptitle(_pretty(label), fontsize=14, fontweight="bold", y=1.01)
-    _save(fig, figure_dir / f"combined_evidence_distribution_{label}.png")
+    _save(fig, figure_dir / (filename or f"combined_evidence_distribution_{label}.png"))

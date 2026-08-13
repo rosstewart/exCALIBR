@@ -21,18 +21,48 @@ Differences from the legacy notebook script:
     calibration files (`analysis.config.YILE_DIR`, not produced by this
     pipeline) — guarded with `analysis.config.warn_if_missing` so a missing
     directory skips Figure 4 with a warning instead of crashing.
-  - The RAD51D/XRCC2/BARD1 "extra plots" section imports a `fit_hist_snv_plot`
-    module that only exists as an import statement in the legacy script — no
-    defining file was found anywhere in this repo (see TODO below). That
-    section is left as a documented no-op that prints a warning rather than
-    a fabricated reimplementation.
+  - The legacy script's RAD51D/XRCC2/BARD1 "extra plots" (produced alongside
+    Figure 4 but not part of it) live in `analysis.extra_gene_fits` instead,
+    called from `analyze_pipeline_output.py` -- kept out of this module so a
+    reproduction of just Figure 4 doesn't also need them (they in turn depend
+    on a `fit_hist_snv_plot` module that only exists as an import statement in
+    the legacy script; see that module's own TODO).
 
 No plotting code (colors, figsize, GridSpec ratios, titles, linestyles) has
 been altered anywhere below relative to the legacy script — only data
 sourcing and control flow (functions instead of top-level `# In[N]:` cells).
+
+Running standalone
+------------------
+Figure 4 does *not* require running `analyze_pipeline_output.py` or any other
+part of `analysis/` first -- `build_figure4()` rebuilds everything it needs
+(confusion matrices, the MSH2 mixture fit, panels e/f's REVEL data) from disk
+on its own the moment it's called; the only reason `analyze_pipeline_output.py`
+passes it `danzs_oob`/`auths_oob`/`dataset_names` is to avoid redoing that
+work a second time in the same notebook run, not because it's required.
+
+    cd exCALIBR && python -m analysis.figure4.driver --help
+
+Every one of Figure 4's five on-disk inputs has its own CLI flag (see --help),
+so a caller passing all five needs nothing from `analysis/config.py` at all --
+`analysis.config`'s `EXCALIBR_*` environment variables (each documented there
+with what it is and its on-disk default) are consulted only as the fallback
+for whichever flags are left unset:
+
+    --output-dir        EXCALIBR_OUTPUT_DIR       run_igvf_batch.py output tree (danz/auth confusion, MSH2 scoreset)
+    --dataset-tsv       EXCALIBR_DATASET_TSV      master integrated-variant-effect TSV
+    --dataset-configs   EXCALIBR_DATASET_CONFIGS  dataset -> (n_c, benign_method) JSON
+    --precomputed-fits  EXCALIBR_PRECOMPUTED_FITS gzipped bootstrap fits (MSH2 mixture overlay, panel a)
+    --revel-dir         EXCALIBR_YILE_DIR         external REVEL gene-specific calibration files (panels e/f only)
+    --figure-dir        EXCALIBR_FIGURE_DIR       where fig4_PP.png / Figure4.pdf get written (default: OUTPUT_DIR/figures)
+
+Missing `--revel-dir`/`EXCALIBR_YILE_DIR` or MSH2 calibration data prints a
+warning and skips (see build_figure4's docstring) rather than raising, so a
+partial pipeline output directory won't crash this.
 """
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Optional
@@ -83,7 +113,7 @@ def _load_msh2_calibration(output_dir, dataset_tsv, precomputed_fits, dataset_co
         precomputed_fits=precomputed_fits,
         dataset_configs_path=dataset_configs_path,
         pipeline_dataset=msh2_pipeline_key,
-        clinvar_release="2026",
+        clinvar_release="2025",
         n_c=n_c,
     )
     return scoreset_2018, scoreset, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped
@@ -181,7 +211,20 @@ def _build_panel_d_data():
 # (Yile's REVEL threshold/score files) — not produced by this pipeline.
 # ---------------------------------------------------------------------------
 
-def _get_stack_bar_plot_data(gene: str, dist: str, yile_dir: str):
+def _revel_path(revel_dir: str, filename: str) -> Path:
+    """Resolve `revel_dir/filename`, preferring a `.gz`-compressed copy if
+    that's what's on disk (e.g. a space-trimmed bundle from
+    `export_msh2_bundle.py`) over the plain file -- pandas' read_csv/
+    read_table infer gzip compression from the `.gz` extension automatically,
+    so callers just get back whichever path actually exists."""
+    plain = Path(revel_dir) / filename
+    gzipped = Path(revel_dir) / f"{filename}.gz"
+    if not plain.exists() and gzipped.exists():
+        return gzipped
+    return plain
+
+
+def _get_stack_bar_plot_data(gene: str, dist: str, revel_dir: str):
     """Load the data `get_StackBarPlot(gene, dist)` needed for panel 4e.
 
     Ported from the legacy driver's ``get_StackBarPlot`` — only the data
@@ -194,12 +237,20 @@ def _get_stack_bar_plot_data(gene: str, dist: str, yile_dir: str):
         "BP4_Very Strong", "BP4_Strong", "BP4_Moderate+", "BP4_Moderate", "BP4_Supporting",
         "IR", "PP3_Supporting", "PP3_Moderate", "PP3_Moderate+", "PP3_Strong", "PP3_Very Strong"
     ]
-    path = yile_dir
-    threshdf = pd.read_csv(f"{path}/{dist}_gene_specific_calibration_thresholds_20260118.csv", index_col=0).drop("calibration_model", axis=1)
+    threshdf = pd.read_csv(
+        _revel_path(revel_dir, f"{dist}_gene_specific_calibration_thresholds_20260118.csv"),
+        index_col=0,
+    ).drop("calibration_model", axis=1)
     sorted_thresholds = threshdf.loc[gene]
 
-    labfn = f"{path}/{gene}_{dist}_labeled.txt"
+    labfn = _revel_path(revel_dir, f"{gene}_{dist}_labeled.txt")
     labdat = pd.read_table(labfn, header=None)
+    # Files may carry leading descriptive columns (variant name, short mutation
+    # name, ...) before the score/label pair that plot_panel_e actually needs;
+    # panel_e indexes those as columns 0/1, so always take the last two columns.
+    if labdat.shape[1] > 2:
+        labdat = labdat.iloc[:, [-2, -1]]
+        labdat.columns = [0, 1]
 
     if dist == 'AM':
         thresh_old = [np.nan, np.nan, 0.07, 0.099, 0.169, 0.792, 0.906, 0.972, 0.99, np.nan]
@@ -214,11 +265,12 @@ def _get_stack_bar_plot_data(gene: str, dist: str, yile_dir: str):
     thresh_old = pd.Series(thresh_old, index=[x for x in categories if x != 'IR'])
 
     required_columns = [dist, 'merg_clinvar_sig', 'GeneSymbol']
-    try:
+    scores_path = _revel_path(revel_dir, f"{gene}_{dist}_scores.tsv")
+    if scores_path.exists():
         if dist == 'MP2':
-            snvdf = pd.read_table(f"{path}/{gene}_{dist}_scores.tsv", index_col=0)
+            snvdf = pd.read_table(scores_path, index_col=0)
         else:
-            snvdf = pd.read_table(f"{path}/{gene}_{dist}_scores.tsv", header=None)
+            snvdf = pd.read_table(scores_path, header=None)
         if not snvdf.empty:
             if dist == 'MP2':
                 snvdf = snvdf.drop_duplicates()[[scrcol]].copy()
@@ -229,7 +281,7 @@ def _get_stack_bar_plot_data(gene: str, dist: str, yile_dir: str):
             snvdf['GeneSymbol'] = gene
         else:
             snvdf = pd.DataFrame(columns=required_columns)
-    except (pd.errors.EmptyDataError, FileNotFoundError):
+    else:
         snvdf = pd.DataFrame(columns=required_columns)
 
     oldsorted_thresholds = pd.Series(thresh_old, index=[x for x in categories if x != 'IR'])
@@ -237,13 +289,13 @@ def _get_stack_bar_plot_data(gene: str, dist: str, yile_dir: str):
     return gene, dist, labdat, snvdf, sorted_thresholds, oldsorted_thresholds
 
 
-def _build_panel_ef_data(yile_dir: str):
+def _build_panel_ef_data(revel_dir: str):
     gene_4e, dist_4e, labdat_4e, snvdf_4e, sorted_thresholds_4e, oldsorted_thresholds_4e = (
-        _get_stack_bar_plot_data('MSH2', 'REVEL', yile_dir)
+        _get_stack_bar_plot_data('MSH2', 'REVEL', revel_dir)
     )
 
     dist_4f = 'REVEL'
-    heatmap_fn = f"{yile_dir}/{dist_4f}_heatmap_data_pillar.csv"
+    heatmap_fn = _revel_path(revel_dir, f"{dist_4f}_heatmap_data_pillar.csv")
     finalout_4f = pd.read_csv(heatmap_fn)
 
     return (
@@ -253,75 +305,31 @@ def _build_panel_ef_data(yile_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# RAD51D / XRCC2 / BARD1 extra fit plots
-#
-# TODO: fit_hist_snv_plot module not found in repo, skipping. Only the import
-# statement `from fit_hist_snv_plot import plot_figure_panel_a, plot_figure_panel_b`
-# exists in the legacy script (test/auxiliary_fig_creation/pillar_project_figure4.py);
-# no file defining `fit_hist_snv_plot` was found anywhere in this repo. Rather
-# than fabricate an implementation, this section prints a warning and returns.
-# ---------------------------------------------------------------------------
-
-def _build_extra_gene_fits(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path, figure_dir):
-    try:
-        import fit_hist_snv_plot  # noqa: F401
-    except ImportError:
-        print(
-            "  SKIP RAD51D/XRCC2/BARD1 extra fit plots: 'fit_hist_snv_plot' module "
-            "not found in repo (only its import statement exists in the legacy "
-            "script test/auxiliary_fig_creation/pillar_project_figure4.py) — "
-            "TODO: port/locate this module if these plots are needed."
-        )
-        return
-
-    # If fit_hist_snv_plot is ever added to the repo, wire it up here following
-    # the same load_scoreset_and_fits(dataset) pattern as _load_msh2_calibration,
-    # for datasets RAD51D_unpublished / XRCC2_unpublished / BARD1_unpublished,
-    # then call fit_hist_snv_plot.plot_figure_panel_a / plot_figure_panel_b and
-    # save to figure_dir / {"xrcc2","rad51d","bard1"}_{fits,snv}.png.
-    from fit_hist_snv_plot import plot_figure_panel_a, plot_figure_panel_b  # noqa: F401
-
-    for dataset, tag in [
-        ("RAD51D_unpublished", "rad51d"),
-        ("XRCC2_unpublished", "xrcc2"),
-        ("BARD1_unpublished", "bard1"),
-    ]:
-        try:
-            scoreset, indv_summary, fits, score_range, n_c, n_samples, flipped = load_scoreset_and_fits(
-                dataset, output_dir=output_dir, dataset_tsv=dataset_tsv,
-                precomputed_fits=precomputed_fits, dataset_configs_path=dataset_configs_path,
-            )
-        except (FileNotFoundError, KeyError, ValueError) as e:
-            print(f"  SKIP extra fit plot for {dataset}: {e}")
-            continue
-
-        minimal = dataset == "BARD1_unpublished"
-        fig_a = plot_figure_panel_a(
-            scoreset, indv_summary, fits, score_range, flipped, n_samples,
-            layout='vertical', minimal=minimal, figsize=(6.6, 7.3),
-        )
-        fig_b = plot_figure_panel_b(
-            scoreset, indv_summary, score_range, flipped,
-            use_twin_axes=True, minimal=minimal, figsize=(6.6, 7.3),
-        )
-        fig_a.savefig(figure_dir / f"{tag}_fits.png", dpi=300, bbox_inches='tight')
-        fig_b.savefig(figure_dir / f"{tag}_snv.png", dpi=300, bbox_inches='tight')
-        plt.close(fig_a)
-        plt.close(fig_b)
-
-
-# ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
 def build_figure4(
     output_dir=None,
     figure_dir=None,
+    dataset_tsv=None,
+    precomputed_fits=None,
+    dataset_configs_path=None,
+    revel_dir=None,
+    panel_c_data=None,
     danzs_oob=None,
     auths_oob=None,
     dataset_names=None,
+    vus_pct_danz=None,
+    vus_pct_auth=None,
 ):
     """Build Figure 4 (unified a-f panel figure) and save to figure_dir.
+
+    `output_dir`/`figure_dir`/`dataset_tsv`/`precomputed_fits`/
+    `dataset_configs_path`/`revel_dir` are each independently optional --
+    any left as None falls back to the matching `analysis.config` constant
+    (itself overridable via the matching `EXCALIBR_*` env var, see this
+    module's "Running standalone" docstring section above). Passing them
+    explicitly here take priority over both.
 
     Pass `danzs_oob`/`auths_oob`/`dataset_names` (e.g. straight from the
     notebook's own section-3 `conf_by_method[method]` / `auth_by_method[method]`
@@ -329,11 +337,36 @@ def build_figure4(
     same run, instead of re-discovering pipeline output, re-loading every
     variants CSV, and rebuilding author labels from scratch a second time.
     If any of the three is omitted, they're all rebuilt fresh from
-    `output_dir` (same as before).
+    `output_dir` (same as before) -- which, for panel c, means walking and
+    rebuilding *every* dataset under `output_dir`, not just MSH2, since panel
+    c's matrices are an aggregate across the whole pipeline run, not an
+    MSH2-specific quantity.
 
-    Also attempts the RAD51D/XRCC2/BARD1 extra fit plots (skipped with a
-    warning — see `_build_extra_gene_fits` — since `fit_hist_snv_plot` isn't
-    present in this repo).
+    `panel_c_data`, if given, is a path written by
+    `analysis.figure4.export_msh2_bundle` / `analysis.figure4.panel_c_io.
+    save_panel_c_bundle`: the panel c aggregate matrices computed *once* from
+    the full pipeline output and cached to a small JSON file, so a minimal
+    MSH2-only reproduction bundle (a trimmed dataset_tsv/precomputed_fits/
+    dataset_configs plus just MSH2's calibration/LR files and REVEL files)
+    doesn't also need to ship (or re-walk) the entire multi-dataset pipeline
+    output tree just for this one panel. Takes priority over
+    `danzs_oob`/`auths_oob`/`dataset_names`/`vus_pct_danz`/`vus_pct_auth` if
+    both are given.
+
+    `vus_pct_danz`/`vus_pct_auth`, if given, are pooled VUS-determinate
+    percentages (analysis.confusion.build_vus_coverage /
+    build_author_vus_coverage + _aggregate_coverage_pct, over the same
+    dataset/method scope as danzs_oob/auths_oob) shown in panel c's
+    "Determinate: Controls X%, VUS Y%" caption. Omitted (not faked) when not
+    supplied -- panel c previously hardcoded these to 79.7%/93.2% regardless
+    of what was actually loaded.
+
+    Renders only Figure 4 itself -- the RAD51D/XRCC2/BARD1 extra fit plots
+    that the legacy script also produced alongside Figure 4 are unrelated
+    supplementary output, not part of Figure 4, and live in
+    `analysis.extra_gene_fits.build_extra_gene_fits` (called from
+    `analyze_pipeline_output.py`) instead, so this module can be handed to
+    someone reproducing just Figure 4 without also needing that.
 
     No-op safe to call repeatedly; guards missing external data (YILE_DIR)
     and missing/incomplete pipeline output by printing a warning and skipping
@@ -343,9 +376,10 @@ def build_figure4(
     figure_dir = Path(figure_dir or cfg.FIGURE_DIR)
     figure_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_tsv = cfg.DATASET_TSV
-    precomputed_fits = cfg.PRECOMPUTED_FITS
-    dataset_configs_path = cfg.DATASET_CONFIGS
+    dataset_tsv = dataset_tsv or cfg.DATASET_TSV
+    precomputed_fits = precomputed_fits or cfg.PRECOMPUTED_FITS
+    dataset_configs_path = dataset_configs_path or cfg.DATASET_CONFIGS
+    revel_dir = revel_dir or cfg.YILE_DIR
 
     print("Building Figure 4...")
 
@@ -357,7 +391,10 @@ def build_figure4(
         print(f"  SKIP Figure 4: could not load MSH2 calibration data ({e})")
         return
 
-    if danzs_oob is None or auths_oob is None or dataset_names is None:
+    if panel_c_data is not None:
+        from analysis.figure4.panel_c_io import load_panel_c_bundle
+        danzs_oob, auths_oob, dataset_names, vus_pct_danz, vus_pct_auth = load_panel_c_bundle(panel_c_data)
+    elif danzs_oob is None or auths_oob is None or dataset_names is None:
         danzs_oob, auths_oob, dataset_names = _build_confusion_matrices(
             output_dir, dataset_tsv, dataset_configs_path
         )
@@ -367,14 +404,14 @@ def build_figure4(
 
     prior, Post_p, Post_b, p_data_sim, b_data_sim = _build_panel_d_data()
 
-    if cfg.warn_if_missing(cfg.YILE_DIR, "Figure 4 panels e/f (REVEL gene-specific calibration files)"):
+    if cfg.warn_if_missing(revel_dir, "Figure 4 panels e/f (REVEL gene-specific calibration files)"):
         return
 
     try:
         (
             gene_4e, dist_4e, labdat_4e, snvdf_4e, sorted_thresholds_4e, oldsorted_thresholds_4e,
             dist_4f, finalout_4f,
-        ) = _build_panel_ef_data(cfg.YILE_DIR)
+        ) = _build_panel_ef_data(revel_dir)
     except (FileNotFoundError, pd.errors.EmptyDataError) as e:
         print(f"  SKIP Figure 4: could not load panel e/f data from YILE_DIR ({e})")
         return
@@ -385,6 +422,7 @@ def build_figure4(
         prior, Post_p, Post_b, p_data_sim, b_data_sim,
         gene_4e, dist_4e, labdat_4e, snvdf_4e, sorted_thresholds_4e, oldsorted_thresholds_4e,
         dist_4f, finalout_4f,
+        vus_pct_danz=vus_pct_danz, vus_pct_auth=vus_pct_auth,
     )
     fig.savefig(figure_dir / "fig4_PP.png", dpi=300, bbox_inches='tight')
     fig.savefig(figure_dir / "Figure4.pdf", dpi=300, bbox_inches='tight')
@@ -394,4 +432,54 @@ def build_figure4(
     else:
         plt.close(fig)
 
-    _build_extra_gene_fits(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path, figure_dir)
+
+def _main():
+    parser = argparse.ArgumentParser(
+        description="Build Figure 4 standalone -- every input below is optional; "
+                    "anything not passed here falls back to analysis.config (itself "
+                    "overridable via the matching EXCALIBR_* env var). Nothing is "
+                    "required from analysis.config unless you omit the flag for it.",
+    )
+    parser.add_argument("--output-dir", default=None,
+                         help="run_igvf_batch.py output tree. "
+                              "Falls back to EXCALIBR_OUTPUT_DIR / analysis.config.OUTPUT_DIR.")
+    parser.add_argument("--dataset-tsv", default=None,
+                         help="Master integrated-variant-effect TSV (the --dataset input to "
+                              "run_igvf_batch.py). Falls back to EXCALIBR_DATASET_TSV / "
+                              "analysis.config.DATASET_TSV.")
+    parser.add_argument("--dataset-configs", default=None,
+                         help="Dataset -> (n_c, benign_method) JSON (the --dataset-configs input "
+                              "to run_igvf_batch.py). Falls back to EXCALIBR_DATASET_CONFIGS / "
+                              "analysis.config.DATASET_CONFIGS.")
+    parser.add_argument("--precomputed-fits", default=None,
+                         help="Gzipped bootstrap fits JSON (the --precomputed-fits input to "
+                              "run_igvf_batch.py; needed for the MSH2 mixture overlay in panel a). "
+                              "Falls back to EXCALIBR_PRECOMPUTED_FITS / analysis.config.PRECOMPUTED_FITS.")
+    parser.add_argument("--revel-dir", default=None,
+                         help="External REVEL gene-specific calibration files, not produced by this "
+                              "pipeline (panels e/f only; skipped with a warning if missing). "
+                              "Falls back to EXCALIBR_YILE_DIR / analysis.config.YILE_DIR.")
+    parser.add_argument("--figure-dir", default=None,
+                         help="Where fig4_PP.png / Figure4.pdf get written. "
+                              "Falls back to EXCALIBR_FIGURE_DIR / analysis.config.FIGURE_DIR.")
+    parser.add_argument("--panel-c-data", default=None,
+                         help="Precomputed panel c (ExCALIBR vs. author confusion) aggregate JSON, "
+                              "written by analysis.figure4.export_msh2_bundle / "
+                              "analysis.figure4.panel_c_io.save_panel_c_bundle. If given, skips "
+                              "walking --output-dir for every dataset just to rebuild panel c -- "
+                              "the one piece of Figure 4 that isn't MSH2-specific, needed for a "
+                              "minimal MSH2-only reproduction bundle.")
+    args = parser.parse_args()
+    build_figure4(
+        output_dir=args.output_dir,
+        figure_dir=args.figure_dir,
+        dataset_tsv=args.dataset_tsv,
+        precomputed_fits=args.precomputed_fits,
+        dataset_configs_path=args.dataset_configs,
+        revel_dir=args.revel_dir,
+        panel_c_data=args.panel_c_data,
+    )
+
+
+if __name__ == "__main__":
+    _main()

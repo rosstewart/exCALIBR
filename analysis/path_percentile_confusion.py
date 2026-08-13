@@ -157,7 +157,7 @@ def main():
     parser.add_argument("--dataset-configs", default=config.DATASET_CONFIGS)
     args = parser.parse_args()
 
-    figure_dir = Path(args.figure_dir) if args.figure_dir else Path(config.FIGURE_DIR)
+    figure_dir = Path(args.figure_dir) if args.figure_dir else Path(config.FIGURE_DIR) / "path_percentile_ablation"
     figure_dir.mkdir(parents=True, exist_ok=True)
 
     with open(args.dataset_configs) as f:

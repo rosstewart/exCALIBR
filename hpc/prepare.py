@@ -55,6 +55,19 @@ if str(_SCRIPT_DIR) not in sys.path:
 _DEFAULT_N_BOOTSTRAPS = 1000
 _DEFAULT_NUM_FITS = 100
 
+# (n_bootstraps, fits_per_bootstrap) shorthands for `default`/`pillar_project`
+# mode's --preset. Duplicated from run_pipeline.py's BOOTSTRAP_PRESETS (not
+# imported -- run_pipeline.py pulls in src.assay_calibration.pipeline at
+# module level, ~800 MB, which this module deliberately avoids at argparse
+# time; see _parse_seed's docstring above). Keep in sync with that dict.
+_BOOTSTRAP_PRESETS = {
+    "light": (20, 8),
+    "medium": (100, 8),
+    "large": (500, 8),
+    "xl": (1000, 8),
+    "finest": (1000, 100),
+}
+
 
 def _available_memory_mb() -> float:
     """Return available system memory in MB (Linux /proc/meminfo MemAvailable)."""
@@ -242,9 +255,11 @@ def _requires_2018(df: pd.DataFrame, dataset: str) -> bool:
     return df[df["Dataset"] == dataset]["Gene"].iloc[0] in genes_2018
 
 
-def _resolve_dataset_filter(args) -> "set[str] | None":
-    """Union of --datasets and --datasets-file, or None if neither was given
-    (meaning: no filter, process every dataset in --dataframe)."""
+def _resolve_dataset_filter(args, df: "pd.DataFrame | None" = None) -> "set[str] | None":
+    """Union of --datasets, --datasets-file, and --genes, or None if none of
+    them were given (meaning: no filter, process every dataset in
+    --dataframe). --genes requires df (to look up its Gene column) since,
+    unlike the other two, it names genes rather than exact Dataset values."""
     names: "set[str]" = set()
     if getattr(args, "datasets", None):
         names.update(args.datasets)
@@ -255,11 +270,28 @@ def _resolve_dataset_filter(args) -> "set[str] | None":
                 line = line.split("#", 1)[0].strip()
                 if line:
                     names.add(line)
+    genes = getattr(args, "genes", None)
+    if genes:
+        upper = {g.upper() for g in genes}
+        gene_col = df["Gene"].astype(str)
+        matched = df.loc[gene_col.str.upper().isin(upper), "Dataset"].unique()
+        found_upper = {g.upper() for g in gene_col.unique()}
+        missing = sorted(g for g in genes if g.upper() not in found_upper)
+        if missing:
+            print(f"  WARNING: {len(missing)} requested gene(s) not found in "
+                  f"--dataframe's Gene column: {missing}")
+        names.update(matched)
     return names or None
 
 
-def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
-    """Return {dataset_name → [component_ints]} from a config JSON."""
+def _components_from_config(config_file: str | None, new_to_old: dict, complement: bool = False) -> dict:
+    """Return {dataset_name → [component_ints]} from a config JSON.
+
+    If complement=True, return the component(s) NOT pinned by the config
+    entry instead (e.g. config pins 2c → return [3]; config pins "all" →
+    return []). Datasets with no config entry at all are unaffected by
+    complement (still [2, 3]) since nothing is pinned for them either way.
+    """
     if config_file is None:
         config_file = str(_REPO_ROOT / "src" / "igvf_configs" / "dataset_configs_jan_2026.json")
     with open(config_file) as f:
@@ -281,9 +313,10 @@ def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
         # n_c token is the first element. Same "n_c" extraction as
         # analysis/discovery.py's _parse_dataset_config_entry.
         n_c = str(entry.get("n_c", "3c")) if isinstance(entry, dict) else str(entry[0])
-        if n_c == "all":
-            return [2, 3]
-        return [int(n_c[0])]
+        configured = [2, 3] if n_c == "all" else [int(n_c[0])]
+        if complement:
+            return sorted(set([2, 3]) - set(configured))
+        return configured
 
     return lookup
 
@@ -291,7 +324,8 @@ def _components_from_config(config_file: str | None, new_to_old: dict) -> dict:
 def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type,
                               force_gaussian=False, default_release="2026",
-                              master_seed=DEFAULT_MASTER_SEED):
+                              master_seed=DEFAULT_MASTER_SEED,
+                              spliceai_threshold=0.2, vep_splice_filter=True):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -300,10 +334,15 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
 
     if selected_components is None:
         selected_components = [2, 3]
+    elif not selected_components:
+        print(f"  {dataset_name} skipping: no components to run "
+              f"(already fully covered by --config-file; --complement-components)")
+        return None
     print(f"  {dataset_name}: components={selected_components}")
 
     try:
-        kw = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
+        kw = dict(clinvar_release=clinvar_release, min_clinvar_star=1,
+                   spliceai_threshold=spliceai_threshold, vep_splice_filter=vep_splice_filter)
         if population_type:
             kw["population_type"] = population_type
         ds = Scoreset(df_ds, **kw)
@@ -409,8 +448,17 @@ def run_default(args):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
-    N_BOOTSTRAPS = _DEFAULT_N_BOOTSTRAPS
-    NUM_FITS = _DEFAULT_NUM_FITS
+    preset_n_bootstraps, preset_num_fits = _BOOTSTRAP_PRESETS[args.preset]
+    N_BOOTSTRAPS = args.n_bootstraps if args.n_bootstraps is not None else preset_n_bootstraps
+    NUM_FITS = args.fits_per_bootstrap if args.fits_per_bootstrap is not None else preset_num_fits
+    print(f"Bootstrap budget: preset={args.preset!r} -> n_bootstraps={N_BOOTSTRAPS}, "
+          f"fits_per_bootstrap={NUM_FITS}")
+
+    spliceai_threshold_str = str(args.spliceai_threshold).strip().lower()
+    spliceai_threshold = None if spliceai_threshold_str == "none" else float(args.spliceai_threshold)
+    vep_splice_filter = not args.disable_vep_splice_filter
+    print(f"Splice filters: vep_splice_filter={vep_splice_filter}, spliceai_threshold={spliceai_threshold}")
+
     output_dir = args.output_dir
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
 
@@ -423,6 +471,11 @@ def run_default(args):
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
     df = pd.read_csv(df_path, sep=sep)
 
+    if args.complement_components and args.components is not None:
+        raise SystemExit("--complement-components cannot be combined with --components")
+    if args.complement_components and args.config_file is None:
+        raise SystemExit("--complement-components requires --config-file")
+
     # Component selection: explicit flag > config file > default [2, 3]
     if args.components is not None:
         _comp_for = lambda name: args.components  # noqa: E731
@@ -430,14 +483,17 @@ def run_default(args):
     elif args.config_file is not None:
         name_map_df = pd.read_csv("/data/ross/assay_calibration/dataframe/new_dataset_names.csv")
         new_to_old = dict(zip(name_map_df["New_names"], name_map_df["Old_names"]))
-        _comp_for = _components_from_config(args.config_file, new_to_old)
-        print(f"Components: per-dataset from {args.config_file}")
+        _comp_for = _components_from_config(args.config_file, new_to_old,
+                                             complement=args.complement_components)
+        mode_desc = "complement of per-dataset config (only un-run n_c)" if args.complement_components \
+            else "per-dataset from config"
+        print(f"Components: {mode_desc} ({args.config_file})")
     else:
         _comp_for = lambda name: [2, 3]  # noqa: E731
         print("Components: [2, 3] for all datasets (no --config-file or --components given)")
 
     datasets = df.Dataset.unique()
-    dataset_filter = _resolve_dataset_filter(args)
+    dataset_filter = _resolve_dataset_filter(args, df)
     if dataset_filter is not None:
         # --datasets/--datasets-file entries may carry the "_clinvar_2018"
         # suffix used for pipeline *output* naming (see _requires_2018
@@ -449,8 +505,8 @@ def run_default(args):
             print(f"  WARNING: {len(missing)} requested dataset(s) not found in "
                   f"--dataframe's Dataset column: {missing}")
         datasets = [ds for ds in datasets if ds in normalized_filter]
-        print(f"Datasets: {len(datasets)} (filtered via --datasets/--datasets-file "
-              f"from {len(dataset_filter)} requested)")
+        print(f"Datasets: {len(datasets)} (filtered via --datasets/--datasets-file/"
+              f"--genes to {len(datasets)} of {len(dataset_filter)} requested)")
     else:
         print(f"Datasets: {len(datasets)}")
     for ds in sorted(datasets):
@@ -472,6 +528,8 @@ def run_default(args):
             population_type=args.population_type,
             force_gaussian=args.force_gaussian,
             master_seed=args.seed,
+            spliceai_threshold=spliceai_threshold,
+            vep_splice_filter=vep_splice_filter,
         )
         for ds in datasets
     )
@@ -1273,13 +1331,50 @@ def main():
                        help="Only generate jobs for these Dataset name(s) (as they "
                             "appear in --dataframe's Dataset column), instead of "
                             "every unique dataset found there. Combinable with "
-                            "--datasets-file (union of both).")
+                            "--datasets-file/--genes (union of all given).")
         p.add_argument("--datasets-file", default=None,
                        help="Path to a text file with one Dataset name per line "
                             "(blank lines and '#'-prefixed comments ignored) to "
                             "restrict job generation to, instead of every unique "
                             "dataset in --dataframe. Combinable with --datasets "
-                            "(union of both).")
+                            "/--genes (union of all given).")
+        p.add_argument("--genes", nargs="+", default=None,
+                       help="Only generate jobs for datasets whose Gene column "
+                            "matches one of these gene(s) (case-insensitive), i.e. "
+                            "every dataset for that gene in --dataframe, regardless "
+                            "of whether it appears in --config-file. Combinable with "
+                            "--datasets/--datasets-file (union of all given).")
+        p.add_argument("--complement-components", action="store_true",
+                       help="For each dataset, run only the component count(s) NOT "
+                            "already pinned in --config-file (e.g. run 3c if the "
+                            "config pins 2c; run nothing if it pins \"all\"). "
+                            "Datasets absent from --config-file are unaffected and "
+                            "still get every component ([2, 3]). Requires "
+                            "--config-file; incompatible with --components.")
+        p.add_argument("--preset", choices=list(_BOOTSTRAP_PRESETS), default="finest",
+                       help="Bootstrap/fit-count shorthand (n_bootstraps, fits_per_bootstrap): "
+                            f"{_BOOTSTRAP_PRESETS} -- see run_pipeline.py's identical "
+                            "BOOTSTRAP_PRESETS / docs/configuration.md#quality-vs-speed-presets. "
+                            "Default 'finest' == today's previously-hardcoded "
+                            f"(1000 bootstraps, {_DEFAULT_NUM_FITS} fits) behavior. "
+                            "--n-bootstraps/--fits-per-bootstrap each override just that "
+                            "one setting.")
+        p.add_argument("--n-bootstraps", type=int, default=None,
+                       help="(Advanced) overrides --preset's n_bootstraps.")
+        p.add_argument("--fits-per-bootstrap", type=int, default=None,
+                       help="(Advanced) overrides --preset's fits_per_bootstrap "
+                            "(applied to every component count).")
+        p.add_argument("--spliceai-threshold", default="0.2",
+                       help="Ablation: SpliceAI DS_{AG,AL,DG,DL} threshold used by "
+                            "Scoreset.splicing_filter for assays that don't detect "
+                            "splice effects (default: 0.2, matching the prior "
+                            "hardcoded behavior). Pass 'none' to disable SpliceAI-"
+                            "score-based filtering entirely (keep all rows regardless "
+                            "of SpliceAI score).")
+        p.add_argument("--disable-vep-splice-filter", action="store_true",
+                       help="Ablation: skip the VEP splice-consequence-based row drop "
+                            "in Scoreset.splicing_filter (default: filter is applied, "
+                            "matching prior hardcoded behavior).")
         return p
 
     p_def = sub.add_parser("default", help="Univariate Scoreset from integrated TSV")

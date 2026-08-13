@@ -439,7 +439,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
 
         if annotate_gene_scatter and r['gene'] not in ['RAD51C', 'OTC', 'SCN5A', 'RAD51D', 'FKRP', 'PALB2', 'KCNQ4', 'BARD1']:
             text = ax_gene.text(r['auth_accuracy'], r['danz_accuracy'],
-                               rf"$\mathbfit{{{r['gene']}}}$", fontsize=FONTSIZE_LEGEND,
+                               rf"$\mathit{{{r['gene']}}}$", fontsize=FONTSIZE_LEGEND,
                                ha='center', va='center', fontweight='bold', zorder=10)
 
             # Add white border/stroke
@@ -636,7 +636,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
             ax.grid(True, alpha=0.2, axis='x', which='major')
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
-            ax.set_title(rf"$\mathbfit{{{gene_name}}}$", fontsize=FONTSIZE_AXIS_LABEL)
+            ax.set_title(rf"$\mathit{{{gene_name}}}$", fontsize=FONTSIZE_AXIS_LABEL)
 
             if letter == "(C)":
                 ax.text(-0.29, PANEL_LETTER_Y + 0.12, letter, transform=ax.transAxes,
@@ -868,7 +868,7 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
         ax.spines['right'].set_visible(False)
 
         # Title with gene name only (disease will be shown in brackets above)
-        ax.set_title(rf"$\mathbfit{{{gene_name}}}$",
+        ax.set_title(rf"$\mathit{{{gene_name}}}$",
                     fontsize=FONTSIZE_AXIS_LABEL, fontweight='bold')
 
     # ========== ADD DISEASE GROUP BRACKETS ==========

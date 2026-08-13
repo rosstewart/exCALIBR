@@ -1,0 +1,62 @@
+{
+  "F9_Popp_2025_carboxy_F9_specific": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_carboxy_gla_motif": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_heavy_chain": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_light_chain": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "GCK_Gersing_2023_complementation": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "GCK_Gersing_2024_abundance": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "LDLR_Tabet_2025_presence_VLDL": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "LDLR_Tabet_2025_uptake": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Boettcher_2019_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PTEN_Matreyek_2018_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "PTEN_Mighell_2018_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  }
+}

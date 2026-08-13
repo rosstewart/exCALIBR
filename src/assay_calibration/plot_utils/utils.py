@@ -2340,12 +2340,12 @@ def plot_scoreset_final_pillar_project_v2(dataset, scoreset_2018, scoreset, indv
 
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
-def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_MIXTURE_FITS=False, HIDE_COMPONENT_FITS=True, HIDE_COMPONENT_VARIANCE=True, FIRST_ONLY=False, SHOW_PRIOR=True):
+def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_MIXTURE_FITS=False, HIDE_COMPONENT_FITS=True, HIDE_COMPONENT_VARIANCE=True, FIRST_ONLY=False, SHOW_PRIOR=True, loader_fn=None):
     """
     Create a 2x2 grid of dataset plots for publication.
     Each panel shows all samples for one dataset stacked vertically.
     Formatted to match Yang distance comparison plots.
-    
+
     Parameters:
     -----------
     dataset_names : list of str
@@ -2356,7 +2356,19 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
         List of keep_old datasets
     figsize : tuple
         Figure size (default: (16, 13.33333))
-    
+    loader_fn : callable, optional
+        dataset -> (scoreset, indv_summary, fits, score_range, config, n_c,
+        flipped, n_samples), same 8-tuple shape as the default
+        `load_dataset_for_plot(dataset, dataset_configs, dataset_relax_configs,
+        keep_old_list)` call below. Pass this to source data from the current
+        pipeline's output (e.g. analysis.legacy_fits.load_scoreset_and_fits)
+        instead of the legacy hand-curated point_assignment_*/{dataset}/*.pkl
+        files `load_dataset_for_plot` reads by default -- those files no
+        longer exist on disk for any dataset as of the 2026-08 pipeline
+        refactor. `dataset_configs`/`dataset_relax_configs`/`keep_old_list`
+        are ignored (but still required as positional args, for existing
+        callers) when `loader_fn` is given.
+
     Returns:
     --------
     matplotlib figure
@@ -2389,9 +2401,12 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
         
         # Load data for this dataset
         try:
-            scoreset, indv_summary, fits, score_range, config, n_c, flipped, n_samples = load_dataset_for_plot(
-                dataset, dataset_configs, dataset_relax_configs, keep_old_list
-            )
+            if loader_fn is not None:
+                scoreset, indv_summary, fits, score_range, config, n_c, flipped, n_samples = loader_fn(dataset)
+            else:
+                scoreset, indv_summary, fits, score_range, config, n_c, flipped, n_samples = load_dataset_for_plot(
+                    dataset, dataset_configs, dataset_relax_configs, keep_old_list
+                )
         except Exception as e:
             print(f"Error loading {dataset}: {e}")
             continue
@@ -2509,7 +2524,12 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                        horizontalalignment='left')
                 
                 # Gene and author name centered (matching Yang plot)
-                ax.set_title(rf"$\mathbfit{{{gene_name}}}$ – {author_name}",
+                # \mathbfit isn't a real mathtext command (matplotlib's
+                # built-in mathtext, unlike full LaTeX with usetex=True,
+                # doesn't support it) -- \mathit alone renders the gene name
+                # in italics; fontweight='bold' below already bolds the
+                # whole title text (both the gene name and " - {author}").
+                ax.set_title(rf"$\mathit{{{gene_name}}}$ – {author_name}",
              fontsize=14, fontweight='bold', pad=8)
             
             # X-axis only on last sample
@@ -2778,7 +2798,12 @@ def plot_four_datasets_gmm_scores(dataset_names, dataset_configs, dataset_relax_
             if sample_idx == 0:
                 gene_name = dataset.split('_')[0]
                 author_name = dataset.split('_')[1]
-                ax.set_title(rf"$\mathbfit{{{gene_name}}}$ – {author_name}",
+                # \mathbfit isn't a real mathtext command (matplotlib's
+                # built-in mathtext, unlike full LaTeX with usetex=True,
+                # doesn't support it) -- \mathit alone renders the gene name
+                # in italics; fontweight='bold' below already bolds the
+                # whole title text (both the gene name and " - {author}").
+                ax.set_title(rf"$\mathit{{{gene_name}}}$ – {author_name}",
                              fontsize=14, fontweight='bold', pad=8)
 
             is_last_sample = (sample_num == len(scoreset.sample_counts) - 1 or

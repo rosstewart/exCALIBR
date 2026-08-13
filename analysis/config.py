@@ -38,7 +38,7 @@ DATASET_TSV = _env(
 # analysis.discovery.resolve_component / legacy_fits.resolve_component_for).
 DATASET_CONFIGS = _env(
     "EXCALIBR_DATASET_CONFIGS",
-    "/home/rcstewart/exCALIBR/src/igvf_configs/dataset_configs_jul_2026.json",
+    "/home/rcstewart/exCALIBR/src/igvf_configs/dataset_configs_aug_2026.json",
 )
 
 # Precomputed bootstrap fits (gzipped JSON of full per-bootstrap component
@@ -190,6 +190,32 @@ SKEW_LOCKED_OUTPUT_DIR = _env(
     "EXCALIBR_SKEW_LOCKED_OUTPUT_DIR", "/data/ross/assay_calibration/skew_locked_gmm/calib"
 )
 
+# SpliceAI-threshold / VEP-splice-filter ablation sweep (analysis.
+# splice_ablation) -- one subdirectory per condition under this root, each a
+# full ExCALIBR-shaped output tree (same layout as OUTPUT_DIR/
+# SKEW_LOCKED_OUTPUT_DIR, discovered via analysis.discovery). Condition
+# subdirectory names: "thresh_{0.1..0.9}" (VEP splice-consequence filter ON,
+# SpliceAI threshold = that value) and "keep_all" (VEP filter OFF, SpliceAI
+# threshold disabled) -- see analysis/build_splice_ablation_jobs.py, which
+# produces this tree via `hpc/prepare.py pillar_project
+# --spliceai-threshold/--disable-vep-splice-filter`.
+SPLICE_ABLATION_ROOT = _env(
+    "EXCALIBR_SPLICE_ABLATION_ROOT", "/data/ross/assay_calibration/explorer_jobs_pp_spliceAIthresh"
+)
+
+# "Manual-prior" ExCALIBR -- canonical pipeline rerun with the per-dataset
+# prior manually fixed at 0.1 instead of ExCALIBR's normal auto-fit prior.
+# Same ExCALIBR-shaped output tree as OUTPUT_DIR/SKEW_LOCKED_OUTPUT_DIR
+# above, so it's discovered/loaded exactly like a normal pipeline run via
+# analysis.discovery, not analysis.comparison_methods. Used for the 3-way
+# ExCALIBR / acmgscaler / ExCALIBR(prior=0.1) confusion grid in section 3a2
+# of analyze_pipeline_output.py. TEMP PLACEHOLDER PATH -- this run doesn't
+# exist on disk yet; update once it's been produced (or set
+# EXCALIBR_MANUAL_PRIOR_OUTPUT_DIR).
+MANUAL_PRIOR_OUTPUT_DIR = _env(
+    "EXCALIBR_MANUAL_PRIOR_OUTPUT_DIR", "/data/ross/assay_calibration/exc_pp_clinvar2025_calib_prior10p"
+)
+
 # Full per-bootstrap component fits for the skew-locked run (same
 # {dataset: {seed: {"2c"/"3c": {"fit": ..., "val_ll": float}}}} format as
 # PRECOMPUTED_FITS above) -- used only to compare each dataset's selected
@@ -198,6 +224,25 @@ SKEW_LOCKED_OUTPUT_DIR = _env(
 SKEW_LOCKED_BOOTSTRAP_RESULTS = _env(
     "EXCALIBR_SKEW_LOCKED_BOOTSTRAP_RESULTS",
     "/data/ross/assay_calibration/skew_locked_gmm/bootstrap_results.json.gz",
+)
+
+# Pathomechanism-aware ExCALIBR rerun ("canonical" vs "pathomech_boundary"
+# comparison -- see Supplementary Section sec:pathomechanism_prior). Same
+# ExCALIBR-shaped output tree as OUTPUT_DIR/SKEW_LOCKED_OUTPUT_DIR, so it's
+# discovered/loaded exactly like a normal pipeline run via analysis.discovery.
+# Used by analyze_pipeline_output.py's pathomechanism comparison section,
+# which reuses the loading logic from
+# test/plot_canonical_vs_pathomech_boundary_confusion.py. TEMP PLACEHOLDER
+# PATH -- this run is still in progress as of 2026-08-12 (only one dataset
+# present on disk so far); update once it's complete, or set
+# EXCALIBR_PATHOMECHANISM_OUTPUT_DIR. The previously-generated pathomech
+# figures (now under FIGURE_DIR/clinvar_comparisons/pathomechanism/) came
+# from a different, since-renamed output tree
+# (exc_pp_clinvar2025_calib_pathomech_boundary_oldKCNQ4_DDX3X) and will look
+# stale/inconsistent with a fresh run against this directory.
+PATHOMECHANISM_OUTPUT_DIR = _env(
+    "EXCALIBR_PATHOMECHANISM_OUTPUT_DIR",
+    "/data/ross/assay_calibration/exc_pp_clinvar2025_calib_pathomech",
 )
 
 # Reconstructed excalibr_datasets.csv -- calibration ranges + sample counts +

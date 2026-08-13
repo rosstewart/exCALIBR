@@ -1257,12 +1257,16 @@ def plot_all_configs_comparison(
     benign_percentile: float = 95.0,
 ) -> plt.Figure:
     """
-    Grid comparison of all (2c/3c) × (avg/benign) calibration configs.
+    Grid comparison of all (2c/3c) × (avg/benign[/synonymous]) calibration configs.
 
-    Layout (3 rows per n_c):
-      density row : [sample density + component fits] … | blank | blank
-      avg row     : [density + avg threshold shading] … | avg LR+ | avg confusion
-      benign row  : [density + benign shading]        … | benign LR+ | benign confusion
+    Layout (1 + len(BENIGN_METHODS) rows per n_c):
+      density row     : [sample density + component fits] … | blank | blank
+      avg row         : [density + avg threshold shading] … | avg LR+ | avg confusion
+      benign row      : [density + benign shading]        … | benign LR+ | benign confusion
+      synonymous row  : only added when at least one n_c has a "synonymous"
+                         calibration present (i.e. --include-synonymous-benign-method
+                         was used and the dataset has a Synonymous sample) --
+                         same panels as the avg/benign rows.
 
     The selected config panels are highlighted with a green border and bold title.
 
@@ -1274,6 +1278,8 @@ def plot_all_configs_comparison(
     import seaborn as sns
 
     BENIGN_METHODS = ["avg", "benign"]
+    if any(f"{nc}_synonymous" in calibrations for nc in ("2c", "3c")):
+        BENIGN_METHODS = BENIGN_METHODS + ["synonymous"]
     n_components = [nc for nc in ["2c", "3c"]
                     if nc in fits_by_nc and any(f"{nc}_{b}" in calibrations for b in BENIGN_METHODS)]
     if not n_components:
@@ -1281,13 +1287,14 @@ def plot_all_configs_comparison(
 
     n_samples = scoreset.n_samples
     n_cols = n_samples + 2          # sample columns + LR+ + confusion
-    n_rows_per_nc = 3               # density, avg, benign
+    n_rows_per_nc = 1 + len(BENIGN_METHODS)   # density + one row per benign_method
     n_rows = len(n_components) * n_rows_per_nc
     hist_colors = ["#CA7682", "#1D7AAB", "#A0A0A0", "#6BAA75"]
 
     height_ratios = []
     for _ in n_components:
-        height_ratios.extend([1.4, 1.0, 1.0])
+        height_ratios.append(1.4)
+        height_ratios.extend([1.0] * len(BENIGN_METHODS))
     total_height = sum(height_ratios) * 3.5
     fig_width = 4.5 * n_cols
 
@@ -1313,8 +1320,7 @@ def plot_all_configs_comparison(
 
     for nc_idx, n_c_str in enumerate(n_components):
         row_density = nc_idx * n_rows_per_nc
-        row_avg     = nc_idx * n_rows_per_nc + 1
-        row_benign  = nc_idx * n_rows_per_nc + 2
+        method_rows = {m: row_density + 1 + mi for mi, m in enumerate(BENIGN_METHODS)}
         fits = fits_by_nc.get(n_c_str, [])
 
         # Score range reference (first available calibration for this n_c)
@@ -1366,8 +1372,8 @@ def plot_all_configs_comparison(
         if xlim is None and score_range_ref is not None:
             xlim = (float(score_range_ref[0]), float(score_range_ref[-1]))
 
-        # --- Rows 1 & 2: per-method (avg, benign) ---
-        for benign_method, row_m in [("avg", row_avg), ("benign", row_benign)]:
+        # --- Rows 1..N: per-method (avg, benign[, synonymous]) ---
+        for benign_method, row_m in method_rows.items():
             comp_key = f"{n_c_str}_{benign_method}"
             calib = calibrations.get(comp_key)
             is_selected = (n_c_str, benign_method) == selected_config

@@ -895,36 +895,186 @@ def kmeans_init_anchored(X, sample_indicators, **kwargs):
     return component_parameters, kmeans
 
 
+def _mom_delta_magnitude(projected_data):
+    """Method-of-moments estimate of |delta| in [0,1) (the standardized
+    skew-normal shape magnitude) from a 1-D projection's sample skewness,
+    inverting the Azzalini skew-normal skewness formula -- the same
+    inversion sn_method_of_moments_init already uses for the univariate
+    path, reused here to size the CFUSN Delta init's MAGNITUDE (not just
+    its sign) from data instead of a fixed constant.
+
+    Returns None if there isn't enough data or the inversion degenerates
+    (caller falls back to the fixed default in that case).
+    """
+    if len(projected_data) < 8:
+        return None
+    m3 = sps.skew(projected_data)
+    if np.isnan(m3) or np.abs(m3) < 1e-10:
+        return 0.0
+    a1 = np.sqrt(2 / np.pi)
+    c = (4 - np.pi) / 2
+    try:
+        delta = 1.0 / np.sqrt(a1 ** 2 * (1 + (c / np.abs(m3)) ** (2 / 3)))
+    except (ZeroDivisionError, FloatingPointError):
+        return None
+    if np.isnan(delta) or delta >= 0.99:
+        return None
+    return float(delta)
+
+
+def _skewness_z_score(projected_data):
+    """|sample skewness| / its standard error under the null of no skew:
+    SE = sqrt(6n(n-1) / ((n-2)(n+1)(n+3))), the finite-sample formula (not
+    the large-n approximation sqrt(6/n), since per-cluster n can be modest).
+    This is what the magnitude shrinkage below thresholds confidence
+    against, instead of trusting the raw method-of-moments point estimate
+    unconditionally (which manufactures spurious skew from pure sampling
+    noise when true skew is 0 -- the point estimate never converges to 0 on
+    symmetric data at any practical N, since the inversion formula is badly
+    conditioned near skew=0, while this z-score stays correctly calibrated
+    regardless of N).
+    """
+    n = len(projected_data)
+    if n < 8:
+        return 0.0, 0.0
+    m3 = sps.skew(projected_data)
+    if np.isnan(m3):
+        return 0.0, 0.0
+    se = np.sqrt(6 * n * (n - 1) / ((n - 2) * (n + 1) * (n + 3)))
+    z = abs(m3) / se if se > 0 else 0.0
+    return float(m3), float(z)
+
+
+def _shrinkage_james_stein(z, c=1.0):
+    """max(0, 1 - c/z**2): a continuous [0,1] weight on how much to trust
+    the method-of-moments magnitude estimate, exactly 0 at z=0 and ->1 as
+    z grows -- a smooth alternative to a hard significance cutoff, so
+    partial confidence gets partial (not all-or-nothing) trust.
+    """
+    if z <= 0:
+        return 0.0
+    return max(0.0, 1.0 - c / (z * z))
+
+
+def _partial_projection(Xc, evec, min_weight_frac=0.5):
+    """Per-row projection onto evec using only that row's OBSERVED entries,
+    renormalized by the fraction of evec's squared weight actually present
+    -- the projection analog of _partial_distance_sq's per-row available-
+    case normalization (already used for k-means clustering under
+    missingness). Rows carrying less than min_weight_frac of evec's total
+    squared weight are dropped.
+
+    Needed because requiring EVERY one of the p dimensions to be observed
+    (the previous behavior) can be permanently unsatisfiable for real
+    multi-assay genes: direct inspection of TP53's actual data (9911 rows
+    x 16 dims, pooling multiple partially-overlapping assays) found 0 rows
+    complete across all 16 dims, even though every PAIR of dimensions has
+    substantial co-observation (the missingness graph is fully connected,
+    just never jointly complete) -- silently disabling both the skew-sign
+    estimate and the magnitude estimate on every cluster, every restart,
+    confirmed via a bit-identical before/after production sanity refit.
+
+    Returns a 1-D array of valid renormalized projections (may be shorter
+    than len(Xc)), or an empty array if none qualify.
+    """
+    Xc = np.asarray(Xc, dtype=float)
+    evec = np.asarray(evec, dtype=float)
+    obs = ~np.isnan(Xc)
+    total_weight = float(np.sum(evec ** 2))
+    if total_weight < 1e-12:
+        return np.array([])
+    observed_weight = (obs * (evec ** 2)[None, :]).sum(axis=1)
+    weight_frac = observed_weight / total_weight
+    keep = weight_frac >= min_weight_frac
+    if not keep.any():
+        return np.array([])
+    Xf = np.where(obs, Xc, 0.0)
+    raw_proj = Xf[keep] @ evec
+    scale_correction = np.sqrt(total_weight / np.maximum(observed_weight[keep], 1e-12))
+    return raw_proj * scale_correction
+
+
+# Calibrated in tests/cfusn_simulations/sim_delta_init_mom_shrinkage.py at
+# production's actual multi-restart budget (min(4**K,100) restarts, tested
+# at n_restarts=4): balances near-exact small-skew recovery and correct
+# near-zero suppression against a real, irreducible medium-skew ambiguity
+# (a genuine statistical power limit at realistic per-cluster N, not a
+# tuning failure -- see that script's docstring and results). This is the
+# value the confidence weight converges to exactly when a column's
+# projection uses ALL of a cluster's rows (info_frac=1, e.g. clean,
+# fully-observed data) -- see _init_delta_matrix's adaptive c below.
+_JS_SHRINKAGE_C_BASE = 1.0
+_FALLBACK_SCALE = 0.1
+_MIN_WEIGHT_FRAC = 0.5
+_MIN_INFO_FRAC = 0.01
+
+
 def _init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=None):
     """Initialize Delta (p, q) matrix for CFUSN.
 
     Uses the top-q eigenvectors of cov as skewness directions. Each column j
-    gets a sign determined by:
-      1. Base sign: sign of marginal skewness of cluster data projected onto
-         eigenvector j (uses complete rows of Xc; falls back to +1 if too few).
-      2. Enumerated flip: multiplied by cluster_sign_pattern[j] ∈ {-1, +1},
-         which comes from decoding lambdaIndex in the caller.
+    gets:
+      1. A MAGNITUDE that blends a data-driven method-of-moments skewness
+         estimate with a small fixed fallback, continuously weighted by how
+         statistically significant the cluster's sample skewness is
+         (_shrinkage_james_stein on _skewness_z_score) -- rather than a
+         single fixed scale, which sim_delta_init_magnitude.py showed is a
+         genuine local-optimum trap (no fixed scale is simultaneously
+         small enough to avoid manufacturing skew from noise and large
+         enough to recover real large skew).
+
+         The z-score's confidence threshold (James-Stein c) is ADAPTIVE,
+         not a single global constant: c_adaptive = _JS_SHRINKAGE_C_BASE /
+         info_frac, where info_frac is the fraction of this cluster's rows
+         that actually contributed to this column's projection. At
+         info_frac=1 (fully-observed data) this reduces EXACTLY to the
+         clean-data-calibrated base constant; as missingness degrades a
+         projection's usable row count, c rises automatically, requiring
+         proportionally stronger evidence before trusting the data-driven
+         estimate -- tested in tests/cfusn_simulations/sim_delta_init_
+         adaptive_c.py to avoid needing a hand-picked single constant that
+         is either excellent on clean data and unsafe on heavily-missing
+         data, or safe everywhere but never as accurate as the clean-data
+         constant on clean data.
+      2. A sign determined by:
+         a. Base sign: sign of marginal skewness of cluster data projected
+            onto eigenvector j (uses _partial_projection -- only that
+            row's observed entries, rescaled -- rather than requiring
+            every one of the p dimensions observed at once).
+         b. Enumerated flip: multiplied by cluster_sign_pattern[j] ∈ {-1,
+            +1}, which comes from decoding lambdaIndex in the caller.
 
     If cluster_sign_pattern is None, a random sign is used (original behaviour).
     """
     rng = rng or np.random.RandomState()
     eigvals, eigvecs = np.linalg.eigh(cov)
     top_idx = np.argsort(eigvals)[::-1][:q]
+    n_cluster = len(Xc) if Xc is not None else 0
 
     Delta = np.zeros((p, q))
     for j, idx in enumerate(top_idx):
-        scale = 0.1 * np.sqrt(eigvals[idx])
         evec = eigvecs[:, idx]
+        fallback = _FALLBACK_SCALE * np.sqrt(eigvals[idx])
 
-        # Base sign from marginal skewness of cluster data along this eigenvector
+        # Base sign from marginal skewness of cluster data along this
+        # eigenvector, and a confidence-weighted blend of the data-driven
+        # magnitude estimate with the fixed fallback.
         skew_sign = 1
-        if Xc is not None:
-            complete_rows = ~np.isnan(Xc).any(axis=1)
-            Xc_comp = Xc[complete_rows]
-            if len(Xc_comp) >= 8:
-                sk = sps.skew(Xc_comp @ evec)
-                if abs(sk) > 1e-6:
-                    skew_sign = int(np.sign(sk))
+        scale = fallback
+        if Xc is not None and n_cluster > 0:
+            projected = _partial_projection(Xc, evec, min_weight_frac=_MIN_WEIGHT_FRAC)
+            if len(projected) >= 8:
+                m3, z = _skewness_z_score(projected)
+                if abs(m3) > 1e-6:
+                    skew_sign = int(np.sign(m3))
+                delta_mag = _mom_delta_magnitude(projected)
+                if delta_mag is not None:
+                    mom_scale = delta_mag * np.sqrt(eigvals[idx])
+                    info_frac = max(len(projected) / n_cluster, _MIN_INFO_FRAC)
+                    c_adaptive = _JS_SHRINKAGE_C_BASE / info_frac
+                    weight = _shrinkage_james_stein(z, c=c_adaptive)
+                    weight = min(max(weight, 0.0), 1.0)
+                    scale = weight * mom_scale + (1 - weight) * fallback
 
         # Enumerated flip from lambdaIndex (or random if not provided)
         enum_sign = (

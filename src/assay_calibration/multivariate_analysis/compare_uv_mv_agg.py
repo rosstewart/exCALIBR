@@ -5,7 +5,7 @@ across all scoresets belonging to the same gene.
 Univariate calibrations live under labelseq_uv_calib/<dataset_name>/, one
 directory per scoreset (e.g. braf_abundance_HSP90i, braf_abundance_No_treatment,
 braf_activity_No_treatment all belong to gene "braf"). Each directory has a
-"<dataset_name>_3c_variants.csv" with a `standard_points` column per variant.
+"<dataset_name>_3c_avg_variants.csv" with a `standard_points` column per variant.
 
 Since these labelseq scoresets have no genomic coordinates (Chrom/hg38_start
 are entirely null) and `hgvs_c` is not 100% populated for any gene checked,
@@ -36,13 +36,27 @@ build_agg_uv_comparison(gene_ms, mv_points_by_gene, uv_calib_dir=DEFAULT_UV_CALI
        print_latex_table.
 """
 
+import json
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from .eval_plot_utils import _accumulate_into
+# aggregate_nonconflicting/aggregate_max now live in mv_analysis.uv_agg
+# (generalized for LABEL-seq/predictor-mv/TP53-integrated alike); re-exported
+# here unchanged for backward compatibility with existing callers. mv_analysis
+# lives at the repo root, three levels up from this file, which isn't always
+# on sys.path (e.g. from a notebook) -- add it if the plain import fails.
+try:
+    from mv_analysis.uv_agg import aggregate_nonconflicting, aggregate_max
+except ImportError:
+    _repo_root = str(Path(__file__).resolve().parents[3])
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from mv_analysis.uv_agg import aggregate_nonconflicting, aggregate_max
 
 DEFAULT_UV_CALIB_DIR = "/data/ross/assay_calibration/labelseq_uv_calib"
 
@@ -72,6 +86,29 @@ def _extract_hgvs_c(variant_id):
     return m.group(1) if m else None
 
 
+def classify_score_from_point_ranges(score, point_ranges):
+    """Evidence points for *score* using a calibration.json's own
+    ``point_ranges`` (``{"<pts>": [[lower, upper], ...]}``, possibly several
+    disjoint intervals per point value). This is the CANONICAL classification
+    -- do not trust a variants.csv's own precomputed ``standard_points``
+    column, which can be stale relative to point_ranges (observed directly:
+    braf_activity_No_treatment's CSV assigns +1 to scores its own
+    calibration.json's point_ranges place in the -1 bucket; other datasets in
+    the same tree are fine, so this isn't a systemic sign-flip bug, just an
+    out-of-date CSV -- recomputing from point_ranges sidesteps it either way).
+    Boundaries are lower-inclusive, upper-exclusive: [lower, upper). Returns
+    0 (uncertain) when no range matches; NaN when the score is NaN.
+    """
+    if pd.isna(score):
+        return np.nan
+    for pts_str, ranges in point_ranges.items():
+        pts = int(pts_str)
+        for lower, upper in ranges:
+            if lower <= score < upper:
+                return pts
+    return 0
+
+
 # ── Loading univariate calibrations ─────────────────────────────────────────
 
 def discover_gene_uv_datasets(gene, uv_calib_dir=DEFAULT_UV_CALIB_DIR):
@@ -84,16 +121,22 @@ def discover_gene_uv_datasets(gene, uv_calib_dir=DEFAULT_UV_CALIB_DIR):
     )
 
 
-def load_uv_scoreset_points(dataset_name, uv_calib_dir=DEFAULT_UV_CALIB_DIR, component='3c'):
-    """Load per-variant standard_points for one univariate scoreset.
+def load_uv_scoreset_points(dataset_name, uv_calib_dir=DEFAULT_UV_CALIB_DIR, component='3c_avg'):
+    """Load per-variant evidence points for one univariate scoreset, computed
+    directly from the canonical calibration.json's point_ranges applied to
+    the CSV's 'score' column (see classify_score_from_point_ranges for why).
 
     Returns a DataFrame with columns ['hgvs_c', 'standard_points']; rows whose
     variant_id doesn't contain a recognizable hgvs_c suffix are dropped.
     """
-    csv_path = Path(uv_calib_dir) / dataset_name / f"{dataset_name}_{component}_variants.csv"
-    df = pd.read_csv(csv_path)
+    base_dir = Path(uv_calib_dir) / dataset_name
+    stem = f"{dataset_name}_{component}"
+    df = pd.read_csv(base_dir / f"{stem}_variants.csv")
+    with open(base_dir / f"{stem}_calibration.json") as f:
+        point_ranges = json.load(f)["point_ranges"]
+    points = df['score'].map(lambda s: classify_score_from_point_ranges(s, point_ranges))
     hgvs_c = df['variant_id'].map(_extract_hgvs_c)
-    out = pd.DataFrame({'hgvs_c': hgvs_c, 'standard_points': df['standard_points']})
+    out = pd.DataFrame({'hgvs_c': hgvs_c, 'standard_points': points})
     return out.dropna(subset=['hgvs_c'])
 
 
@@ -141,7 +184,7 @@ def _resolve_index(hgvs_c, bridge, key_index):
     return None
 
 
-def build_uv_points_matrix(ms, gene, df_labelseq, uv_calib_dir=DEFAULT_UV_CALIB_DIR, component='3c'):
+def build_uv_points_matrix(ms, gene, df_labelseq, uv_calib_dir=DEFAULT_UV_CALIB_DIR, component='3c_avg'):
     """Return (dataset_names, points_matrix).
 
     points_matrix has shape (n_datasets, ms.n_variants); NaN where a
@@ -170,57 +213,7 @@ def build_uv_points_matrix(ms, gene, df_labelseq, uv_calib_dir=DEFAULT_UV_CALIB_
     return datasets, mat
 
 
-# ── Aggregation across scoresets ────────────────────────────────────────────
-
-def aggregate_nonconflicting(mat):
-    """Combine evidence across datasets (rows) per variant (columns).
-
-    Same-sign (or zero) evidence -> value with largest magnitude.
-    Discordant (both a positive and a negative value present) -> 0.
-    All-missing column -> NaN.
-    """
-    D, N = mat.shape
-    out = np.full(N, np.nan)
-    for j in range(N):
-        vals = mat[:, j]
-        vals = vals[~np.isnan(vals)]
-        if len(vals) == 0:
-            continue
-        pos = vals[vals > 0]
-        neg = vals[vals < 0]
-        if len(pos) and len(neg):
-            out[j] = 0.0
-        elif len(pos):
-            out[j] = pos.max()
-        elif len(neg):
-            out[j] = neg.min()
-        else:
-            out[j] = 0.0
-    return out
-
-
-def aggregate_max(mat):
-    """Elementwise max across datasets per variant, e.g. (-1, 2) -> 2.
-
-    If all values for a variant are <= 0, take the one with the largest
-    absolute value instead, e.g. (-1, 0) -> -1, (-3, -1) -> -3.
-
-    All-missing column -> NaN.
-    """
-    D, N = mat.shape
-    out = np.full(N, np.nan)
-    for j in range(N):
-        vals = mat[:, j]
-        vals = vals[~np.isnan(vals)]
-        if len(vals):
-            if np.all(vals <= 0):
-                out[j] = vals[np.argmax(np.abs(vals))]
-            else:
-                out[j] = vals.max()
-    return out
-
-
-def compute_gene_uv_agg(ms, gene, df_labelseq, uv_calib_dir=DEFAULT_UV_CALIB_DIR, component='3c'):
+def compute_gene_uv_agg(ms, gene, df_labelseq, uv_calib_dir=DEFAULT_UV_CALIB_DIR, component='3c_avg'):
     """Load + aggregate all univariate scoresets for *gene* against *ms*.
 
     Returns None if no univariate calibration directories are found for gene.
@@ -240,7 +233,7 @@ def compute_gene_uv_agg(ms, gene, df_labelseq, uv_calib_dir=DEFAULT_UV_CALIB_DIR
 
 def build_agg_uv_comparison(gene_ms, mv_points_by_gene, df_labelseq,
                              uv_calib_dir=DEFAULT_UV_CALIB_DIR,
-                             component='3c', non_nu_genes=None,
+                             component='3c_avg', non_nu_genes=None,
                              mv_key='MV',
                              nonconflicting_key='UV non-conflicting',
                              max_key='UV max'):

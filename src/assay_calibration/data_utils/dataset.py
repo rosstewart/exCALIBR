@@ -877,6 +877,22 @@ class Scoreset:
                       f"nonsense variant row(s) outside aa 51-349")
 
     def splicing_filter(self, **kwargs):
+        """Optional Arguments (both ablation knobs for the SpliceAI-
+        threshold / VEP-splice-consequence sweep; defaults reproduce the
+        original hardcoded behavior byte-for-byte):
+        - vep_splice_filter : bool (default True) — whether to drop rows
+          whose simplified_consequence is a splice-region/site/acceptor/
+          donor VEP call. False keeps them.
+        - spliceai_threshold : float | None (default 0.2) — drop rows where
+          any spliceAI_DS_{AG,AL,DG,DL} >= this value. None disables the
+          SpliceAI-score-based drop entirely (keep all rows regardless of
+          SpliceAI score).
+        Neither has any effect when the assay itself detects splice effects
+        (splice_measure == "Yes") -- same as before.
+        """
+        vep_splice_filter = kwargs.get("vep_splice_filter", True)
+        spliceai_threshold = kwargs.get("spliceai_threshold", 0.2)
+
         _dataset_name = self.dataframe["Dataset"].iloc[0] if "Dataset" in self.dataframe.columns and len(self.dataframe) else "?"
         self.detects_splice = (
             self.dataframe.loc[:, "splice_measure"].unique()[0] == "Yes"  # type: ignore
@@ -884,29 +900,37 @@ class Scoreset:
         # if assay does not detect effects of splicing, remove likely splicing aberrations
         if not self.detects_splice:
             _before = len(self.dataframe)
-            # Remove VEP (mapped/unmapped) consequences
-            self.dataframe = self.dataframe[
-                ~self.dataframe.simplified_consequence.str.lower().isin([
-                    "splice region",
-                    "splice_site_variant",
-                    "splice_acceptor_variant",
-                    "splice_donor_variant",
-                ])
-            ]
-            _dropped_consequence = _before - len(self.dataframe)
+            _dropped_consequence = 0
+            if vep_splice_filter:
+                # Remove VEP (mapped/unmapped) consequences
+                self.dataframe = self.dataframe[
+                    ~self.dataframe.simplified_consequence.str.lower().isin([
+                        "splice region",
+                        "splice_site_variant",
+                        "splice_acceptor_variant",
+                        "splice_donor_variant",
+                    ])
+                ]
+                _dropped_consequence = _before - len(self.dataframe)
 
-            # Remove SpliceAI scores
-            spliceai_cols = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
-            _before_spliceai = len(self.dataframe)
-            mask = self.dataframe[spliceai_cols].lt(0.2) | self.dataframe[spliceai_cols].isna()
-            self.dataframe = self.dataframe[mask.all(axis=1)]
-            _dropped_spliceai = _before_spliceai - len(self.dataframe)
+            _dropped_spliceai = 0
+            if spliceai_threshold is not None:
+                # Remove SpliceAI scores
+                spliceai_cols = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
+                _before_spliceai = len(self.dataframe)
+                mask = self.dataframe[spliceai_cols].lt(spliceai_threshold) | self.dataframe[spliceai_cols].isna()
+                self.dataframe = self.dataframe[mask.all(axis=1)]
+                _dropped_spliceai = _before_spliceai - len(self.dataframe)
 
             if _dropped_consequence or _dropped_spliceai:
-                print(f"  [{_dataset_name}] splicing_filter (assay does not detect splice effects): "
+                print(f"  [{_dataset_name}] splicing_filter (assay does not detect splice effects; "
+                      f"vep_splice_filter={vep_splice_filter}, spliceai_threshold={spliceai_threshold}): "
                       f"dropped {_dropped_consequence} splice-consequence row(s) + "
                       f"{_dropped_spliceai} SpliceAI-flagged row(s) "
                       f"(of {_before} pre-filter)")
+            elif not vep_splice_filter and spliceai_threshold is None:
+                print(f"  [{_dataset_name}] splicing_filter: both vep_splice_filter and "
+                      f"spliceai_threshold disabled — no splice-variant rows dropped")
         else:
             print(f"  [{_dataset_name}] splicing_filter: assay detects splice effects "
                   f"(splice_measure == 'Yes') — no splice-variant rows dropped")

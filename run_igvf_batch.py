@@ -530,6 +530,40 @@ def _run_one_combo(
     return comp_key, log_fp_all
 
 
+def _detect_benign_sample_availability(dataset_df: pd.DataFrame, dataset_name: str, args) -> Tuple[bool, bool]:
+    """Cheaply build a Scoreset for this dataset (no fitting) just to check
+    which of the two benign-defining samples (Benign/Likely Benign,
+    Synonymous) actually have any rows -- so callers can decide whether
+    "avg" would be identical to "benign" (no synonymous) and whether a
+    "synonymous" combo is even runnable, without waiting for a full
+    _run_one_combo pass to find out.
+
+    Returns (has_benign, has_synonymous).
+    """
+    probe_config = PipelineConfig(
+        dataset_csv=args.dataset,
+        dataset_name=dataset_name,
+        output_dir=args.output_dir,
+        components=[2],
+        benign_method="avg",
+        clinvar_release=getattr(args, "clinvar_release", None) or "2026",
+        min_clinvar_star=args.min_clinvar_star,
+        population_type=args.population_type,
+        synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+    )
+    scoreset = load_dataset_from_df(dataset_df, probe_config)
+    has_benign = False
+    has_synonymous = False
+    for i, sample_name in enumerate(scoreset.sample_names):
+        if scoreset.sample_counts[i] == 0:
+            continue
+        if sample_name == "Benign/Likely Benign":
+            has_benign = True
+        elif sample_name == "Synonymous":
+            has_synonymous = True
+    return has_benign, has_synonymous
+
+
 def run_all_configs_for_dataset(
     dataset_name: str,
     df: pd.DataFrame,
@@ -573,10 +607,28 @@ def run_all_configs_for_dataset(
             fits_by_nc[n_c_str] = fits
             seeds_by_nc[n_c_str] = np.array(seeds)
 
+    # A dataset with no Synonymous sample makes "avg" and "benign" compute the
+    # exact same thing -- process_component_fits silently forces avg->benign
+    # in that case (see its "No synonymous sample" warning). Detect this up
+    # front so we can skip the redundant second run and just duplicate the
+    # first one's output instead of paying for prior estimation, LR curves,
+    # and variant-evidence assignment twice for an identical result.
+    _, has_synonymous = _detect_benign_sample_availability(dataset_df, dataset_name, args)
+
+    want_configs = list(ALL_CONFIGS)
+    if has_synonymous and getattr(args, "include_synonymous_benign_method", False):
+        want_configs += [("2c", "synonymous"), ("3c", "synonymous")]
+
     # Determine which combos need to run
     combos_to_run = []
-    for n_c_str, benign_method in ALL_CONFIGS:
+    redundant_avg_nc = set()  # n_c strings where avg==benign (no synonymous) -> copy, don't recompute
+    for n_c_str, benign_method in want_configs:
         if n_c_str not in fits_by_nc:
+            continue
+        if benign_method == "synonymous" and not has_synonymous:
+            continue  # shouldn't happen given the has_synonymous gate above, but stay safe
+        if benign_method == "avg" and not has_synonymous:
+            redundant_avg_nc.add(n_c_str)
             continue
         comp_key = f"{n_c_str}_{benign_method}"
         calib_path = output_dir / f"{dataset_name}_{comp_key}_calibration.json"
@@ -589,7 +641,7 @@ def run_all_configs_for_dataset(
         else:
             combos_to_run.append((n_c_str, benign_method))
 
-    if not combos_to_run:
+    if not combos_to_run and not redundant_avg_nc:
         return
 
     # Group combos by n_c: avg runs before benign within each group so log_fp
@@ -633,6 +685,34 @@ def run_all_configs_for_dataset(
             )
             if is_avg and returned_log_fp is not None:
                 log_fp_all = returned_log_fp
+
+    # No-synonymous datasets: "avg" was skipped above since it's identical to
+    # "benign" -- duplicate benign's output under the avg filenames (with the
+    # n_c/benign_method fields patched to say "avg") instead of leaving no
+    # avg output at all, so anything expecting an avg config to exist (e.g.
+    # a dataset_configs entry with benign_method="avg" as the selected
+    # config) still finds one.
+    for n_c_str in redundant_avg_nc:
+        avg_calib = output_dir / f"{dataset_name}_{n_c_str}_avg_calibration.json"
+        avg_lr = output_dir / f"{dataset_name}_{n_c_str}_avg_lr_values.json.gz"
+        benign_calib = output_dir / f"{dataset_name}_{n_c_str}_benign_calibration.json"
+        benign_lr = output_dir / f"{dataset_name}_{n_c_str}_benign_lr_values.json.gz"
+        if avg_calib.exists() and avg_lr.exists():
+            continue
+        if not (benign_calib.exists() and benign_lr.exists()):
+            continue  # benign itself didn't produce output (e.g. failed) -- nothing to copy
+        with open(benign_calib) as f:
+            cal = json.load(f)
+        cal["n_c"] = f"{n_c_str}_avg"
+        cal["benign_method"] = "avg"
+        with open(avg_calib, "w") as f:
+            json.dump(cal, f, indent=2)
+        with gzip.open(benign_lr, "rt", encoding="utf-8") as f:
+            lr = json.load(f)
+        lr["n_c"] = f"{n_c_str}_avg"
+        with gzip.open(avg_lr, "wt", encoding="utf-8") as f:
+            json.dump(lr, f)
+        print(f"  {n_c_str}_avg: no Synonymous sample -- identical to {n_c_str}_benign, copied instead of recomputing")
 
 
 def _compute_all_configs_metrics(
@@ -763,10 +843,18 @@ def generate_all_configs_viz(
         if fits:
             fits_by_nc[n_c_str] = fits
 
+    # Candidate combos to look for on disk: the standard 4, plus synonymous
+    # variants if --include-synonymous-benign-method was used (loading is
+    # tolerant of missing files below, so it's safe to always list these --
+    # they're simply skipped when absent, e.g. no Synonymous sample).
+    all_configs_effective = list(ALL_CONFIGS)
+    if getattr(args, "include_synonymous_benign_method", False):
+        all_configs_effective += [("2c", "synonymous"), ("3c", "synonymous")]
+
     # Load calibrations from disk (new or old format)
     cal_paths: Dict[str, Path] = {}   # raw JSON paths, for metrics computation
     calibrations: Dict[str, Dict] = {}
-    for n_c_str, benign_method in ALL_CONFIGS:
+    for n_c_str, benign_method in all_configs_effective:
         comp_key = f"{n_c_str}_{benign_method}"
         calib_path = output_dir / f"{dataset_name}_{comp_key}_calibration.json"
         lr_path = output_dir / f"{dataset_name}_{comp_key}_lr_values.json.gz"
@@ -800,7 +888,7 @@ def generate_all_configs_viz(
             hdr = f"  {'Config':<22} {'MCC':>8} {'Acc':>7} {'Cov':>7} {'TP':>5} {'TN':>5} {'FP':>5} {'FN':>5} {'IR_P':>6} {'IR_B':>6}"
             print(hdr)
             print("  " + "-" * (len(hdr) - 2))
-            for ck in [f"{n}_{b}" for n, b in ALL_CONFIGS]:
+            for ck in [f"{n}_{b}" for n, b in all_configs_effective]:
                 if ck not in metrics:
                     continue
                 m = metrics[ck]
@@ -812,7 +900,7 @@ def generate_all_configs_viz(
         logger.warning(f"  Metrics computation failed: {e}")
 
     # Individual viz per combo
-    for n_c_str, benign_method in ALL_CONFIGS:
+    for n_c_str, benign_method in all_configs_effective:
         comp_key = f"{n_c_str}_{benign_method}"
         if comp_key not in calibrations or n_c_str not in fits_by_nc:
             continue
@@ -1062,6 +1150,13 @@ def main():
                             "generate individual and comparison visualizations. "
                             "The config from --dataset-configs is used only to mark the 'selected' "
                             "config in the comparison plot.")
+    parser.add_argument("--include-synonymous-benign-method", action="store_true",
+                       help="With --all-configs, also run the 'synonymous' benign_method "
+                            "(benign defined via the Synonymous sample alone) for each "
+                            "(n_c) where the dataset actually has a Synonymous sample. "
+                            "Silently skipped for datasets without one. Not included in "
+                            "the avg/benign comparison PNG grid -- calibration.json/"
+                            "lr_values.json.gz and config_metrics.json only.")
     parser.add_argument("--generate-config-template", metavar="OUTPUT_JSON",
                        help="Write a config template JSON (all datasets with n_c/benign_method=null) "
                             "and exit. Preserves override fields from --dataset-configs if provided.")
@@ -1201,6 +1296,16 @@ def main():
         return
         print(f"Filtered to {len(csv_datasets)} requested datasets")
 
+    # Precomputed-fits files are frozen artifacts of a past run and may still
+    # key some datasets under an older/renamed identifier than the one in the
+    # current dataset CSV (e.g. "BRCA2_Huang_2026" before that dataset was
+    # renamed to "BRCA2_Huang_2025_SGE" in the master TSV). Reuse
+    # analysis.discovery's DATASET_RENAMES (old name -> current name) as the
+    # single source of truth for these renames, inverted here since we're
+    # going from the *current* dataset CSV name back to the old fits key.
+    from analysis.discovery import DATASET_RENAMES
+    DATASET_NAME_ALIASES = {new: old for old, new in DATASET_RENAMES.items()}
+
     datasets_to_process = []
     for dataset_name in csv_datasets:
         # Determine ClinVar mode
@@ -1219,9 +1324,13 @@ def main():
             continue
 
         if bootstrap_key not in all_bootstrap_results:
-            print(f"  SKIP {dataset_name}: not in precomputed fits "
-                  f"(tried '{bootstrap_key}')")
-            continue
+            aliased_key = DATASET_NAME_ALIASES.get(bootstrap_key)
+            if aliased_key and aliased_key in all_bootstrap_results:
+                bootstrap_key = aliased_key
+            else:
+                print(f"  SKIP {dataset_name}: not in precomputed fits "
+                      f"(tried '{bootstrap_key}')")
+                continue
 
         # Look up config; fall back to running all components with model selection
         config_entry = (

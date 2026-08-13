@@ -49,6 +49,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", default=None, help=f"default: {cfg.OUTPUT_DIR}")
     parser.add_argument("--dataset-tsv", default=None, help=f"default: {cfg.DATASET_TSV}")
+    parser.add_argument("--dataset-configs", default=None, help=f"default: {cfg.DATASET_CONFIGS}")
+    parser.add_argument("--precomputed-fits", default=None, help=f"default: {cfg.PRECOMPUTED_FITS}")
     parser.add_argument("--datasets", nargs="+", default=None,
                          help="Restrict to these dataset names (default: every dataset discovered under --output-dir)")
     parser.add_argument("--with-yang", action="store_true",
@@ -82,6 +84,7 @@ def main():
         print(f"\nComputing Yang distances (n_grid={args.yang_n_grid}, all bootstraps/dataset) ...")
         yang_df = compute_yang_distances_all(
             dataset_list, output_dir=output_dir, dataset_tsv=args.dataset_tsv,
+            precomputed_fits=args.precomputed_fits, dataset_configs_path=args.dataset_configs,
             n_jobs=args.n_jobs, n_grid=args.yang_n_grid, checkpoint_path=args.yang_checkpoint,
         )
         print(f"Yang distances computed for {len(yang_df)}/{len(dataset_list)} dataset(s)")

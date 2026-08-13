@@ -37,13 +37,23 @@ DEFAULT_EXCLUDED_DATASETS = {
 # "..._3c_avg_calibration.json" — part of the component token ("3c_avg"), not the method.
 BENIGN_METHODS = {"avg", "benign", "synonymous"}
 
-# Dataset-name spellings that differ between the pipeline/dataset_configs
-# naming (used throughout output directory trees) and the master TSV's own
-# "Dataset" column, not covered by new_dataset_names.csv. Scoped to this
-# analysis module only -- deliberately not added to new_dataset_names.csv,
-# which is shared with the rest of the pipeline. pipeline name -> master TSV name.
-_DATASET_TSV_NAME_ALIASES = {
+# Dataset-name spellings that differ between an old/frozen pipeline artifact
+# (dataset_configs, precomputed bootstrap fits, or an output directory tree
+# written before an upstream rename) and the master TSV's current "Dataset"
+# column, not covered by new_dataset_names.csv. Scoped to this analysis
+# module only -- deliberately not added to new_dataset_names.csv, which is
+# shared with the rest of the pipeline. old/frozen name -> current TSV name.
+#
+# Single source of truth for this rename: also used by discover_outputs (see
+# below) to canonicalize dataset names found in *output* directory trees, and
+# by run_igvf_batch.py (inverted) to find a dataset's precomputed bootstrap
+# fits under the pre-rename key. If you add an entry here for a new rename,
+# check whether run_igvf_batch.py's dataset_configs*.json also still uses the
+# old name -- if so, rename that key too rather than relying on an alias,
+# since load_all_variants below skips any dataset absent from dataset_configs.
+DATASET_RENAMES = {
     "CHEK2_McCarthy_Leo_2024": "CHEK2_McCarthy-Leo_2024",
+    "BRCA2_Huang_2026": "BRCA2_Huang_2025_SGE",
 }
 
 
@@ -128,44 +138,78 @@ _recompute_points_from_calibration = recompute_points_from_calibration
 
 def discover_outputs(
     output_dir: Path,
+    dataset_renames: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Dict[str, Dict[str, Path]]], Dict[str, Optional[int]], Dict]:
     """Walk output_dir for *_variants.csv and *_calibration.json files.
 
-    Returns
-    -------
-    tree : {dataset → {comp → {method → csv_path or None}}}
-    model_selections : {dataset → conservative_k or None}
-    calibrations : {dataset → {method → {comp → cal_path}}}
+    `dataset_renames` (default `DATASET_RENAMES`) canonicalizes any output
+    found under an old/pre-rename dataset name (e.g. a stale
+    "BRCA2_Huang_2026" directory left over from before that dataset was
+    renamed to "BRCA2_Huang_2025_SGE" in the master TSV) onto the *current*
+    name's tree entry, so it doesn't sit under a name dataset_configs no
+    longer recognizes -- load_all_variants skips any dataset absent from
+    dataset_configs, so an un-canonicalized rename would silently vanish from
+    analysis outright rather than just looking stale.
+
+    Old- and current-named output are merged per (comp, method) slot with
+    old-named output only filling gaps: canonically-named output for a given
+    (comp, method) is processed first and always wins outright; an
+    old-named directory's file for that same slot is discarded (a console
+    NOTE is printed either way) rather than silently overwriting it, since
+    rglob's sort order alone doesn't reliably tell you which run is newer.
     """
+    dataset_renames = DATASET_RENAMES if dataset_renames is None else dataset_renames
     tree: Dict[str, Dict[str, Dict[str, Path]]] = {}
     model_selections: Dict[str, Optional[int]] = {}
     calibrations: Dict = {}
 
-    for csv_path in sorted(output_dir.rglob("*_variants.csv")):
+    def _variants_sort_key(p: Path) -> bool:
+        parsed = _parse_variants_stem(p.stem)
+        return bool(parsed and parsed[0] in dataset_renames)
+
+    def _calibration_sort_key(p: Path) -> bool:
+        parsed = _parse_calibration_stem(p.stem)
+        return bool(parsed and parsed[0] in dataset_renames)
+
+    for csv_path in sorted(output_dir.rglob("*_variants.csv"), key=_variants_sort_key):
         parsed = _parse_variants_stem(csv_path.stem)
         if parsed is None:
             continue
         dataset, method, comp = parsed
-        tree.setdefault(dataset, {}).setdefault(comp, {})[method] = csv_path
+        canonical = dataset_renames.get(dataset, dataset)
+        slot = tree.setdefault(canonical, {}).setdefault(comp, {})
+        if method in slot:
+            if dataset != canonical:
+                print(f"  NOTE: ignoring stale output from renamed dataset '{dataset}' "
+                      f"(comp={comp}/{method}) -- '{canonical}' already has output there")
+            continue
+        slot[method] = csv_path
+        if dataset != canonical:
+            print(f"  NOTE: no output found yet for '{canonical}' comp={comp}/{method}; "
+                  f"using output from its old/renamed name '{dataset}' ({csv_path})")
 
         ms_path = csv_path.parent / f"{dataset}_model_selection.json"
-        if ms_path.exists() and dataset not in model_selections:
+        if ms_path.exists() and canonical not in model_selections:
             try:
                 with open(ms_path) as f:
                     ms = json.load(f)
-                model_selections[dataset] = ms.get("conservative_k")
+                model_selections[canonical] = ms.get("conservative_k")
             except Exception:
                 pass
 
-    for cal_path in sorted(output_dir.rglob("*_calibration.json")):
+    for cal_path in sorted(output_dir.rglob("*_calibration.json"), key=_calibration_sort_key):
         parsed = _parse_calibration_stem(cal_path.stem)
         if parsed is None:
             continue
         dataset, method, comp = parsed
-        calibrations.setdefault(dataset, {}).setdefault(method, {})[comp] = cal_path
+        canonical = dataset_renames.get(dataset, dataset)
+        cslot = calibrations.setdefault(canonical, {}).setdefault(method, {})
+        if comp in cslot:
+            continue
+        cslot[comp] = cal_path
 
         # Register method in tree if not already present from a variants CSV
-        tree.setdefault(dataset, {}).setdefault(comp, {}).setdefault(method, None)
+        tree.setdefault(canonical, {}).setdefault(comp, {}).setdefault(method, None)
 
     return tree, model_selections, calibrations
 
@@ -247,6 +291,47 @@ def load_master_df(dataset_tsv: str) -> pd.DataFrame:
     return _master_df_cache[dataset_tsv]
 
 
+def resolve_dataset_tsv_name(
+    csv_name: str, df_full: pd.DataFrame, dataset_tsv: str,
+    old_to_new: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Resolve `csv_name` (a pipeline/CSV dataset name, already with any
+    `_clinvar_2018` suffix stripped) to whichever spelling actually appears
+    in `df_full`'s `Dataset` column -- the single canonical lookup every
+    call site that joins pipeline output against the master TSV by dataset
+    name should go through, instead of each re-implementing its own subset
+    of this fallback chain (which is how `DATASET_RENAMES` ended
+    up applied in `_filter_dataset_df`/`build_variants_from_scoreset` but
+    not in `analysis.clingen.build_clingen_confusion` or
+    `analysis.author_labels.load_author_labels_for_dataset`, silently
+    SKIPping any dataset that only the alias table -- not
+    new_dataset_names.csv -- covers, e.g. BRCA2_Huang_2026 ->
+    BRCA2_Huang_2025_SGE).
+
+    Tries, in order: the name as-is; `old_to_new` (loaded from
+    new_dataset_names.csv via `analysis.author_labels.load_name_mapping` if
+    not passed in -- callers already holding it should pass it to avoid
+    re-reading that CSV per dataset); `DATASET_RENAMES` (this
+    module's own hardcoded old/frozen-name -> master-TSV-name table, for
+    renames not covered by new_dataset_names.csv). Returns None, not the
+    unresolved csv_name, if no spelling is actually present in df_full --
+    callers should treat that as "not found" rather than filtering on a
+    name that will just come back empty.
+    """
+    if (df_full["Dataset"] == csv_name).any():
+        return csv_name
+    if old_to_new is None:
+        from analysis.author_labels import load_name_mapping
+        old_to_new, _ = load_name_mapping(str(dataset_tsv))
+    alt = old_to_new.get(csv_name)
+    if alt and (df_full["Dataset"] == alt).any():
+        return alt
+    alt = DATASET_RENAMES.get(csv_name)
+    if alt and (df_full["Dataset"] == alt).any():
+        return alt
+    return None
+
+
 def _filter_dataset_df(df_full: pd.DataFrame, dataset: str, dataset_tsv: str) -> pd.DataFrame:
     """Slice the (large, all-datasets) master dataframe down to one dataset's
     rows. Kept separate from scoreset construction so callers that need to
@@ -254,19 +339,10 @@ def _filter_dataset_df(df_full: pd.DataFrame, dataset: str, dataset_tsv: str) ->
     load_all_variants) can do this filtering once in the parent process and
     hand each worker only its own small slice -- never the full master frame."""
     csv_name = dataset.replace("_clinvar_2018", "")
-    df_ds = df_full[df_full["Dataset"] == csv_name].copy()
-    if df_ds.empty:
-        from analysis.author_labels import load_name_mapping
-        old_to_new, _ = load_name_mapping(str(dataset_tsv))
-        alt = old_to_new.get(csv_name)
-        if alt:
-            df_ds = df_full[df_full["Dataset"] == alt].copy()
-    if df_ds.empty:
-        alt = _DATASET_TSV_NAME_ALIASES.get(csv_name)
-        if alt:
-            df_ds = df_full[df_full["Dataset"] == alt].copy()
-    if df_ds.empty:
+    resolved = resolve_dataset_tsv_name(csv_name, df_full, dataset_tsv)
+    if resolved is None:
         raise ValueError(f"Dataset '{csv_name}' not found in {dataset_tsv}")
+    df_ds = df_full[df_full["Dataset"] == resolved].copy()
     df_ds["Dataset"] = dataset
     return df_ds
 

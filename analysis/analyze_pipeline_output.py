@@ -108,12 +108,17 @@ from analysis.author_labels import attach_author_labels
 from analysis.confusion import (
     build_confusion_matrix,
     build_author_confusion_matrix,
+    build_vus_coverage,
+    build_author_vus_coverage,
+    build_both_determinate_confusion_matrices,
     make_confusion_figure,
     make_single_confusion_figure,
+    make_confusion_grid_figure,
+    _aggregate_coverage_pct,
 )
 from analysis.evidence import build_evidence_arrays, build_author_array, make_evidence_figure
 from analysis.calibration_plots import load_lr_values, make_calibration_figure
-from analysis.plot_common import save_and_show
+from analysis.plot_common import save_and_show, save_latex_table
 
 OUTPUT_DIR = Path(config.OUTPUT_DIR)
 DATASET_TSV = config.DATASET_TSV
@@ -121,6 +126,35 @@ DATASET_CONFIGS_PATH = config.DATASET_CONFIGS
 PRECOMPUTED_FITS = config.PRECOMPUTED_FITS
 FIGURE_DIR = Path(config.FIGURE_DIR)
 FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def figure_subdirs(figure_dir: Path) -> dict:
+    """Named subfolders every figure-producing section below writes into,
+    grouped by comparison/ablation type rather than left flat in
+    `figure_dir` -- see each section's own call sites for which subfolder it
+    uses. Created up front so no individual plotting call needs its own
+    mkdir. `robustness_downsampling`/`robustness_label_noise` and
+    `bootstrap_reduction`/`fit_number_comparison` additionally get their own
+    dataset-level subfolders, created lazily by analysis/robustness.py
+    itself (see plot_robustness_config_summary /
+    plot_bootstrap_reduction_config_summary)."""
+    subdirs = {
+        "author": figure_dir / "clinvar_comparisons" / "author",
+        "acmgscaler": figure_dir / "clinvar_comparisons" / "acmgscaler",
+        "gmm_baseline": figure_dir / "clinvar_comparisons" / "gmm_baseline",
+        "skew_locked": figure_dir / "clinvar_comparisons" / "skew_locked",
+        "pathomechanism": figure_dir / "clinvar_comparisons" / "pathomechanism",
+        "clingen": figure_dir / "clingen_comparisons",
+        "path_percentile": figure_dir / "path_percentile_ablation",
+        "manuscript": figure_dir / "manuscript_figures",
+        "tables": figure_dir / "manuscript_figures" / "tables",
+    }
+    for d in subdirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return subdirs
+
+
+FIGURE_SUBDIRS = figure_subdirs(FIGURE_DIR)
 
 print(f"OUTPUT_DIR       = {OUTPUT_DIR}")
 print(f"DATASET_TSV      = {DATASET_TSV}")
@@ -153,6 +187,7 @@ def main():
     output_dir = Path(args.output_dir)
     figure_dir = Path(args.figure_dir) if args.figure_dir else output_dir / "figures"
     figure_dir.mkdir(parents=True, exist_ok=True)
+    figure_subdirs_ = figure_subdirs(figure_dir)
 
     print("=" * 80)
     print("PIPELINE OUTPUT ANALYSIS")
@@ -184,6 +219,8 @@ def main():
 
     conf_by_method_ = {m: [] for m in methods_}
     auth_by_method_ = {m: [] for m in methods_}
+    vus_by_method_ = {m: [] for m in methods_}
+    auth_vus_by_method_ = {m: [] for m in methods_}
     for dataset_ in datasets_:
         df_ds = df[df["dataset"] == dataset_]
         for method_ in methods_:
@@ -194,9 +231,18 @@ def main():
             auth_by_method_[method_].append(
                 build_author_confusion_matrix(df_m, use_oob=use_oob_) if not df_m.empty else None
             )
+            vus_by_method_[method_].append(
+                build_vus_coverage(df_m, use_oob=use_oob_, label=f"{dataset_}/{method_}") if not df_m.empty else None
+            )
+            auth_vus_by_method_[method_].append(
+                build_author_vus_coverage(df_m) if not df_m.empty else None
+            )
 
     for m in methods_:
-        make_single_confusion_figure(conf_by_method_[m], datasets_, label=m, figure_dir=figure_dir)
+        make_single_confusion_figure(
+            conf_by_method_[m], datasets_, label=m, figure_dir=figure_subdirs_["author"],
+            vus_coverages=vus_by_method_[m], filename=f"excalibr_vs_clinvar_{m}.png",
+        )
 
     primary_method_ = methods_[0]
     auths_ = auth_by_method_[primary_method_]
@@ -204,14 +250,18 @@ def main():
         make_confusion_figure(
             danzs_m1=conf_by_method_[primary_method_], danzs_m2=auths_,
             dataset_names=datasets_, label1=primary_method_, label2="author",
-            figure_dir=figure_dir,
+            figure_dir=figure_subdirs_["author"], filename="excalibr_vs_author.png",
+            vus_coverages_m1=vus_by_method_[primary_method_],
+            vus_coverages_m2=auth_vus_by_method_[primary_method_],
         )
 
     for method_ in methods_:
         df_m = df[df["method"] == method_]
         all_danz, all_clinvar = build_evidence_arrays(df_m)
         all_author = build_author_array(df_m)
-        make_evidence_figure(all_danz, all_author, all_clinvar, label=method_, figure_dir=figure_dir)
+        make_evidence_figure(
+            all_danz, all_author, all_clinvar, label=method_, figure_dir=figure_subdirs_["manuscript"],
+        )
 
     print(f"\n{'=' * 80}\nANALYSIS COMPLETE\n{'=' * 80}")
     print(f"Figures saved to: {figure_dir}")
@@ -265,6 +315,10 @@ use_oob = True
 
 conf_by_method = {m: [] for m in methods}
 auth_by_method = {m: [] for m in methods}
+vus_by_method = {m: [] for m in methods}
+auth_vus_by_method = {m: [] for m in methods}
+both_det_excalibr_by_method = {m: [] for m in methods}
+both_det_author_by_method = {m: [] for m in methods}
 
 for dataset in datasets:
     df_ds = df[df["dataset"] == dataset]
@@ -276,20 +330,130 @@ for dataset in datasets:
         auth_by_method[method].append(
             build_author_confusion_matrix(df_m, use_oob=use_oob) if not df_m.empty else None
         )
+        vus_by_method[method].append(
+            build_vus_coverage(df_m, use_oob=use_oob, label=f"{dataset}/{method}") if not df_m.empty else None
+        )
+        auth_vus_by_method[method].append(
+            build_author_vus_coverage(df_m) if not df_m.empty else None
+        )
+        both_det_excalibr, both_det_author = (
+            build_both_determinate_confusion_matrices(df_m, use_oob=use_oob, label=f"{dataset}/{method}")
+            if not df_m.empty else (None, None)
+        )
+        both_det_excalibr_by_method[method].append(both_det_excalibr)
+        both_det_author_by_method[method].append(both_det_author)
 
 # Calibration-vs-ClinVar confusion matrix, per method — always plotted.
 for m in methods:
-    make_single_confusion_figure(conf_by_method[m], datasets, label=m, figure_dir=FIGURE_DIR)
+    make_single_confusion_figure(
+        conf_by_method[m], datasets, label=m, figure_dir=FIGURE_SUBDIRS["author"],
+        vus_coverages=vus_by_method[m], filename=f"excalibr_vs_clinvar_{m}.png",
+    )
 
 # ExCALIBR vs. author, for whichever method is primary (first discovered).
+# auth_by_method entries are already None for any dataset with zero
+# determinate author calls (see build_author_confusion_matrix) -- such a
+# dataset means the author functional classification was never recorded,
+# not that the author genuinely called every control indeterminate, so it's
+# excluded from this aggregate rather than padding it with synthetic IR.
 primary_method = methods[0]
 auths = auth_by_method[primary_method]
 if any(a is not None for a in auths):
     make_confusion_figure(
         danzs_m1=conf_by_method[primary_method], danzs_m2=auths,
         dataset_names=datasets, label1=primary_method, label2="author",
-        figure_dir=FIGURE_DIR,
+        figure_dir=FIGURE_SUBDIRS["author"], filename="excalibr_vs_author.png",
+        vus_coverages_m1=vus_by_method[primary_method],
+        vus_coverages_m2=auth_vus_by_method[primary_method],
     )
+
+# %% [markdown]
+# ### 3a1b. ExCALIBR vs. author, determinate-determinate calls only
+#
+# Same two [BLB,PLP] x [Normal,IR,Abnormal] confusion matrices as the panel
+# above (ExCALIBR vs ClinVar, author vs ClinVar), just restricted to the
+# subset of P/LP+B/LB variants where BOTH ExCALIBR (points != 0) and the
+# author (Normal/Abnormal, not an indeterminate code or missing) made a
+# determinate call -- see `build_both_determinate_confusion_matrices`. The
+# IR column is necessarily all-zero on both sides by construction; what
+# this isolates is whether ExCALIBR's and the author's *accuracy* against
+# ClinVar (not their coverage) differ once both have actually committed to
+# a call.
+
+# %%
+both_det_excalibr = both_det_excalibr_by_method[primary_method]
+both_det_author = both_det_author_by_method[primary_method]
+if any(m is not None for m in both_det_excalibr) and any(m is not None for m in both_det_author):
+    make_confusion_figure(
+        danzs_m1=both_det_excalibr, danzs_m2=both_det_author,
+        dataset_names=datasets, label1=primary_method, label2="author",
+        figure_dir=FIGURE_SUBDIRS["author"], filename="excalibr_vs_author_both_determinate.png",
+    )
+else:
+    print("  SKIP ExCALIBR-vs-author both-determinate figure: no dataset had any determinate-determinate call")
+
+# %% [markdown]
+# ### 3a1c. Gene-deduplicated confusion matrices
+#
+# Section 3's per-dataset sum above counts a variant once per assay it
+# appears in -- if two different MAVE studies of the same gene both scored
+# the same genomic variant, it contributes twice to that aggregate. This
+# panel instead merges every assay's copy of the same physical variant
+# (matched by Gene/Chrom/hgvs_c, not the assay-specific MaveDB key -- see
+# `analysis.multi_scoreset.genomic_variant_key`) into one row per gene
+# before building the confusion matrix: the merged evidence points are the
+# abs-max across assays if they agree in sign, else 0 (0,5 -> 5; -1,-3 ->
+# -3; 2,-1 -> 0); merged author calls follow the same rule (conflicting
+# Normal/Abnormal calls across assays -> indeterminate).
+#
+# The ExCALIBR-vs-author panel additionally drops any gene whose author
+# calls are entirely indeterminate/missing across every one of its
+# deduped variants (`restrict_to_genes_with_author_data`) -- same
+# rationale as build_author_confusion_matrix's own all-indeterminate
+# guard in section 3: a gene where the author functional classification
+# was simply never recorded shouldn't count as "author called everything
+# indeterminate". The standalone ExCALIBR-vs-ClinVar panel above it keeps
+# every gene, since that panel doesn't involve author calls at all.
+
+# %%
+from analysis.multi_scoreset import (
+    build_gene_deduped_variants, build_deduped_confusion_matrix, build_deduped_author_confusion_matrix,
+    restrict_to_genes_with_author_data,
+)
+
+df_primary_dedup = df[df["method"] == primary_method]
+deduped_variants = build_gene_deduped_variants(df_primary_dedup, use_oob=use_oob)
+n_genes_deduped = deduped_variants["gene"].nunique()
+n_multi_assay = int((deduped_variants["n_assays"] > 1).sum())
+print(f"Gene-deduplicated: {len(deduped_variants):,} unique variants across {n_genes_deduped} genes "
+      f"({n_multi_assay:,} scored by more than one assay)")
+
+deduped_matrix = build_deduped_confusion_matrix(deduped_variants)
+
+deduped_variants_with_author = restrict_to_genes_with_author_data(deduped_variants)
+n_genes_with_author = deduped_variants_with_author["gene"].nunique()
+print(f"Gene-deduplicated, restricted to genes with real author data: {n_genes_with_author}/{n_genes_deduped} genes "
+      f"({len(deduped_variants_with_author):,} variants)")
+deduped_matrix_for_author = build_deduped_confusion_matrix(deduped_variants_with_author)
+deduped_author_matrix = build_deduped_author_confusion_matrix(deduped_variants_with_author)
+
+if deduped_matrix is not None:
+    make_single_confusion_figure(
+        [deduped_matrix], ["gene_deduped"], label=primary_method, figure_dir=FIGURE_SUBDIRS["author"],
+        filename="excalibr_vs_clinvar_gene_deduped.png",
+        title_suffix=f"({n_genes_deduped} genes, {len(deduped_variants):,} unique variants, gene-deduplicated)",
+    )
+else:
+    print("  SKIP gene-deduplicated confusion figure: no P/LP or B/LB variants in deduped scope")
+
+if deduped_matrix_for_author is not None and deduped_author_matrix is not None:
+    make_confusion_figure(
+        danzs_m1=[deduped_matrix_for_author], danzs_m2=[deduped_author_matrix], dataset_names=["gene_deduped"],
+        label1=primary_method, label2="author", figure_dir=FIGURE_SUBDIRS["author"],
+        filename="excalibr_vs_author_gene_deduped.png",
+    )
+else:
+    print("  SKIP gene-deduplicated ExCALIBR-vs-author figure: no matrix on one or both sides")
 
 # %% [markdown]
 # ### 3a2. ExCALIBR vs. other comparison methods
@@ -350,12 +514,26 @@ def _all_indeterminate_matrix(excalibr_matrix):
 
 comparison_matches = {}  # method_label -> (matched_excalibr, matched_other, matched_datasets), filled below
 
+# Which clinvar_comparisons/ subfolder each comparison method's figures land
+# in -- keyed by the exact method_label string each call site below passes.
+_COMPARISON_SUBDIR_KEY = {
+    "acmgscaler": "acmgscaler",
+    "skew_locked": "skew_locked",
+    "gmm_plp_blb": "gmm_baseline",
+    "gmm_plp_blb_synon": "gmm_baseline",
+    "gmm_all_plp_blb": "gmm_baseline",
+    "gmm_all_plp_blb_synon": "gmm_baseline",
+}
+
 def _compare_vs_excalibr(conf_raw, method_label):
     """conf_raw : per-dataset confusion matrices (or None) for `method_label`,
     same order as `datasets`. Produces both the all_datasets and
     matched_datasets confusion figures against conf_by_method[primary_method],
-    and records the matched-datasets triple in `comparison_matches` for the
+    routed into the clinvar_comparisons/{acmgscaler,gmm_baseline,skew_locked}/
+    subfolder matching `method_label` (see _COMPARISON_SUBDIR_KEY), and
+    records the matched-datasets triple in `comparison_matches` for the
     aggregate performance report in 3b."""
+    figure_dir = FIGURE_SUBDIRS[_COMPARISON_SUBDIR_KEY[method_label]]
     n_missing = sum(
         1 for m, d in zip(conf_raw, conf_by_method[primary_method])
         if m is None and d is not None
@@ -371,7 +549,7 @@ def _compare_vs_excalibr(conf_raw, method_label):
         make_confusion_figure(
             danzs_m1=conf_by_method[primary_method], danzs_m2=conf_all,
             dataset_names=datasets, label1=primary_method, label2=method_label,
-            figure_dir=FIGURE_DIR, tag="all_datasets",
+            figure_dir=figure_dir, filename=f"excalibr_vs_{method_label}_all_datasets.png",
         )
     else:
         print(f"  SKIP {method_label} comparison (all_datasets): no ExCALIBR matrices to pair with")
@@ -384,11 +562,37 @@ def _compare_vs_excalibr(conf_raw, method_label):
         make_confusion_figure(
             danzs_m1=matched_excalibr, danzs_m2=matched_other,
             dataset_names=matched_datasets, label1=primary_method, label2=method_label,
-            figure_dir=FIGURE_DIR, tag="matched_datasets",
+            figure_dir=figure_dir, filename=f"excalibr_vs_{method_label}_matched_datasets.png",
         )
         comparison_matches[method_label] = (matched_excalibr, matched_other, matched_datasets)
     else:
         print(f"  SKIP {method_label} comparison (matched_datasets): no dataset produced a matrix")
+
+# --- manual-prior ExCALIBR rerun (prior=0.1 fixed, not auto-fit) ---
+# Loaded here (rather than down in 3a3 alongside skew-locked) so it's
+# available for the 3-way ExCALIBR/acmgscaler/manual-prior grid right below.
+# analysis.config.MANUAL_PRIOR_OUTPUT_DIR is currently a TEMP PLACEHOLDER
+# PATH -- this rerun doesn't exist on disk yet, so this cell just prints a
+# warning and leaves manual_prior_conf_raw as None until it's populated.
+# Same full ExCALIBR-shaped output tree as OUTPUT_DIR/SKEW_LOCKED_OUTPUT_DIR,
+# so discovered/loaded via analysis.discovery exactly like a normal
+# pipeline run, not analysis.comparison_methods. use_oob=False to match the
+# skew-locked/GMM-baseline convention below (flip to True once/if this rerun
+# carries oob_* columns).
+manual_prior_conf_raw = None
+if not config.warn_if_missing(config.MANUAL_PRIOR_OUTPUT_DIR, "ExCALIBR manual-prior (0.1) comparison"):
+    mp_tree, mp_model_selections, mp_calibrations = discover_outputs(Path(config.MANUAL_PRIOR_OUTPUT_DIR))
+    mp_df = load_all_variants(
+        tree=mp_tree, model_selections=mp_model_selections, dataset_configs=dataset_configs,
+        methods_filter=None, datasets_filter=datasets, calibrations=mp_calibrations, min_controls=0,
+    )
+    manual_prior_conf_raw = []
+    for dataset in datasets:
+        df_mp = mp_df[mp_df["dataset"] == dataset] if not mp_df.empty else mp_df
+        manual_prior_conf_raw.append(
+            build_confusion_matrix(df_mp, use_oob=False, label=f"{dataset}/manual_prior_0.1")
+            if not df_mp.empty else None
+        )
 
 # --- acmgscaler ---
 # Precomputed by run_acmgscaler_all.py (analysis.config.ACMGSCALER_OUTPUT_DIR)
@@ -405,6 +609,51 @@ if not config.warn_if_missing(config.ACMGSCALER_OUTPUT_DIR, "acmgscaler comparis
         for dataset in datasets
     ]
     _compare_vs_excalibr(acmgscaler_conf_raw, "acmgscaler")
+
+    # 3-way grid: ExCALIBR (normal auto-fit prior) vs acmgscaler vs ExCALIBR
+    # rerun with prior manually fixed at 0.1 -- lets you see at a glance
+    # whether acmgscaler's disagreement with ExCALIBR tracks the prior
+    # choice itself rather than the calibration method.
+    #
+    # Restricted to the intersection of datasets where all three actually
+    # produced a matrix -- acmgscaler skips datasets it can't calibrate
+    # (<10 P or <10 B controls) and the manual-prior rerun is its own,
+    # separately-run pipeline output tree that may simply not cover every
+    # dataset the main run does (e.g. one added after the manual-prior rerun
+    # was last generated) -- pooling each panel over its own, independently
+    # -sized set of non-None datasets would silently compare unequal
+    # populations panel to panel.
+    if manual_prior_conf_raw is not None and any(m is not None for m in manual_prior_conf_raw):
+        _grid_excalibr = conf_by_method[primary_method]
+        _common_idx = [
+            i for i in range(len(datasets))
+            if _grid_excalibr[i] is not None and acmgscaler_conf_raw[i] is not None
+            and manual_prior_conf_raw[i] is not None
+        ]
+        _missing_datasets = {
+            "excalibr": [datasets[i] for i in range(len(datasets)) if _grid_excalibr[i] is None],
+            "acmgscaler": [datasets[i] for i in range(len(datasets)) if acmgscaler_conf_raw[i] is None],
+            "manual_prior_0.1": [datasets[i] for i in range(len(datasets)) if manual_prior_conf_raw[i] is None],
+        }
+        for _panel, _miss in _missing_datasets.items():
+            if _miss:
+                print(f"  3-way grid: {_panel} missing {len(_miss)} dataset(s) not in the common scope: {_miss}")
+        if _common_idx:
+            make_confusion_grid_figure(
+                panels=[
+                    (primary_method, [_grid_excalibr[i] for i in _common_idx]),
+                    ("acmgscaler", [acmgscaler_conf_raw[i] for i in _common_idx]),
+                    ("manual prior=0.1", [manual_prior_conf_raw[i] for i in _common_idx]),
+                ],
+                figure_dir=FIGURE_SUBDIRS["acmgscaler"],
+                filename="excalibr_vs_acmgscaler_vs_manual_prior_grid.png",
+                suptitle=f"ExCALIBR vs. acmgscaler vs. ExCALIBR (manual prior=0.1) "
+                         f"({len(_common_idx)} common datasets)",
+            )
+        else:
+            print("  SKIP 3-way ExCALIBR/acmgscaler/manual-prior grid: no dataset had a matrix in all three")
+    else:
+        print("  SKIP 3-way ExCALIBR/acmgscaler/manual-prior grid: manual-prior output not available")
 
 # --- simple GMM baseline, both pooling variants ---
 if config.GMM_BASELINE_OUTPUT_DIR:
@@ -529,6 +778,67 @@ else:
     ll_diff_df = pd.DataFrame()
 
 ll_diff_df
+
+# %% [markdown]
+# ### 3a4b. Pathomechanism-aware prior/LR+ comparison
+#
+# "canonical" = the standard ExCALIBR fit (OUTPUT_DIR). "pathomech_boundary"
+# = the same pipeline rerun with the pathomechanism-aware prior/likelihood
+# ratio (Supplementary Section sec:pathomechanism_prior) enabled via
+# --pathomechanism-prior --pathomechanism-method boundary, read from
+# config.PATHOMECHANISM_OUTPUT_DIR. Logic ported from (not duplicated by
+# reference to) test/plot_canonical_vs_pathomech_boundary_confusion.py, which
+# remains runnable standalone. config.PATHOMECHANISM_OUTPUT_DIR is currently
+# a TEMP PLACEHOLDER PATH (run still in progress as of 2026-08-12) -- this
+# cell prints a warning and skips until it's populated.
+
+# %%
+if not config.warn_if_missing(config.PATHOMECHANISM_OUTPUT_DIR, "pathomechanism comparison"):
+    pm_tree, pm_model_selections, pm_calibrations = discover_outputs(Path(config.PATHOMECHANISM_OUTPUT_DIR))
+    pm_df_all = load_all_variants(
+        tree=pm_tree, model_selections=pm_model_selections, dataset_configs=dataset_configs,
+        methods_filter=None, datasets_filter=None, calibrations=pm_calibrations, min_controls=0,
+    )
+    pm_method = sorted(pm_df_all["method"].unique())[0] if not pm_df_all.empty else None
+    pm_df = pm_df_all[pm_df_all["method"] == pm_method] if pm_method else pm_df_all
+
+    pathomech_datasets = sorted(set(datasets) | set(pm_df["dataset"].unique()))
+    canonical_conf, pathomech_conf = [], []
+    for ds in pathomech_datasets:
+        df_c = df[(df["dataset"] == ds) & (df["method"] == primary_method)]
+        df_p = pm_df[pm_df["dataset"] == ds]
+        canonical_conf.append(build_confusion_matrix(df_c, use_oob=True, label=f"{ds}/canonical") if not df_c.empty else None)
+        pathomech_conf.append(build_confusion_matrix(df_p, use_oob=True, label=f"{ds}/pathomech_boundary") if not df_p.empty else None)
+
+    make_single_confusion_figure(
+        canonical_conf, pathomech_datasets, label="canonical",
+        figure_dir=FIGURE_SUBDIRS["pathomechanism"], filename="excalibr_canonical.png",
+    )
+    make_single_confusion_figure(
+        pathomech_conf, pathomech_datasets, label="pathomech_boundary",
+        figure_dir=FIGURE_SUBDIRS["pathomechanism"], filename="excalibr_pathomech_boundary.png",
+    )
+    make_confusion_figure(
+        danzs_m1=canonical_conf, danzs_m2=pathomech_conf, dataset_names=pathomech_datasets,
+        label1="canonical", label2="pathomech_boundary", figure_dir=FIGURE_SUBDIRS["pathomechanism"],
+        filename="canonical_vs_pathomech_boundary_all_datasets.png",
+    )
+
+    pathomech_diff_rows = []
+    for ds, c, p in zip(pathomech_datasets, canonical_conf, pathomech_conf):
+        if c is None or p is None or c.equals(p):
+            continue
+        pathomech_diff_rows.append({
+            "dataset": ds,
+            "canonical_PLP_Normal": int(c.loc["PLP", "Normal"]), "pathomech_PLP_Normal": int(p.loc["PLP", "Normal"]),
+            "canonical_PLP_Abnormal": int(c.loc["PLP", "Abnormal"]), "pathomech_PLP_Abnormal": int(p.loc["PLP", "Abnormal"]),
+            "canonical_BLB_Abnormal": int(c.loc["BLB", "Abnormal"]), "pathomech_BLB_Abnormal": int(p.loc["BLB", "Abnormal"]),
+        })
+    pathomech_diff_df = pd.DataFrame(pathomech_diff_rows)
+    print(f"Datasets with a CHANGED confusion matrix under the pathomechanism prior: "
+          f"{len(pathomech_diff_df)}/{len(pathomech_datasets)}")
+    if not pathomech_diff_df.empty:
+        pathomech_diff_df.to_csv(FIGURE_SUBDIRS["pathomechanism"] / "canonical_vs_pathomech_diff.csv", index=False)
 
 # %% [markdown]
 # ### 3a5. Robustness analysis (downsampling / label discordance)
@@ -699,6 +1009,35 @@ if not config.warn_if_missing(config.FIT_NUMBER_COMPARISON_SUMMARY_CSV, "fit-num
     plot_fit_number_comparison_curve(fit_number_summary, figure_dir=FIGURE_DIR, label="all_datasets")
 
 # %% [markdown]
+# ### 3a8. SpliceAI threshold / VEP splice-consequence filter ablation
+#
+# `Scoreset.splicing_filter` (`src/assay_calibration/data_utils/dataset.py`)
+# drops rows flagged as likely splicing aberrations -- by VEP consequence
+# and/or a SpliceAI DS_{AG,AL,DG,DL} >= 0.2 threshold -- for any assay that
+# doesn't itself detect splice effects. How sensitive is calibration
+# performance to that threshold, and to disabling either filter entirely?
+#
+# Unlike the downsample/discordance robustness conditions in 3a5, each
+# condition here (`analysis/build_splice_ablation_jobs.py`'s
+# `thresh_0.1`..`thresh_0.9` + `keep_all` subdirectories under
+# `analysis.config.SPLICE_ABLATION_ROOT`) is a full, independently-fit
+# ExCALIBR output tree -- discovered/loaded exactly like a normal pipeline
+# run (same pattern as 3a3's skew-locked comparison), no reference-
+# population indirection needed.
+
+# %%
+from analysis.splice_ablation import run_splice_ablation_analysis, plot_splice_ablation_curve
+
+if not config.warn_if_missing(config.SPLICE_ABLATION_ROOT, "splice ablation analysis"):
+    splice_ablation_summary = run_splice_ablation_analysis(
+        config.SPLICE_ABLATION_ROOT, dataset_configs=dataset_configs,
+    )
+    if not splice_ablation_summary.empty:
+        print(f"Splice ablation: {splice_ablation_summary['condition_label'].nunique()} condition(s), "
+              f"{splice_ablation_summary['dataset'].nunique()} dataset(s)")
+        plot_splice_ablation_curve(splice_ablation_summary, figure_dir=FIGURE_DIR, label="all_datasets")
+
+# %% [markdown]
 # ### 3b. Aggregate performance report + manuscript LaTeX table
 #
 # `print_aggregate_performance` (src/assay_calibration/plot_utils/utils.py)
@@ -722,7 +1061,8 @@ if _auth_pairs:
     danz_agg_metrics, auth_agg_metrics, individual_metrics_df = print_aggregate_performance(
         list(_danzs_auth), list(_auths_auth), list(_names_auth),
     )
-    latex_performance_table_clinvar(danz_agg_metrics, auth_agg_metrics)
+    _clinvar_perf_latex = latex_performance_table_clinvar(danz_agg_metrics, auth_agg_metrics)
+    save_latex_table(_clinvar_perf_latex, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance.tex")
 else:
     print("  SKIP aggregate performance report: no datasets with both ExCALIBR and author matrices")
 
@@ -781,15 +1121,19 @@ for method in methods:
     df_m = df[df["method"] == method]
     all_danz, all_clinvar = build_evidence_arrays(df_m)
     all_author = build_author_array(df_m)
-    make_evidence_figure(all_danz, all_author, all_clinvar, label=method, figure_dir=FIGURE_DIR)
+    make_evidence_figure(all_danz, all_author, all_clinvar, label=method, figure_dir=FIGURE_SUBDIRS["manuscript"])
 
 # Skew-locked evidence distribution, same shape as the loop above -- skew_df
 # is built in 3a3 (empty DataFrame if that section skipped, e.g.
-# SKEW_LOCKED_OUTPUT_DIR missing).
+# SKEW_LOCKED_OUTPUT_DIR missing). Routed alongside the rest of the
+# skew-locked ablation's figures rather than into manuscript_figures/.
 if not skew_df.empty:
     skew_all_danz, skew_all_clinvar = build_evidence_arrays(skew_df)
     skew_all_author = build_author_array(skew_df)
-    make_evidence_figure(skew_all_danz, skew_all_author, skew_all_clinvar, label="skew_locked", figure_dir=FIGURE_DIR)
+    make_evidence_figure(
+        skew_all_danz, skew_all_author, skew_all_clinvar, label="skew_locked",
+        figure_dir=FIGURE_SUBDIRS["skew_locked"],
+    )
 
 # %% [markdown]
 # ### 4b. Combined author + ClinVar evidence distribution, and gene-wise evidence table
@@ -807,8 +1151,16 @@ if not skew_df.empty:
 from analysis.evidence import build_dataset_info_and_arrays, make_combined_evidence_figure
 from src.assay_calibration.plot_utils.utils import compute_genewise_evidence_table
 
-AUTHOR_PANEL_DATASETS = datasets    # restrict to a curated subset here if desired
-CLINVAR_PANEL_DATASETS = datasets   # restrict to a curated subset here if desired
+# Author-annotated subset -- reused below (and again for CLINGEN_DATASETS)
+# rather than recomputed. Restricting the author panel to this subset (while
+# the ClinVar panel below spans every dataset) matches the legacy script's
+# original two-scope design (see make_combined_evidence_figure's docstring);
+# leaving both panels at the full `datasets` list here was an unfilled
+# placeholder that made the two panels coincidentally identical.
+datasets_with_author = [d for d, a in zip(datasets, auth_by_method[primary_method]) if a is not None]
+
+AUTHOR_PANEL_DATASETS = datasets_with_author  # restrict to a curated subset here if desired
+CLINVAR_PANEL_DATASETS = datasets             # restrict to a curated subset here if desired
 
 df_primary = df[df["method"] == primary_method]
 
@@ -822,7 +1174,7 @@ dataset_info_df_full, all_danz_oob_full, _, all_clinvar_full = build_dataset_inf
 if len(all_danz_oob) and len(all_danz_oob_full):
     make_combined_evidence_figure(
         all_danz_oob, all_author, all_danz_oob_full, all_clinvar_full,
-        label=primary_method, figure_dir=FIGURE_DIR,
+        label=primary_method, figure_dir=FIGURE_SUBDIRS["manuscript"],
     )
 
     gwe_author_table, gwe_clinvar_table, gwe_latex_str = compute_genewise_evidence_table(
@@ -830,6 +1182,7 @@ if len(all_danz_oob) and len(all_danz_oob_full):
         all_danz_oob_full, all_clinvar_full[:, :4], dataset_info_df_full,
     )
     print(gwe_latex_str)
+    save_latex_table(gwe_latex_str, FIGURE_SUBDIRS["tables"] / "gene_wise_evidence_distribution.tex")
 else:
     print("  SKIP combined evidence distribution / gene-wise table: no variants in scope")
 
@@ -849,29 +1202,66 @@ else:
 # variant/points table reloaded fresh from the Scoreset -- see
 # `build_clingen_confusion`'s docstring for why (their on-disk
 # *_variants.csv can undercount VUS for exactly these datasets).
+#
+# Scope is restricted to `datasets_with_author` -- the same subset of
+# datasets used for the ExCALIBR-vs-author ClinVar panels in section 3,
+# where `build_author_confusion_matrix` found at least one determinate
+# (Normal/Abnormal) author call. A dataset outside that subset never had its
+# author functional classification recorded at all, so including it here
+# would (same rationale as section 3) make it look like the author called
+# every one of its ClinGen-labeled variants indeterminate, when really the
+# author column was simply never populated for that dataset.
+#
+# Four variants of the panel are built below:
+# - per-assay sum, PS3/BS3 stripped (the original/default behavior)
+# - gene-deduplicated, PS3/BS3 stripped (merges each gene's assays' copies
+#   of the same physical variant first, same idea as section 3a1c)
+# - per-assay sum, PS3/BS3 KEPT (circularity check: how much of ClinGen's
+#   "ground truth" is itself derived from functional-assay evidence)
+# - gene-deduplicated, PS3/BS3 KEPT
 
 # %%
-from analysis.clingen import build_clingen_confusion, convert_3x2_to_2x3, plot_2x3_confusions_nature
+from analysis.clingen import (
+    build_clingen_confusion, build_gene_deduped_clingen_confusion,
+    convert_3x2_to_2x3, plot_2x3_confusions_nature,
+)
 from analysis.manuscript_stats import latex_performance_table_clingen
 
-CLINGEN_DATASETS = datasets  # explicit, adjustable — narrow if desired
+# datasets_with_author computed once, above in section 4b.
+print(f"ClinGen scope: {len(datasets_with_author)}/{len(datasets)} datasets have real author data")
 
-clingen_confusion, clingen_genes = build_clingen_confusion(
-    df_primary, DATASET_TSV, CLINGEN_DATASETS, use_oob=True,
-    tree=tree, model_selections=model_selections, calibrations=calibrations,
-)
-if clingen_genes:
-    fig = plot_2x3_confusions_nature({
-        'auth': convert_3x2_to_2x3(clingen_confusion['auth']),
-        'excalibr': convert_3x2_to_2x3(clingen_confusion['excalibr']),
-    })
-    save_and_show(fig, FIGURE_DIR / "clingen_confusion.png")
-    latex_performance_table_clingen({
-        'excalibr': convert_3x2_to_2x3(clingen_confusion['excalibr']),
-        'auth': convert_3x2_to_2x3(clingen_confusion['auth']),
-    })
-else:
-    print("  SKIP ClinGen confusion: no genes with usable ClinGen evidence codes in scope")
+CLINGEN_DATASETS = datasets_with_author  # explicit, adjustable — narrow if desired
+
+CLINGEN_VARIANTS = [
+    ("clingen_confusion", "gene-deduped=False, PS3/BS3 stripped=True", False, True),
+    ("clingen_confusion_gene_deduped", "gene-deduped=True, PS3/BS3 stripped=True", True, True),
+    ("clingen_confusion_with_ps3bs3", "gene-deduped=False, PS3/BS3 stripped=False", False, False),
+    ("clingen_confusion_gene_deduped_with_ps3bs3", "gene-deduped=True, PS3/BS3 stripped=False", True, False),
+]
+
+for tag, desc, gene_dedup, strip_ps3bs3 in CLINGEN_VARIANTS:
+    print(f"\n--- ClinGen confusion ({desc}) ---")
+    clingen_confusion, clingen_genes, clingen_records = build_clingen_confusion(
+        df_primary, DATASET_TSV, CLINGEN_DATASETS, use_oob=True,
+        tree=tree, model_selections=model_selections, calibrations=calibrations,
+        strip_functional_evidence=strip_ps3bs3,
+    )
+    if gene_dedup:
+        clingen_confusion, clingen_genes = build_gene_deduped_clingen_confusion(clingen_records)
+
+    if clingen_genes:
+        fig = plot_2x3_confusions_nature({
+            'auth': convert_3x2_to_2x3(clingen_confusion['auth']),
+            'excalibr': convert_3x2_to_2x3(clingen_confusion['excalibr']),
+        })
+        save_and_show(fig, FIGURE_SUBDIRS["clingen"] / f"{tag}.png")
+        _clingen_perf_latex = latex_performance_table_clingen({
+            'excalibr': convert_3x2_to_2x3(clingen_confusion['excalibr']),
+            'auth': convert_3x2_to_2x3(clingen_confusion['auth']),
+        })
+        save_latex_table(_clingen_perf_latex, FIGURE_SUBDIRS["tables"] / f"{tag}_performance.tex")
+    else:
+        print(f"  SKIP ClinGen confusion ({desc}): no genes with usable ClinGen evidence codes in scope")
 
 # %% [markdown]
 # ### 4d. Evidence-level comparison + assay-level statistics
@@ -944,7 +1334,7 @@ if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-c
     fig, _ = plot_evidence_comparison(
         excalibr_path_counts, excalibr_ben_counts, auth_path_counts, auth_ben_counts,
     )
-    save_and_show(fig, FIGURE_DIR / "num_datasets_reach_evidence.png")
+    save_and_show(fig, FIGURE_SUBDIRS["manuscript"] / "num_datasets_reach_evidence.png")
 
 if not config.warn_if_missing(config.ASSAY_METHOD_MAP_CSV, "assay method map (dataset_stats/point heatmap)"):
     assay_method_map = pd.read_csv(config.ASSAY_METHOD_MAP_CSV)
@@ -957,7 +1347,7 @@ if not config.warn_if_missing(config.ASSAY_METHOD_MAP_CSV, "assay method map (da
         dataset_info_df_full, all_danz_oob_full,
         assay_method_map=assay_method_map, sort_by='model_system',
     )
-    save_and_show(fig, FIGURE_DIR / "points_heatmap_sort_model_system.png")
+    save_and_show(fig, FIGURE_SUBDIRS["manuscript"] / "points_heatmap_sort_model_system.png")
 
 # %% [markdown]
 # ## 5. Per-dataset calibration figures
@@ -978,6 +1368,53 @@ if _vis_candidates:
     display(Image(filename=str(_vis_candidates[0])))
 else:
     print(f"  No existing visualization.png found for {_example_dataset} under {OUTPUT_DIR / _example_dataset}")
+
+# %% [markdown]
+# ## 5b. Four-dataset model-fit comparison figure (main text Figure "fig:fits")
+#
+# Reproduces the BRCA1/GCK/PTEN/CRX 2x2 model-fit comparison figure
+# (`model_fits_comparison.png` in the paper). This was previously only
+# produced by the standalone `test/plot_MSH2_ex.py`, via
+# `plot_four_datasets_publication` (`src/assay_calibration/plot_utils/utils.py`)
+# reading from a hand-curated `point_assignment_*/{dataset}/*.pkl` directory
+# tree that no longer exists on disk for any dataset as of the pipeline
+# refactor (that script is left fixed but unrunnable as-is; see its own
+# `datasets_to_plot` comment). Here we instead pass `plot_four_datasets_publication`
+# a `loader_fn` backed by `analysis.legacy_fits.load_scoreset_and_fits`, the
+# current bridge from saved pipeline output (calibration/LR-values/
+# PRECOMPUTED_FITS) to the same `(scoreset, indv_summary, fits, score_range,
+# config, n_c, flipped, n_samples)` shape the plotting function expects --
+# same visual output, current data source.
+
+# %%
+from analysis import legacy_fits
+from src.assay_calibration.plot_utils.utils import plot_four_datasets_publication
+
+FOUR_PANEL_DATASETS = [
+    "BRCA1_Findlay_2018_clinvar_2018",
+    "GCK_Gersing_2024_abundance",
+    "PTEN_Mighell_2018_clinvar_2018",
+    "CRX_Shepherdson_2024",
+]
+
+def _four_panel_loader(dataset):
+    n_c, benign_method = legacy_fits.resolve_component_for(
+        dataset, output_dir=str(OUTPUT_DIR), dataset_configs_path=DATASET_CONFIGS_PATH,
+    )
+    scoreset, indv_summary, fits, score_range, n_c2, n_samples, flipped = legacy_fits.load_scoreset_and_fits(
+        dataset, output_dir=str(OUTPUT_DIR), dataset_tsv=DATASET_TSV, precomputed_fits=PRECOMPUTED_FITS,
+        dataset_configs_path=DATASET_CONFIGS_PATH, n_c=n_c, benign_method=benign_method,
+    )
+    return scoreset, indv_summary, fits, score_range, (n_c, benign_method), n_c2, flipped, n_samples
+
+_missing_four_panel = [d for d in FOUR_PANEL_DATASETS if d not in datasets]
+if _missing_four_panel:
+    print(f"  SKIP four-dataset model-fit figure: {_missing_four_panel} not in section 1's discovered datasets")
+else:
+    fig = plot_four_datasets_publication(
+        FOUR_PANEL_DATASETS, dataset_configs, {}, set(), loader_fn=_four_panel_loader,
+    )
+    save_and_show(fig, FIGURE_SUBDIRS["manuscript"] / "model_fits_comparison.png")
 
 # %% [markdown]
 # ## 6. Yang distance bootstrap diagnostic
@@ -1009,6 +1446,27 @@ if not config.warn_if_missing(config.EXCALIBR_DATASETS_TABLE_CSV, "Yang distance
     in_scope[["dataset"] + yang_cols] if yang_cols else None
 
 # %% [markdown]
+# ### 6b. Yang distance 4-panel diagnostic figure (Extended Data Figure "fig:dists")
+#
+# Unlike the table above (pre-reduced medians from a batch-computed CSV),
+# this recomputes the full per-bootstrap Yang-distance distribution live for
+# just the same 4 datasets used in section 5b's Figure "fig:fits" (BRCA1/GCK/
+# PTEN/CRX) -- the manuscript's own `fig:dists` shows exactly this scope, not
+# all datasets, so recomputing the other ~76 datasets' full distributions
+# here would be wasted cost. Reuses `_four_panel_loader` from section 5b so
+# both figures are guaranteed to be built from the identical underlying fit.
+
+# %%
+if _missing_four_panel:
+    print(f"  SKIP Yang distance diagnostic figure: {_missing_four_panel} not in section 1's discovered datasets")
+else:
+    from analysis.calibration_plots import plot_yang_distance_diagnostic
+
+    plot_yang_distance_diagnostic(
+        FOUR_PANEL_DATASETS, _four_panel_loader, FIGURE_SUBDIRS["manuscript"],
+    )
+
+# %% [markdown]
 # ## 7. Figure 4, extended-data appendix, gene-performance/OR scatter
 #
 # Ported from `test/auxiliary_fig_creation/`. Some panels need external,
@@ -1023,10 +1481,30 @@ from analysis.figure4 import driver as figure4_driver
 # danz/auth matrices) instead of having build_figure4 re-discover pipeline
 # output, re-load every variants CSV, and rebuild author labels from scratch.
 figure4_driver.build_figure4(
-    output_dir=OUTPUT_DIR, figure_dir=FIGURE_DIR,
+    output_dir=OUTPUT_DIR, figure_dir=FIGURE_SUBDIRS["manuscript"],
     danzs_oob=conf_by_method[primary_method],
     auths_oob=auth_by_method[primary_method],
     dataset_names=datasets,
+    vus_pct_danz=_aggregate_coverage_pct(vus_by_method[primary_method]),
+    vus_pct_auth=_aggregate_coverage_pct(auth_vus_by_method[primary_method]),
+)
+
+# %% [markdown]
+# ### 7a. RAD51D/XRCC2/BARD1 extra fit plots
+#
+# Supplementary to Figure 4 in the legacy script, but not one of its panels --
+# kept separate (`analysis.extra_gene_fits`) so `analysis/figure4/driver.py`
+# can be handed to someone reproducing just Figure 4 without also needing
+# these. Currently a no-op (prints a warning and skips): depends on a
+# `fit_hist_snv_plot` module that only exists as an import statement in the
+# legacy script, see that module's own TODO.
+
+# %%
+from analysis.extra_gene_fits import build_extra_gene_fits
+
+build_extra_gene_fits(
+    OUTPUT_DIR, DATASET_TSV, PRECOMPUTED_FITS, DATASET_CONFIGS_PATH,
+    FIGURE_SUBDIRS["manuscript"],
 )
 
 # %%
@@ -1039,14 +1517,14 @@ from analysis import extended_data_appendix
 # in scope for the rest of this notebook, with no separate exclusion list.
 extended_data_appendix.build_appendix_pdf(
     dataset_list=datasets,
-    output_path=FIGURE_DIR / "extended_data_appendix.pdf",
+    output_path=FIGURE_SUBDIRS["manuscript"] / "extended_data_appendix.pdf",
     plot_thresholds=True,
 )
 
 # %%
 from analysis import gene_performance_scatter
 
-gene_performance_scatter.build_gene_performance_scatter(output_dir=OUTPUT_DIR, figure_dir=FIGURE_DIR)
+gene_performance_scatter.build_gene_performance_scatter(output_dir=OUTPUT_DIR, figure_dir=FIGURE_SUBDIRS["manuscript"])
 
 # %% [markdown]
 # ## 8. Dataset description table
@@ -1056,3 +1534,58 @@ from analysis.gene_table import build_dataset_table
 
 dataset_table = build_dataset_table()
 dataset_table.head()
+
+# %% [markdown]
+# ## 9. Per-scoreset VUS evidence breakdown, ranked by indeterminate count
+#
+# For each dataset (scoreset), among only the `is_vus` variants (ClinVar
+# VUS -- always ClinVar-2026-based per-variant, see
+# `variant_evidence.py::_get_variant_is_vus`, regardless of whatever
+# `clinvar_release` that dataset's own P/LP/B/LB controls use), classify each
+# VUS by the sign of its effective evidence points (`analysis.plot_common.
+# effective_points`, OOB with in-bag fallback -- same points
+# `build_confusion_matrix` uses for BLB/PLP rows): negative -> benign-leaning
+# evidence, zero -> indeterminate (no evidence, inside the IR range),
+# positive -> pathogenic-leaning evidence. Ranked descending by the raw
+# indeterminate VUS count -- the scoresets contributing the most "VUS that
+# stay VUS" (no evidence pull either direction) surface first.
+
+# %%
+from analysis.plot_common import effective_points as _effective_points_vus
+
+_vus_rows = []
+for _ds in datasets:
+    _df_ds = df_primary[df_primary["dataset"] == _ds]
+    if "is_vus" not in _df_ds.columns or _df_ds.empty:
+        continue
+    _df_vus = _df_ds[_df_ds["is_vus"].fillna(False).astype(bool)]
+    _n_vus = len(_df_vus)
+    if _n_vus == 0:
+        continue
+    _pts = _effective_points_vus(_df_vus, use_oob=True, label=_ds, context="VUS")
+    _n_neg = int((_pts < 0).sum())
+    _n_ind = int((_pts == 0).sum())
+    _n_pos = int((_pts > 0).sum())
+    _vus_rows.append({
+        "dataset": _ds,
+        "n_vus": _n_vus,
+        "n_indeterminate": _n_ind,
+        "pct_indeterminate": 100 * _n_ind / _n_vus,
+        "n_negative": _n_neg,
+        "pct_negative": 100 * _n_neg / _n_vus,
+        "n_positive": _n_pos,
+        "pct_positive": 100 * _n_pos / _n_vus,
+    })
+
+vus_evidence_df = pd.DataFrame(_vus_rows)
+if not vus_evidence_df.empty:
+    vus_evidence_df = vus_evidence_df.sort_values(
+        "n_indeterminate", ascending=False,
+    ).reset_index(drop=True)
+    print(f"\n{'=' * 80}\nPER-SCORESET VUS EVIDENCE ({primary_method}), "
+          f"ranked by # indeterminate VUS\n{'=' * 80}")
+    print(vus_evidence_df.round(1).to_string(index=False))
+else:
+    print("  SKIP per-scoreset VUS evidence breakdown: no is_vus variants in scope")
+
+vus_evidence_df

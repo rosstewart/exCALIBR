@@ -361,3 +361,95 @@ def make_calibration_figure(
 
     tag_suffix = f"_{tag}" if tag else ""
     _save(fig, figure_dir / f"calibration_{dataset}{tag_suffix}.png")
+
+
+# ---------------------------------------------------------------------------
+# Yang-distance bootstrap diagnostic (Extended Data Figure "fig:dists")
+# ---------------------------------------------------------------------------
+
+_YANG_SAMPLE_ORDER = ["pathogenic", "benign", "gnomad", "synonymous"]
+_YANG_SAMPLE_LABELS = {"pathogenic": "P/LP", "benign": "B/LB", "gnomad": "gnomAD", "synonymous": "Synonymous"}
+# Same palette as plot_four_datasets_publication's sample_colors, for visual
+# consistency between Figure "fig:fits" and this extended-data companion.
+_YANG_SAMPLE_COLORS = {
+    "pathogenic": "#CA7682", "benign": "#1D7AAB", "gnomad": "#A0A0A0", "synonymous": "#6BAA75",
+}
+
+
+def plot_yang_distance_diagnostic(
+    dataset_names: List[str],
+    loader_fn,
+    figure_dir: Path,
+    filename: str = "yang_distance_diagnostic.png",
+    good_fit_threshold: float = 0.2,
+    n_jobs: int = 8,
+):
+    """4-panel (2x2) diagnostic: distribution of per-bootstrap Yang distances
+    (normalized, p=2) between each sample's empirical training data and its
+    fitted skew-normal mixture CDF, for each of `dataset_names` -- pairs with
+    Extended Data Figure "fig:dists" in the manuscript, which shows this for
+    the same 4 datasets used in Figure "fig:fits" (BRCA1/GCK/PTEN/CRX).
+
+    `loader_fn(dataset) -> (scoreset, indv_summary, fits, score_range, config,
+    n_c, flipped, n_samples)`, the same shape
+    src.assay_calibration.plot_utils.utils.plot_four_datasets_publication's
+    own `loader_fn` argument expects (e.g. a thin wrapper around
+    analysis.legacy_fits.load_scoreset_and_fits) -- pass the identical
+    loader used for that figure so both are computed from the same
+    underlying fit.
+
+    A dashed horizontal line at `good_fit_threshold` marks the "good fit"
+    cutoff used in the main text (distances below 0.2).
+    """
+    from analysis.yang_distance import compute_bootstrap_yang_distances_parallel
+
+    if len(dataset_names) != 4:
+        raise ValueError("Must provide exactly 4 dataset names")
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    panel_letters = ["A", "B", "C", "D"]
+
+    for ax, dataset, letter in zip(axes.flat, dataset_names, panel_letters):
+        try:
+            scoreset, indv_summary, fits, score_range, config, n_c, flipped, n_samples = loader_fn(dataset)
+        except Exception as e:
+            ax.set_title(f"({letter}) {dataset}\n[failed to load: {e}]", fontsize=10)
+            ax.axis("off")
+            print(f"  SKIP Yang distance panel for {dataset}: {e}")
+            continue
+
+        distances = compute_bootstrap_yang_distances_parallel(dataset, n_c, fits, scoreset, n_jobs=n_jobs)
+
+        present = [
+            k for k in _YANG_SAMPLE_ORDER
+            if k in distances and not np.all(np.isnan(distances[k]))
+        ]
+        if not present:
+            ax.set_title(f"({letter}) {dataset}\n[no sample had valid distances]", fontsize=10)
+            ax.axis("off")
+            continue
+
+        data = [distances[k][~np.isnan(distances[k])] for k in present]
+        positions = np.arange(len(present)) + 1
+
+        bp = ax.boxplot(data, positions=positions, widths=0.6, patch_artist=True, showfliers=False)
+        for patch, key in zip(bp["boxes"], present):
+            patch.set_facecolor(_YANG_SAMPLE_COLORS.get(key, "#888888"))
+            patch.set_alpha(0.6)
+
+        ax.axhline(good_fit_threshold, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        ax.set_xticks(positions)
+        ax.set_xticklabels([_YANG_SAMPLE_LABELS.get(k, k) for k in present], fontsize=9)
+        gene_name = dataset.split("_")[0]
+        author_name = dataset.split("_")[1] if "_" in dataset else ""
+        # \mathit (not \mathbfit -- see plot_four_datasets_publication) for
+        # italic gene name; matplotlib's built-in mathtext doesn't support
+        # \mathbfit outside a full LaTeX (usetex=True) install.
+        ax.set_title(f"({letter}) " + rf"$\mathit{{{gene_name}}}$ – {author_name}", fontsize=12)
+        ax.set_ylabel("Normalized Yang distance (p=2)", fontsize=9)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, alpha=0.2, linewidth=0.5)
+
+    fig.tight_layout()
+    _save(fig, figure_dir / filename)
+    return fig

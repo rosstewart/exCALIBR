@@ -1,0 +1,457 @@
+{
+  "ASPA_Gr\u00f8nb\u00e6k-Thygesen_2024_abundance": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "ASPA_Gr\u00f8nb\u00e6k-Thygesen_2024_toxicity": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BAP1_Waters_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BARD1_IGVF": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA1_Adamovich_2022_Cisplatin_Resistance_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA1_Adamovich_2022_HDR_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA1_Findlay_2018_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_Hu_2024": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_Huang_2026": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_IGVF": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_Sahu_2023_exon13_Cisplatin_Resistance": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_Sahu_2023_exon13_Olaparib_Resistance": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_Sahu_2023_exon13_SGE": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_Sahu_2023_exon13_global_score": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "BRCA2_Sahu_2025_SGE": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CALM1_CALM2_CALM3_Weile_2017": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "CARD11_Meitlis_2020_SGE_Ibrutinib_GoF": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CARD11_Meitlis_2020_SGE_LoF": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CBS_Sun_2020_high_B6": {
+    "n_c": "2c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "CBS_Sun_2020_low_B6": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CHEK2_Gebbia_2024": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CHEK2_McCarthy_Leo_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CHEK2_McCarthy-Leo_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CRX_Shepherdson_2024": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "CTCF_IGVF": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "DDX3X_Radford_2023": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_carboxy_F9_specific": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_carboxy_gla_motif": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_heavy_chain": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_light_chain": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "F9_Popp_2025_strep_2": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "FKRP_Ma_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "G6PD_IGVF": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "GCK_Gersing_2023_complementation": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "GCK_Gersing_2024_abundance": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "HMBS_van_Loggerenberg_2023_combined": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "HMBS_van_Loggerenberg_2023_erythroid": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "HMBS_van_Loggerenberg_2023_ubquitous": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "JAG1_Gilbert_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "KCNE1_Muhammad_2024_potassium_flux": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "KCNE1_Muhammad_2024_trafficking": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "KCNE1_Muhammad_2024_trafficking_WT_background_DN": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "KCNH2_Jiang_2022": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "KCNH2_Kozek_Glazer_2020": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "KCNH2_O_Neill_2024_surface_expression": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "KCNQ4_Zheng_2022_current_homozygous": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "KCNQ4_Zheng_2022_v12_homozygous": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "LARGE1_Ma_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "LDLR_Tabet_2025_abundance": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "LDLR_Tabet_2025_uptake": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "LDLR_Tabet_2025_presence_VLDL": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "MSH2_Jia_2021_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "NDUFAF6_Sung_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "OTC_Lo_2023": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PALB2_Boonen_2026": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PALB2_Boonen_2026_SGE": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PALB2_IGVF": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PAX6_McDonnell_2024_BLX_geneticin": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PAX6_McDonnell_2024_BLX_no_geneticin": {
+    "n_c": "2c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "PAX6_McDonnell_2024_LE9_geneticin": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PAX6_McDonnell_2024_LE9_no_geneticin": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "PTEN_Matreyek_2018_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "PTEN_Mighell_2018_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "RAD51C_Olvera-Le\u00f3n_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "RAD51D_IGVF": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "RHO_Wan_2019": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "SCN5A_Glazer_2020": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "SCN5A_Ma_2024": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "SFPQ_IGVF": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "SGCB_Li_2023": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TARDBP_Bolognesi_Faure_2019": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Boettcher_2019_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Fayer_2021_meta_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Fortuno_2021_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Funk_2025_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Giacomelli_2018_combined_score_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Giacomelli_2018_p53null_Nutlin3_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "TP53_Giacomelli_2018_p53null_etoposide_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_AIP1nWT_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_BAXnWT_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_GADD45nWT_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_MDM2nWT_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_NOXAnWT_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_P53R2nWT_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_WAF1nWT_clinvar_2018": {
+    "n_c": "2c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TP53_Kato_2003_h1433snWT_clinvar_2018": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TPK1_Weile_2017": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "TSC2_IGVF": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "VHL_Buckley_2024": {
+    "n_c": "3c",
+    "benign_method": "avg",
+    "liberal_monotonicity": true
+  },
+  "XRCC2_IGVF": {
+    "n_c": "3c",
+    "benign_method": "benign",
+    "liberal_monotonicity": true
+  }
+}

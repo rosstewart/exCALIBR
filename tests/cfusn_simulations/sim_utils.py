@@ -195,6 +195,114 @@ def inject_missingness(X, frac_per_dim, rng):
     return X
 
 
+def inject_block_missingness(X, blocks, block_frac_missing, rng):
+    """Like inject_missingness, but each block of columns is jointly
+    observed or jointly missing together per row (one Bernoulli draw per
+    row per block), instead of independent per-dimension MCAR.
+
+    Mirrors real multi-assay datasets like TP53's (confirmed via direct
+    inspection of ms.scores): dims 0-7 there are ALWAYS co-observed
+    together (2244/2244 pairwise co-observation -- one 8-readout assay a
+    variant either has or doesn't), dims {8,9,12} likewise (8188/8188).
+    Independent per-dimension MCAR (inject_missingness) cannot reproduce
+    this correlated structure, which matters here: with p=16 blocks like
+    this, EVERY pairwise overlap can be large (the co-observation graph is
+    fully connected -- not "disjoint" dimensions) while the JOINT
+    intersection across all p dims is still exactly empty (0/9911 rows
+    fully observed for real TP53), which is the condition this whole
+    investigation is about.
+
+    Parameters
+    ----------
+    X : (N, p) fully-observed array
+    blocks : list of column-index lists (may overlap or partition p; real
+        data can have both jointly-missing groups and individually-sparse
+        singleton "blocks" of size 1)
+    block_frac_missing : list of floats, one per block, each in [0, 1)
+    rng : np.random.RandomState
+    """
+    X = np.asarray(X, dtype=float).copy()
+    N = X.shape[0]
+    assert len(blocks) == len(block_frac_missing)
+    for cols, frac in zip(blocks, block_frac_missing):
+        if frac <= 0:
+            continue
+        n_missing = int(round(frac * N))
+        idx = rng.choice(N, size=n_missing, replace=False)
+        for c in cols:
+            X[idx, c] = np.nan
+    return X
+
+
+# ── Projection-aware skewness estimation under pervasive missingness ───────
+# ── (no row need be fully observed for these to return a value) ───────────
+
+def _partial_projection(Xc, evec, min_weight_frac=0.5, return_weights=False):
+    """Per-row projection onto evec using only that row's OBSERVED entries,
+    renormalized by the fraction of evec's squared weight actually present
+    -- the projection analog of _partial_distance_sq's per-row available-
+    case normalization (already promoted to production for k-means
+    clustering under missingness).
+
+    Rows where the observed dimensions carry less than min_weight_frac of
+    evec's total squared weight are dropped (too little of the
+    projection's actual signal is present to trust the renormalized
+    value) -- unlike _partial_distance_sq, which uses every row regardless
+    of how little is observed (fine for a distance/argmin comparison, but
+    a skewness estimate from a mostly-imputed-away projection would be
+    unreliable in a way a clustering label wouldn't be).
+
+    Returns a 1-D array of valid renormalized projections (may be shorter
+    than len(Xc)), or an empty array if none qualify. If return_weights,
+    also returns each kept row's weight_frac (how much of evec's weight
+    was actually observed for it, in [min_weight_frac, 1]) -- a per-row
+    information/reliability weight for _skewness_z_score_weighted's
+    effective-sample-size correction, since a row rescaled up from e.g.
+    50% observed weight carries genuinely less information than a fully-
+    observed row, even though both contribute one value to the array.
+    """
+    Xc = np.asarray(Xc, dtype=float)
+    evec = np.asarray(evec, dtype=float)
+    obs = ~np.isnan(Xc)
+    total_weight = float(np.sum(evec ** 2))
+    if total_weight < 1e-12:
+        return (np.array([]), np.array([])) if return_weights else np.array([])
+    observed_weight = (obs * (evec ** 2)[None, :]).sum(axis=1)
+    weight_frac = observed_weight / total_weight
+    keep = weight_frac >= min_weight_frac
+    if not keep.any():
+        return (np.array([]), np.array([])) if return_weights else np.array([])
+    Xf = np.where(obs, Xc, 0.0)
+    raw_proj = Xf[keep] @ evec
+    # Renormalize: an all-observed row's projection has "scale" sqrt(total_weight)
+    # in the sense that Var(evec.X) ~ sum(evec_k^2) under iid-unit-variance dims;
+    # a partially-observed row's raw dot product only accumulates
+    # observed_weight worth of that -- rescale so partial and full rows are
+    # on a comparable scale before computing skewness across them together.
+    scale_correction = np.sqrt(total_weight / np.maximum(observed_weight[keep], 1e-12))
+    projections = raw_proj * scale_correction
+    if return_weights:
+        return projections, weight_frac[keep]
+    return projections
+
+
+def _meanimpute_projection(Xc, evec):
+    """Per-row projection onto evec after filling NaN with that column's
+    own mean -- every row contributes a full-length projection (imputed
+    entries contribute exactly the column mean, i.e. zero deviation along
+    that axis, diluting rather than distorting the projection), so this
+    never drops rows the way _partial_projection's min_weight_frac can,
+    at the cost of systematically shrinking the estimated skewness toward
+    0 in proportion to how much of each row was imputed.
+    """
+    Xc = np.asarray(Xc, dtype=float)
+    evec = np.asarray(evec, dtype=float)
+    col_means = np.nanmean(Xc, axis=0)
+    col_means = np.where(np.isnan(col_means), 0.0, col_means)
+    Xfilled = np.where(np.isnan(Xc), col_means[None, :], Xc)
+    return Xfilled @ evec
+
+
 # ── Ground-truth recovery scoring ───────────────────────────────────────────
 
 def _omega(Delta, Gamma):
@@ -855,6 +963,50 @@ def _skewness_z_score(projected_data):
     return float(m3), float(z)
 
 
+def _skewness_z_score_weighted(projected_data, weights=None):
+    """Like _skewness_z_score, but uses an EFFECTIVE sample size (Kish's
+    formula: n_eff = (sum w)^2 / sum(w^2)) in the SE formula instead of the
+    raw row count, when per-row weights are given.
+
+    Motivation: _partial_projection's rescaled rows are NOT all equally
+    informative -- a row reconstructed from 50% of an eigenvector's weight
+    was rescaled up by ~1.4x and is genuinely noisier than a fully-observed
+    row, but the plain _skewness_z_score counts every row the same,
+    treating a batch of low-information reconstructed rows as if it were a
+    clean iid sample of the same size. This was diagnosed directly: the
+    SAME James-Stein c=1.0 calibrated on clean data produced far worse
+    zero/small-regime false positives under TP53-shaped missingness
+    (sim_delta_init_missingness_c_sweep.py), consistent with z being
+    systematically inflated (SE under-estimated) when weights are ignored.
+    Kish's n_eff shrinks toward the count of "worth one clean data point"
+    when weights are uneven/small, so it correctly returns a SMALLER,
+    more honest sample size (hence bigger SE, smaller z) when most kept
+    rows carry only partial information -- without needing a separately
+    retuned c for the missing-data case.
+
+    weights=None (or all-equal) reduces exactly to _skewness_z_score's
+    plain n (n_eff == n in that case).
+    """
+    n = len(projected_data)
+    if n < 8:
+        return 0.0, 0.0
+    m3 = sps_skew(projected_data)
+    if np.isnan(m3):
+        return 0.0, 0.0
+    if weights is None:
+        n_eff = float(n)
+    else:
+        w = np.asarray(weights, dtype=float)
+        sw = w.sum()
+        sw2 = (w ** 2).sum()
+        n_eff = (sw ** 2 / sw2) if sw2 > 1e-12 else float(n)
+    if n_eff < 8:
+        return 0.0, 0.0
+    se = np.sqrt(6 * n_eff * (n_eff - 1) / ((n_eff - 2) * (n_eff + 1) * (n_eff + 3)))
+    z = abs(m3) / se if se > 0 else 0.0
+    return float(m3), float(z)
+
+
 # ── Continuous shrinkage (Item 2): smooth alternatives to the hard z-gate ──
 
 def _shrinkage_james_stein(z, c):
@@ -1043,6 +1195,420 @@ def init_delta_matrix_mom_shrunk_bimodal(cov, p, q, Xc=None, cluster_sign_patter
     return init_delta_matrix_mom_shrunk(cov, p, q, Xc=Xc, cluster_sign_pattern=cluster_sign_pattern,
                                         rng=rng, fallback_scale=fallback_scale,
                                         shrinkage_fn=shrinkage_fn, c=c)
+
+
+def init_delta_matrix_mom_shrunk_projection(cov, p, q, Xc=None, cluster_sign_pattern=None,
+                                            rng=None, fallback_scale=0.1,
+                                            shrinkage_fn=_shrinkage_james_stein,
+                                            projection_method="complete",
+                                            min_weight_frac=0.5,
+                                            **shrinkage_kwargs):
+    """Like init_delta_matrix_mom_shrunk, but generalizes how each column's
+    1-D projection is computed from Xc, via projection_method:
+
+      "complete"   -- production's current behavior: only rows complete
+                       across ALL p dimensions (Xc[~isnan(Xc).any(axis=1)]).
+                       Confirmed via direct inspection of real TP53 data
+                       (9911 rows x 16 dims, 0 rows fully observed even
+                       though the pairwise co-observation graph is fully
+                       CONNECTED -- see inject_block_missingness's
+                       docstring) that this can be permanently 0 rows for
+                       real multi-assay genes, silently disabling BOTH the
+                       sign estimate and the shrunk magnitude estimate on
+                       every cluster, every restart -- confirmed via a
+                       bit-identical before/after TP53 sanity refit.
+      "partial"    -- _partial_projection: per-row projection using only
+                       that row's observed entries, renormalized, dropping
+                       rows with too little of evec's weight observed
+                       (min_weight_frac).
+      "meanimpute" -- _meanimpute_projection: every row contributes (NaN
+                       filled with column mean), diluting rather than
+                       dropping.
+
+    Sign and magnitude both come from whichever projection this produces
+    (same downstream logic as init_delta_matrix_mom_shrunk otherwise).
+    """
+    rng = rng or np.random.RandomState()
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    top_idx = np.argsort(eigvals)[::-1][:q]
+
+    Delta = np.zeros((p, q))
+    for j, idx in enumerate(top_idx):
+        evec = eigvecs[:, idx]
+        fallback = fallback_scale * np.sqrt(eigvals[idx])
+
+        skew_sign = 1
+        scale = fallback
+        if Xc is not None:
+            if projection_method == "complete":
+                complete_rows = ~np.isnan(Xc).any(axis=1)
+                Xc_comp = Xc[complete_rows]
+                projected = Xc_comp @ evec if len(Xc_comp) >= 8 else np.array([])
+            elif projection_method == "partial":
+                projected = _partial_projection(Xc, evec, min_weight_frac=min_weight_frac)
+            elif projection_method == "meanimpute":
+                projected = _meanimpute_projection(Xc, evec)
+            else:
+                raise ValueError(f"unknown projection_method: {projection_method!r}")
+
+            if len(projected) >= 8:
+                m3, z = _skewness_z_score(projected)
+                if abs(m3) > 1e-6:
+                    skew_sign = int(np.sign(m3))
+                delta_mag = _mom_delta_magnitude(projected)
+                if delta_mag is not None:
+                    mom_scale = delta_mag * np.sqrt(eigvals[idx])
+                    weight = float(shrinkage_fn(z, **shrinkage_kwargs))
+                    weight = min(max(weight, 0.0), 1.0)
+                    scale = weight * mom_scale + (1 - weight) * fallback
+
+        enum_sign = (
+            int(cluster_sign_pattern[j])
+            if cluster_sign_pattern is not None
+            else rng.choice([-1, 1])
+        )
+        Delta[:, j] = skew_sign * enum_sign * scale * evec
+
+    Delta += rng.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
+
+    Gamma = cov - Delta @ Delta.T
+    eigvals_G = np.linalg.eigvalsh(Gamma)
+    if eigvals_G.min() < 1e-6:
+        for _ in range(20):
+            Delta *= 0.9
+            Gamma = cov - Delta @ Delta.T
+            if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                break
+
+    return Delta
+
+
+def init_delta_matrix_mom_shrunk_adaptive_c(cov, p, q, Xc=None, cluster_sign_pattern=None,
+                                            rng=None, fallback_scale=0.1,
+                                            shrinkage_fn=_shrinkage_james_stein,
+                                            projection_method="complete",
+                                            min_weight_frac=0.5, c_base=1.0,
+                                            min_info_frac=0.01):
+    """Like init_delta_matrix_mom_shrunk_projection, but instead of using a
+    single externally-fixed James-Stein c for every column regardless of
+    how much missingness degraded its projection, scales c UP inversely
+    with how much of the cluster's data actually contributed to that
+    column's projection:
+
+        info_frac = (# rows used in the projection) / (# rows in cluster)
+        c_adaptive = c_base / max(info_frac, min_info_frac)
+
+    At info_frac=1 (a fully-observed cluster/column -- e.g. clean data, or
+    projection_method="complete" when completeness happens to hold), this
+    reduces EXACTLY to c_base (this investigation's clean-data-calibrated
+    value, c_base=1.0) by construction. As missingness shrinks info_frac
+    (e.g. TP53-shaped data, where far fewer rows qualify for a "partial"
+    projection than exist in the cluster), c rises automatically -- no
+    separate, hand-picked "missing-data constant" (like the c=4 explored
+    as a fixed universal compromise) is needed; the SAME formula anchored
+    at the SAME clean-data c_base handles both regimes, with the degree of
+    missingness (directly measurable from the data) doing the interpolation
+    instead of a manual choice between two fixed candidates.
+
+    min_info_frac floors c_adaptive's growth (avoiding a divide-by-near-
+    zero blowup when only a handful of rows qualify).
+    """
+    rng = rng or np.random.RandomState()
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    top_idx = np.argsort(eigvals)[::-1][:q]
+    n_cluster = len(Xc) if Xc is not None else 0
+
+    Delta = np.zeros((p, q))
+    for j, idx in enumerate(top_idx):
+        evec = eigvecs[:, idx]
+        fallback = fallback_scale * np.sqrt(eigvals[idx])
+
+        skew_sign = 1
+        scale = fallback
+        if Xc is not None and n_cluster > 0:
+            if projection_method == "complete":
+                complete_rows = ~np.isnan(Xc).any(axis=1)
+                Xc_comp = Xc[complete_rows]
+                projected = Xc_comp @ evec if len(Xc_comp) >= 8 else np.array([])
+            elif projection_method == "partial":
+                projected = _partial_projection(Xc, evec, min_weight_frac=min_weight_frac)
+            elif projection_method == "meanimpute":
+                projected = _meanimpute_projection(Xc, evec)
+            else:
+                raise ValueError(f"unknown projection_method: {projection_method!r}")
+
+            if len(projected) >= 8:
+                m3, z = _skewness_z_score(projected)
+                if abs(m3) > 1e-6:
+                    skew_sign = int(np.sign(m3))
+                delta_mag = _mom_delta_magnitude(projected)
+                if delta_mag is not None:
+                    mom_scale = delta_mag * np.sqrt(eigvals[idx])
+                    info_frac = max(len(projected) / n_cluster, min_info_frac)
+                    c_adaptive = c_base / info_frac
+                    weight = float(shrinkage_fn(z, c=c_adaptive))
+                    weight = min(max(weight, 0.0), 1.0)
+                    scale = weight * mom_scale + (1 - weight) * fallback
+
+        enum_sign = (
+            int(cluster_sign_pattern[j])
+            if cluster_sign_pattern is not None
+            else rng.choice([-1, 1])
+        )
+        Delta[:, j] = skew_sign * enum_sign * scale * evec
+
+    Delta += rng.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
+
+    Gamma = cov - Delta @ Delta.T
+    eigvals_G = np.linalg.eigvalsh(Gamma)
+    if eigvals_G.min() < 1e-6:
+        for _ in range(20):
+            Delta *= 0.9
+            Gamma = cov - Delta @ Delta.T
+            if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                break
+
+    return Delta
+
+
+def init_delta_matrix_mom_shrunk_projection_ess(cov, p, q, Xc=None, cluster_sign_pattern=None,
+                                                rng=None, fallback_scale=0.1,
+                                                shrinkage_fn=_shrinkage_james_stein,
+                                                min_weight_frac=0.5,
+                                                **shrinkage_kwargs):
+    """Like init_delta_matrix_mom_shrunk_projection(projection_method=
+    "partial"), but feeds _partial_projection's per-row weight_frac into
+    _skewness_z_score_weighted's effective-sample-size correction instead
+    of the plain row-count z-score -- the fix for
+    sim_delta_init_missingness_c_sweep.py's finding that the SAME
+    clean-data-calibrated c=1.0 produced far worse zero/small-regime false
+    positives under TP53-shaped missingness (a partially-reconstructed row
+    was being counted as fully informative, inflating z). The goal is a
+    SINGLE c that works reasonably for both clean and highly-missing data,
+    rather than needing two separately-calibrated constants.
+
+    Only implemented for projection_method="partial" (the method that
+    actually produces meaningful per-row weights to correct with;
+    "complete" and "meanimpute" don't have a natural analog -- "complete"
+    rows are already all full-weight, "meanimpute" rows are all nominally
+    "full length" but diluted rather than reweighted).
+    """
+    rng = rng or np.random.RandomState()
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    top_idx = np.argsort(eigvals)[::-1][:q]
+
+    Delta = np.zeros((p, q))
+    for j, idx in enumerate(top_idx):
+        evec = eigvecs[:, idx]
+        fallback = fallback_scale * np.sqrt(eigvals[idx])
+
+        skew_sign = 1
+        scale = fallback
+        if Xc is not None:
+            projected, weights = _partial_projection(
+                Xc, evec, min_weight_frac=min_weight_frac, return_weights=True
+            )
+
+            if len(projected) >= 8:
+                m3, z = _skewness_z_score_weighted(projected, weights=weights)
+                if abs(m3) > 1e-6:
+                    skew_sign = int(np.sign(m3))
+                delta_mag = _mom_delta_magnitude(projected)
+                if delta_mag is not None:
+                    mom_scale = delta_mag * np.sqrt(eigvals[idx])
+                    weight = float(shrinkage_fn(z, **shrinkage_kwargs))
+                    weight = min(max(weight, 0.0), 1.0)
+                    scale = weight * mom_scale + (1 - weight) * fallback
+
+        enum_sign = (
+            int(cluster_sign_pattern[j])
+            if cluster_sign_pattern is not None
+            else rng.choice([-1, 1])
+        )
+        Delta[:, j] = skew_sign * enum_sign * scale * evec
+
+    Delta += rng.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
+
+    Gamma = cov - Delta @ Delta.T
+    eigvals_G = np.linalg.eigvalsh(Gamma)
+    if eigvals_G.min() < 1e-6:
+        for _ in range(20):
+            Delta *= 0.9
+            Gamma = cov - Delta @ Delta.T
+            if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                break
+
+    return Delta
+
+
+# ── Multi-component whole-init routines: empirical-Bayes-pooled vs. a ──────
+# ── single manually-chosen c, for a direct, apples-to-apples comparison ────
+# ── (needs K>=2 components so there's more than 2 z-scores to pool -- a ────
+# ── single-component fit's 2 columns are too few for EB to have anything ───
+# ── meaningful to estimate from). Clean, fully-observed data only -- this ──
+# ── isolates "does pooling beat a fixed c" from the separate missingness/ ──
+# ── projection-noise issues already investigated (init_delta_matrix_mom_ ──
+# ── shrunk_projection and friends). ─────────────────────────────────────
+
+def _cluster_column_stats(X, labels, n_clusters, latent_q):
+    """First pass shared by both multi-component init routines below:
+    k-means already ran (labels given); for each cluster, eigendecompose
+    its covariance and compute each of the top-q eigenvectors' skewness
+    z-score and method-of-moments magnitude estimate. Returns a list (one
+    dict per cluster) with cov/mu/per-column stats, plus the flat list of
+    every (cluster, column) z-score -- the pool empirical Bayes draws from.
+    """
+    K_dim = X.shape[1]
+    cluster_info = []
+    for c in range(n_clusters):
+        Xc = X[labels == c]
+        mu = Xc.mean(axis=0)
+        cov = np.cov(Xc, rowvar=False) + 1e-6 * np.eye(K_dim)
+        eigvals_cov = np.linalg.eigvalsh(cov)
+        if eigvals_cov.min() < 1e-8:
+            cov = cov + (1e-8 - eigvals_cov.min()) * np.eye(K_dim)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        top_idx = np.argsort(eigvals)[::-1][:latent_q]
+        cols = []
+        for idx in top_idx:
+            evec = eigvecs[:, idx]
+            proj = Xc @ evec
+            m3, z = _skewness_z_score(proj)
+            delta_mag = _mom_delta_magnitude(proj)
+            cols.append(dict(evec=evec, eigval=eigvals[idx], m3=m3, z=z, delta_mag=delta_mag))
+        cluster_info.append(dict(mu=mu, cov=cov, cols=cols))
+    return cluster_info
+
+
+def _build_delta_from_weights(cluster_info, n_clusters, latent_q, lambdaIndex,
+                              weights, fallback_scale, rng):
+    """Second pass shared by both routines: given a per-(cluster,column)
+    shrinkage weight already decided (however it was derived), build each
+    cluster's (mu, Delta, Gamma). weights is a flat list in the same
+    (cluster, column) order _cluster_column_stats produced.
+    """
+    n_sign_per_cluster = 2 ** latent_q
+    K_dim = cluster_info[0]["mu"].shape[0]
+    component_parameters = []
+    w_idx = 0
+    for c in range(n_clusters):
+        info = cluster_info[c]
+        Delta = np.zeros((K_dim, latent_q))
+        cluster_pattern_idx = (lambdaIndex // (n_sign_per_cluster ** c)) % n_sign_per_cluster
+        cluster_sign_pattern = [((cluster_pattern_idx >> j) & 1) * 2 - 1 for j in range(latent_q)]
+        for j, colinfo in enumerate(info["cols"]):
+            weight = weights[w_idx]
+            w_idx += 1
+            fallback = fallback_scale * np.sqrt(colinfo["eigval"])
+            skew_sign = int(np.sign(colinfo["m3"])) if abs(colinfo["m3"]) > 1e-6 else 1
+            if colinfo["delta_mag"] is not None:
+                mom_scale = colinfo["delta_mag"] * np.sqrt(colinfo["eigval"])
+                scale = weight * mom_scale + (1 - weight) * fallback
+            else:
+                scale = fallback
+            enum_sign = cluster_sign_pattern[j]
+            Delta[:, j] = skew_sign * enum_sign * scale * colinfo["evec"]
+
+        Delta += rng.uniform(-0.05, 0.05, size=(K_dim, latent_q)) * np.sqrt(np.diag(info["cov"]))[:, None]
+        Gamma = info["cov"] - Delta @ Delta.T
+        Gamma = 0.5 * (Gamma + Gamma.T)
+        eigvals_G = np.linalg.eigvalsh(Gamma)
+        if eigvals_G.min() < 1e-6:
+            for _ in range(20):
+                Delta *= 0.9
+                Gamma = info["cov"] - Delta @ Delta.T
+                if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                    break
+        component_parameters.append((info["mu"], Delta, Gamma))
+
+    component_parameters.sort(key=lambda p: p[0][0])
+    return component_parameters
+
+
+def kmeans_init_mv_fixed_c(X, **kwargs):
+    """Multi-component whole-init routine using a single, externally
+    chosen, manually-tuned James-Stein c applied independently to every
+    (cluster, column) -- the status quo approach this session has been
+    calibrating via simulation sweeps. Clean fully-observed data only
+    (plain sklearn KMeans); kwargs: n_clusters, latent_q, lambdaIndex, rng,
+    c (the manually-chosen constant, default 1.0), fallback_scale.
+    """
+    from sklearn.cluster import KMeans
+
+    rng = kwargs.get("rng") or np.random.RandomState()
+    n_clusters = kwargs.get("n_clusters", 2)
+    latent_q = kwargs.get("latent_q", 2)
+    lambdaIndex = kwargs.get("lambdaIndex", 0)
+    c = kwargs.get("c", 1.0)
+    fallback_scale = kwargs.get("fallback_scale", 0.1)
+
+    km = KMeans(n_clusters=n_clusters, n_init=5, random_state=rng)
+    labels = km.fit_predict(X)
+
+    cluster_info = _cluster_column_stats(X, labels, n_clusters, latent_q)
+    weights = []
+    for info in cluster_info:
+        for colinfo in info["cols"]:
+            weights.append(min(max(_shrinkage_james_stein(colinfo["z"], c=c), 0.0), 1.0))
+
+    component_parameters = _build_delta_from_weights(
+        cluster_info, n_clusters, latent_q, lambdaIndex, weights, fallback_scale, rng
+    )
+    return component_parameters, (labels, km)
+
+
+def kmeans_init_mv_eb(X, **kwargs):
+    """Multi-component whole-init routine using a POOLED empirical-Bayes
+    shrinkage weight instead of an externally chosen c: computes every
+    (cluster, column) z-score within this SAME init call (needs no EM --
+    only the k-means clustering that already happened), then derives ONE
+    shared shrinkage weight from their pooled spread via the classical
+    positive-part James-Stein rule:
+
+        weight = max(0, 1 - (m-2) / sum_j(z_j^2))
+
+    where m = total number of pooled z-scores and the sum runs over every
+    (cluster, column) pair. If the pooled z^2 values are mostly close to
+    their null expectation (~1 each, under no real skew anywhere), m-2 is
+    comparable to the sum and weight collapses toward 0 (correctly
+    distrusting the individual per-column MoM estimates); if several
+    z-scores are large (real skew present), the sum dominates m-2 and
+    weight rises toward 1 -- entirely from the observed data, no
+    externally chosen constant. (This is the single-shared-weight,
+    positive-part form of the classical James-Stein estimator for
+    simultaneously shrinking several estimates toward zero; a fuller
+    version could shrink each cluster's own subset differently, but the
+    single pooled weight is the natural first thing to test against a
+    single global manually-chosen c, since that's exactly what it's
+    replacing.)
+
+    kwargs: same as kmeans_init_mv_fixed_c, minus c (not used -- derived).
+    """
+    from sklearn.cluster import KMeans
+
+    rng = kwargs.get("rng") or np.random.RandomState()
+    n_clusters = kwargs.get("n_clusters", 2)
+    latent_q = kwargs.get("latent_q", 2)
+    lambdaIndex = kwargs.get("lambdaIndex", 0)
+    fallback_scale = kwargs.get("fallback_scale", 0.1)
+
+    km = KMeans(n_clusters=n_clusters, n_init=5, random_state=rng)
+    labels = km.fit_predict(X)
+
+    cluster_info = _cluster_column_stats(X, labels, n_clusters, latent_q)
+    all_z = [colinfo["z"] for info in cluster_info for colinfo in info["cols"]]
+    m = len(all_z)
+    S = float(sum(z ** 2 for z in all_z))
+    if m > 2 and S > 1e-9:
+        eb_weight = max(0.0, 1.0 - (m - 2) / S)
+    else:
+        eb_weight = 0.0
+    weights = [eb_weight] * m
+
+    component_parameters = _build_delta_from_weights(
+        cluster_info, n_clusters, latent_q, lambdaIndex, weights, fallback_scale, rng
+    )
+    return component_parameters, (labels, km)
 
 
 def init_delta_matrix_mom_gated(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=None,

@@ -68,17 +68,14 @@ def load_author_labels_for_dataset(
         print(f"  SKIP author labels for {dataset}: excluded dataset")
         return {}
 
-    csv_name = base
-    df_ds = df_full[df_full["Dataset"] == csv_name].copy()
-    if df_ds.empty and old_to_new:
-        alt_name = old_to_new.get(csv_name)
-        if alt_name:
-            df_ds = df_full[df_full["Dataset"] == alt_name].copy()
-            if not df_ds.empty:
-                csv_name = alt_name
-    if df_ds.empty:
+    from analysis.discovery import resolve_dataset_tsv_name
+
+    resolved_name = resolve_dataset_tsv_name(base, df_full, "", old_to_new=old_to_new or {})
+    if resolved_name is None:
         print(f"  SKIP author labels for {dataset}: '{base}' not found in dataset CSV")
         return {}
+    csv_name = resolved_name
+    df_ds = df_full[df_full["Dataset"] == csv_name].copy()
     df_ds["Dataset"] = dataset
 
     try:
