@@ -51,8 +51,9 @@ def points_to_confusion_thresholded(labels, points, path_threshold, ben_threshol
 
 def _eval_labels(ms, p_idx, b_idx):
     sa = ms.sample_assignments
-    plp_mask = sa[:, p_idx].astype(bool)
-    blb_mask = sa[:, b_idx].astype(bool)
+    n = sa.shape[0]
+    plp_mask = sa[:, p_idx].astype(bool) if p_idx is not None else np.zeros(n, dtype=bool)
+    blb_mask = sa[:, b_idx].astype(bool) if b_idx is not None else np.zeros(n, dtype=bool)
     eval_mask = plp_mask | blb_mask
     return eval_mask, plp_mask[eval_mask].astype(int)
 
@@ -84,16 +85,23 @@ def _mv_metric_rows(analysis, modes, mode_labels, **run_kwargs):
     return pd.DataFrame(rows)
 
 
-def _uv_metric_rows(gene, gene_set, ms):
+def _uv_metric_rows(gene, gene_set, ms, p_idx, b_idx):
     """('UV non-conflicting'/'UV max' rows, uv_dataset_names) or (empty df, None)
     if no UV comparison is available for this gene/gene-set (see
     uv_sources.py's per-gene-set caveats -- FGFR pending; combined only
-    verified for TP53-shaped data so far)."""
+    verified for TP53-shaped data so far).
+
+    ``p_idx``/``b_idx`` must be the *effective* indices into
+    ``ms.sample_assignments`` (i.e. already remapped past any empty/dropped
+    fixed-role columns, as ``MVCalibrationAnalysis._eff_idx`` does) -- NOT
+    the raw fixed-role indices 0/1. Passing raw 0/1 silently mis-scores
+    genes missing an earlier role class (e.g. no P/LP observations shifts
+    B/LB into column 0), comparing the wrong sample pair without erroring."""
     uv = uv_sources.load_uv_points(gene, ms, gene_set)
     if uv is None:
         return pd.DataFrame(), None
     names, mat = uv
-    eval_mask, labels = _eval_labels(ms, 0, 1)
+    eval_mask, labels = _eval_labels(ms, p_idx, b_idx)
 
     rows = []
     for key, pts in [("UV non-conflicting", uv_agg.aggregate_nonconflicting(mat)),
@@ -126,7 +134,7 @@ def build_comparison_table(
     if not compare_uv:
         return mv_table, None
 
-    uv_table, uv_dataset_names = _uv_metric_rows(gene, gene_set, ms)
+    uv_table, uv_dataset_names = _uv_metric_rows(gene, gene_set, ms, analysis.p_idx, analysis.b_idx)
     if uv_table.empty:
         reason = "pending data" if gene_set == "fgfr" else "no bridge/UV source for this gene-set"
         print(f"  [{gene}/{gene_set}] UV comparison unavailable ({reason})")

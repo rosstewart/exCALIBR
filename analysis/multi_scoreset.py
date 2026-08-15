@@ -36,6 +36,28 @@ so Chrom stays folded into the returned tail rather than parsed out
 separately; that's fine here since the key only needs to be a consistent,
 collision-free identifier of the physical variant, not a column-by-column
 decomposition.
+
+Amino-acid-level (protein-level) assay rows need different treatment. A
+single aa-level measurement is routinely stored as multiple master-TSV rows
+-- one per degenerate codon that can produce the same amino-acid change
+(e.g. one p.Ala7* measurement as 3 rows for stop codons TAA/TAG/TGA) -- and
+the pipeline's variant_id (src.assay_calibration.pipeline.variant_evidence.
+_get_variant_ids) picks whichever codon happens to be `variants[0]`, an
+arbitrary choice among them. Keying an aa-level row's variant_key off that
+picked Chrom/hgvs_c (as if it were a real nt-level identity) means
+cross-assay matching for aa-level variants rests on that pick being
+consistent across every assay/dataset scoring the same amino-acid change --
+true in practice today (verified empirically) but not a guaranteed
+invariant of the underlying data. `genomic_variant_key` therefore branches
+on `nucleotide_or_aa`: aa-level rows are keyed on the real amino-acid
+identity (Gene + aa_ref + aa_pos + aa_alt, namespaced with an `_aa_` marker)
+instead of the picked codon's Chrom/hgvs_c, while nt-level rows keep the
+original Chrom/hgvs_c-tail behavior. This also means an aa-level
+measurement and an nt-level measurement of a gene/position are never
+merged into the same variant_key -- by design: an aa-level score reflects
+whichever underlying nt change(s) produced it, which may not be the same
+nt change an nt-level assay separately measured, so aa-level and nt-level
+pools stay in disjoint keyspaces rather than being coerced together.
 """
 from __future__ import annotations
 
@@ -47,21 +69,38 @@ import pandas as pd
 from analysis.plot_common import effective_points as _effective_points, sample_matches
 
 
-def genomic_variant_key(variant_id: str, gene: str) -> str:
-    """f'{Gene}_{Chrom}_{hgvs_c}' (Chrom+hgvs_c kept as one unparsed tail --
-    see module docstring) recovered from a pipeline variant_id -- the
-    assay-independent identity of the physical variant. `gene` is the
-    already-known, reliable value for this row (see
-    build_gene_deduped_variants, derived from the dataset name -- not
-    re-parsed from the id string), used to locate the literal f"_{gene}_"
-    marker inside `variant_id` so the "{Chrom}_{hgvs_c}" tail is recovered
-    correctly regardless of how many underscores hgvs_c itself contains
-    (e.g. RefSeq "NM_007294.4:c.5565A>T"). Uses the LAST occurrence of the
-    marker, since the assay-specific MaveDB key prefix could in principle
-    (rarely) also contain the gene name as a substring. Falls back to the
-    raw variant_id (never matches across assays) if the marker isn't found
-    at all -- e.g. the "variant_N" fallback used when a Scoreset lacks
-    get_variants_by_id/_keep_mask."""
+def genomic_variant_key(
+    variant_id: str,
+    gene: str,
+    nucleotide_or_aa: Optional[str] = None,
+    aa_ref: Optional[str] = None,
+    aa_pos=None,
+    aa_alt: Optional[str] = None,
+) -> str:
+    """Assay-independent identity of the physical variant.
+
+    For nt-level rows (nucleotide_or_aa in {"nt", "dna"}, or unknown --
+    the safe fallback when the caller doesn't have these fields): recovers
+    f'{Gene}_{Chrom}_{hgvs_c}' (Chrom+hgvs_c kept as one unparsed tail --
+    see module docstring) from `variant_id`, exactly as before. Uses the
+    LAST occurrence of the literal f"_{gene}_" marker, since the
+    assay-specific MaveDB key prefix could in principle (rarely) also
+    contain the gene name as a substring. Falls back to the raw variant_id
+    (never matches across assays) if the marker isn't found at all -- e.g.
+    the "variant_N" fallback used when a Scoreset lacks
+    get_variants_by_id/_keep_mask.
+
+    For aa-level rows (nucleotide_or_aa == "aa"): keyed on the real
+    amino-acid identity (Gene + aa_ref + aa_pos + aa_alt), NOT on
+    variant_id's Chrom/hgvs_c tail -- see module docstring for why that tail
+    is an arbitrary, unreliable pick for aa-level measurements. Namespaced
+    with an "_aa_" marker so an aa-level key can never collide with an
+    nt-level key for the same gene/position -- aa-level and nt-level
+    measurements are always kept as separate variants, never merged.
+    """
+    if nucleotide_or_aa == "aa" and pd.notna(aa_ref) and pd.notna(aa_pos) and pd.notna(aa_alt):
+        return f"{gene}_aa_{aa_ref}{int(aa_pos)}{aa_alt}"
+
     marker = f"_{gene}_"
     idx = str(variant_id).rfind(marker)
     if idx == -1:
@@ -118,9 +157,19 @@ def build_gene_deduped_variants(df_primary: pd.DataFrame, use_oob: bool = True) 
     """
     df = df_primary.copy()
     df["gene"] = df["dataset"].str.split("_").str[0]
-    df["variant_key"] = [
-        genomic_variant_key(vid, gene) for vid, gene in zip(df["variant_id"], df["gene"])
-    ]
+    has_aa_fields = all(c in df.columns for c in ("nucleotide_or_aa", "aa_ref", "aa_pos", "aa_alt"))
+    if has_aa_fields:
+        df["variant_key"] = [
+            genomic_variant_key(vid, gene, noa, ar, ap, aa)
+            for vid, gene, noa, ar, ap, aa in zip(
+                df["variant_id"], df["gene"], df["nucleotide_or_aa"],
+                df["aa_ref"], df["aa_pos"], df["aa_alt"],
+            )
+        ]
+    else:
+        df["variant_key"] = [
+            genomic_variant_key(vid, gene) for vid, gene in zip(df["variant_id"], df["gene"])
+        ]
     df["points"] = _effective_points(df, use_oob, label="gene_dedup", context="all")
 
     rows = []

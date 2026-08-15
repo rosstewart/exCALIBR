@@ -260,7 +260,11 @@ def build_clingen_confusion(
             records.append({
                 "dataset": dataset,
                 "gene": gene,
-                "variant_key": genomic_variant_key(vid, gene),
+                "variant_key": genomic_variant_key(
+                    vid, gene,
+                    getattr(v0, "nucleotide_or_aa", None), getattr(v0, "aa_ref", None),
+                    getattr(v0, "aa_pos", None), getattr(v0, "aa_alt", None),
+                ),
                 "clingen_label": clingen_label,
                 "points": points,
                 "auth_label": auth_class if isinstance(auth_class, str) else None,

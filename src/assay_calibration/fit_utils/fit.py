@@ -665,6 +665,16 @@ class Fit:
         else:
             include = sample_assignments.any(axis=1) & ~np.isnan(observations)
 
+        # Tracks each row's index in the ORIGINAL self.scoreset.scores array
+        # (what _build_oob_mapping/_process_variant_oob index into) through
+        # every subsequent row-dropping filter below, so val_variant_indices
+        # -- computed against the filtered `observations` -- can be mapped
+        # back to scoreset-space indices rather than exported as raw
+        # filtered-space positions (which silently misalign whenever this
+        # filtering, or the mv overlap-check filtering below, actually drops
+        # rows -- e.g. a sample-assigned row with a NaN score).
+        original_indices = np.flatnonzero(include)
+
         observations = observations[include]
         sample_assignments = sample_assignments[include]
 
@@ -700,6 +710,7 @@ class Fit:
                 )
                 observations = observations[valid]
                 sample_assignments = sample_assignments[valid]
+                original_indices = original_indices[valid]
             kwargs["calibrated_dims"] = calibrated_dims
 
             # ── Per-dimension standardization ────────────────────────────
@@ -775,7 +786,11 @@ class Fit:
                     "train_sample_assignments": sample_assignments[train_indices],
                     "val_observations": observations[val_indices] if len(val_indices) else None,
                     "val_sample_assignments": sample_assignments[val_indices] if len(val_indices) else None,
-                    "val_variant_indices": val_indices if len(val_indices) else None,
+                    # Mapped through original_indices (see above) so this
+                    # indexes into self.scoreset.scores, not the filtered
+                    # `observations` array train_indices/val_indices are
+                    # relative to.
+                    "val_variant_indices": original_indices[val_indices] if len(val_indices) else None,
                     "constrained": constrained,
                     "init_method": init_methods[i],
                     "init_constraint_adjustment": init_constraint_adjustments[i],

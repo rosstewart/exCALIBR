@@ -429,6 +429,12 @@ print(f"Gene-deduplicated: {len(deduped_variants):,} unique variants across {n_g
       f"({n_multi_assay:,} scored by more than one assay)")
 
 deduped_matrix = build_deduped_confusion_matrix(deduped_variants)
+# points_col="points": build_gene_deduped_variants' own merged evidence-points
+# column (abs-max across assays), not ExCALIBR's raw standard_points/
+# oob_points -- see build_vus_coverage. deduped_variants already carries
+# is_vus (any() across assays, see build_gene_deduped_variants), so this
+# needs no further plumbing.
+deduped_vus_coverage = build_vus_coverage(deduped_variants, points_col="points")
 
 deduped_variants_with_author = restrict_to_genes_with_author_data(deduped_variants)
 n_genes_with_author = deduped_variants_with_author["gene"].nunique()
@@ -436,12 +442,19 @@ print(f"Gene-deduplicated, restricted to genes with real author data: {n_genes_w
       f"({len(deduped_variants_with_author):,} variants)")
 deduped_matrix_for_author = build_deduped_confusion_matrix(deduped_variants_with_author)
 deduped_author_matrix = build_deduped_author_confusion_matrix(deduped_variants_with_author)
+# Same restricted (genes-with-real-author-data) scope on both sides, so
+# ExCALIBR's own VUS-determinate% and the author VUS-determinate% shown in
+# this panel's caption describe the identical gene subset as the matrices
+# above them -- same principle as build_author_vus_coverage's own guard.
+deduped_vus_for_author = build_vus_coverage(deduped_variants_with_author, points_col="points")
+deduped_author_vus = build_author_vus_coverage(deduped_variants_with_author)
 
 if deduped_matrix is not None:
     make_single_confusion_figure(
         [deduped_matrix], ["gene_deduped"], label=primary_method, figure_dir=FIGURE_SUBDIRS["author"],
         filename="excalibr_vs_clinvar_gene_deduped.png",
         title_suffix=f"({n_genes_deduped} genes, {len(deduped_variants):,} unique variants, gene-deduplicated)",
+        vus_coverages=[deduped_vus_coverage],
     )
 else:
     print("  SKIP gene-deduplicated confusion figure: no P/LP or B/LB variants in deduped scope")
@@ -451,6 +464,8 @@ if deduped_matrix_for_author is not None and deduped_author_matrix is not None:
         danzs_m1=[deduped_matrix_for_author], danzs_m2=[deduped_author_matrix], dataset_names=["gene_deduped"],
         label1=primary_method, label2="author", figure_dir=FIGURE_SUBDIRS["author"],
         filename="excalibr_vs_author_gene_deduped.png",
+        vus_coverages_m1=[deduped_vus_for_author],
+        vus_coverages_m2=[deduped_author_vus],
     )
 else:
     print("  SKIP gene-deduplicated ExCALIBR-vs-author figure: no matrix on one or both sides")
@@ -525,14 +540,27 @@ _COMPARISON_SUBDIR_KEY = {
     "gmm_all_plp_blb_synon": "gmm_baseline",
 }
 
-def _compare_vs_excalibr(conf_raw, method_label):
+def _compare_vs_excalibr(conf_raw, method_label, vus_raw=None):
     """conf_raw : per-dataset confusion matrices (or None) for `method_label`,
     same order as `datasets`. Produces both the all_datasets and
     matched_datasets confusion figures against conf_by_method[primary_method],
     routed into the clinvar_comparisons/{acmgscaler,gmm_baseline,skew_locked}/
     subfolder matching `method_label` (see _COMPARISON_SUBDIR_KEY), and
     records the matched-datasets triple in `comparison_matches` for the
-    aggregate performance report in 3b."""
+    aggregate performance report in 3b.
+
+    `vus_raw`, if given: per-dataset (n_determinate, n_vus)-or-None VUS
+    coverage for `method_label` itself (same order as `conf_raw`/`datasets`,
+    built via analysis.confusion.build_vus_coverage -- e.g. with
+    points_col="acmgscaler_points" for acmgscaler, or the default
+    standard_points/oob_points path for gmm/skew_locked, which are already
+    ExCALIBR-shaped). Paired with ExCALIBR's own vus_by_method[primary_method]
+    (already computed once in section 3, reused here unchanged) so every
+    comparison method's confusion figure shows a "Determinate: ExCALIBR X%,
+    {method_label} Y%" caption the same way the ExCALIBR-vs-author panel
+    does, via the same vus_coverages_m1/m2 mechanism -- no separate caption
+    logic needed per method.
+    """
     figure_dir = FIGURE_SUBDIRS[_COMPARISON_SUBDIR_KEY[method_label]]
     n_missing = sum(
         1 for m, d in zip(conf_raw, conf_by_method[primary_method])
@@ -550,6 +578,8 @@ def _compare_vs_excalibr(conf_raw, method_label):
             danzs_m1=conf_by_method[primary_method], danzs_m2=conf_all,
             dataset_names=datasets, label1=primary_method, label2=method_label,
             figure_dir=figure_dir, filename=f"excalibr_vs_{method_label}_all_datasets.png",
+            vus_coverages_m1=vus_by_method[primary_method] if vus_raw is not None else None,
+            vus_coverages_m2=vus_raw,
         )
     else:
         print(f"  SKIP {method_label} comparison (all_datasets): no ExCALIBR matrices to pair with")
@@ -563,6 +593,10 @@ def _compare_vs_excalibr(conf_raw, method_label):
             danzs_m1=matched_excalibr, danzs_m2=matched_other,
             dataset_names=matched_datasets, label1=primary_method, label2=method_label,
             figure_dir=figure_dir, filename=f"excalibr_vs_{method_label}_matched_datasets.png",
+            vus_coverages_m1=(
+                [vus_by_method[primary_method][i] for i in matched_idx] if vus_raw is not None else None
+            ),
+            vus_coverages_m2=([vus_raw[i] for i in matched_idx] if vus_raw is not None else None),
         )
         comparison_matches[method_label] = (matched_excalibr, matched_other, matched_datasets)
     else:
@@ -602,13 +636,22 @@ if not config.warn_if_missing(config.MANUAL_PRIOR_OUTPUT_DIR, "ExCALIBR manual-p
 # run_acmgscaler_all.py separately (it parallelizes across datasets via
 # joblib) if ACMGSCALER_OUTPUT_DIR is stale or unset.
 if not config.warn_if_missing(config.ACMGSCALER_OUTPUT_DIR, "acmgscaler comparison"):
-    acmgscaler_conf_raw = [
-        build_acmgscaler_confusion_matrix(df_acmg, label=dataset)
-        if (df_acmg := load_acmgscaler_variants(dataset, config.ACMGSCALER_OUTPUT_DIR)) is not None
-        else None
-        for dataset in datasets
-    ]
-    _compare_vs_excalibr(acmgscaler_conf_raw, "acmgscaler")
+    acmgscaler_conf_raw = []
+    acmgscaler_vus_raw = []
+    for dataset in datasets:
+        df_acmg = load_acmgscaler_variants(dataset, config.ACMGSCALER_OUTPUT_DIR)
+        acmgscaler_conf_raw.append(
+            build_acmgscaler_confusion_matrix(df_acmg, label=dataset) if df_acmg is not None else None
+        )
+        # points_col="acmgscaler_points": acmgscaler's own evidence direction,
+        # not ExCALIBR's standard_points/oob_points -- see build_vus_coverage.
+        # Requires is_vus/auth_label on df_acmg, which only exist once
+        # run_acmgscaler_all.py has been rerun with the comparison_methods.py
+        # fix that added those columns to build_variants_df_from_scoreset.
+        acmgscaler_vus_raw.append(
+            build_vus_coverage(df_acmg, points_col="acmgscaler_points") if df_acmg is not None else None
+        )
+    _compare_vs_excalibr(acmgscaler_conf_raw, "acmgscaler", vus_raw=acmgscaler_vus_raw)
 
     # 3-way grid: ExCALIBR (normal auto-fit prior) vs acmgscaler vs ExCALIBR
     # rerun with prior manually fixed at 0.1 -- lets you see at a glance
@@ -659,13 +702,21 @@ if not config.warn_if_missing(config.ACMGSCALER_OUTPUT_DIR, "acmgscaler comparis
 if config.GMM_BASELINE_OUTPUT_DIR:
     for variant in config.GMM_BASELINE_VARIANTS:
         gmm_conf_raw = []
+        gmm_vus_raw = []
         for dataset in datasets:
             df_gmm = load_comparison_variants(dataset, variant, config.GMM_BASELINE_OUTPUT_DIR)
             gmm_conf_raw.append(
                 build_confusion_matrix(df_gmm, use_oob=False, label=f"{dataset}/gmm_{variant}")
                 if df_gmm is not None else None
             )
-        _compare_vs_excalibr(gmm_conf_raw, f"gmm_{variant}")
+            # No points_col override -- the GMM baseline's variants.csv is
+            # already ExCALIBR-shaped (standard_points column), same reason
+            # build_confusion_matrix above needs no method-specific handling.
+            gmm_vus_raw.append(
+                build_vus_coverage(df_gmm, use_oob=False, label=f"{dataset}/gmm_{variant}")
+                if df_gmm is not None else None
+            )
+        _compare_vs_excalibr(gmm_conf_raw, f"gmm_{variant}", vus_raw=gmm_vus_raw)
 else:
     print("  SKIP GMM baseline comparison: analysis.config.GMM_BASELINE_OUTPUT_DIR not set")
 
@@ -693,13 +744,18 @@ if not config.warn_if_missing(config.SKEW_LOCKED_OUTPUT_DIR, "skew-locked ExCALI
         methods_filter=None, datasets_filter=datasets, calibrations=skew_calibrations, min_controls=0,
     )
     skew_locked_conf_raw = []
+    skew_locked_vus_raw = []
     for dataset in datasets:
         df_sk = skew_df[skew_df["dataset"] == dataset] if not skew_df.empty else skew_df
         skew_locked_conf_raw.append(
             build_confusion_matrix(df_sk, use_oob=False, label=f"{dataset}/skew_locked")
             if not df_sk.empty else None
         )
-    _compare_vs_excalibr(skew_locked_conf_raw, "skew_locked")
+        skew_locked_vus_raw.append(
+            build_vus_coverage(df_sk, use_oob=False, label=f"{dataset}/skew_locked")
+            if not df_sk.empty else None
+        )
+    _compare_vs_excalibr(skew_locked_conf_raw, "skew_locked", vus_raw=skew_locked_vus_raw)
 else:
     skew_tree, skew_model_selections, skew_calibrations = {}, {}, {}
     skew_df = pd.DataFrame()
@@ -1611,3 +1667,133 @@ else:
     print("  SKIP per-scoreset VUS evidence breakdown: no is_vus variants in scope")
 
 vus_evidence_df
+
+# %% [markdown]
+# ## 10. Manuscript summary numbers
+#
+# Computes the headline numbers behind the ExCALIBR Results paragraph:
+# genes reached, overall benign/pathogenic evidence totals, ExCALIBR-vs-
+# functional-annotation agreement with ClinVar controls, VUS coverage of the
+# indeterminate range, and the OddsPath-approach coverage gap. Scope is every
+# gene in this pipeline run except `EXCLUDED_GENES` (F9/TP53 use separate
+# classifier models to integrate multiple datasets; SFPQ remains a candidate
+# disease gene) -- biobank/All-of-Us association numbers are out of scope
+# entirely (nothing in this pipeline supports them).
+#
+# `EXCLUDED_GENES` only ever derives new, section-local variables below
+# (`deduped_scope`, `df_scope`, ...) -- it never filters or mutates
+# `deduped_variants`, `df_primary_dedup`, or any object shared with the
+# figures/matrices built earlier in this notebook, which keep including
+# every gene exactly as before.
+
+# %%
+from analysis.plot_common import effective_points as _effective_points_summary
+from src.assay_calibration.plot_utils.utils import compute_aggregate_metrics
+
+EXCLUDED_GENES = {"F9", "TP53", "SFPQ"}
+
+# -- 1. Gene scope --------------------------------------------------------
+deduped_scope = deduped_variants[~deduped_variants["gene"].isin(EXCLUDED_GENES)]
+n_genes_summary = deduped_scope["gene"].nunique()
+n_genes_with_evidence = deduped_scope.loc[deduped_scope["points"] != 0, "gene"].nunique()
+
+# -- 2. Overall variant effect measurement / unique variant totals --------
+df_scope = df_primary_dedup.copy()
+df_scope["gene"] = df_scope["dataset"].str.split("_").str[0]
+df_scope = df_scope[~df_scope["gene"].isin(EXCLUDED_GENES)]
+_pts_scope = _effective_points_summary(df_scope, use_oob=True, label="manuscript_summary", context="all")
+n_vem_total = len(df_scope)
+n_vem_benign = int((_pts_scope < 0).sum())
+n_vem_pathogenic = int((_pts_scope > 0).sum())
+n_unique_variants = len(deduped_scope)
+
+# -- 3. ExCALIBR vs functional-annotation agreement with ClinVar controls --
+deduped_scope_with_author = restrict_to_genes_with_author_data(deduped_scope)
+excalibr_matrix_summary = build_deduped_confusion_matrix(deduped_scope_with_author)
+author_matrix_summary = build_deduped_author_confusion_matrix(deduped_scope_with_author)
+if excalibr_matrix_summary is not None and author_matrix_summary is not None:
+    danz_agg_summary, auth_agg_summary, _ = compute_aggregate_metrics(
+        danzs=[excalibr_matrix_summary], auths=[author_matrix_summary],
+        dataset_names=["gene_deduped_scope"],
+    )
+    excalibr_agreement_pct = danz_agg_summary["accuracy"] * 100
+    author_agreement_pct = auth_agg_summary["accuracy"] * 100
+else:
+    excalibr_agreement_pct = None
+    author_agreement_pct = None
+
+# -- 4. VUS indeterminate-range coverage (ExCALIBR vs author) --------------
+excalibr_vus_summary = build_vus_coverage(deduped_scope_with_author, points_col="points")
+author_vus_summary = build_author_vus_coverage(deduped_scope_with_author)
+
+def _pct_indeterminate(coverage):
+    if coverage is None:
+        return None
+    n_determinate, n_vus = coverage
+    return 100 * (n_vus - n_determinate) / n_vus if n_vus else None
+
+pct_indeterminate_excalibr = _pct_indeterminate(excalibr_vus_summary)
+pct_indeterminate_author = _pct_indeterminate(author_vus_summary)
+
+# -- 5. OddsPath-gap datasets ----------------------------------------------
+datasets_scope = sorted(df_scope["dataset"].unique())
+calibrated_datasets = [
+    ds for ds in datasets_scope
+    if (_effective_points_summary(
+        df_scope[df_scope["dataset"] == ds], use_oob=True, label=ds, context="all",
+    ) != 0).any()
+]
+
+n_additional = 0
+n_vem_additional = 0
+n_variants_additional = 0
+if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-code CSV (manuscript summary)"):
+    df_op_summary = pd.read_csv(config.OP_EVIDENCE_CODES_CSV)
+    oddspath_datasets = set(df_op_summary["Dataset"].unique())
+    additional_datasets = [d for d in calibrated_datasets if d not in oddspath_datasets]
+    n_additional = len(additional_datasets)
+    df_additional = df_scope[df_scope["dataset"].isin(additional_datasets)]
+    n_vem_additional = len(df_additional)
+    deduped_additional = build_gene_deduped_variants(df_additional, use_oob=use_oob)
+    n_variants_additional = len(deduped_additional)
+
+# -- Summary ----------------------------------------------------------------
+print(f"\n{'=' * 80}\nMANUSCRIPT SUMMARY NUMBERS "
+      f"(scope: all genes except {sorted(EXCLUDED_GENES)})\n{'=' * 80}")
+print(f"Genes in scope: {n_genes_summary}")
+print(f"Genes with >=1 point of pathogenic or benign evidence: {n_genes_with_evidence}/{n_genes_summary}")
+print(f"Variant effect measurements: {n_vem_total:,} total "
+      f"({n_vem_benign:,} benign evidence, {n_vem_pathogenic:,} pathogenic evidence)")
+print(f"Unique variants (gene-deduplicated, aa/nt-separated): {n_unique_variants:,} "
+      f"across {n_genes_summary} genes")
+if excalibr_agreement_pct is not None:
+    print(f"Agreement with ClinVar PLP/BLB controls: "
+          f"ExCALIBR {excalibr_agreement_pct:.1f}% vs functional annotation {author_agreement_pct:.1f}%")
+else:
+    print("  SKIP agreement comparison: no author/ExCALIBR confusion matrix available in scope")
+if pct_indeterminate_excalibr is not None:
+    print(f"VUS assigned to indeterminate range: "
+          f"functional annotation {pct_indeterminate_author:.1f}% vs ExCALIBR {pct_indeterminate_excalibr:.1f}%"
+          if pct_indeterminate_author is not None else
+          f"VUS assigned to indeterminate range (ExCALIBR): {pct_indeterminate_excalibr:.1f}%")
+else:
+    print("  SKIP VUS coverage comparison: no VUS in scope")
+print(f"Datasets calibrated by ExCALIBR but not covered by the OddsPath approach: {n_additional} "
+      f"({n_vem_additional:,} variant effect measurements, {n_variants_additional:,} unique variants)")
+
+manuscript_summary_df = pd.DataFrame([{
+    "n_genes": n_genes_summary,
+    "n_genes_with_evidence": n_genes_with_evidence,
+    "n_vem_total": n_vem_total,
+    "n_vem_benign": n_vem_benign,
+    "n_vem_pathogenic": n_vem_pathogenic,
+    "n_unique_variants": n_unique_variants,
+    "excalibr_agreement_pct": excalibr_agreement_pct,
+    "author_agreement_pct": author_agreement_pct,
+    "pct_indeterminate_excalibr": pct_indeterminate_excalibr,
+    "pct_indeterminate_author": pct_indeterminate_author,
+    "n_additional_oddspath_gap_datasets": n_additional,
+    "n_vem_additional_oddspath_gap": n_vem_additional,
+    "n_unique_variants_additional_oddspath_gap": n_variants_additional,
+}])
+manuscript_summary_df

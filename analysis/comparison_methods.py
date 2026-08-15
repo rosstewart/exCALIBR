@@ -134,10 +134,23 @@ def build_variants_df_from_scoreset(scoreset) -> pd.DataFrame:
     reused here so run_acmgscaler/make_acmgscaler_figure work identically
     whether df_variants came from a saved *_variants.csv or was built fresh
     from the master dataframe like run_igvf_batch.py/hpc/simple_gmm_baseline.py do.
+
+    Also carries `auth_label`/`is_vus` (via the same _get_variant_is_vus/
+    scoreset.auth_labels _build_standard_table itself uses) so this
+    comparison method's variants -- and any pure ClinVar-VUS ones outside
+    every fitting-relevant sample group, via the same
+    _get_vus_only_extra_rows _build_standard_table appends -- can feed the
+    same analysis.confusion.build_vus_coverage/build_author_vus_coverage
+    used for ExCALIBR's own VUS-coverage reporting, rather than this
+    comparison method having no VUS/author data at all.
     """
-    from src.assay_calibration.pipeline.variant_evidence import _get_variant_ids
+    from src.assay_calibration.pipeline.variant_evidence import (
+        _get_variant_ids, _get_variant_is_vus, _get_vus_only_extra_rows,
+    )
 
     ids = _get_variant_ids(scoreset)
+    auth_labels = getattr(scoreset, "auth_labels", None)
+    is_vus = _get_variant_is_vus(scoreset)
     rows = []
     for idx in range(len(scoreset.scores)):
         matched = [
@@ -145,11 +158,31 @@ def build_variants_df_from_scoreset(scoreset) -> pd.DataFrame:
             for s_idx in range(len(scoreset.sample_names))
             if scoreset._sample_assignments[idx, s_idx]
         ]
-        rows.append({
+        row = {
             "variant_id": ids[idx] if idx < len(ids) else f"variant_{idx}",
             "score": float(scoreset.scores[idx]),
             "sample": "|".join(matched) if matched else "Unknown",
-        })
+        }
+        if auth_labels is not None:
+            row["auth_label"] = auth_labels[idx]
+        if is_vus is not None:
+            row["is_vus"] = is_vus[idx]
+        rows.append(row)
+
+    # Pure ClinVar-VUS variants outside every fitting-relevant sample group --
+    # same rationale/extra rows as _build_standard_table's identical block.
+    # score/sample/auth_label/is_vus only; acmgscaler_points (or whatever
+    # comparison-specific column) gets computed on this row the same as
+    # every other row once run_acmgscaler() (or equivalent) processes the
+    # returned DataFrame, since that scores every row uniformly by `score`.
+    for e in _get_vus_only_extra_rows(scoreset):
+        row = {"variant_id": e["variant_id"], "score": e["score"], "sample": "Unknown"}
+        if auth_labels is not None:
+            row["auth_label"] = e["auth_label"]
+        if is_vus is not None:
+            row["is_vus"] = e["is_vus"]
+        rows.append(row)
+
     return pd.DataFrame(rows)
 
 

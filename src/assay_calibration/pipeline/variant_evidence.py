@@ -18,6 +18,8 @@ from ..fit_utils.fit import calculate_score_ranges, thresholds_from_prior
 from ..fit_utils.point_ranges import (
     enforce_monotonicity_point_ranges,
     extend_points_to_xlims,
+    clean_benign_fragments_no_extend,
+    clean_bidirectional_pathogenic_evidence,
 )
 from .config import PipelineConfig
 
@@ -84,6 +86,41 @@ def _get_variant_ids(scoreset) -> List[str]:
     return ids
 
 
+def _get_variant_aa_fields(scoreset) -> Optional[List[Dict]]:
+    """Per-kept-variant {nucleotide_or_aa, aa_ref, aa_pos, aa_alt}, aligned
+    1:1 with _get_variant_ids's output -- exact structural mirror of
+    _get_variant_is_vus/_get_variant_is_snv (same _keep_mask gate, same
+    lockstep with the kept-population loop).
+
+    These fields distinguish an amino-acid-level (protein-level) assay
+    measurement from a nucleotide-level one -- needed because a single
+    aa-level measurement is routinely stored as multiple master-TSV rows
+    (one per degenerate codon that produces the same amino-acid change), so
+    the Chrom/hgvs_c that _get_variant_ids picks (`variants[0]`) is an
+    arbitrary choice among those codons for aa-level rows, not a stable
+    identity -- see analysis.multi_scoreset.genomic_variant_key, which uses
+    these fields instead of Chrom/hgvs_c for aa-level cross-assay matching.
+    Read off variants[0], same object _get_variant_ids itself uses for
+    Gene/Chrom/hgvs_c -- these four fields are constant within a
+    mavedb_variant_urn group (verified against the master TSV), so this is
+    exact, not an approximation.
+    """
+    if not (hasattr(scoreset, "get_variants_by_id") and hasattr(scoreset, "_keep_mask")):
+        return None
+    fields = []
+    variants_by_id = scoreset.get_variants_by_id()
+    for all_idx, (_, variants) in enumerate(variants_by_id.items()):
+        if scoreset._keep_mask[all_idx]:
+            v0 = variants[0]
+            fields.append({
+                "nucleotide_or_aa": getattr(v0, "nucleotide_or_aa", None),
+                "aa_ref": getattr(v0, "aa_ref", None),
+                "aa_pos": getattr(v0, "aa_pos", None),
+                "aa_alt": getattr(v0, "aa_alt", None),
+            })
+    return fields
+
+
 def _get_variant_is_vus(scoreset) -> Optional[List[bool]]:
     """Per-kept-variant VUS flag, aligned 1:1 with _get_variant_ids's output.
 
@@ -111,6 +148,71 @@ def _get_variant_is_vus(scoreset) -> Optional[List[bool]]:
         if scoreset._keep_mask[all_idx]:
             is_vus.append(any(getattr(v, "is_vus", False) for v in variants))
     return is_vus
+
+
+def _get_variant_is_snv(scoreset) -> Optional[List[bool]]:
+    """Per-kept-variant SNV flag, aligned 1:1 with _get_variant_ids's output --
+    exact structural mirror of _get_variant_is_vus (same _keep_mask gate, same
+    lockstep with the kept-population loop). A group counts as SNV if ANY raw
+    row in it does (see Variant.is_snv), matching is_vus's any-of-group rule.
+    """
+    if not (hasattr(scoreset, "get_variants_by_id") and hasattr(scoreset, "_keep_mask")):
+        return None
+    is_snv = []
+    variants_by_id = scoreset.get_variants_by_id()
+    for all_idx, (_, variants) in enumerate(variants_by_id.items()):
+        if scoreset._keep_mask[all_idx]:
+            is_snv.append(any(getattr(v, "is_snv", False) for v in variants))
+    return is_snv
+
+
+def _get_vus_only_extra_rows(scoreset) -> List[Dict]:
+    """Extra per-variant rows for ClinVar-VUS variants that `_get_variant_ids`/
+    `_get_variant_is_vus` drop -- variants outside every fitting-relevant
+    sample group (Pathogenic/Benign/population/Synonymous), so
+    `scoreset._keep_mask` is False for them even though they're perfectly
+    real, analyzable variants. `keep_mask`/`sample_assignments`/
+    `scoreset.scores` (the fitting-relevant Scoreset internals) are NEVER
+    touched here or anywhere in this module -- this is a purely additive,
+    independent side-channel, read directly off the raw Variant objects via
+    the same re-callable `get_variants_by_id()` grouping `_get_variant_ids`
+    itself uses (so a group's inclusion/exclusion can never disagree between
+    the two: `_keep_mask` is computed once per group, never partially).
+
+    Returns one dict per excluded VUS group: {variant_id, score, auth_label,
+    is_vus (always True), is_snv, nucleotide_or_aa, aa_ref, aa_pos, aa_alt}.
+    `variant_id` reuses _get_variant_ids's own id-construction convention so
+    ids stay unique and consistent whether a variant ends up in the main
+    (kept) population or here.
+    """
+    if not (hasattr(scoreset, "get_variants_by_id") and hasattr(scoreset, "_keep_mask")):
+        return []
+    extra = []
+    variants_by_id = scoreset.get_variants_by_id()
+    excluded = 0
+    for all_idx, (key, variants) in enumerate(variants_by_id.items()):
+        if scoreset._keep_mask[all_idx]:
+            continue
+        if not any(getattr(v, "is_vus", False) for v in variants):
+            continue
+        v0 = variants[0]
+        if hasattr(v0, "ID"):
+            variant_id = f"{key}_{v0.Gene}_{v0.Chrom}_{v0.hgvs_c}"
+        else:
+            variant_id = f"vus_only_{excluded}"
+        extra.append({
+            "variant_id": variant_id,
+            "score": float(v0.assay_score),
+            "auth_label": v0.auth_label,
+            "is_vus": True,
+            "is_snv": any(getattr(v, "is_snv", False) for v in variants),
+            "nucleotide_or_aa": getattr(v0, "nucleotide_or_aa", None),
+            "aa_ref": getattr(v0, "aa_ref", None),
+            "aa_pos": getattr(v0, "aa_pos", None),
+            "aa_alt": getattr(v0, "aa_alt", None),
+        })
+        excluded += 1
+    return extra
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +292,8 @@ def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0,
     has_percentiles = lr_5 is not None
     auth_labels = getattr(scoreset, "auth_labels", None)
     is_vus = _get_variant_is_vus(scoreset)
+    is_snv = _get_variant_is_snv(scoreset)
+    aa_fields = _get_variant_aa_fields(scoreset)
 
     rows = []
     for idx in range(len(scoreset.scores)):
@@ -227,10 +331,98 @@ def _build_standard_table(scoreset, calibration: Dict, percentile: float = 5.0,
             row["auth_label"] = auth_labels[idx]
         if is_vus is not None:
             row["is_vus"] = is_vus[idx]
+        if is_snv is not None:
+            row["is_snv"] = is_snv[idx]
+        if aa_fields is not None:
+            row.update(aa_fields[idx])
 
         rows.append(row)
 
+    # Pure ClinVar-VUS variants outside every fitting-relevant sample group
+    # (keep_mask=False) never appear in the loop above -- append their rows
+    # here, scored the same way (standard_points from the same point_ranges;
+    # bootstrap percentiles re-interpolated on just these extra scores), but
+    # with no sample-group membership (sample="Unknown") and correctly no
+    # oob_points downstream (they were never part of fitting/held out of a
+    # bootstrap -- see compute_variant_table's OOB merge, a plain left-merge
+    # that leaves these NaN, and analysis/plot_common.py::effective_points,
+    # which already falls back to standard_points whenever oob is NaN).
+    extra = _get_vus_only_extra_rows(scoreset)
+    if extra:
+        extra_scores = np.array([e["score"] for e in extra])
+        ex_lr_5, ex_lr_95, ex_post_5, ex_post_95 = _compute_bootstrap_lr_percentiles(
+            extra_scores, calibration, percentile, benign_percentile)
+        for i, e in enumerate(extra):
+            row = {
+                "variant_id": e["variant_id"],
+                "score": e["score"],
+                "sample": "Unknown",
+                "standard_points": _assign_points(e["score"], point_ranges),
+            }
+            if has_percentiles:
+                row["lr_plus_5th"] = float(ex_lr_5[i]) if ex_lr_5 is not None else np.nan
+                row["lr_plus_95th"] = float(ex_lr_95[i]) if ex_lr_95 is not None else np.nan
+                row["posterior_5th"] = float(ex_post_5[i]) if ex_post_5 is not None else np.nan
+                row["posterior_95th"] = float(ex_post_95[i]) if ex_post_95 is not None else np.nan
+            if auth_labels is not None:
+                row["auth_label"] = e["auth_label"]
+            if is_vus is not None:
+                row["is_vus"] = e["is_vus"]
+            if is_snv is not None:
+                row["is_snv"] = e["is_snv"]
+            if aa_fields is not None:
+                row["nucleotide_or_aa"] = e["nucleotide_or_aa"]
+                row["aa_ref"] = e["aa_ref"]
+                row["aa_pos"] = e["aa_pos"]
+                row["aa_alt"] = e["aa_alt"]
+            rows.append(row)
+
     return pd.DataFrame(rows)
+
+
+def _classify_continuous_one(l5, l95, prior, targets, floor_at_neutral):
+    """One variant's (lr_plus, posterior, classification, display_points) from
+    its 5th/95th-percentile log(LR+) bounds -- factored out of
+    _build_continuous_table's per-idx loop so the extra (VUS-only,
+    keep_mask=False) rows it appends can reuse the identical decision logic
+    rather than duplicating it. See _build_continuous_table's own docstring
+    for the pathogenic/benign-candidate selection rule this implements.
+    """
+    from assay_calibration.fit_utils.bayesian_thresholds import (
+        bayes_posterior_from_lr, continuous_classify, piecewise_display_points,
+    )
+
+    if np.isnan(l5) and np.isnan(l95):
+        return np.nan, np.nan, "Unknown", np.nan
+
+    cat_p5 = (str(continuous_classify(np.exp(l5), prior, targets, floor_at_neutral))
+              if not np.isnan(l5) else "Unknown")
+    cat_p95 = (str(continuous_classify(np.exp(l95), prior, targets, floor_at_neutral))
+               if not np.isnan(l95) else "Unknown")
+    path_ok = cat_p5 in ("LP", "P")
+    ben_ok = cat_p95 in ("LB", "B")
+
+    if path_ok and ben_ok:
+        use_path = abs(l5) >= abs(l95)
+    elif path_ok:
+        use_path = True
+    elif ben_ok:
+        use_path = False
+    else:
+        use_path = None
+
+    if use_path is None:
+        l_rep = l5 if (not np.isnan(l5) and (np.isnan(l95) or abs(l5) <= abs(l95))) else l95
+        lr_i = float(np.exp(l_rep))
+        post_i = float(bayes_posterior_from_lr(lr_i, prior))
+        return lr_i, post_i, "VUS", 0.0
+
+    l_use = l5 if use_path else l95
+    lr_i = float(np.exp(l_use))
+    post_i = float(bayes_posterior_from_lr(lr_i, prior))
+    label = cat_p5 if use_path else cat_p95
+    display_pts = float(piecewise_display_points(l_use, prior, targets, floor_at_neutral))
+    return lr_i, post_i, label, display_pts
 
 
 def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame:
@@ -276,6 +468,8 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
     ids = _get_variant_ids(scoreset)
     auth_labels = getattr(scoreset, "auth_labels", None)
     is_vus = _get_variant_is_vus(scoreset)
+    is_snv = _get_variant_is_snv(scoreset)
+    aa_fields = _get_variant_aa_fields(scoreset)
 
     scores = np.array([float(scoreset.scores[i]) for i in range(len(scoreset.scores))])
     lr_5, lr_95, _, _ = _compute_bootstrap_lr_percentiles(scores, calibration, percentile, benign_percentile)
@@ -292,39 +486,8 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
     rows = []
     for idx in range(len(scoreset.scores)):
         score = scores[idx]
-        l5, l95 = log_lr_5[idx], log_lr_95[idx]
-
-        if np.isnan(l5) and np.isnan(l95):
-            lr_i = np.nan; post_i = np.nan; label = "Unknown"; display_pts = np.nan
-        else:
-            cat_p5 = (str(continuous_classify(np.exp(l5), prior, targets, floor_at_neutral))
-                      if not np.isnan(l5) else "Unknown")
-            cat_p95 = (str(continuous_classify(np.exp(l95), prior, targets, floor_at_neutral))
-                       if not np.isnan(l95) else "Unknown")
-            path_ok = cat_p5 in ("LP", "P")
-            ben_ok = cat_p95 in ("LB", "B")
-
-            if path_ok and ben_ok:
-                use_path = abs(l5) >= abs(l95)
-            elif path_ok:
-                use_path = True
-            elif ben_ok:
-                use_path = False
-            else:
-                use_path = None
-
-            if use_path is None:
-                l_rep = l5 if (not np.isnan(l5) and (np.isnan(l95) or abs(l5) <= abs(l95))) else l95
-                lr_i = float(np.exp(l_rep))
-                post_i = float(bayes_posterior_from_lr(lr_i, prior))
-                label = "VUS"
-                display_pts = 0.0
-            else:
-                l_use = l5 if use_path else l95
-                lr_i = float(np.exp(l_use))
-                post_i = float(bayes_posterior_from_lr(lr_i, prior))
-                label = cat_p5 if use_path else cat_p95
-                display_pts = float(piecewise_display_points(l_use, prior, targets, floor_at_neutral))
+        lr_i, post_i, label, display_pts = _classify_continuous_one(
+            log_lr_5[idx], log_lr_95[idx], prior, targets, floor_at_neutral)
 
         # See _build_standard_table's identical logic — sample_assignments is
         # multi-label; keep every matching category, pipe-separated.
@@ -348,7 +511,48 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
             row["auth_label"] = auth_labels[idx]
         if is_vus is not None:
             row["is_vus"] = is_vus[idx]
+        if is_snv is not None:
+            row["is_snv"] = is_snv[idx]
+        if aa_fields is not None:
+            row.update(aa_fields[idx])
         rows.append(row)
+
+    # Pure ClinVar-VUS variants outside every fitting-relevant sample group
+    # (keep_mask=False) -- see _build_standard_table's identical block for
+    # the full rationale. Classified via the same _classify_continuous_one
+    # helper on bootstrap percentiles re-interpolated for just these scores;
+    # sample="Unknown" (no group membership).
+    extra = _get_vus_only_extra_rows(scoreset)
+    if extra:
+        extra_scores = np.array([e["score"] for e in extra])
+        ex_lr_5, ex_lr_95, _, _ = _compute_bootstrap_lr_percentiles(
+            extra_scores, calibration, percentile, benign_percentile)
+        ex_log_lr_5 = np.log(ex_lr_5) if ex_lr_5 is not None else np.full(len(extra), np.nan)
+        ex_log_lr_95 = np.log(ex_lr_95) if ex_lr_95 is not None else np.full(len(extra), np.nan)
+        for i, e in enumerate(extra):
+            lr_i, post_i, label, display_pts = _classify_continuous_one(
+                ex_log_lr_5[i], ex_log_lr_95[i], prior, targets, floor_at_neutral)
+            row = {
+                "variant_id": e["variant_id"],
+                "score": e["score"],
+                "sample": "Unknown",
+                "lr_plus": lr_i,
+                "posterior": post_i,
+                "classification": label,
+                "display_points": display_pts,
+            }
+            if auth_labels is not None:
+                row["auth_label"] = e["auth_label"]
+            if is_vus is not None:
+                row["is_vus"] = e["is_vus"]
+            if is_snv is not None:
+                row["is_snv"] = e["is_snv"]
+            if aa_fields is not None:
+                row["nucleotide_or_aa"] = e["nucleotide_or_aa"]
+                row["aa_ref"] = e["aa_ref"]
+                row["aa_pos"] = e["aa_pos"]
+                row["aa_alt"] = e["aa_alt"]
+            rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -478,6 +682,8 @@ def _process_variant_oob(
     percentile: float = 5.0,
     benign_percentile: Optional[float] = None,
     postprocess: bool = True,
+    force_no_postprocess: bool = False,
+    benign_center: Optional[float] = None,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
@@ -488,9 +694,15 @@ def _process_variant_oob(
     3. Compute OOB median prior
     4. Compute OOB LR+ and filter NaN columns
     5. calculate_score_ranges (median prior, 5th/95th percentile LR+)
-    6. enforce_monotonicity_point_ranges (first pass)
-    7. extend_points_to_xlims
-    8. enforce_monotonicity_point_ranges (second pass)
+    6. Postprocess -- same branch the global in-bag fit took for this dataset
+       (see visualize.py's process_component_fits): bidirectional cleanup
+       (clean_benign_fragments_no_extend + clean_bidirectional_pathogenic_evidence)
+       when force_no_postprocess is True, else the plain
+       enforce_monotonicity_point_ranges -> extend_points_to_xlims ->
+       enforce_monotonicity_point_ranges sequence, else no postprocessing at all.
+       force_no_postprocess/benign_center are dataset-level values computed once
+       from the FULL bootstrap ensemble in visualize.py -- reused verbatim here,
+       never recomputed from this variant's (much smaller, noisier) OOB subset.
     9. Flatten and assign points
 
     Returns (variant_idx, result_dict) or (variant_idx, {"_fail": reason}).
@@ -540,7 +752,16 @@ def _process_variant_oob(
             for point in pr:
                 pr[point] = []
 
-        if postprocess:
+        if force_no_postprocess:
+            # Same branch as the in-bag fit for this dataset: auto-detected
+            # bidirectional assay, postprocess_point_ranges is force-overridden
+            # regardless of its raw value (matches visualize.py's
+            # `elif force_no_postprocess:` branch).
+            clean_benign_fragments_no_extend(pr, point_values, vsr, liberal=liberal)
+            clean_bidirectional_pathogenic_evidence(
+                pr, point_values, vsr, benign_center, liberal=liberal, inf=True,
+            )
+        elif postprocess:
             # Step 6: enforce monotonicity (first pass)
             enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
@@ -549,6 +770,7 @@ def _process_variant_oob(
 
             # Step 8: enforce monotonicity (second pass)
             enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
+        # else: no postprocessing at all (matches visualize.py's --no-postprocess branch).
 
         # Step 9: flatten and assign
         pts = _assign_points(score, pr)
@@ -581,6 +803,13 @@ def _compute_oob_evidence(
     log_fb = np.asarray(calibration["log_fb"])
     score_range = np.asarray(calibration["score_range"])
     flipped = calibration.get("scoreset_flipped", False)
+    # Dataset-level bidirectional-postprocessing decision from the global
+    # in-bag fit (visualize.py's process_component_fits). Deliberately absent
+    # from on-disk *_calibration.json (not in calibration_compact's whitelist
+    # in pipeline/utils.py:save_results), so any calibration dict reconstructed
+    # purely from disk JSON falls back to "no override" here.
+    force_no_postprocess = calibration.get("force_no_postprocess", False)
+    benign_center = calibration.get("benign_center", None)
     valid_seeds = np.asarray(calibration["valid_bootstrap_seeds"])
 
     oob_map = _build_oob_mapping(scoreset, dataset_splits, valid_seeds)
@@ -601,6 +830,8 @@ def _compute_oob_evidence(
             percentile=getattr(config, "pathogenic_percentile", 5.0),
             benign_percentile=getattr(config, "benign_percentile", None),
             postprocess=postprocess,
+            force_no_postprocess=force_no_postprocess,
+            benign_center=benign_center,
         )
         for vidx, oob_idx in oob_map.items()
     )

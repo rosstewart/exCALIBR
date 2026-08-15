@@ -286,13 +286,14 @@ def is_bidirectional_by_weights(component_params, source_weights, reference_weig
 
 
 def is_bidirectional_by_raw_points(ranges_p, ranges_b):
-    """ARCHIVED, unused: Method A ("raw points") auto-detection, superseded by
-    the component-weights method (is_bidirectional_by_weights) as the
-    canonical bidirectional-detection approach. No longer wired into
-    process_component_fits/PipelineConfig/CLI -- kept here for reference
-    only. Does this fit's RAW (pre-postprocess) set of pathogenic/benign
-    point ranges show a pathogenic -> benign -> pathogenic pattern along the
-    score axis (pathogenic evidence on both sides of a benign region)?
+    """Method A ("raw points") bidirectional auto-detection. Used in
+    ``visualize.py``'s bidirectional-detect block for n_c < 3 fits, where the
+    component-weights method (is_bidirectional_by_weights) can't apply (it
+    needs a pathogenic-like component on each side of the reference, i.e.
+    >=3 components total). Does this fit's RAW (pre-postprocess) set of
+    pathogenic/benign point ranges show a pathogenic -> benign -> pathogenic
+    pattern along the score axis (pathogenic evidence on both sides of a
+    benign region)?
 
     ``ranges_p``/``ranges_b`` are the per-fit dicts of point_value -> flat
     [lo, hi, lo, hi, ...] arrays produced by ``get_point_ranges`` (positive

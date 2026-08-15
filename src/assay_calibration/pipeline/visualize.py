@@ -30,6 +30,7 @@ from ..fit_utils.point_ranges import (
     resolve_pathomechanism_anchor,
     _compute_log_fp_only,
     is_bidirectional_by_weights,
+    is_bidirectional_by_raw_points,
     resolve_bidirectional_weight_vectors,
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
@@ -973,11 +974,22 @@ def process_component_fits(
     percent_no_evidence = {point: 0.0 for point in config.point_values + list(-1 * np.array(config.point_values))}
 
     # Auto-detect bidirectional assays (e.g. LoF/GoF in one assay) per
-    # bootstrap fit from mixture-component weights, and force
-    # postprocess_point_ranges=False (custom pathogenic-island extend
-    # instead of standard monotonicity/extend-to-xlims) for this dataset
-    # when a majority of fits are flagged -- see PipelineConfig.auto_bidirectional
-    # and BIDIRECTIONAL_VOTE_THRESHOLD (fit_utils/point_ranges.py).
+    # bootstrap fit, and force postprocess_point_ranges=False (custom
+    # pathogenic-island extend instead of standard monotonicity/extend-to-xlims)
+    # for this dataset when a majority of fits are flagged -- see
+    # PipelineConfig.auto_bidirectional and BIDIRECTIONAL_VOTE_THRESHOLD
+    # (fit_utils/point_ranges.py).
+    #
+    # Method choice depends on n_c: the mixture-component-weights method
+    # (is_bidirectional_by_weights) needs >=2 non-reference components (one
+    # on each side of the reference) plus the reference itself, i.e. >=3
+    # components total, so it's meaningless for 2c fits (only one
+    # non-reference component exists -- nothing for it to detect). For n_c<3,
+    # use the raw-points method instead: it looks for a
+    # pathogenic->benign->pathogenic pattern directly in each fit's raw
+    # (pre-postprocess) threshold-crossing point ranges, which a 2c fit's
+    # non-monotonic LR+ curve can still exhibit even with only one
+    # non-reference component.
     force_no_postprocess = False
     auto_bidirectional = getattr(config, "auto_bidirectional", False)
     if auto_bidirectional and n_c >= 3:
@@ -1001,6 +1013,19 @@ def process_component_fits(
         logger.info(
             f"  Bidirectional auto-detect: {n_flagged}/{len(fits)} bootstrap fits flagged "
             f"({frac_flagged:.1%}), threshold={BIDIRECTIONAL_VOTE_THRESHOLD:.0%} -> "
+            f"{'forcing postprocess_point_ranges=False' if force_no_postprocess else 'no override'}"
+        )
+    elif auto_bidirectional:
+        n_flagged = sum(
+            1 for ranges_p, ranges_b in zip(ranges_pathogenic, ranges_benign)
+            if is_bidirectional_by_raw_points(ranges_p, ranges_b)
+        )
+        frac_flagged = n_flagged / len(fits) if fits else 0.0
+        force_no_postprocess = frac_flagged >= BIDIRECTIONAL_VOTE_THRESHOLD
+        logger.info(
+            f"  Bidirectional auto-detect (raw-points, n_c={n_c}): {n_flagged}/{len(fits)} "
+            f"bootstrap fits flagged ({frac_flagged:.1%}), "
+            f"threshold={BIDIRECTIONAL_VOTE_THRESHOLD:.0%} -> "
             f"{'forcing postprocess_point_ranges=False' if force_no_postprocess else 'no override'}"
         )
     # benign_center: same actual-score mean already used for scoreset_flipped
@@ -1157,6 +1182,14 @@ def process_component_fits(
         'scoreset_flipped': scoreset_flipped,
         'n_valid_fits': len(fits),
         'acmg_mapping_method': acmg_mapping_method,
+        # In-memory only -- deliberately NOT part of calibration_compact's
+        # on-disk *_calibration.json whitelist (pipeline/utils.py:save_results).
+        # Threaded through to variant_evidence.py's OOB path so per-variant OOB
+        # postprocessing takes the same branch (plain vs bidirectional-cleanup
+        # vs none) as this global in-bag fit, instead of always using the plain
+        # path regardless of how this dataset was actually postprocessed.
+        'force_no_postprocess': force_no_postprocess,
+        'benign_center': benign_center,
     }
     # Include pre-filter log_fp so callers can share it with a sibling benign combo.
     # Only populated when return_log_fp_all=True and precomputed_log_fp_all was not given.

@@ -811,7 +811,17 @@ class Scoreset:
         
         # drop NaNs in chosen score column
         dataframe = dataframe.dropna(subset=[score_col])
-        
+
+        log_transform = kwargs.get("log_transform", False)
+        if log_transform:
+            non_positive = (dataframe[score_col] <= 0).sum()
+            if non_positive:
+                raise ValueError(
+                    f"log_transform=True but {score_col!r} has {non_positive} "
+                    f"non-positive value(s); cannot take log."
+                )
+            dataframe = dataframe.assign(**{score_col: np.log(dataframe[score_col])})
+
         # (this does nothing by default)
         dataframe = Scoreset.remove_outliers(dataframe, **kwargs)
         
@@ -894,6 +904,15 @@ class Scoreset:
         spliceai_threshold = kwargs.get("spliceai_threshold", 0.2)
 
         _dataset_name = self.dataframe["Dataset"].iloc[0] if "Dataset" in self.dataframe.columns and len(self.dataframe) else "?"
+        if self.dataframe["splice_measure"].isna().any():
+            raise ValueError(
+                f"[{_dataset_name}] splicing_filter: 'splice_measure' column contains NaN/missing "
+                f"values -- this must be explicitly 'Yes' or 'No' for every row, since NaN silently "
+                f"compared unequal to 'Yes' and was being treated as 'No' (dropping SpliceAI-flagged "
+                f"and splice-consequence rows for an assay whose splice-detection status was never "
+                f"actually recorded). Fix the source dataframe's splice_measure column for this "
+                f"dataset rather than relying on this fallback."
+            )
         self.detects_splice = (
             self.dataframe.loc[:, "splice_measure"].unique()[0] == "Yes"  # type: ignore
         )
@@ -1005,6 +1024,7 @@ class Scoreset:
         self._extra_func_classes = np.empty((self.n_variants, _K), dtype=object) if _K else None
         self._snv_scores = []
         self._vus_scores = []
+        self._vus_auth_labels = []
         self._all_scores = []
         self._aa_subs = np.empty(self.n_variants, dtype='U50')
         self._variant_codes = []
@@ -1060,6 +1080,7 @@ class Scoreset:
 
             if any(v.is_vus for v in variants):
                 self._vus_scores.append(score0)
+                self._vus_auth_labels.append(v0.auth_label)
 
             try:
                 self._aa_subs[idx] = v0.aa_ref + str(int(v0.aa_pos)) + v0.aa_alt
@@ -1163,6 +1184,7 @@ class Scoreset:
         self.sample_counts = self._sample_assignments.sum(axis=0)
         self._snv_scores = np.array(self._snv_scores)
         self._vus_scores = np.array(self._vus_scores)
+        self._vus_auth_labels = np.array(self._vus_auth_labels)
         self._all_scores = np.array(self._all_scores)
 
     
@@ -1320,15 +1342,23 @@ class Scoreset:
     @property
     def vus_scores(self):
         return self._vus_scores
-    
+
+    @property
+    def vus_auth_labels(self):
+        """Author labels for every ClinVar-VUS variant, independent of
+        sample_assignments/keep_mask -- aligned 1:1 with vus_scores, not with
+        scores/auth_labels (which are restricted to the fitting-relevant,
+        keep_mask-kept population)."""
+        return self._vus_auth_labels
+
     @property
     def all_scores(self):
         return self._all_scores
-        
+
     @property
     def aa_subs(self):
         return self._aa_subs
-        
+
     @property
     def variant_codes(self):
         return self._variant_codes

@@ -54,9 +54,13 @@ class PipelineConfig:
     # instead extends only the outermost pathogenic evidence island on each
     # side to the axis limit, via extend_bidirectional_pathogenic_islands --
     # see that function's docstring for the full rationale/algorithm.
-    # Only applies when n_c >= 3 (2c can't exhibit a sandwiched pattern).
-    # (An earlier "raw points" detection method -- is_bidirectional_by_raw_points
-    # -- was tried and archived in favor of this weights-based method.)
+    # Weights-based detection only applies when n_c >= 3 (needs a
+    # pathogenic-like component on each side of the reference, so a 2c fit's
+    # single non-reference component has nothing to detect). For n_c < 3,
+    # is_bidirectional_by_raw_points is used instead -- it looks for a
+    # pathogenic->benign->pathogenic pattern directly in each fit's raw
+    # (pre-postprocess) threshold-crossing point ranges, which a 2c fit's
+    # non-monotonic LR+ curve can still exhibit.
     auto_bidirectional: bool = True
 
     benign_method: Literal["benign", "avg", "synonymous"] = "avg"

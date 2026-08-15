@@ -150,6 +150,7 @@ def _shared_data(jobs: list) -> dict | None:
         "train_sample_assignments": j["train_sample_assignments"],
         "val_observations": j["val_observations"],
         "val_sample_assignments": j["val_sample_assignments"],
+        "val_variant_indices": j["val_variant_indices"],
     }
 
 
@@ -877,6 +878,7 @@ def _build_gene_set_ms_map(gene_set, args):
         return build_fgfr_multiscoresets(
             genes=args.genes, exclude_genes=args.exclude_genes,
             combine_genes=not getattr(args, "fgfr_separate", False),
+            log_transform=getattr(args, "log_transform", True),
         )
 
     if gene_set == "tp53":
@@ -1471,6 +1473,10 @@ def main():
                               "(one per gene) instead of the default: pooling all target "
                               "genes' P/LP/B/LB/gnomAD/Synonymous variants into one combined "
                               "MultiScoreset")
+    p_multi.add_argument("--no-log-transform", action="store_false",
+                         dest="log_transform", default=True,
+                         help="[--gene-set fgfr] Disable the default per-dimension natural-log "
+                              "transform of scores before fitting (default: log-transform on)")
     p_multi.add_argument("--predictor-data-dir",
                          default="/data/ross/assay_calibration/predictor_calibrations/"
                                  "single_gene_calibration_data",

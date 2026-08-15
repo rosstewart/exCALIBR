@@ -211,56 +211,69 @@ def _integrated_df():
     return pd.read_csv(path, sep=sep, low_memory=False)
 
 
-def _build_integrated_hgvs_bridge(df_integrated, gene):
-    """{hgvs_c: short_protein_variant} for *gene*, where short_protein_variant
-    is "<aa_ref><aa_pos><aa_alt>" (e.g. "A119T") -- the SAME short format
-    combined.py's own get_functionally_assayed_protein_variants builds and
-    that 'combined' gene-set MultiScoresets actually key on (confirmed via
-    ms._variants_kept, e.g. ['A102G', 'A102V', ...]). An earlier version of
-    this bridge matched against hgvs_p/genomic columns instead, which never
-    matches these short-format keys -- confirmed empirically: it produced
-    an all-NaN points matrix (zero bridged variants) for every one of the 8
-    'combined' genes tested, not just some."""
-    sub = df_integrated[df_integrated["Gene"] == gene]
-    sub = sub.dropna(subset=["hgvs_c"]).drop_duplicates(subset="hgvs_c")
-    bridge = {}
-    for row in sub.itertuples(index=False):
-        aa_ref, aa_pos, aa_alt = getattr(row, "aa_ref", None), getattr(row, "aa_pos", None), getattr(row, "aa_alt", None)
-        if pd.isna(aa_ref) or pd.isna(aa_pos) or pd.isna(aa_alt):
-            continue
-        bridge[row.hgvs_c] = f"{aa_ref}{int(aa_pos)}{aa_alt}"
-    return bridge
+def _calibration_json_path_for_dataset(dataset_dir_name, uv_calib_dir, dataset_configs):
+    """<uv_calib_dir>/<dataset>/<dataset>_<n_c>_<benign_method>_calibration.json
+    -- the canonical calibration for this dataset, same n_c/benign_method
+    resolution as _uv_variants_csv_path."""
+    cfg = dataset_configs.get(dataset_dir_name)
+    if cfg is None:
+        return None
+    n_c = cfg.get("n_c", "3c")
+    benign_method = cfg.get("benign_method", "avg")
+    return Path(uv_calib_dir) / dataset_dir_name / f"{dataset_dir_name}_{n_c}_{benign_method}_calibration.json"
 
 
 def load_combined_uv_points(gene, ms, df_integrated=None):
-    """UV bridging for 'combined'/'integrated' genes, via aa_ref/aa_pos/
-    aa_alt -> short protein_variant string (matching ms._variants_kept's own
-    format) rather than hgvs_p/genomic (see _build_integrated_hgvs_bridge)."""
+    """UV bridging for 'combined'/'integrated' genes -- reads each dataset's
+    raw score directly from the integrated dataframe (`auth_reported_score`)
+    and classifies it via that dataset's canonical calibration.json, rather
+    than via the corresponding exc_pp `variants.csv`.
+
+    variants.csv can simply be missing rows that the raw dataframe (and the
+    canonical calibration) both have data for -- confirmed for PAX6: two
+    B/LB variants (complex "delins" substitutions) have real scores for
+    every one of PAX6's 4 datasets in the integrated dataframe, but appear
+    in NONE of the 4 corresponding variants.csv files. That's a real gap in
+    variants.csv itself (stale/incomplete), not a bridging bug -- reading
+    the score straight from the source dataframe sidesteps it entirely,
+    since we already have that row's aa_ref/aa_pos/aa_alt (or genomic
+    coordinates) directly, with no variant_id/hgvs_c matching needed at all.
+    """
     datasets = _discover_exc_pp_datasets(gene)
     if not datasets:
         return None
     if df_integrated is None:
         df_integrated = _integrated_df()
     dataset_configs = _dataset_configs()
-    bridge = _build_integrated_hgvs_bridge(df_integrated, gene)
     key_index = {vk: i for i, vk in enumerate(ms._variants_kept)}
+    sub = df_integrated[df_integrated["Gene"] == gene]
+
     mat = np.full((len(datasets), ms.n_variants), np.nan)
     used = []
     for d_i, dataset_name in enumerate(datasets):
-        csv_path = _uv_variants_csv_path(dataset_name, config.EXC_PP_CLINVAR2025_UV_CALIB, dataset_configs)
-        if csv_path is None or not csv_path.exists():
+        cal_path = _calibration_json_path_for_dataset(dataset_name, config.EXC_PP_CLINVAR2025_UV_CALIB, dataset_configs)
+        if cal_path is None or not cal_path.exists():
             continue
-        df = _load_variants_with_canonical_points(csv_path)
-        hgvs_c = df["variant_id"].map(_extract_hgvs_c)
-        for hc, pts in zip(hgvs_c, df["standard_points"]):
-            if hc is None:
+        with open(cal_path) as f:
+            point_ranges = json.load(f)["point_ranges"]
+        rows = sub[sub["Dataset"] == dataset_name]
+        for row in rows.itertuples(index=False):
+            score = getattr(row, "auth_reported_score", None)
+            if score is None or pd.isna(score):
                 continue
-            protein_variant = bridge.get(hc)
-            if protein_variant is None:
+            idx = None
+            chrom, start = getattr(row, "Chrom", None), getattr(row, "hg38_start", None)
+            ref, alt = getattr(row, "ref_allele", None), getattr(row, "alt_allele", None)
+            if pd.notna(chrom) and pd.notna(start) and pd.notna(ref) and pd.notna(alt):
+                idx = key_index.get((gene, str(chrom), str(int(start)), str(ref), str(alt)))
+            if idx is None:
+                aa_ref, aa_pos, aa_alt = getattr(row, "aa_ref", None), getattr(row, "aa_pos", None), getattr(row, "aa_alt", None)
+                if pd.notna(aa_ref) and pd.notna(aa_pos) and pd.notna(aa_alt):
+                    idx = key_index.get(f"{aa_ref}{int(aa_pos)}{aa_alt}")
+            if idx is None:
                 continue
-            idx = key_index.get(protein_variant)
-            if idx is not None:
-                mat[d_i, idx] = pts
+            pts = classify_score_from_point_ranges(score, point_ranges)
+            mat[d_i, idx] = pts
         used.append(dataset_name)
     if not used:
         return None
@@ -315,6 +328,43 @@ def load_fgfr_uv_points(gene, ms):
     return None
 
 
+# ── combined evidence: functional + predictor UV together (Panel C) ──────
+
+def load_combined_all_evidence_uv_points(gene, ms, df_integrated=None):
+    """Functional (exc_pp) and predictor (REVEL/MP2/AM) UV calibrations,
+    merged into ONE matrix so a single non-conflicting aggregation spans
+    both evidence types together -- not two separate non-conflicting
+    aggregates combined after the fact. Used for Panel C's "ExCALIBR"
+    baseline: 'what if every individually-calibrated assay AND predictor
+    for this gene were combined with one non-conflicting rule'."""
+    functional = load_combined_uv_points(gene, ms, df_integrated=df_integrated)
+    predictor = load_predictor_mv_uv_points(gene, ms)
+    names, mats = [], []
+    if functional is not None:
+        f_names, f_mat = functional
+        names.extend(f_names)
+        mats.append(f_mat)
+    if predictor is not None:
+        p_names, p_mat = predictor
+        names.extend(p_names)
+        mats.append(p_mat)
+    if not mats:
+        return None
+    return names, np.vstack(mats)
+
+
+# ── plain "integrated" functional-only genes (Panel A) ────────────────────
+
+def load_integrated_functional_uv_points(gene, ms, df_integrated=None):
+    """Same bridge as load_combined_uv_points (aa_ref/aa_pos/aa_alt -> short
+    protein_variant), for genes whose MV fit is functional-only (built via
+    combined.py::build_functional_scoresets with no predictor merge, e.g.
+    the 15 plain-"integrated" genes in Panel A) -- these share the same
+    ms._variants_kept format as the 'combined' gene-set's functional
+    dimensions, so the exact same bridging function applies unchanged."""
+    return load_combined_uv_points(gene, ms, df_integrated=df_integrated)
+
+
 # ── dispatcher ───────────────────────────────────────────────────────────
 
 def load_uv_points(gene, ms, gene_set):
@@ -328,6 +378,10 @@ def load_uv_points(gene, ms, gene_set):
         return load_tp53_uv_points(ms)
     if gene_set == "combined":
         return load_combined_uv_points(gene, ms)
+    if gene_set == "combined-all-evidence":
+        return load_combined_all_evidence_uv_points(gene, ms)
+    if gene_set == "integrated-functional":
+        return load_integrated_functional_uv_points(gene, ms)
     if gene_set == "predictor-mv":
         return load_predictor_mv_uv_points(gene, ms)
     if gene_set == "fgfr":

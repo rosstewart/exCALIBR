@@ -26,7 +26,9 @@ def load_fgfr_dataframe(data_path: str = DEFAULT_DATA_PATH) -> pd.DataFrame:
     return pd.read_csv(data_path, sep="\t")
 
 
-def _build_one_multiscoreset(gene_df: pd.DataFrame, population_type: str) -> MultiScoreset:
+def _build_one_multiscoreset(
+    gene_df: pd.DataFrame, population_type: str, log_transform: bool = True
+) -> MultiScoreset:
     scoresets = [
         Scoreset.from_mavedb(
             gene_df,
@@ -37,6 +39,7 @@ def _build_one_multiscoreset(gene_df: pd.DataFrame, population_type: str) -> Mul
             splice_measure=False,
             population_type=population_type,
             regularization_type=None,
+            log_transform=log_transform,
         )
         for score_col, fc_col in zip(SCORE_COLS, FUNC_CLASS_COL_PER_DIM)
     ]
@@ -50,6 +53,7 @@ def build_fgfr_multiscoresets(
     exclude_genes: Optional[List[str]] = None,
     population_type: str = "gnomAD",
     combine_genes: bool = True,
+    log_transform: bool = True,
 ) -> Dict[str, MultiScoreset]:
     """Build FGFR MultiScoreset(s) (3 dims: activation/PemR/FutR).
 
@@ -64,6 +68,11 @@ def build_fgfr_multiscoresets(
     different chromosomes, so there's no cross-gene ID collision risk.
     Pass combine_genes=False for the original one-MultiScoreset-per-gene
     behavior.
+
+    log_transform (default True): apply a per-dimension natural-log
+    transform to each assay's scores before fitting (Scoreset._init_dataframe
+    raises if any dimension has non-positive scores). Only affects FGFR
+    ingestion; other gene-sets are unaffected.
 
     ``exclude_genes`` is applied here (not by the caller filtering the
     returned dict) because in combine_genes mode the returned dict has one
@@ -87,10 +96,14 @@ def build_fgfr_multiscoresets(
         # which would give one value per gene) is what pools all target
         # genes' rows into a single Scoreset per score dimension.
         df_combined["Dataset"] = COMBINED_DATASET_NAME
-        return {COMBINED_DATASET_NAME: _build_one_multiscoreset(df_combined, population_type)}
+        return {COMBINED_DATASET_NAME: _build_one_multiscoreset(
+            df_combined, population_type, log_transform=log_transform,
+        )}
 
     gene_ms = {}
     for gene in target_genes:
         gene_df = df_fgfr[df_fgfr[DATASET_COL] == gene]
-        gene_ms[gene] = _build_one_multiscoreset(gene_df, population_type)
+        gene_ms[gene] = _build_one_multiscoreset(
+            gene_df, population_type, log_transform=log_transform,
+        )
     return gene_ms

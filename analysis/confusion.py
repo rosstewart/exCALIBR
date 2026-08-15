@@ -147,20 +147,35 @@ def build_both_determinate_confusion_matrices(
     return excalibr_mat, author_mat
 
 
-def build_vus_coverage(df_sub: pd.DataFrame, use_oob: bool = True, label: str = "") -> Optional[tuple]:
+def build_vus_coverage(
+    df_sub: pd.DataFrame, use_oob: bool = True, label: str = "",
+    points_col: Optional[str] = None,
+) -> Optional[tuple]:
     """(n_determinate, n_vus) among `df_sub`'s ClinVar-VUS variants, by the
-    sign of ExCALIBR's own effective evidence points (nonzero = determinate,
-    same convention as section 9's per-scoreset VUS breakdown in
+    sign of some method's evidence points (nonzero = determinate, same
+    convention as section 9's per-scoreset VUS breakdown in
     analyze_pipeline_output.py). None if `is_vus` isn't present or there are
     no VUS rows -- callers aggregate a list of these across datasets before
     turning the pair into a percentage, so a per-dataset None must be
-    droppable rather than treated as (0, 0)."""
+    droppable rather than treated as (0, 0).
+
+    `points_col`, if given, reads evidence points directly from that column
+    (e.g. "acmgscaler_points" for the acmgscaler comparison, or "points" for
+    gene-deduped variants) instead of computing ExCALIBR's own
+    standard_points/oob_points via _effective_points -- lets any comparison
+    method with its own already-computed points column reuse this same
+    VUS-coverage logic (and the identical Normal/IR/Abnormal-sign
+    determinate convention) rather than reimplementing it per method.
+    """
     if "is_vus" not in df_sub.columns:
         return None
     df_vus = df_sub[df_sub["is_vus"].fillna(False).astype(bool)]
     if df_vus.empty:
         return None
-    pts = _effective_points(df_vus, use_oob, label=label, context="VUS")
+    if points_col is not None:
+        pts = df_vus[points_col]
+    else:
+        pts = _effective_points(df_vus, use_oob, label=label, context="VUS")
     return int((pts != 0).sum()), len(pts)
 
 
@@ -168,8 +183,22 @@ def build_author_vus_coverage(df_sub: pd.DataFrame) -> Optional[tuple]:
     """(n_determinate, n_vus) among `df_sub`'s ClinVar-VUS variants, by the
     author's own call -- determinate meaning `auth_label` is NORMAL/ABNORMAL
     rather than one of the indeterminate codes or missing. Mirrors
-    build_author_confusion_matrix's indeterminate-code handling."""
+    build_author_confusion_matrix's indeterminate-code handling.
+
+    Reuses build_author_confusion_matrix's own "does this dataset have any
+    real recorded author data" guard (calling it and requiring a non-None
+    result) -- a dataset excluded from the controls aggregate because
+    auth_label was never recorded for it (all-NaN) must also be excluded
+    here, otherwise every one of its VUS rows falls into "indeterminate" by
+    missing-data default, which isn't a real author call and would silently
+    drag the VUS determinate rate down for a reason that has nothing to do
+    with author uncertainty -- exactly the asymmetry that inflated the gap
+    between the controls and VUS author-determinate percentages before this
+    guard existed here.
+    """
     if "is_vus" not in df_sub.columns or "auth_label" not in df_sub.columns:
+        return None
+    if build_author_confusion_matrix(df_sub) is None:
         return None
     df_vus = df_sub[df_sub["is_vus"].fillna(False).astype(bool)]
     if df_vus.empty:
