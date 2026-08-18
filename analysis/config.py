@@ -115,6 +115,17 @@ ASSAY_METHOD_MAP_CSV = _env(
     "/data/ross/assay_calibration/dataframe/var_effect_measurements_dataset.csv",
 )
 
+# ClinGen Gene-Disease Validity curations (mode-of-inheritance per gene) --
+# used by the AD-vs-AR performance-comparison subsection in
+# analyze_pipeline_output.py. Raw export has 3 metadata rows + a "+++...+++"
+# separator row before the real header (skiprows=4), plus another
+# "+++...+++" row right after the header that must be filtered out of the
+# data itself.
+CLINGEN_MOI_CSV = _env(
+    "EXCALIBR_CLINGEN_MOI_CSV",
+    "/data/ross/assay_calibration/dataframe/Clingen-Gene-Disease-Summary-2026-04-16.csv",
+)
+
 # ---------------------------------------------------------------------------
 # Comparison methods (analysis.comparison_methods) -- other calibration
 # approaches ExCALIBR gets compared against, beyond the author's own calls.

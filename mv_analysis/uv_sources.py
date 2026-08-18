@@ -248,6 +248,14 @@ def load_combined_uv_points(gene, ms, df_integrated=None):
     key_index = {vk: i for i, vk in enumerate(ms._variants_kept)}
     sub = df_integrated[df_integrated["Gene"] == gene]
 
+    # exc_pp calib directory names (`datasets`, from _discover_exc_pp_datasets)
+    # often carry a suffix (e.g. "_clinvar_2018") not present in the integrated
+    # dataframe's own `Dataset` column values -- matching them by exact string
+    # equality silently returns zero rows for every such dataset (confirmed
+    # for BRCA1: 0/1767 variants bridged despite calibration.json being found).
+    # Resolve via longest-prefix match against the raw Dataset values instead.
+    raw_dataset_names = sorted(sub["Dataset"].unique(), key=len, reverse=True)
+
     mat = np.full((len(datasets), ms.n_variants), np.nan)
     used = []
     for d_i, dataset_name in enumerate(datasets):
@@ -256,7 +264,10 @@ def load_combined_uv_points(gene, ms, df_integrated=None):
             continue
         with open(cal_path) as f:
             point_ranges = json.load(f)["point_ranges"]
-        rows = sub[sub["Dataset"] == dataset_name]
+        raw_name = next((r for r in raw_dataset_names if dataset_name.startswith(r)), None)
+        if raw_name is None:
+            continue
+        rows = sub[sub["Dataset"] == raw_name]
         for row in rows.itertuples(index=False):
             score = getattr(row, "auth_reported_score", None)
             if score is None or pd.isna(score):

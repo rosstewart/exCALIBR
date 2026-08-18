@@ -60,6 +60,14 @@ from src.assay_calibration.pipeline.utils import (
 )
 
 
+def _parse_spliceai_threshold(raw) -> Optional[float]:
+    """--spliceai-threshold CLI value -> float | None -- 'none' (any case)
+    disables SpliceAI-score-based filtering entirely, matching
+    hpc/prepare.py's own inline parsing of the same flag."""
+    text = str(raw).strip().lower()
+    return None if text == "none" else float(raw)
+
+
 def parse_dataset_config(
     config_entry,
 ) -> Tuple[str, str, Dict]:
@@ -194,6 +202,8 @@ def run_single_dataset(
         ),
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         seed=getattr(args, "seed", None),
+        spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
+        vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
     )
 
     output_dir = Path(config.output_dir)
@@ -505,6 +515,8 @@ def _run_one_combo(
             args, "pathomechanism_boundary_joint_prior", "product"
         ),
         auto_bidirectional=getattr(args, "auto_bidirectional", True),
+        spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
+        vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
     )
 
     # Reload scoreset inside the worker (avoids large object serialization)
@@ -550,6 +562,8 @@ def _detect_benign_sample_availability(dataset_df: pd.DataFrame, dataset_name: s
         min_clinvar_star=args.min_clinvar_star,
         population_type=args.population_type,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
+        vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
     )
     scoreset = load_dataset_from_df(dataset_df, probe_config)
     has_benign = False
@@ -832,6 +846,8 @@ def generate_all_configs_viz(
         seed=getattr(args, "seed", None),
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
+        spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
+        vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
     )
     scoreset = load_dataset_from_df(dataset_df, config_load)
 
@@ -1042,6 +1058,26 @@ def main():
                        help="Load Scoreset with synonymous_exclusive=True: synonymous variants "
                             "are assigned only to the synonymous sample, not also to P/LP or B/LB. "
                             "Matches the behaviour used in legacy author-label analysis.")
+
+    # Splice-filter ablation knobs -- same two knobs hpc/prepare.py already
+    # exposes for the bootstrap-fitting side (analysis/build_splice_ablation_jobs.py).
+    # Needed here too so a second-stage run (turning a splice-ablation
+    # condition's precomputed bootstrap fits into calibration output) scores
+    # the SAME variant population those fits were calibrated against,
+    # instead of silently falling back to Scoreset.splicing_filter's own
+    # hardcoded defaults (spliceai_threshold=0.2, vep_splice_filter=True)
+    # regardless of which condition --precomputed-fits came from.
+    parser.add_argument("--spliceai-threshold", default="0.2",
+                       help="Ablation: SpliceAI DS_{AG,AL,DG,DL} threshold used by "
+                            "Scoreset.splicing_filter for assays that don't detect "
+                            "splice effects (default: 0.2, matching the prior "
+                            "hardcoded behavior). Pass 'none' to disable SpliceAI-"
+                            "score-based filtering entirely (keep all rows regardless "
+                            "of SpliceAI score).")
+    parser.add_argument("--disable-vep-splice-filter", action="store_true",
+                       help="Ablation: skip the VEP splice-consequence-based row drop "
+                            "in Scoreset.splicing_filter (default: filter is applied, "
+                            "matching prior hardcoded behavior).")
 
     # ClinVar 2018 gene override
     parser.add_argument("--no-clinvar-2018", action="store_true",

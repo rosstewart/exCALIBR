@@ -215,6 +215,50 @@ def _get_vus_only_extra_rows(scoreset) -> List[Dict]:
     return extra
 
 
+def get_all_variant_groups(scoreset, point_ranges: Dict) -> List[Dict]:
+    """Every `get_variants_by_id()` group for `scoreset` -- ExCALIBR's full
+    scored population (every variant the underlying assay measured),
+    regardless of `_keep_mask`/`is_vus`. `compute_variant_table` (and
+    therefore `load_all_variants`) only ever exports the kept
+    calibration-relevant sample-group population plus ClinVar-VUS variants
+    outside it (`_get_vus_only_extra_rows`) -- the remainder (assay-scored
+    variants that are neither a labeled control nor a ClinVar VUS, often the
+    majority of a dataset) never appears anywhere in that output. Use this
+    function instead when a count needs to reflect literally everything the
+    assay measured (e.g. a manuscript's "variant effect measurements" total),
+    not just the subset ExCALIBR's own evidence/confusion-matrix pipeline
+    analyzes.
+
+    Returns one dict per group: {variant_id, score, standard_points, is_vus,
+    nucleotide_or_aa, aa_ref, aa_pos, aa_alt}. `standard_points` is always
+    the in-bag assignment (`_assign_points` against `point_ranges`) -- no
+    OOB points are available for most of this population, since a variant
+    outside every fitting-relevant sample group was never part of any
+    bootstrap's training/validation split (same reasoning
+    `_get_vus_only_extra_rows`'s docstring already gives for its own extra
+    rows).
+    """
+    if not (hasattr(scoreset, "get_variants_by_id")):
+        return []
+    rows = []
+    for key, variants in scoreset.get_variants_by_id().items():
+        v0 = variants[0]
+        if not hasattr(v0, "ID"):
+            continue
+        score = float(v0.assay_score)
+        rows.append({
+            "variant_id": f"{key}_{v0.Gene}_{v0.Chrom}_{v0.hgvs_c}",
+            "score": score,
+            "standard_points": _assign_points(score, point_ranges),
+            "is_vus": any(getattr(v, "is_vus", False) for v in variants),
+            "nucleotide_or_aa": getattr(v0, "nucleotide_or_aa", None),
+            "aa_ref": getattr(v0, "aa_ref", None),
+            "aa_pos": getattr(v0, "aa_pos", None),
+            "aa_alt": getattr(v0, "aa_alt", None),
+        })
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Standard (in-bag) per-variant assignment
 # ---------------------------------------------------------------------------

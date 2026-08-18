@@ -286,6 +286,15 @@ class PipelineConfig:
     min_clinvar_star: int = 1
     synonymous_exclusive: bool = False
 
+    # Splice-filter ablation knobs, forwarded to Scoreset.splicing_filter via
+    # load_dataset_from_df -- same two knobs hpc/prepare.py already exposes
+    # for the bootstrap-fitting side (analysis/build_splice_ablation_jobs.py),
+    # needed here too so a second-stage run_igvf_batch.py invocation can
+    # reproduce a specific splice-ablation condition's variant population
+    # instead of silently falling back to Scoreset's own hardcoded defaults.
+    spliceai_threshold: Optional[float] = 0.2
+    vep_splice_filter: bool = True
+
     # Progress reporting (optional — used by web backend)
     # If set, the pipeline writes structured JSON progress updates to this path.
     # Has no effect on pipeline behaviour or output when None (the default).

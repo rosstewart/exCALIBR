@@ -224,7 +224,15 @@ def _export_panel_c(output_dir: str, dataset_tsv: str, dataset_configs_path: str
 
     primary_method = sorted(df["method"].unique())[0]
     df_m = df[df["method"] == primary_method]
-    dataset_names = sorted(df_m["dataset"].unique())
+    # F9/TP53 excluded -- those two genes use separate classifier models to
+    # integrate multiple datasets (same exclusion analyze_pipeline_output.py's
+    # section 3a1/7 apply to the danzs_oob/auths_oob it passes build_figure4
+    # directly), so this bundled panel_c.json stays consistent with a
+    # notebook-driven reproduction rather than silently including them here.
+    F9_TP53_GENES = {"F9", "TP53"}
+    dataset_names = sorted(
+        d for d in df_m["dataset"].unique() if d.split("_")[0] not in F9_TP53_GENES
+    )
 
     danzs, auths, vus, auth_vus = [], [], [], []
     for dataset in dataset_names:

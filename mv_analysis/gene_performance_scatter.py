@@ -252,6 +252,33 @@ def _gene_row(gene, gene_set, ms, results_json, dataset_name, aux_idx=None,
         return None
 
 
+def _select_connected_datasets(df_integrated, gene, datasets, scoreset_kwargs, min_overlap_rows=30):
+    """Reduce `datasets` down to the subset the real bootstrap fit was
+    actually trained on, matching hpc/prepare.py's job-generation logic
+    (Fit._select_calibration_dims: pairwise-overlap->=min_overlap_rows graph,
+    keep the largest multi-dim connected component). Building the plain-
+    integrated ms from ALL currently-available datasets for a gene (rather
+    than the historically-selected subset) produces more dimensions than the
+    stored fit's parameters have rows for -- confirmed via IndexError
+    ("index 7 is out of bounds for axis 0 with size 4") for BRCA2, and via
+    a direct pairwise-overlap check for KCNH2 (Jiang_2022<->
+    O_Neill_2024_surface_expression overlap=43 clears 30; Kozek_Glazer_2020's
+    overlap with either is only 1/18, so it's correctly excluded from the
+    real 2D historical fit but was previously included here unconditionally).
+    Returns the filtered (possibly empty) dataset list."""
+    if len(datasets) <= 1:
+        return datasets
+    ms_full = build_multiscoreset_from_long_dataframe(
+        df_integrated, gene, datasets, scoreset_kwargs=scoreset_kwargs,
+    )
+    if ms_full is None:
+        return datasets
+    kept_idx = Fit._select_calibration_dims(ms_full.scores, min_overlap_rows)
+    if not kept_idx:
+        return []
+    return [ms_full.dataset_names[i] for i in kept_idx]
+
+
 # ── Panel A: functional-only, 34 genes ───────────────────────────────────────
 
 def build_panel_a(results_json, cache_dir=None):
@@ -308,6 +335,27 @@ def build_panel_a(results_json, cache_dir=None):
             if not datasets:
                 print(f"  [{gene}] no functional datasets in integrated dataframe, skipping")
                 continue
+            scoreset_kwargs = dict(
+                clinvar_release=resolve_clinvar_release(gene),
+                min_clinvar_star=1, population_type="gnomAD",
+            )
+            # Reduce to the historically-fitted dimension subset (see
+            # _select_connected_datasets) -- the raw `datasets` list above is
+            # every dataset currently in the dataframe for this gene, which
+            # can include more dimensions than the stored bootstrap fit was
+            # actually trained on (confirmed for BRCA2: 8 datasets now vs. a
+            # 4-dim stored fit -> IndexError; KCNH2: Kozek_Glazer_2020 has
+            # negligible overlap with the other 2 datasets and was correctly
+            # excluded from the real 2D fit).
+            selected = _select_connected_datasets(
+                df_integrated, gene, datasets, scoreset_kwargs, min_overlap_rows=30)
+            if not selected:
+                print(f"  [{gene}] no dataset pair clears the overlap threshold, skipping")
+                continue
+            if set(selected) != set(datasets):
+                print(f"  [{gene}] dimension-selection reduced {len(datasets)} -> "
+                      f"{len(selected)} datasets: {selected}")
+            datasets = selected
             # Canonical builder for the plain-"integrated" gene-set (matches
             # hpc/prepare.py::_process_multivariate_gene exactly, which is
             # what these genes' MV fits were actually trained on) -- NOT
@@ -318,11 +366,7 @@ def build_panel_a(results_json, cache_dir=None):
             # "0/1000 valid bootstraps" for BRCA2/F9/KCNH2 with the old
             # builder).
             ms = build_multiscoreset_from_long_dataframe(
-                df_integrated, gene, datasets,
-                scoreset_kwargs=dict(
-                    clinvar_release=resolve_clinvar_release(gene),
-                    min_clinvar_star=1, population_type="gnomAD",
-                ),
+                df_integrated, gene, datasets, scoreset_kwargs=scoreset_kwargs,
             )
             if ms is None:
                 print(f"  [{gene}] fewer than 2 usable dimensions, skipping")

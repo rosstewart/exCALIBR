@@ -367,6 +367,30 @@ if any(a is not None for a in auths):
         vus_coverages_m2=auth_vus_by_method[primary_method],
     )
 
+# ExCALIBR vs. author, F9/TP53 excluded -- same F9/TP53 special-casing
+# section 10 applies to the manuscript summary numbers (those two genes use
+# separate classifier models to integrate multiple datasets), applied here
+# to the primary confusion panel itself rather than only the headline
+# numbers. Gene is derived from the dataset name the same way section 10
+# and _build_all_variant_groups_for_dataset already do.
+F9_TP53_GENES = {"F9", "TP53"}
+_dataset_genes = [d.split("_")[0] for d in datasets]
+_keep_idx = [i for i, g in enumerate(_dataset_genes) if g not in F9_TP53_GENES]
+datasets_no_f9_tp53 = [datasets[i] for i in _keep_idx]
+conf_no_f9_tp53 = [conf_by_method[primary_method][i] for i in _keep_idx]
+auth_no_f9_tp53 = [auth_by_method[primary_method][i] for i in _keep_idx]
+vus_no_f9_tp53 = [vus_by_method[primary_method][i] for i in _keep_idx]
+auth_vus_no_f9_tp53 = [auth_vus_by_method[primary_method][i] for i in _keep_idx]
+
+if any(a is not None for a in auth_no_f9_tp53):
+    make_confusion_figure(
+        danzs_m1=conf_no_f9_tp53, danzs_m2=auth_no_f9_tp53,
+        dataset_names=datasets_no_f9_tp53, label1=primary_method, label2="author",
+        figure_dir=FIGURE_SUBDIRS["author"], filename="excalibr_vs_author_no_f9_tp53.png",
+        vus_coverages_m1=vus_no_f9_tp53,
+        vus_coverages_m2=auth_vus_no_f9_tp53,
+    )
+
 # %% [markdown]
 # ### 3a1b. ExCALIBR vs. author, determinate-determinate calls only
 #
@@ -469,6 +493,27 @@ if deduped_matrix_for_author is not None and deduped_author_matrix is not None:
     )
 else:
     print("  SKIP gene-deduplicated ExCALIBR-vs-author figure: no matrix on one or both sides")
+
+# Gene-deduplicated ExCALIBR-vs-author, F9/TP53 excluded -- same rationale
+# as the regular F9/TP53-excluded panel above, applied to the gene-deduped
+# scope instead.
+deduped_variants_no_f9_tp53 = deduped_variants[~deduped_variants["gene"].isin(F9_TP53_GENES)]
+deduped_variants_with_author_no_f9_tp53 = restrict_to_genes_with_author_data(deduped_variants_no_f9_tp53)
+deduped_matrix_for_author_no_f9_tp53 = build_deduped_confusion_matrix(deduped_variants_with_author_no_f9_tp53)
+deduped_author_matrix_no_f9_tp53 = build_deduped_author_confusion_matrix(deduped_variants_with_author_no_f9_tp53)
+deduped_vus_for_author_no_f9_tp53 = build_vus_coverage(deduped_variants_with_author_no_f9_tp53, points_col="points")
+deduped_author_vus_no_f9_tp53 = build_author_vus_coverage(deduped_variants_with_author_no_f9_tp53)
+
+if deduped_matrix_for_author_no_f9_tp53 is not None and deduped_author_matrix_no_f9_tp53 is not None:
+    make_confusion_figure(
+        danzs_m1=[deduped_matrix_for_author_no_f9_tp53], danzs_m2=[deduped_author_matrix_no_f9_tp53],
+        dataset_names=["gene_deduped"], label1=primary_method, label2="author",
+        figure_dir=FIGURE_SUBDIRS["author"], filename="excalibr_vs_author_gene_deduped_no_f9_tp53.png",
+        vus_coverages_m1=[deduped_vus_for_author_no_f9_tp53],
+        vus_coverages_m2=[deduped_author_vus_no_f9_tp53],
+    )
+else:
+    print("  SKIP gene-deduplicated (F9/TP53 excluded) ExCALIBR-vs-author figure: no matrix on one or both sides")
 
 # %% [markdown]
 # ### 3a2. ExCALIBR vs. other comparison methods
@@ -982,25 +1027,47 @@ if not config.warn_if_missing(config.ROBUSTNESS_OUTPUT_DIR, "robustness analysis
     # All base datasets' (perturbation_type, level) config-summary figures
     # rendered in one parallel batch -- each is an independent, self-
     # contained unit of work (its own pooled_fits_for_level + sample_density
-    # call), the actual cost driver for this section.
+    # call), the actual cost driver for this section. display_images=False:
+    # still rendered and saved to disk, just not dumped inline here too --
+    # this is easily 30+ figures per run, too many to scroll through.
     run_config_summary_plots_batch(
         config_summary_jobs, figure_dir=FIGURE_DIR, robustness_output_dir=config.ROBUSTNESS_OUTPUT_DIR,
+        display_images=False,
     )
 
     # Confusion-matrix grids: 4 columns (one per robustness base dataset) x
     # one row per condition level (control first, then descending downsample
     # N / ascending discordance fraction) -- the same diverging Blue/Gray/Red
     # style used everywhere else, plus each cell's strongest pathogenic/
-    # benign evidence point ("Max strengths: +X, -Y").
+    # benign evidence point ("Max strengths: +X, -Y"). show=False: still
+    # saved to disk, just not displayed inline (same reasoning as
+    # display_images=False above).
     if robustness_matrices:
         plot_robustness_confusion_matrix_grid(
             robustness_matrices, robustness_max_strengths, "downsample",
-            base_datasets=list(robustness_matrices.keys()), figure_dir=FIGURE_DIR,
+            base_datasets=list(robustness_matrices.keys()), figure_dir=FIGURE_DIR, show=False,
         )
         plot_robustness_confusion_matrix_grid(
             robustness_matrices, robustness_max_strengths, "discordance",
-            base_datasets=list(robustness_matrices.keys()), figure_dir=FIGURE_DIR,
+            base_datasets=list(robustness_matrices.keys()), figure_dir=FIGURE_DIR, show=False,
         )
+
+        # Same per-cell seed-to-seed data as the grids above, as a LaTeX
+        # table (accuracy + determinate % + max pathogenic/benign evidence
+        # strength, median [IQR] across the 10 seeds) instead of a figure
+        # caption.
+        from analysis.robustness import robustness_seed_metrics_table
+        from analysis.manuscript_stats import latex_robustness_metrics_table
+
+        for _ptype in ("downsample", "discordance"):
+            _robustness_table_df = robustness_seed_metrics_table(
+                robustness_summaries, robustness_max_strengths, _ptype, list(robustness_matrices.keys()),
+            )
+            if not _robustness_table_df.empty:
+                _robustness_latex = latex_robustness_metrics_table(_robustness_table_df, _ptype)
+                save_latex_table(
+                    _robustness_latex, FIGURE_SUBDIRS["tables"] / f"robustness_{_ptype}_confusion_grid_metrics.tex",
+                )
 
 # %% [markdown]
 # ### 3a6. Bootstrap-count-reduction analysis
@@ -1143,6 +1210,47 @@ if _auth_pairs:
     save_latex_table(_clinvar_perf_latex, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance.tex")
 else:
     print("  SKIP aggregate performance report: no datasets with both ExCALIBR and author matrices")
+
+# Same aggregate report + LaTeX table, F9/TP53 excluded -- reuses the
+# conf_no_f9_tp53/auth_no_f9_tp53/datasets_no_f9_tp53 lists built in 3a1
+# above, no new matrix construction.
+_auth_pairs_no_f9_tp53 = [
+    (d, a, n) for d, a, n in zip(conf_no_f9_tp53, auth_no_f9_tp53, datasets_no_f9_tp53)
+    if d is not None and a is not None
+]
+if _auth_pairs_no_f9_tp53:
+    _danzs_a, _auths_a, _names_a = zip(*_auth_pairs_no_f9_tp53)
+    danz_agg_no_f9_tp53, auth_agg_no_f9_tp53, _ = print_aggregate_performance(
+        list(_danzs_a), list(_auths_a), list(_names_a),
+    )
+    _latex_no_f9_tp53 = latex_performance_table_clinvar(danz_agg_no_f9_tp53, auth_agg_no_f9_tp53)
+    save_latex_table(_latex_no_f9_tp53, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance_no_f9_tp53.tex")
+else:
+    print("  SKIP aggregate performance report (F9/TP53 excluded): no datasets with both matrices")
+
+# Same aggregate report + LaTeX table, gene-deduplicated -- reuses the
+# deduped_matrix_for_author/deduped_author_matrix matrices built in 3a1c.
+if deduped_matrix_for_author is not None and deduped_author_matrix is not None:
+    danz_agg_deduped, auth_agg_deduped, _ = print_aggregate_performance(
+        [deduped_matrix_for_author], [deduped_author_matrix], ["gene_deduped"],
+    )
+    _latex_deduped = latex_performance_table_clinvar(danz_agg_deduped, auth_agg_deduped)
+    save_latex_table(_latex_deduped, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance_gene_deduped.tex")
+else:
+    print("  SKIP aggregate performance report (gene-deduped): no matrix on one or both sides")
+
+# Same aggregate report + LaTeX table, gene-deduplicated with F9/TP53
+# excluded -- reuses the matrices built in 3a1c's F9/TP53-excluded panel.
+if deduped_matrix_for_author_no_f9_tp53 is not None and deduped_author_matrix_no_f9_tp53 is not None:
+    danz_agg_deduped_no_f9_tp53, auth_agg_deduped_no_f9_tp53, _ = print_aggregate_performance(
+        [deduped_matrix_for_author_no_f9_tp53], [deduped_author_matrix_no_f9_tp53], ["gene_deduped"],
+    )
+    _latex_deduped_no_f9_tp53 = latex_performance_table_clinvar(danz_agg_deduped_no_f9_tp53, auth_agg_deduped_no_f9_tp53)
+    save_latex_table(
+        _latex_deduped_no_f9_tp53, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance_gene_deduped_no_f9_tp53.tex",
+    )
+else:
+    print("  SKIP aggregate performance report (gene-deduped, F9/TP53 excluded): no matrix on one or both sides")
 
 # Same aggregate report, restricted to the subset of datasets each comparison
 # method (acmgscaler, the gmm baselines) could actually be calibrated on --
@@ -1555,16 +1663,18 @@ else:
 # %%
 from analysis.figure4 import driver as figure4_driver
 
-# Reuse the confusion matrices already built in section 3 (primary_method's
-# danz/auth matrices) instead of having build_figure4 re-discover pipeline
-# output, re-load every variants CSV, and rebuild author labels from scratch.
+# Reuse the confusion matrices already built in section 3a1 (F9/TP53
+# excluded, non-deduplicated -- variant-effect-measurement level, not
+# 3a1c's gene-deduplicated F9/TP53-excluded variant) instead of having
+# build_figure4 re-discover pipeline output, re-load every variants CSV,
+# and rebuild author labels from scratch.
 figure4_driver.build_figure4(
     output_dir=OUTPUT_DIR, figure_dir=FIGURE_SUBDIRS["manuscript"],
-    danzs_oob=conf_by_method[primary_method],
-    auths_oob=auth_by_method[primary_method],
-    dataset_names=datasets,
-    vus_pct_danz=_aggregate_coverage_pct(vus_by_method[primary_method]),
-    vus_pct_auth=_aggregate_coverage_pct(auth_vus_by_method[primary_method]),
+    danzs_oob=conf_no_f9_tp53,
+    auths_oob=auth_no_f9_tp53,
+    dataset_names=datasets_no_f9_tp53,
+    vus_pct_danz=_aggregate_coverage_pct(vus_no_f9_tp53),
+    vus_pct_auth=_aggregate_coverage_pct(auth_vus_no_f9_tp53),
 )
 
 # %% [markdown]
@@ -1674,17 +1784,94 @@ vus_evidence_df
 # Computes the headline numbers behind the ExCALIBR Results paragraph:
 # genes reached, overall benign/pathogenic evidence totals, ExCALIBR-vs-
 # functional-annotation agreement with ClinVar controls, VUS coverage of the
-# indeterminate range, and the OddsPath-approach coverage gap. Scope is every
-# gene in this pipeline run except `EXCLUDED_GENES` (F9/TP53 use separate
-# classifier models to integrate multiple datasets; SFPQ remains a candidate
-# disease gene) -- biobank/All-of-Us association numbers are out of scope
-# entirely (nothing in this pipeline supports them).
+# indeterminate range, and the OddsPath-approach coverage gap. Printed twice:
+# once for every gene in this pipeline run ("all genes" -- still excludes
+# `DEFAULT_EXCLUDED_DATASETS`' F9_Popp_2025_model/TP53_Fayer_2021_meta_
+# clinvar_2018/SFPQ_IGVF, same as every other section in this notebook, since
+# those never make it into `df` at all -- see analysis/discovery.py), and
+# once with `EXCLUDED_GENES` (F9/TP53 use separate classifier models to
+# integrate multiple datasets; SFPQ remains a candidate disease gene) fully
+# dropped -- biobank/All-of-Us association numbers are out of scope entirely
+# (nothing in this pipeline supports them).
 #
-# `EXCLUDED_GENES` only ever derives new, section-local variables below
-# (`deduped_scope`, `df_scope`, ...) -- it never filters or mutates
+# `_compute_manuscript_summary`'s `excluded_genes` argument only ever derives
+# new, function-local variables -- it never filters or mutates
 # `deduped_variants`, `df_primary_dedup`, or any object shared with the
 # figures/matrices built earlier in this notebook, which keep including
 # every gene exactly as before.
+
+# %% [markdown]
+# ExCALIBR scores every variant the underlying assay measured, not just the
+# subset that ends up in a calibration-relevant sample group (P/LP, B/LB,
+# gnomAD, Synonymous) or is a ClinVar VUS -- but `load_all_variants` (and
+# therefore `df`/`deduped_variants` used everywhere else in this notebook)
+# only ever exports that kept-plus-VUS subset, since that's all
+# ExCALIBR's own evidence/confusion-matrix pipeline needs. "Variant effect
+# measurements" for the manuscript, though, means literally everything the
+# assay measured -- so this rebuilds each dataset's Scoreset (same pattern
+# `analysis.clingen`/`analysis.author_labels` already use for their own
+# side-channel needs) and pulls every `get_variants_by_id()` group via the
+# new `get_all_variant_groups` (src/assay_calibration/pipeline/
+# variant_evidence.py), not just the kept/VUS-only ones. This never touches
+# `df`/`load_all_variants`'s own output -- purely additive, computed once
+# here and reused by both `_compute_manuscript_summary` calls below.
+
+# %%
+import json as _json
+from joblib import Parallel as _Parallel, delayed as _delayed
+from analysis.discovery import (
+    resolve_dataset_tsv_name, resolve_component, _filter_dataset_df, load_master_df, _resolve_n_jobs,
+)
+from src.assay_calibration.pipeline.config import PipelineConfig as _PipelineConfig
+from src.assay_calibration.pipeline.utils import load_dataset_from_df as _load_dataset_from_df
+from src.assay_calibration.pipeline.variant_evidence import get_all_variant_groups
+
+
+def _build_all_variant_groups_for_dataset(dataset, df_ds):
+    comp = resolve_component(dataset, list(tree[dataset].keys()), model_selections, dataset_configs)
+    cal_path = (calibrations or {}).get(dataset, {}).get(primary_method, {}).get(comp)
+    if cal_path is None:
+        return []
+    with open(cal_path) as f:
+        calibration = _json.load(f)
+    clinvar_release = "2018" if "_clinvar_2018" in dataset else "2025"
+    pcfg = _PipelineConfig(
+        dataset_csv=str(DATASET_TSV), dataset_name=dataset, output_dir="/tmp", clinvar_release=clinvar_release,
+    )
+    scoreset = _load_dataset_from_df(df_ds, pcfg)
+    rows = get_all_variant_groups(scoreset, calibration["point_ranges"])
+    for r in rows:
+        r["dataset"] = dataset
+        r["gene"] = dataset.split("_")[0]
+        r["sample"] = None
+    return rows
+
+
+# Slice each dataset's own (small) master-TSV subset ONCE here, in this
+# process, before dispatching to joblib workers -- mirrors load_all_variants'
+# own comment on why this matters: reading DATASET_TSV per-worker instead
+# (inside the parallel function) means every worker process independently
+# re-reads/re-parses the entire multi-GB master TSV from disk.
+_all_groups_datasets = sorted(df_primary_dedup["dataset"].unique())
+_df_full_for_all_groups = load_master_df(DATASET_TSV)
+_all_groups_df_ds = {}
+for _ds in _all_groups_datasets:
+    try:
+        _all_groups_df_ds[_ds] = _filter_dataset_df(_df_full_for_all_groups, _ds, DATASET_TSV)
+    except Exception as e:
+        print(f"  WARNING: could not slice {_ds} for all-variant-groups: {e}")
+del _df_full_for_all_groups
+
+_all_groups_results = _Parallel(n_jobs=_resolve_n_jobs(-1))(
+    _delayed(_build_all_variant_groups_for_dataset)(ds, _all_groups_df_ds[ds])
+    for ds in _all_groups_datasets if ds in _all_groups_df_ds
+)
+df_all_groups = pd.DataFrame(
+    [row for rows in _all_groups_results for row in rows]
+)
+print(f"All-variant-groups population: {len(df_all_groups):,} rows across "
+      f"{df_all_groups['dataset'].nunique()} datasets (vs {len(df_primary_dedup):,} rows in the "
+      f"kept+VUS-only population load_all_variants exports)")
 
 # %%
 from analysis.plot_common import effective_points as _effective_points_summary
@@ -1692,108 +1879,312 @@ from src.assay_calibration.plot_utils.utils import compute_aggregate_metrics
 
 EXCLUDED_GENES = {"F9", "TP53", "SFPQ"}
 
-# -- 1. Gene scope --------------------------------------------------------
-deduped_scope = deduped_variants[~deduped_variants["gene"].isin(EXCLUDED_GENES)]
-n_genes_summary = deduped_scope["gene"].nunique()
-n_genes_with_evidence = deduped_scope.loc[deduped_scope["points"] != 0, "gene"].nunique()
 
-# -- 2. Overall variant effect measurement / unique variant totals --------
-df_scope = df_primary_dedup.copy()
-df_scope["gene"] = df_scope["dataset"].str.split("_").str[0]
-df_scope = df_scope[~df_scope["gene"].isin(EXCLUDED_GENES)]
-_pts_scope = _effective_points_summary(df_scope, use_oob=True, label="manuscript_summary", context="all")
-n_vem_total = len(df_scope)
-n_vem_benign = int((_pts_scope < 0).sum())
-n_vem_pathogenic = int((_pts_scope > 0).sum())
-n_unique_variants = len(deduped_scope)
+def _compute_manuscript_summary(excluded_genes: set, label: str, use_gene_dedup: bool = True) -> dict:
+    # -- 1. Gene scope --------------------------------------------------------
+    deduped_scope = deduped_variants[~deduped_variants["gene"].isin(excluded_genes)]
+    n_genes_summary = deduped_scope["gene"].nunique()
+    n_genes_with_evidence = deduped_scope.loc[deduped_scope["points"] != 0, "gene"].nunique()
 
-# -- 3. ExCALIBR vs functional-annotation agreement with ClinVar controls --
-deduped_scope_with_author = restrict_to_genes_with_author_data(deduped_scope)
-excalibr_matrix_summary = build_deduped_confusion_matrix(deduped_scope_with_author)
-author_matrix_summary = build_deduped_author_confusion_matrix(deduped_scope_with_author)
-if excalibr_matrix_summary is not None and author_matrix_summary is not None:
-    danz_agg_summary, auth_agg_summary, _ = compute_aggregate_metrics(
-        danzs=[excalibr_matrix_summary], auths=[author_matrix_summary],
-        dataset_names=["gene_deduped_scope"],
-    )
-    excalibr_agreement_pct = danz_agg_summary["accuracy"] * 100
-    author_agreement_pct = auth_agg_summary["accuracy"] * 100
-else:
-    excalibr_agreement_pct = None
-    author_agreement_pct = None
+    # -- 2. Overall variant effect measurement / unique variant totals --------
+    # Uses df_all_groups (every variant the assay measured), not df_primary_dedup
+    # (which only carries the kept sample-group + VUS-only subset) -- see the
+    # markdown cell above. standard_points only (no OOB available for most of
+    # this population).
+    df_all_scope = df_all_groups[~df_all_groups["gene"].isin(excluded_genes)]
+    n_vem_total = len(df_all_scope)
+    n_vem_benign = int((df_all_scope["standard_points"] < 0).sum())
+    n_vem_pathogenic = int((df_all_scope["standard_points"] > 0).sum())
+    deduped_all_scope = build_gene_deduped_variants(df_all_scope, use_oob=False)
+    n_unique_variants = len(deduped_all_scope)
+    n_unique_variants_with_evidence = int((deduped_all_scope["points"] != 0).sum())
 
-# -- 4. VUS indeterminate-range coverage (ExCALIBR vs author) --------------
-excalibr_vus_summary = build_vus_coverage(deduped_scope_with_author, points_col="points")
-author_vus_summary = build_author_vus_coverage(deduped_scope_with_author)
+    # Kept sample-group + VUS-only population (df_primary_dedup, with real
+    # OOB points) -- used below (step 5) to decide whether ExCALIBR's actual
+    # evidence-assignment pipeline reached a dataset, and (step 3/4) via
+    # deduped_variants for ClinVar-agreement/VUS-coverage, which only make
+    # sense for ClinVar-labeled variants.
+    df_scope = df_primary_dedup.copy()
+    df_scope["gene"] = df_scope["dataset"].str.split("_").str[0]
+    df_scope = df_scope[~df_scope["gene"].isin(excluded_genes)]
 
-def _pct_indeterminate(coverage):
-    if coverage is None:
-        return None
-    n_determinate, n_vus = coverage
-    return 100 * (n_vus - n_determinate) / n_vus if n_vus else None
+    # -- 3/4. ExCALIBR vs functional-annotation agreement with ClinVar
+    # controls, and VUS indeterminate-range coverage (ExCALIBR vs author) ------
+    if use_gene_dedup:
+        # Variant-level, gene-deduplicated metrics (one row per unique
+        # physical variant, section 3a1c's population).
+        deduped_scope_with_author = restrict_to_genes_with_author_data(deduped_scope)
+        excalibr_matrix_summary = build_deduped_confusion_matrix(deduped_scope_with_author)
+        author_matrix_summary = build_deduped_author_confusion_matrix(deduped_scope_with_author)
+        if excalibr_matrix_summary is not None and author_matrix_summary is not None:
+            danz_agg_summary, auth_agg_summary, _ = compute_aggregate_metrics(
+                danzs=[excalibr_matrix_summary], auths=[author_matrix_summary],
+                dataset_names=["gene_deduped_scope"],
+            )
+            excalibr_agreement_pct = danz_agg_summary["accuracy"] * 100
+            author_agreement_pct = auth_agg_summary["accuracy"] * 100
+        else:
+            excalibr_agreement_pct = None
+            author_agreement_pct = None
 
-pct_indeterminate_excalibr = _pct_indeterminate(excalibr_vus_summary)
-pct_indeterminate_author = _pct_indeterminate(author_vus_summary)
+        excalibr_vus_summary = build_vus_coverage(deduped_scope_with_author, points_col="points")
+        author_vus_summary = build_author_vus_coverage(deduped_scope_with_author)
 
-# -- 5. OddsPath-gap datasets ----------------------------------------------
-datasets_scope = sorted(df_scope["dataset"].unique())
-calibrated_datasets = [
-    ds for ds in datasets_scope
-    if (_effective_points_summary(
-        df_scope[df_scope["dataset"] == ds], use_oob=True, label=ds, context="all",
-    ) != 0).any()
-]
+        def _pct_indeterminate(coverage):
+            if coverage is None:
+                return None
+            n_determinate, n_vus = coverage
+            return 100 * (n_vus - n_determinate) / n_vus if n_vus else None
 
-n_additional = 0
-n_vem_additional = 0
-n_variants_additional = 0
-if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-code CSV (manuscript summary)"):
-    df_op_summary = pd.read_csv(config.OP_EVIDENCE_CODES_CSV)
-    oddspath_datasets = set(df_op_summary["Dataset"].unique())
-    additional_datasets = [d for d in calibrated_datasets if d not in oddspath_datasets]
-    n_additional = len(additional_datasets)
-    df_additional = df_scope[df_scope["dataset"].isin(additional_datasets)]
-    n_vem_additional = len(df_additional)
-    deduped_additional = build_gene_deduped_variants(df_additional, use_oob=use_oob)
-    n_variants_additional = len(deduped_additional)
+        pct_indeterminate_excalibr = _pct_indeterminate(excalibr_vus_summary)
+        pct_indeterminate_author = _pct_indeterminate(author_vus_summary)
+    else:
+        # Variant-effect-measurement statistics: reuses section 3's own
+        # per-dataset conf_by_method/auth_by_method/vus_by_method/
+        # auth_vus_by_method lists (one entry per assay's copy of a variant,
+        # not deduplicated to one row per physical variant), restricted to
+        # this call's gene scope by dataset name -- same
+        # dataset.split("_")[0] convention used above and in
+        # _build_all_variant_groups_for_dataset.
+        _dataset_genes_summary = [d.split("_")[0] for d in datasets]
+        _keep_idx_summary = [i for i, g in enumerate(_dataset_genes_summary) if g not in excluded_genes]
+        _conf_scope = [conf_by_method[primary_method][i] for i in _keep_idx_summary]
+        _auth_scope = [auth_by_method[primary_method][i] for i in _keep_idx_summary]
+        _datasets_scope_names = [datasets[i] for i in _keep_idx_summary]
+        _vus_scope = [vus_by_method[primary_method][i] for i in _keep_idx_summary]
+        _auth_vus_scope = [auth_vus_by_method[primary_method][i] for i in _keep_idx_summary]
 
-# -- Summary ----------------------------------------------------------------
-print(f"\n{'=' * 80}\nMANUSCRIPT SUMMARY NUMBERS "
-      f"(scope: all genes except {sorted(EXCLUDED_GENES)})\n{'=' * 80}")
-print(f"Genes in scope: {n_genes_summary}")
-print(f"Genes with >=1 point of pathogenic or benign evidence: {n_genes_with_evidence}/{n_genes_summary}")
-print(f"Variant effect measurements: {n_vem_total:,} total "
-      f"({n_vem_benign:,} benign evidence, {n_vem_pathogenic:,} pathogenic evidence)")
-print(f"Unique variants (gene-deduplicated, aa/nt-separated): {n_unique_variants:,} "
-      f"across {n_genes_summary} genes")
-if excalibr_agreement_pct is not None:
-    print(f"Agreement with ClinVar PLP/BLB controls: "
-          f"ExCALIBR {excalibr_agreement_pct:.1f}% vs functional annotation {author_agreement_pct:.1f}%")
-else:
-    print("  SKIP agreement comparison: no author/ExCALIBR confusion matrix available in scope")
-if pct_indeterminate_excalibr is not None:
-    print(f"VUS assigned to indeterminate range: "
-          f"functional annotation {pct_indeterminate_author:.1f}% vs ExCALIBR {pct_indeterminate_excalibr:.1f}%"
-          if pct_indeterminate_author is not None else
-          f"VUS assigned to indeterminate range (ExCALIBR): {pct_indeterminate_excalibr:.1f}%")
-else:
-    print("  SKIP VUS coverage comparison: no VUS in scope")
-print(f"Datasets calibrated by ExCALIBR but not covered by the OddsPath approach: {n_additional} "
-      f"({n_vem_additional:,} variant effect measurements, {n_variants_additional:,} unique variants)")
+        if any(a is not None for a in _auth_scope):
+            danz_agg_summary, auth_agg_summary, _ = compute_aggregate_metrics(
+                danzs=_conf_scope, auths=_auth_scope, dataset_names=_datasets_scope_names,
+            )
+            excalibr_agreement_pct = danz_agg_summary["accuracy"] * 100
+            author_agreement_pct = auth_agg_summary["accuracy"] * 100
+        else:
+            excalibr_agreement_pct = None
+            author_agreement_pct = None
 
-manuscript_summary_df = pd.DataFrame([{
-    "n_genes": n_genes_summary,
-    "n_genes_with_evidence": n_genes_with_evidence,
-    "n_vem_total": n_vem_total,
-    "n_vem_benign": n_vem_benign,
-    "n_vem_pathogenic": n_vem_pathogenic,
-    "n_unique_variants": n_unique_variants,
-    "excalibr_agreement_pct": excalibr_agreement_pct,
-    "author_agreement_pct": author_agreement_pct,
-    "pct_indeterminate_excalibr": pct_indeterminate_excalibr,
-    "pct_indeterminate_author": pct_indeterminate_author,
-    "n_additional_oddspath_gap_datasets": n_additional,
-    "n_vem_additional_oddspath_gap": n_vem_additional,
-    "n_unique_variants_additional_oddspath_gap": n_variants_additional,
-}])
+        _excalibr_det_pct = _aggregate_coverage_pct(_vus_scope)
+        _author_det_pct = _aggregate_coverage_pct(_auth_vus_scope)
+        pct_indeterminate_excalibr = 100 - _excalibr_det_pct if _excalibr_det_pct is not None else None
+        pct_indeterminate_author = 100 - _author_det_pct if _author_det_pct is not None else None
+
+    # -- 5. OddsPath-gap datasets ----------------------------------------------
+    datasets_scope = sorted(df_scope["dataset"].unique())
+    calibrated_datasets = [
+        ds for ds in datasets_scope
+        if (_effective_points_summary(
+            df_scope[df_scope["dataset"] == ds], use_oob=True, label=ds, context="all",
+        ) != 0).any()
+    ]
+
+    n_additional = 0
+    n_vem_additional = 0
+    n_variants_additional = 0
+    n_variants_additional_with_evidence = 0
+    if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-code CSV (manuscript summary)"):
+        df_op_summary = pd.read_csv(config.OP_EVIDENCE_CODES_CSV)
+        # OP_EVIDENCE_CODES_CSV spells datasets without the pipeline's
+        # "_clinvar_2018" suffix (e.g. "BRCA1_Findlay_2018", "MSH2_Jia_2021",
+        # "TP53_Fortuno_2021") and can differ by the same old/frozen-name
+        # renames the master TSV does -- reuse resolve_dataset_tsv_name's
+        # canonical resolution chain (as-is -> new_dataset_names.csv ->
+        # DATASET_RENAMES) against this CSV instead of a bare `in` check,
+        # which would otherwise mistake 8 already-covered _clinvar_2018
+        # datasets (BRCA1_Adamovich x2, BRCA1_Findlay_2018, MSH2_Jia_2021,
+        # PTEN_Matreyek_2018, PTEN_Mighell_2018, TP53_Fortuno_2021,
+        # TP53_Funk_2025) for OddsPath coverage gaps.
+        additional_datasets = [
+            d for d in calibrated_datasets
+            if resolve_dataset_tsv_name(d.replace("_clinvar_2018", ""), df_op_summary, config.DATASET_TSV) is None
+        ]
+        n_additional = len(additional_datasets)
+        df_additional = df_all_scope[df_all_scope["dataset"].isin(additional_datasets)]
+        n_vem_additional = len(df_additional)
+        deduped_additional = build_gene_deduped_variants(df_additional, use_oob=False)
+        n_variants_additional = len(deduped_additional)
+        n_variants_additional_with_evidence = int((deduped_additional["points"] != 0).sum())
+
+    # -- Summary ----------------------------------------------------------------
+    print(f"\n{'=' * 80}\nMANUSCRIPT SUMMARY NUMBERS ({label})\n{'=' * 80}")
+    print(f"Genes in scope: {n_genes_summary}")
+    print(f"Genes with >=1 point of pathogenic or benign evidence: {n_genes_with_evidence}/{n_genes_summary}")
+    print(f"Variant effect measurements: {n_vem_total:,} total "
+          f"({n_vem_benign:,} benign evidence, {n_vem_pathogenic:,} pathogenic evidence)")
+    print(f"Unique variants (gene-deduplicated, aa/nt-separated): {n_unique_variants:,} "
+          f"across {n_genes_summary} genes ({n_unique_variants_with_evidence:,} with "
+          f"pathogenic or benign evidence)")
+    if excalibr_agreement_pct is not None:
+        print(f"Agreement with ClinVar PLP/BLB controls: "
+              f"ExCALIBR {excalibr_agreement_pct:.1f}% vs functional annotation {author_agreement_pct:.1f}%")
+    else:
+        print("  SKIP agreement comparison: no author/ExCALIBR confusion matrix available in scope")
+    if pct_indeterminate_excalibr is not None:
+        print(f"VUS assigned to indeterminate range: "
+              f"functional annotation {pct_indeterminate_author:.1f}% vs ExCALIBR {pct_indeterminate_excalibr:.1f}%"
+              if pct_indeterminate_author is not None else
+              f"VUS assigned to indeterminate range (ExCALIBR): {pct_indeterminate_excalibr:.1f}%")
+    else:
+        print("  SKIP VUS coverage comparison: no VUS in scope")
+    print(f"Datasets calibrated by ExCALIBR but not covered by the OddsPath approach: {n_additional} "
+          f"({n_vem_additional:,} variant effect measurements, {n_variants_additional:,} unique variants, "
+          f"{n_variants_additional_with_evidence:,} with pathogenic or benign evidence)")
+
+    return {
+        "scope": label,
+        "n_genes": n_genes_summary,
+        "n_genes_with_evidence": n_genes_with_evidence,
+        "n_vem_total": n_vem_total,
+        "n_vem_benign": n_vem_benign,
+        "n_vem_pathogenic": n_vem_pathogenic,
+        "n_unique_variants": n_unique_variants,
+        "n_unique_variants_with_evidence": n_unique_variants_with_evidence,
+        "excalibr_agreement_pct": excalibr_agreement_pct,
+        "author_agreement_pct": author_agreement_pct,
+        "pct_indeterminate_excalibr": pct_indeterminate_excalibr,
+        "pct_indeterminate_author": pct_indeterminate_author,
+        "n_additional_oddspath_gap_datasets": n_additional,
+        "n_vem_additional_oddspath_gap": n_vem_additional,
+        "n_unique_variants_additional_oddspath_gap": n_variants_additional,
+        "n_unique_variants_additional_oddspath_gap_with_evidence": n_variants_additional_with_evidence,
+    }
+
+
+manuscript_summary_df = pd.DataFrame([
+    _compute_manuscript_summary(set(), label="all genes"),
+    _compute_manuscript_summary(EXCLUDED_GENES, label=f"excluding {sorted(EXCLUDED_GENES)}"),
+    _compute_manuscript_summary(set(), label="all genes (VEM stats)", use_gene_dedup=False),
+    _compute_manuscript_summary(
+        EXCLUDED_GENES, label=f"excluding {sorted(EXCLUDED_GENES)} (VEM stats)", use_gene_dedup=False,
+    ),
+])
 manuscript_summary_df
+
+# %% [markdown]
+# ## 11. Mode of inheritance (AD vs AR) performance comparison
+#
+# Supplementary analysis for a reviewer rebuttal: does ExCALIBR's
+# mode-of-inheritance (MOI)-agnostic calibration systematically bias
+# performance between Autosomal Dominant (AD) and Autosomal Recessive (AR)
+# genes? Mirrors section 3's main ExCALIBR-vs-ClinVar confusion matrix, but
+# split into two pooled panels (AD genes vs AR genes), plus a per-gene
+# statistical comparison (mean/median/n/p-value per metric).
+#
+# Gene-level MOI comes from ClinGen Gene-Disease Validity curations
+# (`config.CLINGEN_MOI_CSV`), filtered to Moderate+ confidence
+# (Definitive/Strong/Moderate -- drops Limited/Disputed/Refuted/No Known
+# Disease Relationship) and MOI in {AD, AR} (drops X-linked/Semidominant/
+# Mitochondrial/Undetermined-only genes entirely). Some genes have a
+# moderate+ entry for BOTH AD and AR (real biology -- e.g. BRCA1 is AD for
+# cancer predisposition, AR for Fanconi anemia); this is run twice, once
+# counting those dual-MOI genes in both groups and once dropping them from
+# both, so the AD/AR comparison doesn't depend on how that edge case is
+# handled. Gene scope is the full, unfiltered `deduped_variants` (matching
+# section 3's main confusion figure) -- not `EXCLUDED_GENES`-filtered.
+
+# %%
+from scipy import stats as sps
+from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+
+_MOI_METRICS = ["dor_standard", "accuracy", "coverage", "mcc", "sensitivity", "specificity"]
+_MOI_METRIC_LABELS = {
+    "dor_standard": "DOR", "accuracy": "Accuracy", "coverage": "Determinate %",
+    "mcc": "MCC", "sensitivity": "Sensitivity", "specificity": "Specificity",
+}
+
+if config.warn_if_missing(config.CLINGEN_MOI_CSV, "ClinGen gene-disease MOI CSV (AD vs AR comparison)"):
+    gene_to_moi_groups = {}
+else:
+    clingen_moi = pd.read_csv(config.CLINGEN_MOI_CSV, skiprows=4)
+    clingen_moi = clingen_moi[clingen_moi["GENE SYMBOL"] != "+++++++++++"]
+    clingen_moi = clingen_moi[clingen_moi["CLASSIFICATION"].isin(["Definitive", "Strong", "Moderate"])]
+    clingen_moi = clingen_moi[clingen_moi["MOI"].isin(["AD", "AR"])]
+    gene_to_moi_groups = clingen_moi.groupby("GENE SYMBOL")["MOI"].apply(set).to_dict()
+
+
+def _compute_moi_comparison(drop_dual_genes: bool, label: str):
+    all_genes_in_scope = sorted(deduped_variants["gene"].unique())
+    ad_genes = [g for g in all_genes_in_scope if "AD" in gene_to_moi_groups.get(g, set())]
+    ar_genes = [g for g in all_genes_in_scope if "AR" in gene_to_moi_groups.get(g, set())]
+    if drop_dual_genes:
+        dual_genes = sorted(set(ad_genes) & set(ar_genes))
+        ad_genes = [g for g in ad_genes if g not in dual_genes]
+        ar_genes = [g for g in ar_genes if g not in dual_genes]
+    else:
+        dual_genes = sorted(set(ad_genes) & set(ar_genes))
+
+    print(f"\n{'=' * 80}\nMODE OF INHERITANCE COMPARISON ({label})\n{'=' * 80}")
+    print(f"AD genes (n={len(ad_genes)}): {ad_genes}")
+    print(f"AR genes (n={len(ar_genes)}): {ar_genes}")
+    print(f"Dual-MOI genes (AD and AR, {'dropped' if drop_dual_genes else 'counted in both'}, "
+          f"n={len(dual_genes)}): {dual_genes}")
+
+    per_gene_rows = []
+    for gene in sorted(set(ad_genes) | set(ar_genes)):
+        matrix = build_deduped_confusion_matrix(deduped_variants[deduped_variants["gene"] == gene])
+        if matrix is None:
+            print(f"  SKIP {gene}: no P/LP or B/LB variants in scope")
+            continue
+        metrics = compute_classification_metrics(matrix)
+        per_gene_rows.append({"gene": gene, **{m: metrics[m] for m in _MOI_METRICS}})
+    per_gene_metrics = pd.DataFrame(per_gene_rows)
+
+    long_rows = []
+    if not per_gene_metrics.empty:
+        for group_label, group_genes in (("AD", ad_genes), ("AR", ar_genes)):
+            sub = per_gene_metrics[per_gene_metrics["gene"].isin(group_genes)].copy()
+            sub["moi_group"] = group_label
+            long_rows.append(sub)
+    moi_long_df = pd.concat(long_rows, ignore_index=True) if long_rows else pd.DataFrame()
+
+    summary_rows = []
+    for metric in _MOI_METRICS:
+        ad_vals = moi_long_df.loc[moi_long_df["moi_group"] == "AD", metric].to_numpy()
+        ar_vals = moi_long_df.loc[moi_long_df["moi_group"] == "AR", metric].to_numpy()
+        # dor_standard is deliberately float('inf') from compute_classification_metrics
+        # whenever a gene's pooled controls have zero FP or zero FN -- expected and
+        # common for our small-per-gene-control-count genes. Averaging inf into a
+        # mean/median silently breaks the whole comparison, so exclude non-finite
+        # values from this metric's summary stats and report the exclusion count
+        # instead of hiding it.
+        ad_finite = ad_vals[np.isfinite(ad_vals)]
+        ar_finite = ar_vals[np.isfinite(ar_vals)]
+        n_inf_ad = len(ad_vals) - len(ad_finite)
+        n_inf_ar = len(ar_vals) - len(ar_finite)
+        if len(ad_finite) and len(ar_finite):
+            p_value = sps.mannwhitneyu(ad_finite, ar_finite, alternative="two-sided").pvalue
+        else:
+            p_value = None
+        summary_rows.append({
+            "metric": _MOI_METRIC_LABELS[metric],
+            "mean_AD": np.mean(ad_finite) if len(ad_finite) else None,
+            "mean_AR": np.mean(ar_finite) if len(ar_finite) else None,
+            "mean_diff": (np.mean(ad_finite) - np.mean(ar_finite))
+                         if len(ad_finite) and len(ar_finite) else None,
+            "median_AD": np.median(ad_finite) if len(ad_finite) else None,
+            "median_AR": np.median(ar_finite) if len(ar_finite) else None,
+            "n_AD": len(ad_finite),
+            "n_AR": len(ar_finite),
+            "n_dor_inf_AD": n_inf_ad if metric == "dor_standard" else None,
+            "n_dor_inf_AR": n_inf_ar if metric == "dor_standard" else None,
+            "p_value": p_value,
+        })
+    moi_comparison_df = pd.DataFrame(summary_rows)
+    print(f"\n{moi_comparison_df.round(4).to_string(index=False)}")
+
+    ad_pooled_matrix = build_deduped_confusion_matrix(deduped_variants[deduped_variants["gene"].isin(ad_genes)])
+    ar_pooled_matrix = build_deduped_confusion_matrix(deduped_variants[deduped_variants["gene"].isin(ar_genes)])
+    fig_filename = f"supp_fig_AD_vs_AR_confusion{'_dual_dropped' if drop_dual_genes else ''}.png"
+    if ad_pooled_matrix is not None and ar_pooled_matrix is not None:
+        make_confusion_figure(
+            danzs_m1=[ad_pooled_matrix], danzs_m2=[ar_pooled_matrix], dataset_names=["AD_vs_AR"],
+            label1="AD", label2="AR", figure_dir=FIGURE_SUBDIRS["manuscript"], filename=fig_filename,
+        )
+    else:
+        print(f"  SKIP {fig_filename}: no P/LP or B/LB variants in one or both groups")
+
+    return moi_comparison_df
+
+
+moi_comparison_dual_counted_df = _compute_moi_comparison(drop_dual_genes=False, label="dual-MOI genes counted in both groups")
+moi_comparison_dual_dropped_df = _compute_moi_comparison(drop_dual_genes=True, label="dual-MOI genes dropped")

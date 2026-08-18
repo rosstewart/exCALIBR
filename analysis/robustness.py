@@ -1096,6 +1096,7 @@ def run_config_summary_plots_batch(
     robustness_output_dir: Optional[str] = None,
     bootstrap_results_path: Optional[str] = None,
     n_jobs: int = -1,
+    display_images: bool = True,
 ):
     """Parallel version of calling run_config_summary_plots once per
     (base_dataset, reference_df, reference_calibration_path) triple in
@@ -1108,6 +1109,12 @@ def run_config_summary_plots_batch(
 
     n_jobs=-1 (default) caps at min(len(tasks), affinity-visible cores) --
     more workers than tasks just wastes process-startup for no benefit.
+
+    `display_images=False` still renders and saves every PNG to disk (each
+    worker's own file write is unaffected), it just skips this function's
+    own post-batch inline display of every saved image back in the main
+    process -- for a caller with enough (base_dataset x level) combinations
+    that displaying all of them inline is too much to scroll through.
 
     ROBUSTNESS_BOOTSTRAP_RESULTS (the per-condition per-bootstrap fits used
     for row 0's density overlay) is decompressed exactly once here, in the
@@ -1157,7 +1164,7 @@ def run_config_summary_plots_batch(
         delayed(_run_config_summary_job)(*task) for task in tasks
     )
 
-    if is_notebook():
+    if display_images and is_notebook():
         from IPython.display import Image, display
         for _, err, out_path in results:
             if err is None and out_path is not None and out_path.exists():
@@ -1229,6 +1236,7 @@ def plot_robustness_confusion_matrix_grid(
     base_datasets: List[str],
     figure_dir: Path,
     filename: str = "confusion_grid.png",
+    show: bool = True,
 ):
     """4-column (one per base dataset) x N-row (control, then every
     discovered level of `perturbation_type`) confusion-matrix grid, in the
@@ -1259,6 +1267,11 @@ def plot_robustness_confusion_matrix_grid(
     A (dataset, level) cell with no seed matrices (e.g. that condition's
     calibration failed to load) is left blank rather than failing the whole
     grid.
+
+    `show=False` still saves the PNG to disk, just skips the inline
+    notebook display -- for callers (e.g. analyze_pipeline_output.py's
+    section 3a5) that already render enough other robustness figures per
+    run that displaying every one inline is too much to scroll through.
     """
     from src.assay_calibration.plot_utils.utils import compute_classification_metrics
 
@@ -1409,7 +1422,81 @@ def plot_robustness_confusion_matrix_grid(
                  fontsize=14, fontweight="bold")
     out_dir = Path(figure_dir) / ("robustness_downsampling" if perturbation_type == "downsample" else "robustness_label_noise")
     out_dir.mkdir(parents=True, exist_ok=True)
-    save_and_show(fig, out_dir / filename)
+    if show:
+        save_and_show(fig, out_dir / filename)
+    else:
+        fig.savefig(out_dir / filename, dpi=300, bbox_inches="tight")
+        print(f"  Saved: {out_dir / filename}")
+        plt.close(fig)
+
+
+def robustness_seed_metrics_table(
+    robustness_summaries: Dict[str, pd.DataFrame],
+    robustness_max_strengths: Dict[str, Dict[Tuple[str, float, int], Tuple[int, int]]],
+    perturbation_type: str,
+    base_datasets: List[str],
+) -> pd.DataFrame:
+    """One row per (base_dataset, level) grid cell -- same population
+    plot_robustness_confusion_matrix_grid draws (that cell's seed-to-seed
+    accuracy/coverage/max-strength spread), as a tidy table instead of a
+    figure caption. Row order matches the grid: control first, then levels
+    descending (downsample) or ascending (discordance). Control has
+    n_seeds == 1 (no spread, just the reference point), matching the grid's
+    own control-row treatment.
+
+    `robustness_summaries` : {base_dataset: metrics_df}, one metrics_df per
+    base dataset as returned by robustness_confusion_matrices_to_metrics --
+    same dict analyze_pipeline_output.py's section 3a5 already builds
+    (one row per (perturbation_type, level, seed), plus a
+    perturbation_type="reference" control row).
+
+    `robustness_max_strengths` : {base_dataset: {(ptype, level, seed):
+    (max_pathogenic_point, max_benign_point)}}, exactly what
+    compute_robustness_max_strengths returns -- same keying convention used
+    to select a grid cell's seeds in plot_robustness_confusion_matrix_grid.
+    """
+    all_levels = sorted({
+        level for df in robustness_summaries.values()
+        for level in df.loc[df["perturbation_type"] == perturbation_type, "level"].unique()
+    })
+    row_keys = ["control"] + (all_levels if perturbation_type == "discordance" else list(reversed(all_levels)))
+
+    rows = []
+    for dataset in base_datasets:
+        df = robustness_summaries.get(dataset)
+        if df is None:
+            continue
+        strengths = robustness_max_strengths.get(dataset, {})
+        for row_key in row_keys:
+            if row_key == "control":
+                sub = df[df["perturbation_type"] == "reference"]
+                level_label = "Control"
+                strength_keys = [k for k in strengths if k[0] == "reference"]
+            else:
+                sub = df[(df["perturbation_type"] == perturbation_type) & (df["level"] == row_key)]
+                level_label = _GRID_LEVEL_LABELS[perturbation_type](row_key)
+                strength_keys = [k for k in strengths if k[0] == perturbation_type and k[1] == row_key]
+            if sub.empty:
+                continue
+            acc_p25, acc_p50, acc_p75 = np.percentile(100 * sub["accuracy"].to_numpy(), [25, 50, 75])
+            cov_p25, cov_p50, cov_p75 = np.percentile(100 * sub["coverage"].to_numpy(), [25, 50, 75])
+
+            maxp_vals = [strengths[k][0] for k in strength_keys]
+            maxb_vals = [strengths[k][1] for k in strength_keys]
+            if maxp_vals:
+                maxp_p25, maxp_p50, maxp_p75 = np.percentile(maxp_vals, [25, 50, 75])
+                maxb_p25, maxb_p50, maxb_p75 = np.percentile(maxb_vals, [25, 50, 75])
+            else:
+                maxp_p25 = maxp_p50 = maxp_p75 = maxb_p25 = maxb_p50 = maxb_p75 = None
+
+            rows.append({
+                "base_dataset": dataset, "level_label": level_label, "n_seeds": len(sub),
+                "accuracy_p25": acc_p25, "accuracy_p50": acc_p50, "accuracy_p75": acc_p75,
+                "coverage_p25": cov_p25, "coverage_p50": cov_p50, "coverage_p75": cov_p75,
+                "maxp_p25": maxp_p25, "maxp_p50": maxp_p50, "maxp_p75": maxp_p75,
+                "maxb_p25": maxb_p25, "maxb_p50": maxb_p50, "maxb_p75": maxb_p75,
+            })
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------

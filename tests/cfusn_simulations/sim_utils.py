@@ -1669,3 +1669,166 @@ def init_delta_matrix_mom_gated(cov, p, q, Xc=None, cluster_sign_pattern=None, r
                 break
 
     return Delta
+
+
+# Module-level config for forced_skew_init_delta_matrix, set by the caller
+# (e.g. a diagnostic script) before monkeypatching production's
+# _init_delta_matrix with this function. Kept as globals rather than extra
+# args since this needs the EXACT _init_delta_matrix(cov, p, q, Xc=None,
+# cluster_sign_pattern=None, rng=None) signature to drop in via monkeypatch.
+FORCED_SKEW_DIMS = []          # column indices to force
+FORCED_SKEW_SIGNS = {}         # {dim_idx: +1 or -1}, sign of forced skew
+FORCED_SKEW_SCALE_FRAC = 0.95  # fraction of sqrt(cov[d,d]) to force onto
+# Must be set by the caller to the ORIGINAL (pre-monkeypatch) production
+# _init_delta_matrix callable -- NOT re-imported by name at call time, since
+# once monkeypatched, the module-level name resolves back to this wrapper
+# and would recurse infinitely.
+FORCED_SKEW_BASE_FN = None
+
+
+def forced_skew_init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=None):
+    """Diagnostic-only variant of production's _init_delta_matrix (see
+    src/assay_calibration/fit_utils/cfusn/initializations.py): runs the
+    normal data-driven init for every dimension, then FORCES the dimensions
+    listed in FORCED_SKEW_DIMS onto a large single-axis skew (magnitude
+    FORCED_SKEW_SCALE_FRAC * sqrt(cov[d,d]), matching the M-step's own
+    magnitude-cap ceiling, sign from FORCED_SKEW_SIGNS) regardless of what
+    the cluster's own local data says.
+
+    Purpose: distinguish whether the real CFUSN mixture's near-symmetric
+    fitted components (measured on real TP53 v3 fits: alpha_ratio ~0.07-1.4
+    for dimensions where an unconditional 1D skew-normal fit finds ~0.995)
+    reflects a genuine MLE optimum, or a local-optimum/init deficiency --
+    by seeding EM at the opposite (large-skew) extreme and checking, via
+    held-out val_ll, whether it converges back down (current low skew is
+    correct) or stays skewed with equal/better val_ll (init was the bug).
+    See the Phase 4 plan for full context.
+    """
+    base_fn = FORCED_SKEW_BASE_FN
+    if base_fn is None:
+        from src.assay_calibration.fit_utils.cfusn.initializations import _init_delta_matrix as base_fn
+
+    Delta = base_fn(cov, p, q, Xc=Xc, cluster_sign_pattern=cluster_sign_pattern, rng=rng)
+
+    for d in FORCED_SKEW_DIMS:
+        if d >= p:
+            continue
+        sign = FORCED_SKEW_SIGNS.get(d, 1)
+        mag = FORCED_SKEW_SCALE_FRAC * np.sqrt(max(cov[d, d], 0.0))
+        Delta[d, :] = 0.0
+        Delta[d, 0] = sign * mag
+
+    Gamma = cov - Delta @ Delta.T
+    eigvals_G = np.linalg.eigvalsh(Gamma)
+    if eigvals_G.min() < 1e-6:
+        for _ in range(20):
+            Delta *= 0.9
+            Gamma = cov - Delta @ Delta.T
+            if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                break
+
+    return Delta
+
+
+# Module-level config for pooled_fallback_init_delta_matrix (Phase 4 Step 2,
+# Approach A). POOLED_DELTA_VEC is a (p,) array: one skew-informed magnitude
+# (signed) per raw dimension, precomputed once per bootstrap from a pooled
+# (all-cluster) scipy.stats.skewnorm.fit on the standardized training data
+# for that dimension -- NOT per-cluster (per-cluster subsets are exactly
+# where the sample-size/missingness instability this shrinkage exists to
+# guard against already lives; see the Phase 4 plan's Step 2 rationale).
+POOLED_DELTA_VEC = None
+
+
+def pooled_fallback_init_delta_matrix(cov, p, q, Xc=None, cluster_sign_pattern=None, rng=None):
+    """Approach A (Phase 4 Step 2): identical to production's
+    _init_delta_matrix except for ONE change -- the JS-shrinkage fallback
+    target. Production shrinks weakly-supported clusters toward
+    _FALLBACK_SCALE * sqrt(eigval) (an essentially symmetric, near-zero-skew
+    constant); this variant shrinks them toward this dimension's own known
+    population-level skew (from POOLED_DELTA_VEC, projected onto the
+    cluster's eigenvector), so an under-supported cluster's fallback is "the
+    population's known skew level" instead of "no skew." Well-supported
+    clusters are unaffected -- the adaptive-c weighting already lets their
+    own local MoM estimate dominate.
+    """
+    global POOLED_DELTA_VEC
+    rng = rng or np.random.RandomState()
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    top_idx = np.argsort(eigvals)[::-1][:q]
+    n_cluster = len(Xc) if Xc is not None else 0
+
+    Delta = np.zeros((p, q))
+    for j, idx in enumerate(top_idx):
+        evec = eigvecs[:, idx]
+        if POOLED_DELTA_VEC is not None:
+            fallback = float(abs(POOLED_DELTA_VEC @ evec))
+        else:
+            fallback = _FALLBACK_SCALE_LOCAL * np.sqrt(eigvals[idx])
+
+        skew_sign = 1
+        scale = fallback
+        if Xc is not None and n_cluster > 0:
+            projected = _partial_projection(Xc, evec, min_weight_frac=0.5)
+            if len(projected) >= 8:
+                m3, z = _skewness_z_score(projected)
+                if abs(m3) > 1e-6:
+                    skew_sign = int(np.sign(m3))
+                delta_mag = _mom_delta_magnitude(projected)
+                if delta_mag is not None:
+                    mom_scale = delta_mag * np.sqrt(eigvals[idx])
+                    info_frac = max(len(projected) / n_cluster, 0.01)
+                    c_adaptive = 1.0 / info_frac
+                    weight = _shrinkage_james_stein(z, c=c_adaptive)
+                    weight = min(max(weight, 0.0), 1.0)
+                    scale = weight * mom_scale + (1 - weight) * fallback
+
+        enum_sign = (
+            int(cluster_sign_pattern[j])
+            if cluster_sign_pattern is not None
+            else rng.choice([-1, 1])
+        )
+        Delta[:, j] = skew_sign * enum_sign * scale * evec
+
+    Delta += rng.uniform(-0.05, 0.05, size=(p, q)) * np.sqrt(np.diag(cov))[:, None]
+
+    Gamma = cov - Delta @ Delta.T
+    eigvals_G = np.linalg.eigvalsh(Gamma)
+    if eigvals_G.min() < 1e-6:
+        for _ in range(20):
+            Delta *= 0.9
+            Gamma = cov - Delta @ Delta.T
+            if np.linalg.eigvalsh(Gamma).min() > 1e-6:
+                break
+
+    return Delta
+
+
+_FALLBACK_SCALE_LOCAL = 0.1
+
+
+def compute_pooled_delta_vec(X):
+    """Compute POOLED_DELTA_VEC from (N, p) data (may contain NaN): per
+    dimension, scipy.stats.skewnorm.fit on all non-NaN values, converted to
+    a signed Delta magnitude via delta = alpha/sqrt(1+alpha^2), magnitude =
+    delta*scale (same decomposition sample_cfusn's generative model uses:
+    X = mu + Delta@T + chol(Gamma)@Z, T ~ half-normal per axis for q=1 --
+    matches Azzalini's loc/scale/alpha parameterization with mu=loc,
+    Delta=scale*delta, Gamma=scale^2*(1-delta^2)).
+    """
+    import scipy.stats as sps_stats
+    p = X.shape[1]
+    vec = np.zeros(p)
+    for d in range(p):
+        x = X[:, d]
+        x = x[~np.isnan(x)]
+        if len(x) < 20:
+            continue
+        try:
+            a, loc, scale = sps_stats.skewnorm.fit(x)
+        except Exception:
+            continue
+        a = np.clip(a, -1e4, 1e4)
+        delta = a / np.sqrt(1 + a ** 2)
+        vec[d] = delta * scale
+    return vec

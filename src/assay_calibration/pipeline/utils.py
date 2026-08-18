@@ -226,6 +226,8 @@ def load_dataset_from_df(df, config):
             min_clinvar_star=config.min_clinvar_star,
             population_type=config.population_type,
             synonymous_exclusive=getattr(config, "synonymous_exclusive", False),
+            spliceai_threshold=getattr(config, "spliceai_threshold", 0.2),
+            vep_splice_filter=getattr(config, "vep_splice_filter", True),
         )
 
     if "score" not in df.columns or "sample_assignments" not in df.columns:

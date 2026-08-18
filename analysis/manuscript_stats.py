@@ -136,3 +136,59 @@ DOR (benign vs. rest) & {fmt(ex['dor_benign'], 1)} & {fmt(au['dor_benign'], 1)} 
 """
     print(table)
     return table
+
+
+def latex_robustness_metrics_table(table_df: pd.DataFrame, perturbation_type: str) -> str:
+    """LaTeX table of accuracy / determinate-% / max evidence strength
+    (median [IQR] across seeds) for every (base_dataset, level) cell of the
+    downsample/discordance robustness confusion-matrix grid
+    (analysis.robustness.plot_robustness_confusion_matrix_grid) -- same
+    data, tidy table form for the manuscript instead of a figure caption.
+
+    `table_df`: analysis.robustness.robustness_seed_metrics_table's output
+    (columns base_dataset, level_label, n_seeds, accuracy_p25/p50/p75,
+    coverage_p25/p50/p75, maxp_p25/p50/p75, maxb_p25/p50/p75), already in
+    the grid's own row order.
+    """
+    def _fmt_pct_cell(p25, p50, p75, n_seeds):
+        if n_seeds <= 1:
+            return f"{p50:.1f}\\%"
+        return f"{p50:.1f}\\% [{p25:.1f}, {p75:.1f}]"
+
+    def _fmt_signed_cell(p25, p50, p75, n_seeds):
+        if p50 is None:
+            return "--"
+        if n_seeds <= 1:
+            return f"{p50:+.0f}"
+        return f"{p50:+.0f} [{p25:+.0f}, {p75:+.0f}]"
+
+    title = "Downsampling" if perturbation_type == "downsample" else "Label discordance"
+    lines = [
+        r"\begin{table}[!tb]",
+        r"\centering",
+        rf"\caption{{Robustness ({title.lower()}) confusion-matrix accuracy, determinate "
+        r"coverage, and max pathogenic/benign evidence strength, median [IQR] across 10 seeds per level.}}",
+        rf"\label{{tab:robustness_{perturbation_type}_metrics}}",
+        r"\begin{tabular}{llcccc}",
+        r"\toprule",
+        r"Dataset & Level & Accuracy & Determinate \% & Max Pathogenic & Max Benign \\",
+        r"\midrule",
+    ]
+    prev_dataset = None
+    for _, row in table_df.iterrows():
+        if prev_dataset is not None and row["base_dataset"] != prev_dataset:
+            lines.append(r"\midrule")
+        prev_dataset = row["base_dataset"]
+        acc_cell = _fmt_pct_cell(row["accuracy_p25"], row["accuracy_p50"], row["accuracy_p75"], row["n_seeds"])
+        cov_cell = _fmt_pct_cell(row["coverage_p25"], row["coverage_p50"], row["coverage_p75"], row["n_seeds"])
+        maxp_cell = _fmt_signed_cell(row["maxp_p25"], row["maxp_p50"], row["maxp_p75"], row["n_seeds"])
+        maxb_cell = _fmt_signed_cell(row["maxb_p25"], row["maxb_p50"], row["maxb_p75"], row["n_seeds"])
+        lines.append(
+            f"{row['base_dataset']} & {row['level_label']} & {acc_cell} & {cov_cell} & "
+            f"{maxp_cell} & {maxb_cell} \\\\"
+        )
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+
+    latex = "\n".join(lines)
+    print(latex)
+    return latex

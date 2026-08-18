@@ -1495,6 +1495,7 @@ class Variant:
         # behaves identically regardless of which source file a row came from.
         self.clinvar_star = _normalize_clinvar_star(self.clinvar_star)
         self.clinvar_star_2026 = _normalize_clinvar_star(self.clinvar_star_2026)
+        self.clinvar_star_2025 = _normalize_clinvar_star(self.clinvar_star_2025)
         self.parse_gnomAD_MAF()
         self.parse_clinvar_sig()
         self.parse_consequences()
@@ -1531,7 +1532,7 @@ class Variant:
             "Likely pathogenic",
             "Pathogenic/Likely pathogenic",
         }
-        self.is_vus = self.sufficient_quality_2026 and self.clinvar_sig_2026 in { # VUS ALWAYS 2026 SINCE NOT CONTROL
+        self.is_vus = self.sufficient_quality_2025 and self.clinvar_sig_2025 in { # VUS ALWAYS 2025 (pillar project) SINCE NOT CONTROL
             "Uncertain significance",
         }
 
@@ -1602,18 +1603,23 @@ class Variant:
         if self.min_clinvar_star == 0:
             self.sufficient_quality = True
             self.sufficient_quality_2026 = True
+            self.sufficient_quality_2025 = True
         elif self.min_clinvar_star == 1:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses
             self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses
         elif self.min_clinvar_star == 2:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status)
             self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status)
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status)
         elif self.min_clinvar_star == 3:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
             self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses)
         elif self.min_clinvar_star == 4:
             self.sufficient_quality = self.clinvar_star not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
             self.sufficient_quality_2026 = self.clinvar_star_2026 not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
+            self.sufficient_quality_2025 = self.clinvar_star_2025 not in zero_star_statuses.union(one_star_status).union(two_star_statuses).union(three_star_statuses)
         else:
             raise ValueError(f"Invalid min_clinvar_star value {self.min_clinvar_star}")
 
