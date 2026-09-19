@@ -58,7 +58,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     adjust_text = None
 
-from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+from src.assay_calibration.plot_utils.utils import compute_classification_metrics, _bold_italic_gene_title
 
 from analysis import config as cfg
 from analysis.discovery import discover_outputs, load_all_variants
@@ -334,6 +334,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
                           danzs, auths, dataset_names, gene_to_vus_count,
                           compute_classification_metrics,
                           df_ors=None,
+                          gene_to_dataset=None,
                           bottom_genes=['BRCA1', 'BRCA2', 'PALB2', 'RAD51C', 'RAD51D'],
                           size_by='vus',
                           annotate_gene_scatter=True, seed=42,
@@ -369,7 +370,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
 
     gene_danz, gene_auth = {}, {}
     for danz_df, auth_df, dataset_name in zip(danzs, auths, dataset_names):
-        if danz_df is None and auth_df is None:
+        if danz_df is None or auth_df is None:
             continue
         gene = dataset_name.split('_')[0]
         if gene not in gene_danz:
@@ -439,8 +440,8 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
 
         if annotate_gene_scatter and r['gene'] not in ['RAD51C', 'OTC', 'SCN5A', 'RAD51D', 'FKRP', 'PALB2', 'KCNQ4', 'BARD1']:
             text = ax_gene.text(r['auth_accuracy'], r['danz_accuracy'],
-                               rf"$\mathit{{{r['gene']}}}$", fontsize=FONTSIZE_LEGEND,
-                               ha='center', va='center', fontweight='bold', zorder=10)
+                               r['gene'], fontsize=FONTSIZE_LEGEND,
+                               ha='center', va='center', fontweight='bold', fontstyle='italic', zorder=10)
 
             # Add white border/stroke
             text.set_path_effects([
@@ -617,6 +618,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
             ax.tick_params(axis='both', labelsize=FONTSIZE_AXIS_TICK, left=show_y_ticks, labelleft=show_y_ticks)
 
             # For each gene, set limits individually
+            ax.set_xscale('log')
             if len(gene_data) > 0:
                 data_max = gene_data['OR_UI'].max()
                 if pd.notna(data_max):
@@ -633,10 +635,56 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
             if data_min < xlim_min:
                 xlim_min = data_min # based on data
 
+            ax.set_xlim(xlim_min, xlim_max)
+
+            # Tick locator/formatter -- same scheme as plot_all_genes_or's
+            # per-gene panels, so both figures render OR axes identically.
+            def simple_formatter(val, pos):
+                if val <= 0:
+                    return ''
+                if 1 <= val < 10:
+                    return str(int(round(val)))
+                if val >= 1000:
+                    return f'{int(val):,}'
+                elif val >= 10:
+                    return str(int(round(val)))
+                else:
+                    return f'{val:.1g}'
+
+            def null_formatter(val, pos):
+                return ''
+
+            if xlim_max < 10:
+                ticks = [1]
+                if xlim_max >= 2:
+                    ticks.append(2)
+                if xlim_max >= 3:
+                    ticks.append(3)
+                if xlim_max >= 5:
+                    ticks.append(5)
+                ax.xaxis.set_major_locator(FixedLocator(ticks))
+                ax.xaxis.set_major_formatter(FuncFormatter(simple_formatter))
+            elif xlim_max in [10, 30, 50]:
+                ticks = [1, 3]
+                if xlim_max == 10:
+                    ticks.extend([5, 10])
+                elif xlim_max == 30:
+                    ticks.extend([10, 30])
+                elif xlim_max == 50:
+                    ticks.extend([10, 50])
+                ax.xaxis.set_major_locator(FixedLocator(ticks))
+                ax.xaxis.set_major_formatter(FuncFormatter(simple_formatter))
+            else:
+                ax.xaxis.set_major_locator(LogLocator(base=10, numticks=5))
+                ax.xaxis.set_major_formatter(FuncFormatter(simple_formatter))
+
+            ax.xaxis.set_minor_formatter(FuncFormatter(null_formatter))
+
             ax.grid(True, alpha=0.2, axis='x', which='major')
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
-            ax.set_title(rf"$\mathit{{{gene_name}}}$", fontsize=FONTSIZE_AXIS_LABEL)
+            _bold_italic_gene_title(ax, gene_name, "", fontsize=FONTSIZE_AXIS_LABEL,
+                                     x=0.5, y=1.0, ha='center', va='bottom')
 
             if letter == "(C)":
                 ax.text(-0.29, PANEL_LETTER_Y + 0.12, letter, transform=ax.transAxes,
@@ -868,8 +916,8 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
         ax.spines['right'].set_visible(False)
 
         # Title with gene name only (disease will be shown in brackets above)
-        ax.set_title(rf"$\mathit{{{gene_name}}}$",
-                    fontsize=FONTSIZE_AXIS_LABEL, fontweight='bold')
+        _bold_italic_gene_title(ax, gene_name, "", fontsize=FONTSIZE_AXIS_LABEL,
+                                 x=0.5, y=1.0, ha='center', va='bottom')
 
     # ========== ADD DISEASE GROUP BRACKETS ==========
 
@@ -1023,6 +1071,7 @@ def build_gene_performance_scatter(
     dataset_tsv: Optional[str] = None,
     dataset_configs_path: Optional[str] = None,
     evidence_counts_dir: Optional[str] = None,
+    evidence_counts: Optional[Dict[str, Dict]] = None,
     or_estimates_csv: Optional[str] = None,
     yuriy_or_csv: Optional[str] = None,
     annotate_gene_scatter: bool = True,
@@ -1034,7 +1083,14 @@ def build_gene_performance_scatter(
     found on disk is skipped (with a warning) rather than crashing:
       - evidence counts (datasets_reached_evidence/*.pkl) missing -> panels
         B/C of the combined figure, and the combined figure itself, are
-        skipped.
+        skipped. Pass `evidence_counts` (the same
+        {"excalibr_path_counts", "excalibr_ben_counts", "auth_path_counts",
+        "auth_ben_counts"} dict shape `load_evidence_counts` returns) to
+        supply these directly -- e.g. from analyze_pipeline_output.py's own
+        section 4d, which computes the ExCALIBR side fresh from pipeline
+        output and the author/OddsPath side from OP_EVIDENCE_CODES_CSV --
+        instead of requiring the legacy datasets_reached_evidence/*.pkl
+        files on disk. Takes precedence over `evidence_counts_dir` when given.
       - OR estimate CSVs missing -> OR panels/supplementary figure/display
         table are skipped.
 
@@ -1071,7 +1127,7 @@ def build_gene_performance_scatter(
     print(f"Computed VUS counts for {len(gene_to_vus_count)} genes")
     result["gene_to_vus_count"] = gene_to_vus_count
 
-    evidence_counts = load_evidence_counts(evidence_counts_dir)
+    evidence_counts = evidence_counts if evidence_counts is not None else load_evidence_counts(evidence_counts_dir)
     df_ors, df_ors_old = load_or_estimates(or_estimates_csv, yuriy_or_csv)
 
     gene_to_dataset = None
@@ -1089,6 +1145,7 @@ def build_gene_performance_scatter(
             compute_classification_metrics=compute_classification_metrics,
             annotate_gene_scatter=annotate_gene_scatter,
             df_ors=df_ors if gene_to_dataset is not None else None,
+            gene_to_dataset=gene_to_dataset,
             bottom_genes=sorted(['BAP1', 'BRCA1', 'MSH2', 'TSC2', 'RAD51D']) + sorted(['KCNQ4']),
             save_path=str(figure_dir / f'gene_brnich_OR{"_noannot" if not annotate_gene_scatter else ""}.png'),
             seed=42,

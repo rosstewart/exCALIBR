@@ -199,7 +199,7 @@
   },
   "LDLR_Tabet_2025_uptake": {
     "n_c": "3c",
-    "benign_method": "benign"
+    "benign_method": "synonymous"
   },
   "LDLR_Tabet_2025_presence_VLDL": {
     "n_c": "3c",
@@ -357,7 +357,7 @@
   },
   "TSC2_IGVF": {
     "n_c": "3c",
-    "benign_method": "synonymous"
+    "benign_method": "avg"
   },
   "VHL_Buckley_2024": {
     "n_c": "3c",

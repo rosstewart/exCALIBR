@@ -137,7 +137,8 @@ def _resolve_n_jobs(n_jobs: int, sample_slice: "pd.DataFrame | None" = None) -> 
 def _strip_minimal(job: dict) -> dict:
     return {k: job[k] for k in (
         "job_id", "bootstrap_seed", "fit_idx", "num_components",
-        "constrained", "init_method", "init_constraint_adjustment", "kwargs"
+        "constrained", "init_method", "init_constraint_adjustment", "kwargs",
+        "nominal_latent_q",
     )}
 
 
@@ -468,7 +469,7 @@ def run_default(args):
     # that isn't forced to 2018 uses this release, rather than 2026.
     default_release = getattr(args, "clinvar_default_release", "2026")
 
-    df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
+    df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
     df = pd.read_csv(df_path, sep=sep)
 
@@ -839,7 +840,7 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
 def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
                                 clinvar_release, component_range, constraint_modes,
                                 latent_q, init_strategy, population_type,
-                                master_seed=DEFAULT_MASTER_SEED):
+                                master_seed=DEFAULT_MASTER_SEED, regularization_type=None):
     from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
 
     gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
@@ -848,6 +849,8 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
     scoreset_kwargs = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
     if population_type:
         scoreset_kwargs["population_type"] = population_type
+    if regularization_type:
+        scoreset_kwargs["regularization_type"] = regularization_type
 
     ms = build_multiscoreset_from_long_dataframe(
         df_gene, gene, datasets, scoreset_kwargs=scoreset_kwargs,
@@ -890,7 +893,8 @@ def _build_gene_set_ms_map(gene_set, args):
 
     if gene_set == "labelseq":
         from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
-        return build_labelseq_multiscoresets()
+        return build_labelseq_multiscoresets(
+            regularization_type=getattr(args, "regularization_type", None))
 
     if gene_set == "card11":
         from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset
@@ -943,6 +947,83 @@ def _build_gene_set_ms_map(gene_set, args):
     raise ValueError(f"Unknown --gene-set {gene_set!r}")
 
 
+def _apply_redundancy_collapse(gene_ms_map, args):
+    """Apply --redundancy-collapse-block (manual, production-safe) and/or
+    --redundancy-collapse-auto (diagnostic-only, prints a warning) to every
+    gene's ms in-place. No-op if neither is set. See
+    src/assay_calibration/multivariate_data/redundancy_collapse.py's module
+    docstring for why manual is the only mechanism validated safe enough
+    for direct production use.
+    """
+    from src.assay_calibration.multivariate_data import redundancy_collapse as rc
+
+    block_names = getattr(args, "redundancy_collapse_block", None)
+    k_override = getattr(args, "redundancy_collapse_k", None)
+    preset = getattr(args, "redundancy_collapse_preset", None)
+    if preset is not None and block_names:
+        print(f"  [redundancy-collapse] --redundancy-collapse-preset={preset} ignored "
+              f"since --redundancy-collapse-block was also given explicitly")
+        preset = None
+    auto_method = getattr(args, "redundancy_collapse_auto", None)
+    if not block_names and not preset and not auto_method:
+        return
+
+    if preset:
+        # Shared with mv_analysis.config's cockpit equivalent, so both tools
+        # apply the exact same preset definition (see redundancy_collapse.py's
+        # PRESETS/apply_preset -- resolves suffixes per-gene since the two
+        # TP53 MultiScoreset builders name the same 8 Kato_2003 dims
+        # differently: "TP53_Kato_2003_AIP1nWT" for --gene-set integrated vs.
+        # bare "AIP1nWT" for the dedicated --gene-set tp53).
+        rc.apply_preset(gene_ms_map, preset, k_override=k_override)
+    elif block_names:
+        if k_override is None:
+            raise ValueError("--redundancy-collapse-block requires --redundancy-collapse-k")
+        k = k_override
+        for gene, ms in gene_ms_map.items():
+            if not all(n in ms.dataset_names for n in block_names):
+                print(f"  [redundancy-collapse] {gene}: missing one or more of "
+                      f"{block_names} in dataset_names, skipping")
+                continue
+            before = list(ms.dataset_names)
+            rc.collapse_block(ms, block_names, k)
+            print(f"  [redundancy-collapse] {gene}: collapsed {block_names} "
+                  f"({len(block_names)} dims) -> {k} PC(s); "
+                  f"{len(before)} -> {len(ms.dataset_names)} total dims")
+
+    if auto_method:
+        print(f"  [redundancy-collapse] WARNING: --redundancy-collapse-auto={auto_method} "
+              f"is diagnostic-only, NOT validated as a safe automatic trigger (see "
+              f"redundancy_collapse.py's module docstring) -- review the blocks below "
+              f"before trusting this run's results.")
+        threshold = args.redundancy_collapse_threshold
+        variance_threshold = args.redundancy_collapse_variance_threshold
+        detect_fn = (rc.detect_redundant_blocks_clique if auto_method == "clique"
+                     else rc.detect_redundant_blocks_connected)
+        for gene, ms in gene_ms_map.items():
+            names = list(ms.dataset_names)
+            blocks = detect_fn(ms.scores, corr_threshold=threshold)
+            if not blocks:
+                continue
+            claimed = set()
+            for block in blocks:  # clique blocks are pre-sorted largest-first
+                if claimed & set(block):
+                    continue  # greedy: skip blocks overlapping an already-applied one
+                block_names_auto = [names[i] for i in block]
+                k = rc.choose_block_k(ms.scores, block, variance_threshold=variance_threshold)
+                if k == len(block):
+                    print(f"  [redundancy-collapse] {gene}: candidate block "
+                          f"{block_names_auto} found but k==block_size (no reduction "
+                          f"achievable at variance_threshold={variance_threshold}), skipping")
+                    continue
+                before = list(ms.dataset_names)
+                rc.collapse_block(ms, block_names_auto, k)
+                print(f"  [redundancy-collapse] {gene}: AUTO-collapsed {block_names_auto} "
+                      f"-> {k} PC(s); {len(before)} -> {len(ms.dataset_names)} total dims")
+                claimed |= set(block)
+                names = list(ms.dataset_names)  # indices shifted, refresh for next block
+
+
 def _load_and_filter_gene_ms_map(gene_set, args):
     """Build + filter + print {gene: ms} for one --gene-set value. Split out
     of run_multivariate_gene_set so `all` (below) can build several
@@ -960,6 +1041,8 @@ def _load_and_filter_gene_ms_map(gene_set, args):
     if args.exclude_genes and gene_set != "fgfr":  # fgfr applies exclude_genes at the source too
         excluded = {g.upper() for g in args.exclude_genes}
         gene_ms_map = {g: ms for g, ms in gene_ms_map.items() if g.upper() not in excluded}
+
+    _apply_redundancy_collapse(gene_ms_map, args)
 
     print(f"\n[{gene_set}] {len(gene_ms_map)} genes:")
     for gene, ms in sorted(gene_ms_map.items()):
@@ -1036,7 +1119,7 @@ def _load_and_filter_gene_groups(args):
     groups. Split out of run_multivariate so `all` (below) can build the
     integrated pipeline's jobs alongside other pipelines' in one manifest.
     """
-    df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz"
+    df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
     df = pd.read_csv(df_path, sep=sep)
 
@@ -1092,6 +1175,7 @@ def _generate_integrated_jobs(df, gene_groups, args):
             init_strategy=args.init_strategy,
             population_type=args.population_type,
             master_seed=args.seed,
+            regularization_type=getattr(args, "regularization_type", None),
         )
         for gene, datasets in gene_groups.items()
     )
@@ -1318,7 +1402,7 @@ def main():
     def _add_default_mode_args(p):
         _add_common_args(p)
         p.add_argument("--dataframe", default=None,
-                       help="Input TSV/CSV (default: integrated_variant_effect_dataset.tsv.gz)")
+                       help="Input TSV/CSV (default: integrated_variant_effect_dataset_pp_final.tsv.gz)")
         p.add_argument("--config-file", default=None,
                        help="Dataset config JSON (default: dataset_configs_jan_2026.json)")
         p.add_argument("--population-type", default=None)
@@ -1449,6 +1533,14 @@ def main():
     p_multi.add_argument("--max-dimensions", type=int, default=None,
                          help="Skip genes with more datasets than this")
     p_multi.add_argument("--population-type", default=None)
+    p_multi.add_argument("--regularization-type", default=None,
+                         choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv"],
+                         help="Adds a 5th sample role retaining variants regardless of "
+                              "clinical label -- 'all_assayed' (every assayed variant; "
+                              "used by this session's staged-init experiments) or one of "
+                              "the SNV-subset variants. Supported for --gene-set "
+                              "labelseq and integrated (the default); not yet wired for "
+                              "fgfr/tp53/card11/combined.")
     p_multi.add_argument("--n-bootstraps", type=int, default=1000)
     p_multi.add_argument("--num-fits", type=int, default=100,
                          help="Override dynamic NUM_FITS (default: 100)")
@@ -1482,6 +1574,52 @@ def main():
                                  "single_gene_calibration_data",
                          help="[--gene-set combined] Directory containing "
                               "{gene}/{gene}_{predictor}.csv.gz")
+    from src.assay_calibration.multivariate_data.redundancy_collapse import PRESETS as _RC_PRESETS
+    p_multi.add_argument("--redundancy-collapse-preset",
+                         choices=sorted(_RC_PRESETS.keys()),
+                         default=None,
+                         help="Shortcut for --redundancy-collapse-block/-k using a named, "
+                              "pre-validated block instead of typing out the dimension names "
+                              "each time -- e.g. 'tp53_kato_pca2' expands to TP53's 8-dim "
+                              "Kato_2003 panel -> 2 PCA components (redundancy_collapse.py's "
+                              "PRESETS dict). Ignored (with a warning) if --redundancy-collapse-"
+                              "block is also given explicitly.")
+    p_multi.add_argument("--redundancy-collapse-block", nargs="+", default=None,
+                         help="Manually collapse this named block of highly-correlated "
+                              "dimensions (names must match the gene's own dataset_names, "
+                              "e.g. TP53's 8-dim Kato_2003 panel) to --redundancy-collapse-k "
+                              "principal components before fitting. Validated on real TP53/"
+                              "LABEL-seq data as the ONLY safe mechanism for this -- see "
+                              "src/assay_calibration/multivariate_data/redundancy_collapse.py's "
+                              "module docstring for why the automatic modes below are "
+                              "diagnostic-only, not safe unsupervised triggers. Applied to "
+                              "every gene in this run whose dataset_names contain all of the "
+                              "given names; silently skipped (with a printed note) for genes "
+                              "that don't have them, so multi-gene sets like labelseq can pass "
+                              "this once for the one gene it applies to.")
+    p_multi.add_argument("--redundancy-collapse-k", type=int, default=None,
+                         help="Target dimensionality for --redundancy-collapse-block "
+                              "(required if that's set). Use "
+                              "redundancy_collapse.choose_block_k for a data-driven "
+                              "starting suggestion, not as an automatic decision.")
+    p_multi.add_argument("--redundancy-collapse-auto", choices=["connected", "clique"], default=None,
+                         help="DIAGNOSTIC/EXPERIMENTAL, not validated as safe: auto-detect and "
+                              "collapse candidate redundant blocks via a correlation-threshold "
+                              "graph (per gene). 'connected' allows transitive chaining and "
+                              "was confirmed on real TP53 data to over-merge (13-14 of 16 dims "
+                              "into one block at threshold 0.7-0.75) -- 'clique' (every pair "
+                              "within a block must individually clear the threshold) fixes "
+                              "that specific failure mode, but neither is safe from a second "
+                              "confirmed issue: no single threshold is both safe and effective "
+                              "across gene sets (real LABEL-seq Abundance/Abundance_HSP90i "
+                              "pairs span r=0.30-0.72 and can land inside TP53's own r=0.6-0.88 "
+                              "redundant range). Only use this to print candidates for review; "
+                              "prefer --redundancy-collapse-block for anything actually run.")
+    p_multi.add_argument("--redundancy-collapse-threshold", type=float, default=0.85,
+                         help="[--redundancy-collapse-auto] Correlation threshold (default 0.85)")
+    p_multi.add_argument("--redundancy-collapse-variance-threshold", type=float, default=0.87,
+                         help="[--redundancy-collapse-auto] Variance-explained bar for "
+                              "choosing each auto-detected block's k (default 0.87)")
     p_multi.set_defaults(func=run_multivariate)
 
     # ── predictor-mv ─────────────────────────────────────────────────────────

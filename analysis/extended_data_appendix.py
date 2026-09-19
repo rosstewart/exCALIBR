@@ -192,7 +192,22 @@ def _load_full_style(
     (scoreset, scoreset_2018, indv_summary, fits, score_range, n_c, scoreset_flipped, n_samples)
     """
     is_2018_gene = dataset.split("_")[0] in GENES_2018
-    fit_dataset = dataset + "_clinvar_2018" if is_2018_gene else dataset
+    # `dataset` is normally the base name (no "_clinvar_2018" suffix) --
+    # `_default_dataset_list_full` filters those out -- but callers can also
+    # pass in a `datasets` list built from `df["dataset"].unique()`
+    # (analyze_pipeline_output.py section 1), where BRCA1/MSH2/PTEN/TP53
+    # currently only exist on disk *already* carrying the literal
+    # "_clinvar_2018" suffix (no separate non-2018 sibling -- same fact noted
+    # elsewhere in analyze_pipeline_output.py). Appending the suffix again in
+    # that case doubles it (e.g. "BRCA1_Findlay_2018_clinvar_2018" ->
+    # "..._clinvar_2018_clinvar_2018"), which load_scoreset_and_fits can't
+    # find on disk -- silently dropping these four genes from the appendix
+    # (the FileNotFoundError is caught and skipped per-dataset by the caller).
+    already_suffixed = dataset.endswith("_clinvar_2018")
+    base_dataset = dataset[: -len("_clinvar_2018")] if already_suffixed else dataset
+    fit_dataset = dataset if already_suffixed else (
+        base_dataset + "_clinvar_2018" if is_2018_gene else base_dataset
+    )
 
     scoreset_2018, indv_summary, fits, score_range, n_c, n_samples, scoreset_flipped = (
         load_scoreset_and_fits(
@@ -202,8 +217,17 @@ def _load_full_style(
     )
 
     if is_2018_gene:
+        # No separate non-2018 dataset exists on disk for these four genes
+        # (only the "_clinvar_2018"-suffixed one was ever run through the
+        # pipeline) -- load_scoreset_and_fits's own `pipeline_dataset` param
+        # exists exactly for this: reuse fit_dataset's on-disk
+        # calibration/fits, but build the Scoreset from `base_dataset` with
+        # clinvar_release="2025" for a "current ClinVar" display panel (see
+        # that function's docstring, which names BRCA1/MSH2/PTEN/TP53
+        # explicitly for this case).
         scoreset, _, _, _, _, _, _ = load_scoreset_and_fits(
-            dataset, output_dir=output_dir, dataset_tsv=dataset_tsv,
+            base_dataset, pipeline_dataset=fit_dataset, clinvar_release="2025",
+            output_dir=output_dir, dataset_tsv=dataset_tsv,
             precomputed_fits=precomputed_fits, dataset_configs_path=dataset_configs_path,
         )
     else:
@@ -240,6 +264,66 @@ def _load_stacked_style(
         )
     )
     return scoreset, indv_summary, fits, score_range, n_c, scoreset_flipped, n_samples
+
+
+def _sample_scores(scoreset, sample_num):
+    """Score array for raw sample slot `sample_num` (0=P/LP, 1=B/LB,
+    2=gnomAD/population, 3=Synonymous), or None if that sample is empty.
+    `sample_assignments`'s columns are compacted (only non-empty samples get
+    a column), so the raw slot has to be mapped to its compacted column
+    index -- same skip-counting every per-sample plotting loop in this file
+    already does inline."""
+    if scoreset.sample_counts[sample_num] == 0:
+        return None
+    sample_idx = sum(1 for i in range(sample_num) if scoreset.sample_counts[i] > 0)
+    mask = scoreset.sample_assignments[:, sample_idx]
+    return scoreset.scores[mask]
+
+
+def _compute_robust_bin_width(scoreset, all_scores, x_min, x_max, n_target_bins=30, max_bin_multiplier=4):
+    """Shared histogram bin width for a dataset's P/LP, B/LB, and SNV/gnomAD
+    panels, robust to a control sample having very few (e.g. 1) variants.
+
+    A single-variant sample's own score range is 0, so it can't sensibly
+    define a bin width itself; letting seaborn auto-choose one for just that
+    sample (the old `except ValueError:` fallback, which drops `binwidth`
+    entirely) picks a width set by seaborn's own default rule, completely
+    disconnected from the assay's actual score scale -- the "bin width can
+    become out of control if there is only 1 sample" bug. Instead, compute a
+    candidate width from each of the P/LP, B/LB, and SNV (`all_scores`)
+    samples' own (finite, non-degenerate) ranges, and use the smallest
+    candidate for every sample. The well-populated SNV sample almost always
+    yields a sensible, fine-grained width, and a degenerate (range-0 or
+    single-point) sample simply contributes no candidate at all rather than
+    forcing an oversized or auto-chosen one.
+
+    A raw per-sample range can just as easily be pathologically *small*
+    instead (e.g. two P/LP variants that happen to score very close
+    together) -- taking that as the shared width for the whole visible axis
+    then means an enormous bin count, rendering every sample (not just the
+    narrow one) as a wall of overplotted, indistinguishably thin bars (the
+    "all samples are just black spikes" bug, e.g.
+    ASPA_Grønbæk-Thygesen_2024_toxicity). Floor the final width at
+    axis_based_width / `max_bin_multiplier` so no single sample's local
+    range can push the shared resolution more than that many times finer
+    than the plain axis-based default.
+    """
+    axis_based = (x_max - x_min) / n_target_bins
+    candidates = []
+    for sample_num in (0, 1):  # P/LP, B/LB
+        data = _sample_scores(scoreset, sample_num)
+        if data is None or len(data) < 2:
+            continue
+        data_range = data.max() - data.min()
+        if data_range > 0:
+            candidates.append(data_range / n_target_bins)
+    if all_scores is not None and len(all_scores) >= 2:
+        snv_range = all_scores.max() - all_scores.min()
+        if snv_range > 0:
+            candidates.append(snv_range / n_target_bins)
+    if not candidates:
+        return axis_based
+    return max(min(candidates), axis_based / max_bin_multiplier)
 
 
 # ---------------------------------------------------------------------------
@@ -338,15 +422,19 @@ def plot_calibration(dataset, scoreset_2018, scoreset, indv_summary, fits, score
     leg_ax = plt.subplot(gs[3, :])
     leg_ax.axis('off')
 
-    # Get score ranges for x-axis limits
-    x_min = score_range[0]
-    x_max = score_range[-1]
-    bin_width = (x_max - x_min) / 50
+    # Get score ranges for x-axis limits. `score_range` is the fit's own LR
+    # grid, which can be narrower than the actual displayed data (e.g.
+    # CARD11_Meitlis_2020_SGE_Ibrutinib_GoF's highest-scoring P/LP variant
+    # sits just outside it) -- widen to also cover every real score so
+    # set_xlim below can't silently clip a real variant's bar off-screen.
+    x_min = min(score_range[0], float(np.nanmin(scoreset.scores)), float(np.nanmin(scoreset_2018.scores)))
+    x_max = max(score_range[-1], float(np.nanmax(scoreset.scores)), float(np.nanmax(scoreset_2018.scores)))
 
     # Get point ranges for threshold plotting
     point_ranges = indv_summary['point_ranges']
 
     all_scores = scoreset.snv_scores
+    bin_width = _compute_robust_bin_width(scoreset, all_scores, x_min, x_max, n_target_bins=50)
 
     # Pre-compute thresholds for fit panels
     threshold_info = []
@@ -402,10 +490,18 @@ def plot_calibration(dataset, scoreset_2018, scoreset, indv_summary, fits, score
         n_count = sample_mask.sum()
 
         try:
-            sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax,
+            sns.histplot(hist_data, binwidth=bin_width, binrange=(x_min, x_max), stat='density', ax=ax,
                    alpha=0.5, color=color)
         except ValueError as e:
-            sns.histplot(hist_data, stat='density', ax=ax,
+            # binwidth+binrange should always succeed since bin count is
+            # then derived from the full (non-degenerate) axis span rather
+            # than this sample's own (possibly single-point) data range --
+            # see _compute_robust_bin_width's docstring on why a dropped
+            # binrange previously let seaborn fall back to an
+            # axis-scale-independent default width of 1.0. Keep binrange
+            # here too so this rarer fallback (e.g. all-NaN data) still
+            # can't produce an oversized bar.
+            sns.histplot(hist_data, binrange=(x_min, x_max), stat='density', ax=ax,
                    alpha=0.5, color=color)
 
         density_sample = sample_density(score_range, fits, sample_idx)
@@ -449,7 +545,18 @@ def plot_calibration(dataset, scoreset_2018, scoreset, indv_summary, fits, score
     ax_fits[0].set_title('ExCALIBR sample fits', loc='left', pad=3, fontsize=fontsize_subtitle)#, style='italic')
 
     # ===== SECOND ROW: Combined histogram =====
+    # Twin y-axes (control variant count on the left, SNV count on the
+    # right) instead of a single shared density axis -- same fix as
+    # analysis/figure4/panels.py::plot_panel_b / fit_hist_snv_plot.py's
+    # use_twin_axes path: 'density' stat on one shared axis lets the
+    # much-more-numerous "All SNVs" sample rescale P/LP and B/LB down to
+    # near-invisible bars (or vice versa), since density normalizes each
+    # sample's bars to its own total count. Counts on two independently-
+    # scaled axes keep every sample's bars visually legible. No axis labels
+    # are added -- purely an internal left/right scaling split, not meant to
+    # be called out on the plot itself.
     sample_handles = []
+    ax_twin = ax_hist.twinx()
 
     num_skipped = 0
     for sample_num in range(len(scoreset.sample_counts)):
@@ -471,17 +578,18 @@ def plot_calibration(dataset, scoreset_2018, scoreset, indv_summary, fits, score
             hist_data = all_scores
             display_name = 'All SNVs'
             n_count = len(all_scores)
+            target_ax = ax_twin
         else:
             hist_data = scoreset.scores[sample_mask]
             display_name = sample_name
             n_count = sample_mask.sum()
-
+            target_ax = ax_hist
 
         try:
-            sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax_hist,
+            sns.histplot(hist_data, binwidth=bin_width, binrange=(x_min, x_max), stat='count', ax=target_ax,
                    alpha=alpha, color=color)
         except ValueError as e:
-            sns.histplot(hist_data, stat='density', ax=ax_hist,
+            sns.histplot(hist_data, binrange=(x_min, x_max), stat='count', ax=target_ax,
                    alpha=alpha, color=color)
 
         face_rgba = to_rgba(color, alpha)
@@ -489,9 +597,14 @@ def plot_calibration(dataset, scoreset_2018, scoreset, indv_summary, fits, score
         sample_handles.append((hist_patch, f'{display_name} (n={n_count:,d})'))
 
     ax_hist.set_xlim(x_min, x_max)
+    ax_twin.set_xlim(x_min, x_max)
+    ax_hist.set_ylim(0, 1.18 * max([p.get_height() for p in ax_hist.patches]) if ax_hist.patches else 1.0)
+    ax_twin.set_ylim(0, 1.18 * max([p.get_height() for p in ax_twin.patches]) if ax_twin.patches else 1.0)
     ax_hist.set_xlabel('')
-    ax_hist.set_ylabel('Density', fontsize=fontsize_subtitle)
+    ax_hist.set_ylabel('')
+    ax_twin.set_ylabel('')
     ax_hist.tick_params(axis='both', labelsize=10)
+    ax_twin.tick_params(axis='y', labelsize=10)
     ax_hist.set_title('Experimental score distributions', loc='left', pad=3, fontsize=fontsize_subtitle)#, style='italic')
 
     # Sample legend
@@ -512,77 +625,71 @@ def plot_calibration(dataset, scoreset_2018, scoreset, indv_summary, fits, score
     # Iterate through all possible point values in order
     all_point_values = sorted([pv for pv in point_ranges.keys() if pv != 0])
 
-    # Add each point value's range
+    # Add each point value's range(s) -- a point value can have more than one
+    # disjoint score interval (e.g. DDX3X_Radford_2023's +1), so every entry
+    # in score_ranges_list must become its own interval, not just the first.
     for point_val in all_point_values:
         score_ranges_list = point_ranges[point_val]
         if not score_ranges_list:
             continue
 
-        # Take the first range (there should only be one per point value)
-        score_range_tuple = score_ranges_list[0]
-
-        if dataset == "PAX6_McDonnell_2024_LE9_geneticin" and point_val == 8:
-            start = x_min
-        else:
-            start = score_range_tuple[0]
-        end = score_range_tuple[1]
-
-        intervals.append((point_val, start, end))
-
-    # Add indeterminate interval (fill the gap)
-    # Find where negative ranges end and positive ranges start
-    negative_intervals = [(pv, s, e) for pv, s, e in intervals if pv < 0]
-    positive_intervals = [(pv, s, e) for pv, s, e in intervals if pv > 0]
-
-    negative_sorted, positive_sorted = None, None
-    if len(negative_intervals) > 0:
-        negative_sorted = sorted(negative_intervals, key=lambda x: x[2])  # Sort by end
-    if len(positive_intervals) > 0:
-        positive_sorted = sorted(positive_intervals, key=lambda x: x[1])  # Sort by start
-
-    if negative_sorted and positive_sorted:
-        if flipped:
-            ir_start = negative_sorted[-1][2]  # End of last negative interval
-            ir_end = positive_sorted[0][1]     # Start of first positive interval
-        else:
-            ir_start = positive_sorted[-1][2]  # End of last negative interval
-            ir_end = negative_sorted[0][1]     # Start of first positive interval
-
-    elif not negative_sorted and not positive_sorted:
-        ir_start, ir_end = x_min, x_max
-    else:
-        ir_start, ir_end = x_min, x_max
-        if flipped:
-            if positive_sorted:
-                # path evidence only, on right side
-                ir_end = positive_sorted[0][1] # start of first positive interval
-            elif negative_sorted:
-                ir_start = negative_sorted[-1][2] # end of last negative interval
+        for range_idx, score_range_tuple in enumerate(score_ranges_list):
+            if range_idx == 0 and dataset == "PAX6_McDonnell_2024_LE9_geneticin" and point_val == 8:
+                start = x_min
             else:
-                raise ValueError("uncaught edge case")
-        else:
-            if positive_sorted:
-                # path evidence only, on right side
-                ir_start = positive_sorted[-1][2] # end of last positive interval
-                print('calm ir',ir_start, ir_end)
-            elif negative_sorted:
-                ir_end = negative_sorted[0][1] # start of first negative interval
-            else:
-                raise ValueError("uncaught edge case")
-    intervals.append((0, ir_start, ir_end))
-    print('ir',ir_start, ir_end)
+                start = score_range_tuple[0]
+            end = score_range_tuple[1]
+
+            intervals.append((point_val, start, end))
+
+    # Fill every real gap between evidence intervals -- including at the
+    # outer axis edges -- with a "0" (indeterminate) interval, not just the
+    # single central gap the old sign/flipped-based heuristic assumed.
+    # DDX3X_Radford_2023's +1 has a second range entirely on the opposite
+    # side of zero from its first (its point_ranges are genuinely
+    # non-monotonic across the score axis), leaving its own separate
+    # indeterminate gap between that and the nearest other evidence interval
+    # that the old single-gap logic never filled. Walking the real intervals
+    # in score order and filling whatever gaps actually exist reproduces the
+    # old single-gap result exactly for ordinary (monotonic) datasets, and
+    # additionally catches any further gaps like this one.
+    intervals_by_start = sorted(intervals, key=lambda x: x[1])
+    filled = []
+    prev_end = x_min
+    for pv, s, e in intervals_by_start:
+        if s > prev_end:
+            filled.append((0, prev_end, s))
+        filled.append((pv, s, e))
+        prev_end = max(prev_end, e)
+    if prev_end < x_max:
+        filled.append((0, prev_end, x_max))
+    if not intervals_by_start:
+        filled = [(0, x_min, x_max)]
+    intervals = filled
 
     # Sort intervals by start position for plotting
     intervals_sorted = sorted(intervals, key=lambda x: x[1])
 
     # Plot intervals
     for point_val, start, end in intervals_sorted:
-        ax_excalibr.axvspan(start, end, color=strength_color[point_val], alpha=1.0)
+        # The outermost point value's interval is unbounded (start=-inf or
+        # end=inf, from point_ranges' calibration.json) -- axvspan builds a
+        # Rectangle from (start, end) directly, and start + width where
+        # width = end - start works out to -inf + inf = NaN whenever start
+        # itself is -inf, which silently renders nothing (the "left half of
+        # the ExCALIBR bar is blank white" bug -- see
+        # analysis/figure4/panels.py plot_panel_b for the same fix). Clip to
+        # the axis's own finite data range for drawing only; `count` below
+        # still uses the true (possibly infinite) bounds so it keeps
+        # including every variant in that tier, not just the ones inside
+        # x_min/x_max.
+        draw_start, draw_end = max(start, x_min), min(end, x_max)
+        ax_excalibr.axvspan(draw_start, draw_end, color=strength_color[point_val], alpha=1.0)
         count = ((all_scores >= start) & (all_scores < end)).sum()
-        if (end - start) > 0.2:
+        if (draw_end - draw_start) > 0.2:
             text_color = 'white' if abs(point_val) >= 7 else 'black'
             ax_excalibr.text(
-                (start + end) / 2, 0.5, f'{count:,}',
+                (draw_start + draw_end) / 2, 0.5, f'{count:,}',
                 ha='center', va='center',
                 fontsize=fontsize_count, color=text_color
             )
@@ -695,12 +802,16 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
             wspace=0.1
         )
 
-        # Setup
-        x_min = score_range_arr[0]
-        x_max = score_range_arr[-1]
-        bin_width = (x_max - x_min) / 30
-        # print(dataset, x_min, x_max, bin_width)
+        # Setup. `score_range_arr` is the fit's own LR grid, which can be
+        # narrower than the actual displayed data (e.g.
+        # CARD11_Meitlis_2020_SGE_Ibrutinib_GoF's highest-scoring P/LP
+        # variant sits just outside it) -- widen to also cover every real
+        # score so set_xlim below can't silently clip a real variant's bar
+        # off-screen.
+        x_min = min(score_range_arr[0], float(np.nanmin(scoreset.scores)), float(np.nanmin(scoreset_2018.scores)))
+        x_max = max(score_range_arr[-1], float(np.nanmax(scoreset.scores)), float(np.nanmax(scoreset_2018.scores)))
         all_scores = scoreset.snv_scores
+        bin_width = _compute_robust_bin_width(scoreset, all_scores, x_min, x_max, n_target_bins=30)
         point_ranges = indv_summary['point_ranges']
 
         # Pre-compute thresholds
@@ -741,10 +852,10 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
             n_count = sample_mask.sum()
 
             try:
-                sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax,
+                sns.histplot(hist_data, binwidth=bin_width, binrange=(x_min, x_max), stat='density', ax=ax,
                        alpha=0.5, color=color)
             except ValueError as e:
-                sns.histplot(hist_data, stat='density', ax=ax,
+                sns.histplot(hist_data, binrange=(x_min, x_max), stat='density', ax=ax,
                        alpha=0.5, color=color)
 
             max_hist_density = max([patch.get_height() for patch in ax.patches]) if ax.patches else 1.0
@@ -795,11 +906,17 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
             if sample_idx == 0:
                 gene_name = dataset.split('_')[0]
                 author_name = dataset.split('_')[1] if len(dataset.split('_')) > 1 else ''
-                ax.set_title(dataset,
+                ax.set_title(dataset.replace("_clinvar_2018", ""),
                            fontsize=9, fontweight='bold', pad=3, loc='left')
 
         # === ROW 2: COMBINED HISTOGRAM ===
+        # Twin y-axes (control variant count / SNV count), same fix and
+        # rationale as plot_calibration's "SECOND ROW" above -- a shared
+        # 'density' axis lets the much-more-numerous SNV sample rescale the
+        # P/LP and B/LB bars down to near-invisible. No labels/ticks on
+        # either y-axis (matches the rest of this compact per-dataset page).
         ax_hist = fig.add_subplot(inner_gs[1, :])
+        ax_twin = ax_hist.twinx()
 
         num_skipped = 0
         sample_handles = []
@@ -822,16 +939,18 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
                 hist_data = all_scores
                 display_name = 'SNVs'
                 n_count = len(all_scores)
+                target_ax = ax_twin
             else:
                 hist_data = scoreset.scores[sample_mask]
                 display_name = sample_name
                 n_count = sample_mask.sum()
+                target_ax = ax_hist
 
             try:
-                sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax_hist,
+                sns.histplot(hist_data, binwidth=bin_width, binrange=(x_min, x_max), stat='count', ax=target_ax,
                        alpha=alpha, color=color)
             except ValueError as e:
-                sns.histplot(hist_data, stat='density', ax=ax_hist,
+                sns.histplot(hist_data, binrange=(x_min, x_max), stat='count', ax=target_ax,
                        alpha=alpha, color=color)
 
             face_rgba = to_rgba(color, alpha)
@@ -839,6 +958,9 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
             sample_handles.append((hist_patch, f'{display_name} ({n_count:,})'))
 
         ax_hist.set_xlim(x_min, x_max)
+        ax_twin.set_xlim(x_min, x_max)
+        ax_hist.set_ylim(0, 1.18 * max([p.get_height() for p in ax_hist.patches]) if ax_hist.patches else 1.0)
+        ax_twin.set_ylim(0, 1.18 * max([p.get_height() for p in ax_twin.patches]) if ax_twin.patches else 1.0)
         ax_hist.set_xlabel('')
         ax_hist.set_ylabel('')
         ax_hist.tick_params(
@@ -849,6 +971,8 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
             labelbottom=False,
             labelleft=False
         )
+        ax_twin.set_ylabel('')
+        ax_twin.tick_params(axis='y', right=False, labelright=False)
 
         sample_legend_handles = [h[0] for h in sample_handles]
         sample_legend_labels = [h[1] for h in sample_handles]
@@ -862,63 +986,60 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
         intervals = []
         all_point_values = sorted([pv for pv in point_ranges.keys() if pv != 0])
 
+        # A point value can have more than one disjoint score interval (e.g.
+        # DDX3X_Radford_2023's +1) -- every entry in score_ranges_list needs
+        # its own interval, not just the first.
         for point_val in all_point_values:
             score_ranges_list = point_ranges[point_val]
             if not score_ranges_list:
                 continue
 
-            score_range_tuple = score_ranges_list[0]
+            for range_idx, score_range_tuple in enumerate(score_ranges_list):
+                # visualization issue
+                if range_idx == 0 and dataset == "PAX6_McDonnell_2024_LE9_geneticin" and point_val == 8:
+                    start = x_min
+                else:
+                    start = score_range_tuple[0]
+                end = score_range_tuple[1]
+                intervals.append((point_val, start, end))
 
-            # visualization issue
-            if dataset == "PAX6_McDonnell_2024_LE9_geneticin" and point_val == 8:
-                start = x_min
-            else:
-                start = score_range_tuple[0]
-            end = score_range_tuple[1]
-            intervals.append((point_val, start, end))
-
-        # Add indeterminate interval
-        negative_intervals = [(pv, s, e) for pv, s, e in intervals if pv < 0]
-        positive_intervals = [(pv, s, e) for pv, s, e in intervals if pv > 0]
-
-        negative_sorted, positive_sorted = None, None
-        if len(negative_intervals) > 0:
-            negative_sorted = sorted(negative_intervals, key=lambda x: x[2])
-        if len(positive_intervals) > 0:
-            positive_sorted = sorted(positive_intervals, key=lambda x: x[1])
-
-        if negative_sorted and positive_sorted:
-            if scoreset_flipped:
-                ir_start = negative_sorted[-1][2]
-                ir_end = positive_sorted[0][1]
-            else:
-                ir_start = positive_sorted[-1][2]
-                ir_end = negative_sorted[0][1]
-        elif not negative_sorted and not positive_sorted:
-            ir_start, ir_end = x_min, x_max
-        else:
-            ir_start, ir_end = x_min, x_max
-            if scoreset_flipped:
-                if positive_sorted:
-                    ir_end = positive_sorted[0][1]
-                elif negative_sorted:
-                    ir_start = negative_sorted[-1][2]
-            else:
-                if positive_sorted:
-                    ir_start = positive_sorted[-1][2]
-                elif negative_sorted:
-                    ir_end = negative_sorted[0][1]
-
-        intervals.append((0, ir_start, ir_end))
+        # Fill every real gap between evidence intervals -- including at the
+        # outer axis edges -- with a "0" (indeterminate) interval. See the
+        # identical rationale in plot_calibration above: DDX3X_Radford_2023's
+        # +1 has a second range entirely on the opposite side of zero from
+        # its first, leaving its own separate indeterminate gap that the old
+        # single-gap sign/flipped-based heuristic never filled. Walking the
+        # real intervals in score order reproduces that old single-gap
+        # result exactly for ordinary (monotonic) datasets.
+        intervals_by_start = sorted(intervals, key=lambda x: x[1])
+        filled = []
+        prev_end = x_min
+        for pv, s, e in intervals_by_start:
+            if s > prev_end:
+                filled.append((0, prev_end, s))
+            filled.append((pv, s, e))
+            prev_end = max(prev_end, e)
+        if prev_end < x_max:
+            filled.append((0, prev_end, x_max))
+        if not intervals_by_start:
+            filled = [(0, x_min, x_max)]
+        intervals = filled
         intervals_sorted = sorted(intervals, key=lambda x: x[1])
 
         # Plot intervals
         for point_val, start, end in intervals_sorted:
-            ax_calib.axvspan(start, end, color=strength_color[point_val], alpha=1.0)
+            # See the identical fix + rationale in plot_calibration above /
+            # analysis/figure4/panels.py plot_panel_b: unbounded outermost
+            # intervals (start=-inf or end=inf) make axvspan's width
+            # (end - start) evaluate to NaN and render nothing. Clip to the
+            # axis's finite range for drawing only; `count` keeps using the
+            # true (possibly infinite) bounds.
+            draw_start, draw_end = max(start, x_min), min(end, x_max)
+            ax_calib.axvspan(draw_start, draw_end, color=strength_color[point_val], alpha=1.0)
             count = ((all_scores >= start) & (all_scores < end)).sum()
-            if (end - start) > (x_max - x_min) * 0.06:
+            if (draw_end - draw_start) > (x_max - x_min) * 0.06:
                 text_color = 'white' if abs(point_val) >= 7 else 'black'
-                ax_calib.text((start + end) / 2, 0.5, f'{count:,}',
+                ax_calib.text((draw_start + draw_end) / 2, 0.5, f'{count:,}',
                             ha='center', va='center', fontsize=7, color=text_color)
 
         ax_calib.set_xlim(x_min, x_max)
@@ -1181,7 +1302,7 @@ def _plot_single_page_stacked(page_idx, page_datasets, nrows, ncols,
 
             # Title on first sample only
             if sample_idx == 0:
-                ax.set_title(dataset,
+                ax.set_title(dataset.replace("_clinvar_2018", ""),
                            fontsize=8, fontweight='bold', pad=4, loc='left')# if panel_col == 0 else 'right')
 
             ax.set_ylim([0, max_hist_density * 1.1])

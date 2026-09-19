@@ -862,8 +862,54 @@ class MVCalibrationAnalysis:
 
         # Detect latent_q from the first valid fit
         self._latent_q = self._detect_latent_q()
+        self._validate_fit_shape()
 
         self.results = {}
+
+    def _validate_fit_shape(self):
+        """Compare the first valid stored fit's dimensionality/role-count
+        against today's freshly-built `ms`, raising/warning immediately
+        instead of surfacing as a downstream `IndexError` (dimension
+        mismatch) or a silent per-bootstrap role misalignment (weight-row
+        mismatch) -- both confirmed as real bugs from stale caches: TP53/
+        BRCA2's integrated dataframe gained assay dimensions after their
+        canonical fits were trained (crashed inside
+        `cfusn_logpdf_alternate_missing`); RET's all_assayed staged-init fit
+        has fewer stored weight rows than today's rebuilt MultiScoreset shows
+        nonzero roles (a role was empty at fit time, then gained samples in
+        the underlying LABEL-seq cache since)."""
+        ms_n_dims = np.asarray(self.ms.scores).shape[1]
+        for boot_data in self.raw_boots.values():
+            for config in self.configs:
+                fit_raw = boot_data.get(config)
+                if fit_raw is None:
+                    continue
+                inner = fit_raw.get('fit', fit_raw)
+                fit = self._reconstitute_params(inner)
+                if fit is None:
+                    continue
+                fit_n_dims = len(fit['component_params'][0][0])
+                if fit_n_dims != ms_n_dims:
+                    raise ValueError(
+                        f"Stored fit for '{self.dataset_name}'/{config} has component "
+                        f"params with {fit_n_dims} dimension(s), but the freshly-built "
+                        f"MultiScoreset has {ms_n_dims} assay dimension(s). The "
+                        f"underlying dataset likely changed since this fit was "
+                        f"generated -- re-fit, or rebuild the dataset to match the "
+                        f"fit's original dimensions."
+                    )
+                n_w = fit['weights'].shape[0]
+                present = np.where(self.ms.sample_counts > 0)[0]
+                if n_w != len(present):
+                    warnings.warn(
+                        f"Stored fit for '{self.dataset_name}'/{config} has {n_w} "
+                        f"weight row(s), but today's MultiScoreset shows "
+                        f"{len(present)} nonzero role(s) ({present.tolist()}). Role "
+                        f"indices may silently misalign against the wrong weight "
+                        f"rows -- the underlying dataset's role-presence likely "
+                        f"changed since this fit was generated."
+                    )
+                return  # one valid fit is enough to check
 
     def _detect_latent_q(self):
         """Detect latent dimension q from the first valid fit in results."""

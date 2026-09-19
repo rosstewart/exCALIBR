@@ -1517,6 +1517,155 @@ def robustness_seed_metrics_table(
 # fitting beyond what tests/benchmark_bootstrap_reduction.py already ran.
 # ---------------------------------------------------------------------------
 
+# Matches tests/benchmark_bootstrap_reduction.py's _DEFAULT_LEVELS -- a
+# dataset with fewer than the requested count of valid bootstraps gets a
+# proxy top-level dir named after however many it actually had (e.g.
+# level_921), not level_1000; compute_bootstrap_reduction_confusion_metrics
+# bins those back into their requested canonical level below.
+_BOOTSTRAP_CANONICAL_LEVELS = (1000, 500, 250, 100, 50, 20)
+
+
+def compute_bootstrap_reduction_confusion_metrics(
+    dataset_name: str, ds_dir: Path, dataset_configs: dict, dataframe_path: str, dataset_df: pd.DataFrame,
+) -> List[dict]:
+    """One row per bootstrap-count level for `dataset_name`: standard
+    classification metrics (accuracy/coverage/sensitivity/specificity/
+    dor_standard/mcc, via compute_classification_metrics) computed directly
+    from that level's own on-disk point_ranges against the dataset's real
+    P/LP/B/LB scores -- the tabular "standard metrics" complement to
+    plot_bootstrap_reduction_config_summary's [p5,p50,p95] LR+-curve bands.
+
+    Mirrors tests/plot_bootstrap_reduction_config.py's own Scoreset-building/
+    level-discovery (kept here, not there, so it's importable from
+    analyze_pipeline_output.py without a `tests/`-module dependency), and
+    run_igvf_batch.py's `_compute_all_configs_metrics` confusion-matrix
+    convention (pts<0 -> Normal, pts==0 -> IR, pts>0 -> Abnormal), but never
+    renders a figure -- just the per-level metrics.
+    """
+    from src.assay_calibration.pipeline.config import PipelineConfig
+    from src.assay_calibration.pipeline.utils import load_dataset_from_df
+    from src.assay_calibration.plot_utils.utils import assign_points, compute_classification_metrics
+
+    level_dirs = sorted(
+        (d for d in ds_dir.iterdir() if d.is_dir() and d.name.startswith("level_")),
+        key=lambda d: int(d.name.replace("level_", "")), reverse=True,
+    )
+    if not level_dirs:
+        return []
+
+    # Discover comp_key ("{n_c}c_{benign_method}") from whichever
+    # calibration file actually exists on disk, rather than predicting it
+    # from dataset_configs -- these directories were generated once and
+    # dataset_configs.json can drift afterwards (renames, benign_method
+    # changes for a given dataset), so today's config entry isn't a
+    # reliable guide to what comp_key the files were actually saved under.
+    # Every level for a given dataset shares the same (n_c, benign_method)
+    # -- tests/benchmark_bootstrap_reduction.py resolves it once per
+    # dataset and reuses it across all levels -- so the first level with a
+    # calibration file determines it for all of them.
+    comp_key = None
+    for level_dir in level_dirs:
+        candidates = list(level_dir.glob(f"{dataset_name}_*_calibration.json"))
+        if len(candidates) == 1:
+            comp_key = candidates[0].name[len(dataset_name) + 1: -len("_calibration.json")]
+            break
+    if comp_key is None or "_" not in comp_key:
+        return []
+    n_c_str, benign_method = comp_key.split("_", 1)
+
+    clinvar_release = "2018" if dataset_name.endswith("_clinvar_2018") else "2025"
+    pcfg = PipelineConfig(
+        dataset_csv=dataframe_path, dataset_name=dataset_name,
+        output_dir=str(ds_dir), components=[int(n_c_str[0])],
+        benign_method=benign_method, clinvar_release=clinvar_release,
+        min_clinvar_star=1, population_type="gnomAD",
+    )
+    try:
+        scoreset = load_dataset_from_df(dataset_df, pcfg)
+    except Exception as e:
+        print(f"  SKIP {dataset_name} (bootstrap-reduction metrics): {type(e).__name__}: {e}")
+        return []
+
+    sample_names = [s[1] for s in scoreset.samples]
+    if "Pathogenic/Likely Pathogenic" not in sample_names or "Benign/Likely Benign" not in sample_names:
+        return []
+    plp_col = sample_names.index("Pathogenic/Likely Pathogenic")
+    blb_col = sample_names.index("Benign/Likely Benign")
+    sample_assignments = np.asarray(scoreset.sample_assignments)
+    plp_mask = sample_assignments[:, plp_col].astype(bool)
+    blb_mask = sample_assignments[:, blb_col].astype(bool)
+    raw_scores = np.asarray(scoreset.scores, dtype=float)
+
+    rows = []
+    for level_dir in level_dirs:
+        N_actual = int(level_dir.name.replace("level_", ""))
+        # A dataset with fewer than the requested bootstrap count available
+        # gets a proxy top-level dir (e.g. level_921) instead of level_1000
+        # -- see tests/benchmark_bootstrap_reduction.py's "effective_baseline"
+        # substitution. Bin it into the smallest canonical level it's still
+        # <=, so it joins that level's aggregate instead of appearing as its
+        # own spurious n=1 row.
+        N = min((lvl for lvl in _BOOTSTRAP_CANONICAL_LEVELS if lvl >= N_actual), default=N_actual)
+        calib_path = level_dir / f"{dataset_name}_{comp_key}_calibration.json"
+        if not calib_path.exists():
+            continue
+        with open(calib_path) as f:
+            cal = json.load(f)
+        if not cal.get("point_ranges"):
+            continue
+
+        points = np.array([assign_points(s, cal["point_ranges"]) for s in raw_scores])
+        plp_pts, blb_pts = points[plp_mask], points[blb_mask]
+        cm = pd.DataFrame(
+            [
+                [int((blb_pts < 0).sum()), int((blb_pts == 0).sum()), int((blb_pts > 0).sum())],
+                [int((plp_pts < 0).sum()), int((plp_pts == 0).sum()), int((plp_pts > 0).sum())],
+            ],
+            index=["BLB", "PLP"], columns=["Normal", "IR", "Abnormal"],
+        )
+        if cm.values.sum() == 0:
+            continue
+        metrics = compute_classification_metrics(cm)
+        rows.append({"dataset": dataset_name, "num_bootstraps": N, **metrics})
+    return rows
+
+
+def bootstrap_reduction_metrics_table(
+    rows_df: pd.DataFrame,
+    metrics: Tuple[str, ...] = ("accuracy", "coverage", "sensitivity", "specificity", "dor_standard", "mcc"),
+) -> pd.DataFrame:
+    """Median [IQR] of each standard classification metric across every
+    dataset, at each bootstrap-count level -- `rows_df` is the concatenation
+    of compute_bootstrap_reduction_confusion_metrics's per-dataset rows.
+
+    "Spread" here is cross-dataset spread at a fixed level, not cross-seed
+    spread within one (dataset, level) cell -- see this section's own module
+    docstring above for why no repeated-seed spread exists at that
+    granularity (exactly one calibration per (dataset, level)); this mirrors
+    how summarize_delta_std_table below pools fit-number-comparison's
+    cross-(dataset, n_c) spread at each restart-count level. Non-finite
+    values (e.g. dor_standard == inf, common whenever a dataset's controls
+    have zero FP or FN at some level) are dropped from that metric's
+    percentiles rather than propagating -- same rationale as
+    analysis.comparison_diagnostics's own inf-DOR handling.
+    """
+    levels = sorted(rows_df["num_bootstraps"].unique(), reverse=True)
+    out = []
+    for N in levels:
+        sub = rows_df[rows_df["num_bootstraps"] == N]
+        row = {"num_bootstraps": N, "n_datasets": len(sub)}
+        for m in metrics:
+            vals = sub[m].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) == 0:
+                row[f"{m}_p25"] = row[f"{m}_p50"] = row[f"{m}_p75"] = np.nan
+                continue
+            p25, p50, p75 = np.percentile(vals, [25, 50, 75])
+            row[f"{m}_p25"], row[f"{m}_p50"], row[f"{m}_p75"] = p25, p50, p75
+        out.append(row)
+    return pd.DataFrame(out)
+
+
 def plot_bootstrap_reduction_config_summary(
     dataset_name: str,
     reference_df: pd.DataFrame,
@@ -1835,6 +1984,49 @@ def plot_fit_number_comparison_curve(
         out_dir = Path(figure_dir) / "fit_number_comparison"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{label}.png"
+        save_and_show(fig, out_path)
+        print(f"  Saved: {out_path}")
+    return fig
+
+
+def plot_skew_locked_vs_regular_ll_boxplot(
+    ll_diff_df: pd.DataFrame,
+    figure_dir: Optional[Path] = None,
+    filename: str = "skew_locked_vs_regular_ll_boxplot.png",
+):
+    """Single box-and-whisker summary of `ll_diff_df["median_diff_std"]`
+    (one value per dataset -- analyze_pipeline_output.py section 3a4's
+    per-dataset median skew_locked-vs-regular val_ll difference, in units of
+    that dataset's own regular-run bootstrap-to-bootstrap SD) across every
+    dataset, plus a jittered scatter of the individual per-dataset values --
+    same median+IQR-with-raw-points design as plot_fit_number_comparison_curve
+    above, condensed to a single box since there's only one condition
+    (skew_locked vs. regular) being summarized, not a level sweep.
+    """
+    vals = ll_diff_df["median_diff_std"].to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+
+    fig, ax = plt.subplots(figsize=(4, 5))
+    ax.boxplot(
+        vals, positions=[1], widths=0.5, showfliers=False,
+        medianprops=dict(color="C0", linewidth=2),
+        boxprops=dict(color="C0"), whiskerprops=dict(color="C0"), capprops=dict(color="C0"),
+    )
+    rng = np.random.default_rng(0)
+    jitter = rng.uniform(-0.08, 0.08, size=len(vals))
+    ax.scatter(1 + jitter, vals, alpha=0.3, s=12, color="C0")
+
+    ax.axhline(0.0, linestyle="--", color="black", alpha=0.6, label="no degradation")
+    ax.set_xticks([1])
+    ax.set_xticklabels([f"skew-locked vs. regular\n(n={len(vals)} datasets)"])
+    ax.set_ylabel(r"$\Delta$ val_ll / regular-run bootstrap SD")
+    ax.set_title("Skew-locked vs. regular: per-dataset median val_ll difference")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", linewidth=0.5, alpha=0.3)
+    fig.tight_layout()
+
+    if figure_dir is not None:
+        out_path = Path(figure_dir) / filename
         save_and_show(fig, out_path)
         print(f"  Saved: {out_path}")
     return fig

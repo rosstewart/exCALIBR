@@ -866,8 +866,8 @@ class Scoreset:
             self.dataframe = self.dataframe[self.dataframe["Flag"].ne("*")]
             _dropped = _before - len(self.dataframe)
             if _dropped:
-                print(f"  [{_dataset_name}] filter_invalid: dropped {_dropped}/{_before} "
-                      f"row(s) with Flag == '*'")
+                logger.debug(f"  [{_dataset_name}] filter_invalid: dropped {_dropped}/{_before} "
+                             f"row(s) with Flag == '*'")
 
         if self.filter_nonsense:
             _before = len(self.dataframe)
@@ -883,8 +883,8 @@ class Scoreset:
             self.dataframe = self.dataframe[mask]
             _dropped = _before - len(self.dataframe)
             if _dropped:
-                print(f"  [{_dataset_name}] filter_invalid: dropped {_dropped}/{_before} "
-                      f"nonsense variant row(s) outside aa 51-349")
+                logger.debug(f"  [{_dataset_name}] filter_invalid: dropped {_dropped}/{_before} "
+                             f"nonsense variant row(s) outside aa 51-349")
 
     def splicing_filter(self, **kwargs):
         """Optional Arguments (both ablation knobs for the SpliceAI-
@@ -942,17 +942,17 @@ class Scoreset:
                 _dropped_spliceai = _before_spliceai - len(self.dataframe)
 
             if _dropped_consequence or _dropped_spliceai:
-                print(f"  [{_dataset_name}] splicing_filter (assay does not detect splice effects; "
-                      f"vep_splice_filter={vep_splice_filter}, spliceai_threshold={spliceai_threshold}): "
-                      f"dropped {_dropped_consequence} splice-consequence row(s) + "
-                      f"{_dropped_spliceai} SpliceAI-flagged row(s) "
-                      f"(of {_before} pre-filter)")
+                logger.debug(f"  [{_dataset_name}] splicing_filter (assay does not detect splice effects; "
+                             f"vep_splice_filter={vep_splice_filter}, spliceai_threshold={spliceai_threshold}): "
+                             f"dropped {_dropped_consequence} splice-consequence row(s) + "
+                             f"{_dropped_spliceai} SpliceAI-flagged row(s) "
+                             f"(of {_before} pre-filter)")
             elif not vep_splice_filter and spliceai_threshold is None:
-                print(f"  [{_dataset_name}] splicing_filter: both vep_splice_filter and "
-                      f"spliceai_threshold disabled — no splice-variant rows dropped")
+                logger.debug(f"  [{_dataset_name}] splicing_filter: both vep_splice_filter and "
+                             f"spliceai_threshold disabled — no splice-variant rows dropped")
         else:
-            print(f"  [{_dataset_name}] splicing_filter: assay detects splice effects "
-                  f"(splice_measure == 'Yes') — no splice-variant rows dropped")
+            logger.debug(f"  [{_dataset_name}] splicing_filter: assay detects splice effects "
+                         f"(splice_measure == 'Yes') — no splice-variant rows dropped")
 
     @staticmethod
     def remove_outliers(dataframe, **kwargs):
@@ -1481,6 +1481,9 @@ class Variant:
         if "clinvar_star_2026" not in variant_info:
             self.clinvar_star_2026 = variant_info.get("clinvar_star_2025", self.clinvar_star)
             self.clinvar_sig_2026 = variant_info.get("clinvar_sig_2025", self.clinvar_sig)
+        if "clinvar_star_2025" not in variant_info:
+            self.clinvar_star_2025 = variant_info.get("clinvar_star_2026", self.clinvar_star)
+            self.clinvar_sig_2025 = variant_info.get("clinvar_sig_2026", self.clinvar_sig)
         # Some source TSVs (integrated_variant_effect_dataset_20260526/
         # 20260615.tsv.gz, sge_variants.expanded, new_igvf_variants.expanded,
         # last_batch.expanded.tsv.gz, and some rows of merged_89datasets.tsv.gz)
@@ -1891,6 +1894,99 @@ def _plot_multiscoreset_scores(scoreset, dim_pairs=None, max_pairs=10, ref_dim=N
     return fig
 
 
+# Fixed sample-role palette/names, in the same order used throughout the codebase
+# (report.py, mv_analysis/gene_3d_evidence.py, etc.): 0=P/LP, 1=B/LB, 2=gnomAD,
+# 3=Synonymous. Indexed by RAW role position (scoreset._sample_assignments columns),
+# not by the filtered/active `sample_assignments` property -- a gene missing an
+# earlier role (e.g. no P/LP) must not shift every later role's color, the same bug
+# class already fixed this session in report.py's _eval_labels.
+SAMPLE_CLASS_COLORS = ['#CA7682', '#1D7AAB', '#A0A0A0', '#6BAA75']
+SAMPLE_CLASS_NAMES_DEFAULT = ['P/LP', 'B/LB', 'gnomAD', 'Synonymous']
+
+
+def _resolve_score_dim(dataset_names, dim):
+    """One dimension spec (int column index, or a substring matched against
+    dataset_names) -> a single resolved column index."""
+    if isinstance(dim, (int, np.integer)):
+        return int(dim)
+    matches = [i for i, name in enumerate(dataset_names) if dim in name]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one dataset name containing {dim!r} among "
+            f"{dataset_names}, found {len(matches)}: {[dataset_names[i] for i in matches]}"
+        )
+    return matches[0]
+
+
+def _plot_multiscoreset_scores_3d_interactive(scoreset, dims=None, sample_indices=None, title=None):
+    """Interactive (plotly) 3D scatter of 3 of this scoreset's score dimensions,
+    one trace per fixed sample-role class, colored in the same fixed palette as
+    the static 2D `.plot()` view (SAMPLE_CLASS_COLORS) -- NOT the MV-evidence
+    diverging colormap `mv_analysis/gene_3d_evidence.py` uses for a different
+    purpose (coloring by calibration evidence strength, not sample class).
+
+    ``dims``: which 3 dimensions to plot -- each entry is either an int column
+    index or a substring matched against `scoreset.dataset_names` (mirroring
+    `mv_analysis/gene_3d_evidence.py`'s `_resolve_dim` convenience). Defaults to
+    the first 3 dimensions if the scoreset has exactly 3; required (raises,
+    listing `dataset_names`) if it has more or fewer.
+
+    ``sample_indices``: which fixed sample-role classes to include (raw role
+    indices into `scoreset._sample_assignments`, e.g. [0, 1] for P/LP + B/LB
+    only). Defaults to every role with at least one observation in this
+    scoreset.
+
+    Returns the plotly Figure (not auto-`.show()`n -- Jupyter's rich repr
+    displays a returned Figure automatically, same as the static `.plot()`
+    returning a matplotlib Figure without forcing a show() call).
+    """
+    import plotly.graph_objects as go
+
+    if dims is None:
+        if scoreset.d != 3:
+            raise ValueError(
+                f"This scoreset has {scoreset.d} dimensions {scoreset.dataset_names} -- "
+                "pass `dims=[i, j, k]` (ints and/or dataset-name substrings) to pick "
+                "exactly 3 to plot."
+            )
+        dim_idx = [0, 1, 2]
+    else:
+        if len(dims) != 3:
+            raise ValueError(f"`dims` must have exactly 3 entries, got {dims!r}")
+        dim_idx = [_resolve_score_dim(scoreset.dataset_names, d) for d in dims]
+
+    sa = scoreset._sample_assignments
+    n_roles = sa.shape[1]
+    if sample_indices is None:
+        sample_indices = [r for r in range(min(n_roles, len(SAMPLE_CLASS_COLORS))) if sa[:, r].any()]
+
+    x_i, y_i, z_i = dim_idx
+    x_all, y_all, z_all = scoreset._scores[:, x_i], scoreset._scores[:, y_i], scoreset._scores[:, z_i]
+    complete = ~(np.isnan(x_all) | np.isnan(y_all) | np.isnan(z_all))
+
+    traces = []
+    for role in sample_indices:
+        mask = sa[:, role].astype(bool) & complete
+        name = SAMPLE_CLASS_NAMES_DEFAULT[role] if role < len(SAMPLE_CLASS_NAMES_DEFAULT) else f"role {role}"
+        color = SAMPLE_CLASS_COLORS[role % len(SAMPLE_CLASS_COLORS)]
+        traces.append(go.Scatter3d(
+            x=x_all[mask], y=y_all[mask], z=z_all[mask],
+            mode='markers', name=f"{name} (n={int(mask.sum()):,d})",
+            marker=dict(color=color, size=4, line=dict(width=0.5, color='#333333'), opacity=0.8),
+        ))
+
+    fig = go.Figure(data=traces, layout=go.Layout(
+        title=title or scoreset.scoreset_name,
+        scene=dict(
+            xaxis_title=scoreset.dataset_names[x_i],
+            yaxis_title=scoreset.dataset_names[y_i],
+            zaxis_title=scoreset.dataset_names[z_i],
+        ),
+        legend=dict(title="Sample class"),
+    ))
+    return fig
+
+
 class _UnionFind:
     """Path-compressed union-find for hashable elements."""
     def __init__(self):
@@ -2284,6 +2380,10 @@ class MultiScoreset:
     def plot(self, dim_pairs=None, max_pairs=10, ref_dim=None):
         return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs, ref_dim=ref_dim)
 
+    def plot_3d_interactive(self, dims=None, sample_indices=None, title=None):
+        return _plot_multiscoreset_scores_3d_interactive(
+            self, dims=dims, sample_indices=sample_indices, title=title)
+
     def __repr__(self):
         out = f"MultiScoreset: {self.scoreset_name}\n"
         out += f"  {self.n_variants} variants, {self.d} assays\n"
@@ -2638,6 +2738,10 @@ class BasicMultiScoreset:
 
     def plot(self, dim_pairs=None, max_pairs=10, ref_dim=None):
         return _plot_multiscoreset_scores(self, dim_pairs=dim_pairs, max_pairs=max_pairs, ref_dim=ref_dim)
+
+    def plot_3d_interactive(self, dims=None, sample_indices=None, title=None):
+        return _plot_multiscoreset_scores_3d_interactive(
+            self, dims=dims, sample_indices=sample_indices, title=title)
 
     def __repr__(self):
         out = f"BasicMultiScoreset: {self.scoreset_name}\n"

@@ -2340,6 +2340,49 @@ def plot_scoreset_final_pillar_project_v2(dataset, scoreset_2018, scoreset, indv
 
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
+def _bold_italic_gene_title(ax, gene_name, suffix, x=0.5, y=1.0, fontsize=14, ha='center', va='bottom', pad=0.0):
+    """Draw "<gene_name> <suffix>" centered at (x, y) in ax-fraction coords,
+    with gene_name italic+bold and suffix bold.
+
+    Plain-text fontweight='bold' has no effect on a mathtext ($...$) span
+    (matplotlib mathtext has no combined bold-italic command -- \\mathit
+    alone stays non-bold and there's no supported \\mathbfit), so this
+    renders gene_name as plain (non-mathtext) text with fontstyle='italic'
+    instead, which *does* respect fontweight. That means gene_name and
+    suffix must be two separate Text artists, positioned here by drawing
+    both once to measure their rendered widths via the renderer, then
+    repositioning them edge-to-edge so the pair is centered as a whole
+    (see analysis/figure4/panels.py::_bold_italic_gene_title, the original
+    of this helper -- duplicated here rather than imported, since panels.py
+    already imports from this module and importing back would be circular).
+    """
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    ax_bbox = ax.get_window_extent(renderer)
+
+    y = y + (pad / 72 * fig.dpi) / ax_bbox.height
+
+    t_gene = ax.text(x, y, gene_name, transform=ax.transAxes, fontsize=fontsize,
+                      fontweight='bold', fontstyle='italic', ha=ha, va=va)
+    t_suffix = ax.text(x, y, suffix, transform=ax.transAxes, fontsize=fontsize,
+                        fontweight='bold', ha=ha, va=va)
+
+    bb_gene = t_gene.get_window_extent(renderer)
+    bb_suffix = t_suffix.get_window_extent(renderer)
+    ax_width = ax_bbox.width
+
+    frac_gene = bb_gene.width / ax_width
+    frac_suffix = bb_suffix.width / ax_width
+    left = x - (frac_gene + frac_suffix) / 2
+
+    t_gene.set_ha('left')
+    t_gene.set_position((left, y))
+    t_suffix.set_ha('left')
+    t_suffix.set_position((left + frac_gene, y))
+    return t_gene, t_suffix
+
+
 def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_MIXTURE_FITS=False, HIDE_COMPONENT_FITS=True, HIDE_COMPONENT_VARIANCE=True, FIRST_ONLY=False, SHOW_PRIOR=True, loader_fn=None):
     """
     Create a 2x2 grid of dataset plots for publication.
@@ -2524,13 +2567,8 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                        horizontalalignment='left')
                 
                 # Gene and author name centered (matching Yang plot)
-                # \mathbfit isn't a real mathtext command (matplotlib's
-                # built-in mathtext, unlike full LaTeX with usetex=True,
-                # doesn't support it) -- \mathit alone renders the gene name
-                # in italics; fontweight='bold' below already bolds the
-                # whole title text (both the gene name and " - {author}").
-                ax.set_title(rf"$\mathit{{{gene_name}}}$ – {author_name}",
-             fontsize=14, fontweight='bold', pad=8)
+                _bold_italic_gene_title(ax, gene_name, f" – {author_name}",
+                                         fontsize=14, pad=8)
             
             # X-axis only on last sample
             is_last_sample = (sample_num == len(scoreset.sample_counts) - 1 or

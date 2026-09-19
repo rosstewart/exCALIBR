@@ -1,4 +1,4 @@
-from .update_steps import em_iteration, get_sample_weights
+from .update_steps import em_iteration, get_sample_weights, gamma_log_prior_total
 from .density_utils import get_likelihood, get_q, _ensure_matrix_delta
 from .initializations import (
     kmeans_init, methodOfMomentsInit, kmeans_init_mv, kmeans_init_mv_anchored,
@@ -63,6 +63,12 @@ def single_fit(
     verbose = kwargs.get("verbose", True)
     check_submerged_duration = kwargs.get("check_submerged_duration", False)
     MIN_SCALE = 1e-100
+    # Relative-to-|LL| thresholds splitting a likelihood decrease into
+    # plateau noise / converged-with-a-tiny-backstep / real M-step overshoot.
+    # See the decrease check in the EM loop below for the measured values
+    # these are set from.
+    PLATEAU_REL_TOL = 1e-8
+    OVERSHOOT_REL_TOL = 1e-5
     mv = multivariate
     latent_q = kwargs.get("latent_q", 2)
     constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
@@ -171,7 +177,7 @@ def single_fit(
                         **kwargs
                     )
             except ValueError as e:
-                if kwargs.get("raise_on_error", False):
+                if kwargs.get("raise_on_error", True):
                     raise
                 if kwargs.get("verbose_init", True):
                     print(f"[INIT FAILED] {e}")
@@ -210,6 +216,17 @@ def single_fit(
         ) / len(sample_indicators)
     ])
 
+    # Penalised objective: when the Gamma ridge is active the M-step maximises
+    # (log L + log p(Gamma)), not log L alone, so BOTH the decrease check and the
+    # convergence test below must run against this series or they will see
+    # spurious decreases in a fit that is improving correctly. With the ridge
+    # disabled gamma_log_prior_total returns 0.0, so `objectives` is elementwise
+    # equal to `likelihoods` and behaviour is bit-identical.
+    def _penalty(params):
+        return gamma_log_prior_total(params, observations, multivariate=mv) / len(sample_indicators)
+
+    objectives = np.array([likelihoods[0] + _penalty(initial_params)])
+
     # ---- First EM iteration ----
     # em_iteration now also returns the per-sample log_pdf cache computed on
     # the *updated* params; we feed it back as cached_log_pdfs to the next
@@ -222,7 +239,7 @@ def single_fit(
             return_log_pdfs=True, **em_kwargs,
         )
     except ZeroDivisionError as e:
-        if kwargs.get("raise_on_error", False):
+        if kwargs.get("raise_on_error", True):
             raise
         print(f"[FIRST EM ITER FAILED] ZeroDivisionError: {e}")
         return dict(
@@ -232,6 +249,7 @@ def single_fit(
         )
 
     likelihoods = np.append(likelihoods, ll)
+    objectives = np.append(objectives, ll + _penalty(updated_component_params))
 
     if verbose:
         q_label = f" (CFUSN q={latent_q})" if mv and latent_q > 1 else ""
@@ -291,55 +309,50 @@ def single_fit(
                     underwater_time += 1
 
             likelihoods = np.append(likelihoods, ll)
+            objectives = np.append(objectives, ll + _penalty(updated_component_params))
 
             # Separation (tempering + repulsion) deliberately trades likelihood
             # for non-overlap, so the penalised objective is not EM-monotone in
-            # the raw LL. Skip backtracking for separation fits and accept the
-            # decrease; convergence is governed by the LL plateau after the
+            # the raw LL. Skip the decrease check for separation fits and accept
+            # the decrease; convergence is governed by the LL plateau after the
             # annealing schedule completes (see sep_min_iters guard below).
-            if it > 0 and likelihoods[-1] < likelihoods[-2] and not separation_active:
-                decrease = likelihoods[-2] - likelihoods[-1]
-                # Trigger backtracking only on a decrease that exceeds floating-
-                # point noise on the LL. The original 1e-13 absolute threshold
-                # fires on every plateau iteration once EM has converged,
-                # wasting up to 10 LL evaluations per iteration on noise.
-                bt_threshold = 1e-8 * abs(likelihoods[-2])
-                if decrease > bt_threshold:
-                    if mv:
-                        # Backtracking: get_likelihood is kept here because it
-                        # evaluates candidate params that aren't stored anywhere
-                        # and are different on each alpha step.
-                        old_params = history[-1]['component_params']
-                        old_weights = history[-1]['weights']
-                        alpha = 0.5
-                        for _ in range(10):
-                            bt_params = _interpolate_params(
-                                old_params, updated_component_params, alpha
-                            )
-                            bt_weights = (1 - alpha) * old_weights + alpha * updated_weights
-                            bt_ll = get_likelihood(
-                                observations, sample_indicators,
-                                bt_params, bt_weights, multivariate=mv,
-                                sample_weights=sample_weights_per_obs,
-                            ) / len(sample_indicators)
-                            if bt_ll >= likelihoods[-2] - 1e-13:
-                                updated_component_params = bt_params
-                                updated_weights = bt_weights
-                                likelihoods[-1] = bt_ll
-                                break
-                            alpha *= 0.5
-                        else:
-                            updated_component_params = old_params
-                            updated_weights = old_weights
-                            likelihoods[-1] = likelihoods[-2]
-                        # Backtracking modified the iterate after em_iteration's
-                        # weight/LL pass cached log_pdfs on pre-backtrack params.
-                        # Force next iter's E-step to recompute density.
-                        cached_log_pdfs = None
-                    else:
-                        raise ValueError(
-                            f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
-                        )
+            if it > 0 and objectives[-1] < objectives[-2] and not separation_active:
+                decrease = objectives[-2] - objectives[-1]
+                # A decrease here is one of two very different things, and the
+                # magnitude relative to the LL separates them cleanly:
+                #
+                #   < PLATEAU_REL_TOL   floating-point noise on a converged
+                #                       plateau -- ignore and keep iterating
+                #                       (the original 1e-13 absolute threshold
+                #                       fired on every such iteration).
+                #   < OVERSHOOT_REL_TOL a real but tiny backward step, seen on
+                #                       weakly-identified multivariate fits
+                #                       that have already converged (measured:
+                #                       5e-7 @ iter 113, 6e-7 @ iter 275, on
+                #                       LL ~ -7). Failing the whole fit here
+                #                       discarded perfectly good converged
+                #                       parameters, which is the common case on
+                #                       low-separation real data. Treat it as
+                #                       convergence: revert to the last good
+                #                       iterate and stop.
+                #   >= OVERSHOOT_REL_TOL genuine M-step overshoot, and it shows
+                #                       up early (measured: 3.4e-3 @ iter 4,
+                #                       2.0e-4 @ iter 20). Still a failed fit --
+                #                       the caller retries with another seed.
+                rel_decrease = decrease / max(abs(objectives[-2]), 1e-300)
+                if rel_decrease >= OVERSHOOT_REL_TOL:
+                    raise ValueError(
+                        f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
+                    )
+                if rel_decrease > PLATEAU_REL_TOL:
+                    # history[-1] was appended at the top of this iteration and
+                    # holds the params whose LL is likelihoods[-2] -- i.e. the
+                    # better of the two iterates.
+                    updated_component_params = history[-1]["component_params"]
+                    updated_weights = history[-1]["weights"]
+                    likelihoods = likelihoods[:-1]
+                    objectives = objectives[:-1]
+                    break
 
             if verbose:
                 pbar.set_postfix({"likelihood": f"{likelihoods[-1]:.6f}"})
@@ -356,8 +369,8 @@ def single_fit(
                 # the next iter and surface the real failure).
                 with np.errstate(invalid='ignore'):
                     rel_change = (
-                        np.abs(likelihoods[-1] - likelihoods[-2])
-                        / abs(likelihoods[-2])
+                        np.abs(objectives[-1] - objectives[-2])
+                        / abs(objectives[-2])
                     )
                 if rel_change < 1e-8:
                     break
@@ -383,7 +396,7 @@ def single_fit(
             raise ValueError("Final parameters violate density constraint")
 
     except (ValueError, ZeroDivisionError) as e:
-        if kwargs.get("raise_on_error", False):
+        if kwargs.get("raise_on_error", True):
             raise
         import traceback
         warnings.warn(f"Failed fit: {e}\n{traceback.format_exc()}")
@@ -405,28 +418,6 @@ def single_fit(
         initial_params=initial_params,
         latent_q=latent_q,
     )
-
-
-def _interpolate_params(old_params, new_params, alpha):
-    """Interpolate between old and new component params.
-
-    Works for both q=1 (Delta is vector) and q>1 (Delta is matrix).
-    """
-    bt_params = []
-    for c in range(len(old_params)):
-        mu_o, D_o, G_o = old_params[c]
-        mu_n, D_n, G_n = new_params[c]
-
-        mu_o, mu_n = np.asarray(mu_o), np.asarray(mu_n)
-        D_o, D_n = np.asarray(D_o, dtype=float), np.asarray(D_n, dtype=float)
-        G_o, G_n = np.asarray(G_o), np.asarray(G_n)
-
-        mu_bt = (1 - alpha) * mu_o + alpha * mu_n
-        D_bt = (1 - alpha) * D_o + alpha * D_n
-        G_bt = (1 - alpha) * G_o + alpha * G_n
-        G_bt = 0.5 * (G_bt + G_bt.T)
-        bt_params.append((mu_bt, D_bt, G_bt))
-    return bt_params
 
 
 def _ensure_cfusn_params(params, latent_q):

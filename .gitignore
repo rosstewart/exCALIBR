@@ -18,3 +18,7 @@ __pycache__/
 #
 # # Jupyter
 .ipynb_checkpoints/
+
+# CFUSN simulation-study run artifacts (re-run often, not committed fixtures)
+tests/cfusn_simulations/results/*.csv
+mv_analysis/figures/

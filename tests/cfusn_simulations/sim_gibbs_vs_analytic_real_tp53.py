@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Production analytic q=2 E-step vs. Gibbs-substituted, on REAL TP53 data
+"""NOTE: the "analytic" q=2 path referenced below is now the EXACT closed
+form (Kan & Robotti 2017), not the ad-hoc approximation this script was
+built to interrogate -- kept as historical record / regression check.
+
+Production analytic q=2 E-step vs. Gibbs-substituted, on REAL TP53 data
 (not synthetic) -- speed and practical-output comparison.
 
 Full TP53 (9911 variants x 16 dims) with genuine Gibbs sampling in every

@@ -11,11 +11,11 @@ shape:
       under-fit) components.
   (2) n_mc_truncated sensitivity: sweep the E-step's Monte-Carlo sample
       count for the truncated-normal moments. Note: _mc_truncated_mvn_moments
-      (update_steps.py) is actually an analytic-approximation path for low
-      q, not literal Monte Carlo sampling -- this experiment explicitly
-      checks (and reports) whether n_mc_truncated has ANY measurable effect
-      on recovery for production's q=2 default, since a flat curve would
-      mean this parameter is effectively a no-op at q=2.
+      (update_steps.py) is actually an EXACT closed-form path at q=2 (not
+      literal Monte Carlo sampling, and no longer even an approximation --
+      see the module docstring), so n_mc_truncated is a true no-op there;
+      this experiment explicitly checks (and reports) that a flat curve
+      results.
 
 Usage:
     python tests/cfusn_simulations/sim_k_and_mc_sensitivity.py

@@ -101,7 +101,14 @@ def build_author_confusion_matrix(df_sub: pd.DataFrame, use_oob: bool = True) ->
     indeterminate_codes = {"NOT SPECIFIED", "INDETERMINATE", "IGNORE"}
 
     def _counts(sub):
-        upper = sub["auth_label"].str.upper()
+        # Real auth_label values include underscore-separated variants (e.g.
+        # "Not_specified", not "Not specified") -- normalize underscores to
+        # spaces before matching indeterminate_codes, otherwise
+        # "NOT_SPECIFIED" never matches "NOT SPECIFIED" and those rows are
+        # silently dropped from all three buckets (undercounting this
+        # matrix's total relative to build_confusion_matrix's, which counts
+        # every P/LP+B/LB row regardless of its author label).
+        upper = sub["auth_label"].str.upper().str.replace("_", " ", regex=False)
         norm = int((upper == "NORMAL").sum())
         abnorm = int((upper == "ABNORMAL").sum())
         ir = int((upper.isin(indeterminate_codes) | sub["auth_label"].isna()).sum())
@@ -204,7 +211,12 @@ def build_author_vus_coverage(df_sub: pd.DataFrame) -> Optional[tuple]:
     if df_vus.empty:
         return None
     indeterminate_codes = {"NOT SPECIFIED", "INDETERMINATE", "IGNORE"}
-    upper = df_vus["auth_label"].str.upper()
+    # See build_author_confusion_matrix's identical fix: real auth_label
+    # values are underscore-separated (e.g. "Not_specified"), which never
+    # matches "NOT SPECIFIED" without this normalization -- those rows would
+    # otherwise be wrongly counted as a determinate author call instead of
+    # indeterminate.
+    upper = df_vus["auth_label"].str.upper().str.replace("_", " ", regex=False)
     n_determinate = int((~(upper.isin(indeterminate_codes) | df_vus["auth_label"].isna())).sum())
     return n_determinate, len(df_vus)
 

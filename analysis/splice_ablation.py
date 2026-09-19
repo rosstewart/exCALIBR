@@ -37,7 +37,7 @@ import matplotlib.pyplot as plt
 from analysis import config as cfg
 from analysis.discovery import discover_outputs, load_all_variants
 from analysis.confusion import build_confusion_matrix
-from analysis.plot_common import save_and_show
+from analysis.plot_common import save_and_show, sample_matches
 
 # Matches "thresh_0.1" .. "thresh_0.9" (build_splice_ablation_jobs.py's own
 # naming) -- anything else (e.g. "keep_all", a stray "logs/" dir) is handled
@@ -74,18 +74,32 @@ def load_splice_ablation_variants(
     condition_dir: Path,
     dataset_configs: Optional[Dict] = None,
     datasets_filter: Optional[List[str]] = None,
+    spliceai_threshold: Optional[float] = 0.2,
+    vep_splice_filter: bool = True,
 ) -> pd.DataFrame:
     """One condition's variants, loaded exactly like a normal pipeline
     output tree (analysis.discovery.discover_outputs + load_all_variants) --
     same pattern analyze_pipeline_output.py section 3a3 uses for
-    SKEW_LOCKED_OUTPUT_DIR. Empty DataFrame if nothing discovered."""
+    SKEW_LOCKED_OUTPUT_DIR. Empty DataFrame if nothing discovered.
+
+    `spliceai_threshold`/`vep_splice_filter` MUST be this condition's own
+    values (from discover_splice_ablation_conditions -- the second tuple
+    element is exactly spliceai_threshold; vep_splice_filter is True for
+    every thresholded condition and False only for "keep_all") -- otherwise
+    load_all_variants rebuilds each dataset's Scoreset with its own
+    hardcoded defaults (0.2/True) regardless of which condition's
+    calibration.json is being applied to it, silently making every
+    condition's "population" identical and defeating the whole point of
+    this ablation. Callers here always pass the condition's real values;
+    nothing in this module relies on the (0.2, True) defaults below.
+    """
     tree, model_selections, calibrations = discover_outputs(condition_dir)
     if not tree:
         return pd.DataFrame()
     return load_all_variants(
         tree=tree, model_selections=model_selections, dataset_configs=dataset_configs,
         methods_filter=None, datasets_filter=datasets_filter, calibrations=calibrations,
-        min_controls=0,
+        min_controls=0, spliceai_threshold=spliceai_threshold, vep_splice_filter=vep_splice_filter,
     )
 
 
@@ -93,11 +107,16 @@ def compute_splice_ablation_confusion_matrices(
     condition_dir: Path,
     dataset_configs: Optional[Dict] = None,
     datasets_filter: Optional[List[str]] = None,
+    spliceai_threshold: Optional[float] = 0.2,
+    vep_splice_filter: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """{dataset: confusion_matrix} for one condition, use_oob=False (these
     reruns don't carry oob_* columns, same convention as the skew-locked/
-    GMM-baseline comparisons)."""
-    df = load_splice_ablation_variants(condition_dir, dataset_configs, datasets_filter)
+    GMM-baseline comparisons). `spliceai_threshold`/`vep_splice_filter` MUST
+    be this condition's own values -- see load_splice_ablation_variants."""
+    df = load_splice_ablation_variants(
+        condition_dir, dataset_configs, datasets_filter, spliceai_threshold, vep_splice_filter,
+    )
     if df.empty:
         return {}
     matrices = {}
@@ -132,7 +151,10 @@ def run_splice_ablation_analysis(
 
     rows = []
     for condition_label, spliceai_threshold, condition_dir in conditions:
-        matrices = compute_splice_ablation_confusion_matrices(condition_dir, dataset_configs, datasets_filter)
+        vep_splice_filter = spliceai_threshold is not None
+        matrices = compute_splice_ablation_confusion_matrices(
+            condition_dir, dataset_configs, datasets_filter, spliceai_threshold, vep_splice_filter,
+        )
         if not matrices:
             print(f"  SKIP {condition_label}: no confusion matrices (no variants discovered under {condition_dir})")
             continue
@@ -143,6 +165,200 @@ def run_splice_ablation_analysis(
                 "dataset": dataset, **metrics,
             })
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Aggregate (all-datasets-pooled) summary tables
+# ---------------------------------------------------------------------------
+
+_SAMPLE_COUNT_CATEGORIES = {
+    "n_plp": "Pathogenic/Likely Pathogenic",
+    "n_blb": "Benign/Likely Benign",
+    # The per-variant "sample" column's real category string for the
+    # background/gnomAD-derived population is "population" (see
+    # analysis.plot_common.sample_matches's own docstring example) --
+    # "gnomAD" is only the --population-type config value that determines
+    # which rows get labeled "population" in the first place, never a
+    # literal category string in the data itself.
+    "n_gnomad": "population",
+    "n_synonymous": "Synonymous",
+}
+
+_PCT_CHANGE_METRICS = [
+    "accuracy", "coverage", "dor_standard", "sensitivity", "specificity", "mcc",
+    "lr_plus_standard", "lr_plus_pathogenic", "lr_plus_benign",
+]
+
+
+def compute_splice_ablation_aggregate_summary(
+    root: Optional[str] = None,
+    dataset_configs: Optional[Dict] = None,
+    datasets_filter: Optional[List[str]] = None,
+    baseline_condition: str = "thresh_0.2",
+) -> pd.DataFrame:
+    """Table A: one row per condition, ALL datasets pooled into a single
+    combined confusion matrix (summed, not per-dataset) -> one aggregate
+    classification-metrics row per condition, same pooling
+    print_aggregate_performance already applies to the main pipeline's
+    results elsewhere in analyze_pipeline_output.py -- just with "condition"
+    as the row axis instead of one aggregate row.
+
+    Also carries each condition's raw PLP/BLB/gnomAD/Synonymous variant
+    counts (pooled across every dataset via analysis.plot_common.
+    sample_matches), plus every metric/count's percent change relative to
+    `baseline_condition` (default "thresh_0.2", matching
+    Scoreset.splicing_filter's own hardcoded defaults --
+    spliceai_threshold=0.2, vep_splice_filter=True).
+
+    Since each condition genuinely uses its own, differently-filtered
+    population (that's the point of the ablation -- see this module's own
+    docstring), a metric's percent change here mixes two effects: the
+    control population itself changed, AND the calibration was refit to
+    that different population. compute_splice_ablation_fixed_population_
+    summary isolates just the second effect, holding the population fixed.
+    """
+    from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+
+    conditions = discover_splice_ablation_conditions(root)
+    if not conditions:
+        print(f"  SKIP splice ablation aggregate summary: no conditions found under "
+              f"{root or cfg.SPLICE_ABLATION_ROOT}")
+        return pd.DataFrame()
+
+    rows = []
+    for condition_label, spliceai_threshold, condition_dir in conditions:
+        vep_splice_filter = spliceai_threshold is not None
+        df = load_splice_ablation_variants(
+            condition_dir, dataset_configs, datasets_filter, spliceai_threshold, vep_splice_filter,
+        )
+        if df.empty:
+            print(f"  SKIP {condition_label}: no variants discovered under {condition_dir}")
+            continue
+
+        matrices = [
+            build_confusion_matrix(df[df["dataset"] == ds], use_oob=False, label=f"{ds}/{condition_label}")
+            for ds in sorted(df["dataset"].unique())
+        ]
+        matrices = [m for m in matrices if m is not None]
+        if not matrices:
+            print(f"  SKIP {condition_label}: no confusion matrices")
+            continue
+        aggregate_matrix = sum(matrices[1:], matrices[0])
+        metrics = compute_classification_metrics(aggregate_matrix)
+
+        row = {"condition_label": condition_label, "spliceai_threshold": spliceai_threshold, **metrics}
+        for col, category in _SAMPLE_COUNT_CATEGORIES.items():
+            row[col] = int(sample_matches(df, category).sum())
+        rows.append(row)
+
+    summary_df = pd.DataFrame(rows)
+    if summary_df.empty or baseline_condition not in summary_df["condition_label"].values:
+        print(f"  NOTE: baseline condition '{baseline_condition}' not in scope -- no pct-change columns")
+        return summary_df
+
+    baseline_row = summary_df.loc[summary_df["condition_label"] == baseline_condition].iloc[0]
+    for col in _PCT_CHANGE_METRICS + list(_SAMPLE_COUNT_CATEGORIES.keys()):
+        base_val = baseline_row[col]
+        summary_df[f"pct_change_{col}"] = np.where(
+            base_val != 0, 100 * (summary_df[col] - base_val) / base_val, np.nan,
+        )
+    return summary_df
+
+
+def compute_splice_ablation_fixed_population_summary(
+    root: Optional[str] = None,
+    dataset_configs: Optional[Dict] = None,
+    datasets_filter: Optional[List[str]] = None,
+    baseline_condition: str = "thresh_0.2",
+) -> pd.DataFrame:
+    """Table B: isolates the calibration-only effect from population drift
+    (see compute_splice_ablation_aggregate_summary's docstring for the
+    confound this addresses). Fixes the variant population to
+    `baseline_condition`'s own (default "thresh_0.2", matching
+    Scoreset.splicing_filter's hardcoded defaults), and for every OTHER
+    condition re-applies THAT condition's own calibration.json point_ranges
+    to this SAME fixed population via
+    analysis.discovery.recompute_points_from_calibration -- the same
+    primitive analysis.robustness's own _iter_robustness_scored uses to
+    apply a condition's point_ranges to a fixed reference population.
+
+    PLP/BLB/gnomAD/Synonymous counts are therefore identical across every
+    row here by construction (always baseline_condition's own counts) --
+    any metric difference reflects purely a calibration-threshold shift,
+    not population composition drift (that's Table A's job).
+    """
+    from analysis.discovery import resolve_component, recompute_points_from_calibration
+    from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+
+    conditions = discover_splice_ablation_conditions(root)
+    condition_dirs = {label: d for label, _, d in conditions}
+    condition_thresholds = {label: t for label, t, _ in conditions}
+    if baseline_condition not in condition_dirs:
+        print(f"  SKIP splice ablation fixed-population summary: baseline condition "
+              f"'{baseline_condition}' not found under {root or cfg.SPLICE_ABLATION_ROOT}")
+        return pd.DataFrame()
+
+    baseline_threshold = condition_thresholds[baseline_condition]
+    baseline_df = load_splice_ablation_variants(
+        condition_dirs[baseline_condition], dataset_configs, datasets_filter,
+        baseline_threshold, baseline_threshold is not None,
+    )
+    if baseline_df.empty:
+        print(f"  SKIP splice ablation fixed-population summary: no variants for baseline "
+              f"condition '{baseline_condition}'")
+        return pd.DataFrame()
+    primary_method = sorted(baseline_df["method"].unique())[0]
+    baseline_df = baseline_df[baseline_df["method"] == primary_method]
+
+    rows = []
+    for condition_label, spliceai_threshold, condition_dir in conditions:
+        tree, model_selections, calibrations = discover_outputs(condition_dir)
+        scored_frames = []
+        for dataset in sorted(baseline_df["dataset"].unique()):
+            df_ds = baseline_df[baseline_df["dataset"] == dataset]
+            if dataset not in tree:
+                continue
+            comp = resolve_component(dataset, list(tree[dataset].keys()), model_selections, dataset_configs)
+            methods_here = list(tree[dataset].get(comp, {}).keys())
+            if not methods_here:
+                continue
+            cal_path = (calibrations or {}).get(dataset, {}).get(sorted(methods_here)[0], {}).get(comp)
+            if cal_path is None:
+                continue
+            try:
+                scored = recompute_points_from_calibration(df_ds, cal_path)
+            except (ValueError, FileNotFoundError, KeyError) as e:
+                print(f"  SKIP {dataset}/{condition_label} (fixed-population): {e}")
+                continue
+            scored["dataset"] = dataset
+            scored_frames.append(scored)
+        if not scored_frames:
+            print(f"  SKIP {condition_label}: no matching calibrations for baseline population")
+            continue
+        scored_df = pd.concat(scored_frames, ignore_index=True)
+
+        matrices = [
+            build_confusion_matrix(
+                scored_df[scored_df["dataset"] == ds], use_oob=False,
+                label=f"{ds}/{condition_label}(fixed-pop)",
+            )
+            for ds in sorted(scored_df["dataset"].unique())
+        ]
+        matrices = [m for m in matrices if m is not None]
+        if not matrices:
+            continue
+        aggregate_matrix = sum(matrices[1:], matrices[0])
+        metrics = compute_classification_metrics(aggregate_matrix)
+        rows.append({"condition_label": condition_label, "spliceai_threshold": spliceai_threshold, **metrics})
+
+    summary_df = pd.DataFrame(rows)
+    if summary_df.empty or baseline_condition not in summary_df["condition_label"].values:
+        return summary_df
+    baseline_row = summary_df.loc[summary_df["condition_label"] == baseline_condition].iloc[0]
+    for col in _PCT_CHANGE_METRICS:
+        base_val = baseline_row[col]
+        summary_df[f"pct_change_{col}"] = np.where(base_val != 0, 100 * (summary_df[col] - base_val) / base_val, np.nan)
+    return summary_df
 
 
 # ---------------------------------------------------------------------------

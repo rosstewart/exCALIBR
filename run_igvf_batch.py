@@ -1278,9 +1278,31 @@ def main():
             "whose preprocessing depends on the ClinVar release."
         )
 
-    # Load splits if provided
+    # Datasets requested for OOB that the splits pickle does not cover; see
+    # the per-dataset lookup below and the parser.error after that loop.
+    datasets_missing_splits = []
+
+    # Load splits. --oob is a hard requirement for --splits-file, not a
+    # best-effort request: this script consumes *precomputed* fits, so the
+    # per-bootstrap train/val membership OOB needs exists nowhere in its
+    # inputs (the fits JSON stores fitted parameters per seed, not resample
+    # composition -- that lives in hpc/prepare.py's `shared_data`). Without
+    # the pickle, compute_variant_table would just log a warning and emit a
+    # table with no oob_points column while still exiting 0 -- a silent
+    # downgrade that is indistinguishable downstream from a run that never
+    # asked for OOB. Fail here instead.
     all_splits = None
-    if args.splits_file and args.oob:
+    if args.oob:
+        if not args.splits_file:
+            parser.error(
+                "--oob requires --splits-file: this script runs from precomputed "
+                "fits, which do not carry per-bootstrap train/val composition, so "
+                "OOB evidence cannot be computed without a splits pickle. "
+                "Regenerate one with hpc/prepare.py pillar_project + "
+                "test/regenerate_pp_splits.py (see that script's docstring)."
+            )
+        if not os.path.exists(args.splits_file):
+            parser.error(f"--splits-file does not exist: {args.splits_file}")
         print(f"\nLoading splits from {args.splits_file}...")
         with open(args.splits_file, "rb") as f:
             all_splits = pickle.load(f)
@@ -1417,10 +1439,19 @@ def main():
                 print(f"  SKIP {effective_dataset_name}: output already exists ({', '.join(existing)})")
                 continue
 
-        # Get splits for this dataset
+        # Get splits for this dataset. Under --oob a dataset missing from the
+        # pickle is an error, not a per-dataset downgrade: the splits pickle
+        # and the fits file must cover the same datasets, and a pickle that
+        # predates a newly added dataset (or a dataset renamed since) would
+        # otherwise yield a table silently lacking oob_points for exactly
+        # that dataset. Collected and reported together after this loop so
+        # one run names every gap instead of dying on the first.
         dataset_splits = None
-        if all_splits and effective_dataset_name in all_splits:
-            dataset_splits = all_splits[effective_dataset_name]
+        if all_splits is not None:
+            if effective_dataset_name not in all_splits:
+                datasets_missing_splits.append(effective_dataset_name)
+            else:
+                dataset_splits = all_splits[effective_dataset_name]
 
         # Slice out just this dataset's rows here, once, in the parent process
         # -- so process-based parallel dispatch (joblib's loky backend) only
@@ -1436,6 +1467,16 @@ def main():
             n_c, benign_method, overrides, dataset_splits,
             clinvar_mode,
         ))
+
+    if datasets_missing_splits:
+        parser.error(
+            f"--oob: {len(datasets_missing_splits)} requested dataset(s) have no "
+            f"entry in --splits-file ({args.splits_file}): "
+            f"{sorted(datasets_missing_splits)}. Regenerate the splits pickle "
+            "against the current --dataset (hpc/prepare.py pillar_project + "
+            "test/regenerate_pp_splits.py --merge-into), or exclude these "
+            "datasets with --datasets."
+        )
 
     # --all-configs: calibration + viz per dataset, one dataset at a time
     if getattr(args, "all_configs", False):

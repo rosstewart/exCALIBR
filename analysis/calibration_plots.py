@@ -26,7 +26,7 @@ try:
 except ImportError:
     _HAS_SNS = False
 
-from src.assay_calibration.plot_utils.utils import log_thresholds_with_ylim_pad
+from src.assay_calibration.plot_utils.utils import log_thresholds_with_ylim_pad, _bold_italic_gene_title
 from analysis.plot_common import sample_matches
 
 
@@ -442,10 +442,14 @@ def plot_yang_distance_diagnostic(
         ax.set_xticklabels([_YANG_SAMPLE_LABELS.get(k, k) for k in present], fontsize=9)
         gene_name = dataset.split("_")[0]
         author_name = dataset.split("_")[1] if "_" in dataset else ""
-        # \mathit (not \mathbfit -- see plot_four_datasets_publication) for
-        # italic gene name; matplotlib's built-in mathtext doesn't support
-        # \mathbfit outside a full LaTeX (usetex=True) install.
-        ax.set_title(f"({letter}) " + rf"$\mathit{{{gene_name}}}$ – {author_name}", fontsize=12)
+        # Panel letter separate from the centered gene/author title (same
+        # split used by plot_four_datasets_publication) -- _bold_italic_gene_title
+        # renders gene_name as plain (non-mathtext) bold+italic text since
+        # mathtext has no combined bold-italic command, so it can't just be
+        # concatenated into one ax.set_title string with the letter prefix.
+        ax.text(0.0, 1.14, f"({letter})", transform=ax.transAxes,
+                fontsize=12, fontweight="bold", va="bottom", ha="left")
+        _bold_italic_gene_title(ax, gene_name, f" – {author_name}", fontsize=12, y=1.0, va="bottom")
         ax.set_ylabel("Normalized Yang distance (p=2)", fontsize=9)
         ax.tick_params(labelsize=8)
         ax.grid(True, alpha=0.2, linewidth=0.5)

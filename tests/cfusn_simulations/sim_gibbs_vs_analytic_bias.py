@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Does production's q=2 analytic E-step approximation (independent
+"""NOTE: update_steps._mc_truncated_mvn_moments's q=2 path is now the
+EXACT closed form (Kan & Robotti 2017), not the approximation this script
+was built to interrogate -- expect ~0 bias below vs. the Gibbs reference
+(historically it was non-zero; that gap was this exact bug). Kept as a
+regression check / historical record rather than rewritten.
+
+Does production's q=2 analytic E-step approximation (independent
 marginals + a linear correlation correction, in
 update_steps._mc_truncated_mvn_moments) meaningfully bias parameter
 recovery, specifically in how well EM exploits the correlation between the

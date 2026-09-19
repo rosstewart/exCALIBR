@@ -86,3 +86,111 @@ LABELSEQ_GENES = (
 
 # FGFR paralogs.
 FGFR_GENES = ("FGFR1", "FGFR2", "FGFR3", "FGFR4")
+
+
+# ---------------------------------------------------------------------------
+# MV results/provenance registry
+# ---------------------------------------------------------------------------
+# Every ad hoc script this session hardcoded its own copy of: which results
+# JSON, which dataset-key naming convention ({gene}_labelseq_mv vs {GENE}_mv
+# vs {GENE}_mv_clinvar_2018 for the GENES_2018 special case vs TP53_tp53_mv
+# for the dedicated TP53 gene-set), which MultiScoreset builder. This is the
+# single place that knowledge should live instead.
+
+# Canonical (production) results -- v3 confirmed this session as the
+# current/correct one (v2 exists on disk too but is superseded/unused).
+CANONICAL_RESULTS_JSON = _env(
+    "MV_CANONICAL_RESULTS",
+    "/data/ross/assay_calibration/multivariate/jobs_all_1000b_8f_v2/bootstrap_results_v3.json.gz")
+
+# Experimental staged-init all_assayed results (mv_analysis/
+# experimental_staged_fit.py) -- NOT wired into hpc/prepare.py's production
+# path yet (see the cockpit plan's item 2). Only labelseq/integrated support
+# all_assayed at all: predictor/combined/card11/tp53 retain no unlabeled bulk
+# at ingestion, confirmed this session.
+EXPERIMENTAL_STAGED_FIT_DIR = _env(
+    "MV_EXPERIMENTAL_STAGED_FIT_DIR",
+    "/data/ross/assay_calibration/multivariate/experimental_staged_fit")
+
+GENE_SETS_SUPPORTING_ALL_ASSAYED = ("labelseq", "integrated")
+
+
+def canonical_dataset_name(gene: str, gene_set: str) -> str:
+    """Resolve the results-JSON top-level key for `gene`'s canonical fit
+    under `gene_set`. Reuses the two existing, already-correct resolvers
+    instead of re-deriving the naming rules here: `gene_set_dataset_label`
+    (regular "{gene}_{gene_set}_mv" formula -- labelseq/tp53/card11/
+    combined/predictor) and `_find_dataset_key` (irregular per-gene lookup,
+    needed for the plain-"integrated" gene-set's GENES_2018/`_mv_clinvar_2018`
+    special-casing and other exceptions like "TP53_tp53_mv" existing
+    alongside "TP53_mv_clinvar_2018"). Deferred imports to avoid a circular
+    import with mv_analysis.gene_performance_scatter (which imports this
+    module).
+    """
+    if gene_set == "integrated":
+        from mv_analysis.gene_performance_scatter import _find_dataset_key
+        return _find_dataset_key(CANONICAL_RESULTS_JSON, gene.upper())
+    from src.assay_calibration.multivariate_data.common import gene_set_dataset_label
+    gene_key = gene.lower() if gene_set == "labelseq" else gene.upper()
+    return gene_set_dataset_label(gene_key, gene_set)
+
+
+def staged_init_results_path(gene: str, gene_set: str, n_components: int = 6) -> str:
+    if gene_set == "labelseq":
+        return (f"{EXPERIMENTAL_STAGED_FIT_DIR}/{gene.lower()}_all_assayed_"
+                f"bootstrap_results_stagedinit_big.json.gz")
+    if gene_set == "integrated":
+        return (f"{EXPERIMENTAL_STAGED_FIT_DIR}/{gene.upper()}_integrated_all_assayed_"
+                f"bootstrap_results_stagedinit_big.json.gz")
+    raise ValueError(
+        f"gene_set={gene_set!r} does not support staged_init_all_assayed -- no "
+        f"unlabeled bulk is retained at ingestion for predictor/combined/card11/tp53 "
+        f"(confirmed this session). Supported: {GENE_SETS_SUPPORTING_ALL_ASSAYED}."
+    )
+
+
+def staged_init_dataset_name(gene: str, gene_set: str) -> str:
+    if gene_set == "labelseq":
+        return f"{gene.upper()}_labelseq_mv"
+    if gene_set == "integrated":
+        return f"{gene.upper()}_mv"
+    raise ValueError(
+        f"gene_set={gene_set!r} does not support staged_init_all_assayed. "
+        f"Supported: {GENE_SETS_SUPPORTING_ALL_ASSAYED}."
+    )
+
+
+def staged_init_config_label(n_components: int = 6) -> str:
+    return f"all_assayed_{n_components}c_stagedinit_big"
+
+
+def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_type=None,
+                                       redundancy_collapse_preset=None):
+    """MultiScoreset builder dispatch by gene_set. Covers labelseq/integrated
+    only -- predictor/combined/card11/tp53's builders currently live inline
+    inside mv_analysis/gene_performance_scatter.py's panel-building functions
+    (build_panel_b/build_panel_c/build_tp53_multiscoreset/
+    build_card11_multiscoreset), not as a standalone (genes, regularization_type)
+    -> {gene: ms} callable -- not wired into this registry yet. There is no
+    dedicated 'tp53' gene_set entry here either -- the cockpit only reaches
+    TP53 via 'integrated' (one of its 19 genes), so `redundancy_collapse_preset`
+    (e.g. "tp53_kato_pca2") is the only way to get TP53's Kato_2003 8-assay
+    panel collapsed to 2 PCs from the cockpit today; see hpc/prepare.py's
+    --redundancy-collapse-preset for the equivalent on the fit-launching side
+    (shared definition: redundancy_collapse.PRESETS/apply_preset).
+    """
+    if gene_set == "labelseq":
+        from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
+        ms_map = build_labelseq_multiscoresets(genes=genes, regularization_type=regularization_type)
+    elif gene_set == "integrated":
+        from mv_analysis.integrated_gene_data import build_integrated_multiscoresets
+        ms_map = build_integrated_multiscoresets(genes=genes, regularization_type=regularization_type)
+    else:
+        raise ValueError(
+            f"No MultiScoreset builder registered for gene_set={gene_set!r} yet. "
+            f"Currently registered: 'labelseq', 'integrated'."
+        )
+    if redundancy_collapse_preset is not None:
+        from src.assay_calibration.multivariate_data import redundancy_collapse as rc
+        rc.apply_preset(ms_map, redundancy_collapse_preset)
+    return ms_map

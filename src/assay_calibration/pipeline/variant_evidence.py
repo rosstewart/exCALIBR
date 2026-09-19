@@ -23,6 +23,8 @@ from ..fit_utils.point_ranges import (
 )
 from .config import PipelineConfig
 
+_MODULE_LOGGER = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -230,16 +232,59 @@ def get_all_variant_groups(scoreset, point_ranges: Dict) -> List[Dict]:
     analyzes.
 
     Returns one dict per group: {variant_id, score, standard_points, is_vus,
-    nucleotide_or_aa, aa_ref, aa_pos, aa_alt}. `standard_points` is always
+    nucleotide_or_aa, aa_ref, aa_pos, aa_alt, gene_symbol, chrom, pos, ref,
+    alt, transcript_id, hgvs_c, hgvs_p, mavedb_urn, is_benign, is_pathogenic,
+    is_gnomad, simplified_consequence, input_row_ids, row_is_benign,
+    row_is_pathogenic, row_is_vus, row_is_gnomad, group_n_rows}.
+    `standard_points` is always
     the in-bag assignment (`_assign_points` against `point_ranges`) -- no
     OOB points are available for most of this population, since a variant
     outside every fitting-relevant sample group was never part of any
     bootstrap's training/validation split (same reasoning
     `_get_vus_only_extra_rows`'s docstring already gives for its own extra
     rows).
+
+    The `gene_symbol`/`chrom`/.../`simplified_consequence` fields are cheap
+    reads off `v0`'s `__dict__` (populated directly from the master TSV row
+    by `Variant.__init__`, see `data_utils/dataset.py`) -- added for
+    `analysis.all_variant_evidence`'s variant-assay/variant-aggregate CSV
+    tables, which need real variant identity/classification, not just
+    scores. `is_benign`/`is_pathogenic`/`is_gnomad` are OR'd across every
+    variant in the group (same promotion rule
+    `test/create_all_variant_evidence_csv.ipynb` uses when several
+    degenerate-codon rows collapse into one group).
+
+    `input_row_ids` is the list of the group's member rows' `_input_row_id`
+    values (empty when the caller didn't inject that column),
+    `row_is_*` are the same members' own un-promoted membership flags
+    (parallel lists), and `group_n_rows` is the member count.
+    The grain of this function is
+    unchanged -- still one dict per MEASURED variant, which is what
+    `analyze_pipeline_output.py`'s "variant effect measurements" total
+    counts -- but a caller that needs per-input-row output (e.g.
+    `analysis.all_variant_evidence`'s variant-assay table, which must keep
+    every nucleotide route to an aa-level measurement rather than just
+    `v0`'s) can explode on `input_row_ids` and join back to its own input
+    dataframe. Note `score` here is the GROUP score, i.e. the mean over the
+    member rows when the Scoreset was built with `score_avg=True` (the
+    default) -- it is not any single member's raw `auth_reported_score`.
     """
     if not (hasattr(scoreset, "get_variants_by_id")):
         return []
+    # Downsampling shrinks _scores/_sample_assignments via
+    # _keep_mask_downsample without touching _keep_mask/_variant_codes/_ids,
+    # which breaks the group-index <-> array-index correspondence every
+    # caller of get_variants_by_id relies on (MultiScoreset._get_variant_keys
+    # raises on the same mismatch). Nothing here indexes those arrays today,
+    # but the row->group mapping this function now exports would be silently
+    # misaligned against them.
+    if getattr(scoreset, "_keep_mask_downsample", None) is not None:
+        raise ValueError(
+            "get_all_variant_groups does not support a downsampled Scoreset: "
+            "_keep_mask_downsample shrinks scores/_sample_assignments without "
+            "updating _keep_mask/_variant_codes/_ids, so group indices no longer "
+            "align with the score arrays."
+        )
     rows = []
     for key, variants in scoreset.get_variants_by_id().items():
         v0 = variants[0]
@@ -255,6 +300,36 @@ def get_all_variant_groups(scoreset, point_ranges: Dict) -> List[Dict]:
             "aa_ref": getattr(v0, "aa_ref", None),
             "aa_pos": getattr(v0, "aa_pos", None),
             "aa_alt": getattr(v0, "aa_alt", None),
+            "gene_symbol": getattr(v0, "Gene", None),
+            "chrom": getattr(v0, "Chrom", None),
+            "pos": getattr(v0, "hg38_start", None),
+            "ref": getattr(v0, "ref_allele", None),
+            "alt": getattr(v0, "alt_allele", None),
+            "transcript_id": getattr(v0, "Ensembl_transcript_ID", None),
+            "hgvs_c": getattr(v0, "hgvs_c", None),
+            "hgvs_p": getattr(v0, "hgvs_p", None),
+            "mavedb_urn": v0.row.get("MaveDB Score Set URN") if hasattr(v0, "row") else None,
+            "is_benign": any(getattr(v, "is_benign", False) for v in variants),
+            "is_pathogenic": any(getattr(v, "is_pathogenic", False) for v in variants),
+            "is_gnomad": any(getattr(v, "is_gnomAD", False) for v in variants),
+            "simplified_consequence": getattr(v0, "simplified_consequence", None),
+            # Read off `row` rather than `__dict__`: Variant._init_variant_info
+            # copies every input column into __dict__ too, but `row` is the
+            # authoritative record and cannot be shadowed by an attribute the
+            # class sets after that copy.
+            "input_row_ids": [
+                v.row["_input_row_id"] for v in variants
+                if hasattr(v, "row") and "_input_row_id" in v.row
+            ],
+            # Per-member (NOT OR-promoted) copies of the membership flags,
+            # parallel to input_row_ids. Taken from the Variant objects so the
+            # class's own ClinVar-release/min_clinvar_star logic is reused
+            # rather than reimplemented against the raw clinvar_sig_* columns.
+            "row_is_benign": [bool(getattr(v, "is_benign", False)) for v in variants],
+            "row_is_pathogenic": [bool(getattr(v, "is_pathogenic", False)) for v in variants],
+            "row_is_vus": [bool(getattr(v, "is_vus", False)) for v in variants],
+            "row_is_gnomad": [bool(getattr(v, "is_gnomAD", False)) for v in variants],
+            "group_n_rows": len(variants),
         })
     return rows
 
@@ -605,6 +680,85 @@ def _build_continuous_table(scoreset, calibration: Dict, config) -> pd.DataFrame
 # OOB helpers
 # ---------------------------------------------------------------------------
 
+def _validate_splits_against_scoreset(
+    scoreset,
+    dataset_splits: Dict[int, Dict],
+    config: PipelineConfig,
+) -> None:
+    """Fail loudly when `dataset_splits` was generated against a different
+    variant population than `scoreset`.
+
+    `val_variant_indices` are positional indices into `scoreset.scores`, so a
+    splits pickle built before the input dataframe / ClinVar release / splice
+    filters changed indexes the *wrong* variants. `_build_oob_mapping` does no
+    bounds checking: an out-of-range index just accumulates under a variant
+    position that does not exist and drops out of the merge, so a stale pickle
+    used to surface only as unexplained OOB coverage loss.
+
+    Two tests, because a bounds check alone catches only the population-shrank
+    case. Populations can also grow, and stale-but-in-bounds indices silently
+    point at the wrong variants rather than dropping out.
+
+    1. `max(val_variant_indices) >= n_pop` -- impossible; the population shrank.
+    2. `max(val_variant_indices) + 1 != n_pop` -- across 1000 bootstraps every
+       variant lands in some validation fold with probability ~1 (missing all
+       of them requires ~0.63**n_bootstraps), so the largest index seen is
+       exactly `n_pop - 1` for a matching pickle. Verified against a real
+       91-dataset splits pickle: `max_idx + 1` equalled the population the
+       pipeline logged at run time for all 87 datasets whose splits were
+       current, and differed only for the 3 known-stale ones. Only applied when
+       there are enough seeds for the argument to hold, since with a handful of
+       bootstraps the top indices legitimately may never be OOB.
+
+    Neither test can catch a population that changed *composition* while
+    keeping its size, so the real invariant remains "regenerate the pickle
+    whenever the dataframe, clinvar_release, or splice-filter settings change".
+    """
+    # Below this, "the largest index is n_pop - 1" stops being a safe inference
+    # and the exact test would false-positive on a legitimately small run.
+    _MIN_SEEDS_FOR_EXACT_CHECK = 50
+
+    n_pop = len(scoreset.scores)
+    max_idx = -1
+    n_indexed_seeds = 0
+    for split in dataset_splits.values():
+        indices = split.get("val_variant_indices")
+        if indices is None:
+            continue
+        n_indexed_seeds += 1
+        arr = np.asarray(indices)
+        if arr.size:
+            max_idx = max(max_idx, int(arr.max()))
+
+    if max_idx < 0:
+        return  # legacy score-matched splits carry no indices to validate
+
+    remedy = (
+        "Regenerate the splits against the current dataframe / clinvar_release / "
+        "splice-filter settings (hpc/prepare.py pillar_project + "
+        "test/regenerate_pp_splits.py) rather than computing OOB evidence from "
+        "mismatched variant indices."
+    )
+
+    if max_idx >= n_pop:
+        raise ValueError(
+            f"Stale splits for dataset '{config.dataset_name}': "
+            f"val_variant_indices reach {max_idx} but the current scoreset has "
+            f"only {n_pop} variants (valid indices 0..{n_pop - 1}). The splits "
+            f"were generated against a larger variant population. {remedy}"
+        )
+
+    if n_indexed_seeds >= _MIN_SEEDS_FOR_EXACT_CHECK and max_idx + 1 != n_pop:
+        raise ValueError(
+            f"Stale splits for dataset '{config.dataset_name}': the splits were "
+            f"generated against a population of {max_idx + 1} variants, but the "
+            f"current scoreset has {n_pop}. Across {n_indexed_seeds} bootstrap "
+            "seeds every variant should appear in some validation fold, so the "
+            f"largest val_variant_index should be {n_pop - 1}, not {max_idx}. "
+            f"The indices therefore refer to a different variant population. {remedy}"
+        )
+
+
 def _build_oob_mapping(
     scoreset,
     dataset_splits: Dict[int, Dict],
@@ -840,7 +994,7 @@ def _compute_oob_evidence(
     """Run OOB evidence computation for all variants that have enough OOB samples."""
 
     def log(msg):
-        (logger.info if logger else print)(msg)
+        (logger.info if logger else _MODULE_LOGGER.debug)(msg)
 
     priors = np.asarray(calibration["priors"])
     log_fp = np.asarray(calibration["log_fp"])
@@ -936,7 +1090,7 @@ def compute_variant_table(
     """
 
     def log(msg):
-        (logger.info if logger else print)(msg)
+        (logger.info if logger else _MODULE_LOGGER.debug)(msg)
 
     # --- standard assignment (always) ---
     acmg_mapping_method = calibration.get(
@@ -958,11 +1112,29 @@ def compute_variant_table(
     if config.compute_oob and acmg_mapping_method == "acmg_bayes":
         log("  Note: OOB evidence not supported for acmg_bayes acmg_mapping_method; skipping")
     elif config.compute_oob:
+        # Both of these were warn-and-skip, which produced a table with no
+        # oob_points column on a successful exit -- downstream consumers
+        # (analysis/discovery.py, the evidence tables) cannot tell that apart
+        # from a deliberately in-bag run, so a missing splits pickle or a
+        # calibration from an older schema silently became "no OOB evidence
+        # exists for this dataset". compute_oob=True is an explicit request;
+        # if it cannot be honored, that is a failure.
         if dataset_splits is None:
-            log("  WARNING: OOB requested but no dataset_splits provided; skipping")
-        elif "valid_bootstrap_seeds" not in calibration:
-            log("  WARNING: OOB requested but calibration missing valid_bootstrap_seeds; skipping")
+            raise ValueError(
+                "config.compute_oob is True but no dataset_splits were provided. "
+                "OOB evidence requires per-bootstrap train/val membership; pass "
+                "the splits for this dataset (run_igvf_batch.py --splits-file, or "
+                "run_pipeline.py's _recover_splits_from_seeds) or set "
+                "compute_oob=False."
+            )
+        if "valid_bootstrap_seeds" not in calibration:
+            raise ValueError(
+                "config.compute_oob is True but the calibration has no "
+                "'valid_bootstrap_seeds' key, so OOB bootstrap indices cannot be "
+                "resolved. Recompute the calibration, or set compute_oob=False."
+            )
         else:
+            _validate_splits_against_scoreset(scoreset, dataset_splits, config)
             log("  Computing OOB evidence...")
             oob = _compute_oob_evidence(
                 scoreset, calibration, dataset_splits, config, logger,

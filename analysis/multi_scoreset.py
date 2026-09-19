@@ -128,7 +128,10 @@ def _merge_author_labels(labels: pd.Series) -> Optional[str]:
     merged call is indeterminate (None, matching auth_label's own
     "no/ambiguous call" convention)."""
     indeterminate_codes = {"NOT SPECIFIED", "INDETERMINATE", "IGNORE"}
-    upper = labels.dropna().astype(str).str.upper()
+    # Real auth_label values are underscore-separated (e.g. "Not_specified"),
+    # which never matches "NOT SPECIFIED" without this normalization -- see
+    # analysis.confusion.build_author_confusion_matrix's identical fix.
+    upper = labels.dropna().astype(str).str.upper().str.replace("_", " ", regex=False)
     determinate = upper[~upper.isin(indeterminate_codes)]
     if determinate.empty:
         return None
@@ -220,7 +223,11 @@ def build_deduped_author_confusion_matrix(deduped: pd.DataFrame) -> Optional[pd.
     indeterminate_codes = {"NOT SPECIFIED", "INDETERMINATE", "IGNORE"}
 
     def _counts(sub):
-        upper = sub["auth_label"].astype(str).str.upper()
+        # See analysis.confusion.build_author_confusion_matrix's identical
+        # fix: real auth_label values are underscore-separated (e.g.
+        # "Not_specified"), which never matches "NOT SPECIFIED" without this
+        # normalization.
+        upper = sub["auth_label"].astype(str).str.upper().str.replace("_", " ", regex=False)
         norm = int((upper == "NORMAL").sum())
         abnorm = int((upper == "ABNORMAL").sum())
         ir = int((upper.isin(indeterminate_codes) | sub["auth_label"].isna()).sum())
@@ -247,7 +254,11 @@ def restrict_to_genes_with_author_data(deduped: pd.DataFrame) -> pd.DataFrame:
     indeterminate_codes = {"NOT SPECIFIED", "INDETERMINATE", "IGNORE"}
 
     def _has_determinate_author(labels: pd.Series) -> bool:
-        upper = labels.dropna().astype(str).str.upper()
+        # See analysis.confusion.build_author_confusion_matrix's identical
+        # fix: real auth_label values are underscore-separated (e.g.
+        # "Not_specified"), which never matches "NOT SPECIFIED" without this
+        # normalization.
+        upper = labels.dropna().astype(str).str.upper().str.replace("_", " ", regex=False)
         return bool((~upper.isin(indeterminate_codes)).any())
 
     genes_with_author_data = deduped.groupby("gene")["auth_label"].apply(_has_determinate_author)

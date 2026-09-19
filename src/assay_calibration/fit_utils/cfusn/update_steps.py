@@ -32,9 +32,44 @@ from typing import List, Tuple, Any
 import numpy as np
 import scipy.stats as sps
 from scipy.stats import truncnorm
-from scipy.special import logsumexp
+from scipy.special import logsumexp, owens_t
 from scipy.linalg import cho_factor, cho_solve
 from scipy.stats import norm
+
+
+def _bvn_cdf_owens(h, k, rho):
+    """Exact standard bivariate normal CDF P(Z1<=h, Z2<=k), corr=rho, via
+    Owen's T function (Owen 1956). Vectorized over h/k; rho scalar/shared.
+
+    Validated to ~2.22e-16 against scipy.stats.multivariate_normal.cdf over
+    500 random cases, and ~40-4900x faster per call at the batch sizes real
+    fits use (this is what makes the exact q=2 E-step below cheap enough to
+    run every EM iteration instead of resorting to Monte Carlo).
+    """
+    h = np.asarray(h, dtype=float)
+    k = np.asarray(k, dtype=float)
+    denom = np.sqrt(max(1 - rho ** 2, 1e-300))
+
+    # The T-function argument a1=(k-rho*h)/(h*denom) is genuinely singular
+    # at h=0 (diverges to +-inf when k!=0, or needs both h,k->0 together
+    # when k==0 too) -- substituting a tiny epsilon for an exactly-zero h
+    # must be done in BOTH the numerator and denominator (not just the
+    # denominator) so the substitution reproduces the correct limiting
+    # value of a1 instead of silently zeroing out the correlation term.
+    # (Caught via a symmetric mean=(0,0) sanity check: using the literal
+    # zero in the numerator gave Phi_2(0,0;0)=0.5 instead of the true
+    # 0.25 -- alpha=0 is a common, not edge-case, state during EM.)
+    h_safe = np.where(h == 0, 1e-12, h)
+    k_safe = np.where(k == 0, 1e-12, k)
+
+    a1 = (k_safe - rho * h_safe) / (h_safe * denom)
+    a2 = (h_safe - rho * k_safe) / (k_safe * denom)
+    T1 = owens_t(h, a1)
+    T2 = owens_t(k, a2)
+
+    hk = h * k
+    delta = np.where((hk > 0) | ((hk == 0) & (h + k >= 0)), 0.0, 0.5)
+    return 0.5 * (norm.cdf(h) + norm.cdf(k)) - T1 - T2 - delta
 
 
 # ══════════════════════════════════════════════
@@ -249,70 +284,153 @@ def _gibbs_sample_tn_q(mean, cov, n_samples, n_burnin=50, rng=None):
 def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
     """E[T] and E[TT'] for T ~ TN_q(mean_j, cov, R^q_+).
 
-    q=2 KEY FIX: fully vectorized over N — zero Python loop.
-    The approximation (independent marginals + correlation correction for
-    the off-diagonal of Psi) is unchanged from the original; only the loop
-    is removed.
+    q=2 fast path: EXACT closed form (Kan & Robotti 2017, JCGS, Theorem 1
+    recursion for F^n_kappa(a,b;mu,Sigma), specialized to n=2, first
+    orthant), not an approximation -- see _bvn_cdf_owens above for the
+    bivariate-CDF piece that makes this cheap enough to call every EM
+    iteration. Validated to ~1e-4 against 2M-sample Monte Carlo across a
+    range of means/correlations/truncation severity.
+
+    This replaces an earlier ad-hoc formula for the cross moment
+    E[T1 T2] (independent-marginals mean product + a linear correlation
+    correction) that was not guaranteed to satisfy the Cauchy-Schwarz
+    bound every genuine second-moment matrix must satisfy
+    (Psi[0,1]^2 <= Psi[0,0]*Psi[1,1]) -- confirmed on real TP53 production
+    data that ~30% of individual observations violated it, occasionally
+    producing a responsibility-weighted Psi_sum with a negative eigenvalue
+    and causing the M-step's Delta update to blow up by orders of
+    magnitude. The exact formula is PSD by construction (it's a genuine
+    second moment, not an approximation to one), so no post-hoc clipping
+    is needed for that failure mode; it also no longer systematically
+    suppresses fitted skew the way the old approximation did.
 
     For q != 2 the original MC path is used unchanged.
+
+    Mirrored in fit_utils/jax_batch/batch_em_cfusn.py's
+    `_component_moments_and_logpdf` (JAX port, for the opt-in GPU path) --
+    keep both in sync if this formula ever changes.
     """
     if rng is None:
         rng = np.random.RandomState()
 
     N, q = means.shape
 
-    # ── q=2 fast path — vectorized ──────────────────────────────────────
+    # ── q=2 fast path — EXACT closed form ───────────────────────────────
     if q == 2:
         cov  = 0.5 * (cov + cov.T)
         eig  = np.linalg.eigvalsh(cov)
         if eig.min() < 1e-12:
             cov = cov + (1e-12 - eig.min() + 1e-12) * np.eye(2)
 
-        std  = np.sqrt(np.diag(cov))                          # (2,)
-        corr = np.clip(cov[0, 1] / (std[0] * std[1] + 1e-15), -0.9999, 0.9999)
+        mu1, mu2   = means[:, 0], means[:, 1]
+        s1sq, s2sq = cov[0, 0], cov[1, 1]
+        s12        = cov[0, 1]
+        s1, s2     = np.sqrt(s1sq), np.sqrt(s2sq)
+        rho        = np.clip(s12 / (s1 * s2), -0.999999, 0.999999)
 
-        # All (N, 2) operations — no Python loop
-        alpha   = means / std[None, :]                        # (N, 2)
-        phi_a   = norm.pdf(alpha)                             # (N, 2)
-        Phi_a   = norm.cdf(alpha)                             # (N, 2)
-        safe    = Phi_a > 1e-12
-        ratio   = np.where(safe,
-                           phi_a / np.where(safe, Phi_a, 1.0),
-                           np.abs(alpha))                     # (N, 2)
+        alpha1, alpha2 = -mu1 / s1, -mu2 / s2
+        # L = P(X1>0, X2>0) computed as a single direct bivariate-CDF call
+        # (via the sign-flip identity P(Z1>a1,Z2>a2) = Phi_2(-a1,-a2;rho)),
+        # NOT as 1-Phi(a1)-Phi(a2)+Phi_2(a1,a2;rho): that difference-of-four-
+        # terms form catastrophically cancels in the truncation-heavy tail
+        # (each term near 0 or 1, true result near 0), and the resulting
+        # floating-point noise is a REAL, non-negligible fraction of the
+        # true value for a large range of realistic (mu, cov) -- confirmed
+        # directly (deep-tail stress test, N=3000 draws): the old form's
+        # negative-noise excursions have median magnitude ~1e-16 regardless
+        # of the true L's scale (i.e. can swamp a true L of 1e-8 or 1e-10
+        # entirely), while this direct form's excursions are ~1e-20,
+        # genuine machine-epsilon dust only when the true L is already
+        # unrepresentable. This was the root cause of a real production
+        # failure mode: as a poorly-supported component's shape drifted
+        # toward extreme skew, a growing fraction of rows hit the old
+        # floor, and that accumulating floor-induced bias eventually
+        # flipped the EM step's net likelihood delta negative, tripping
+        # the hard likelihood-decrease guard (fit.py) and discarding the
+        # whole fit.
+        L = _bvn_cdf_owens(-alpha1, -alpha2, rho)
+        # Floor only against genuine floating-point noise (this form's own
+        # residual negative dust, ~1e-20 scale -- see above), not as a
+        # large-magnitude safety net; downstream overflow protection is
+        # the CLIP/nan_to_num on eta/Psi below, so this floor no longer
+        # needs to double as that safety net.
+        L = np.maximum(L, 1e-300)
 
-        eta     = means + std[None, :] * ratio                # (N, 2)
-        diag_Ps = std[None, :]**2 + means**2 + std[None, :] * means * ratio  # (N, 2)
-        cross   = eta[:, 0] * eta[:, 1] + corr * std[0] * std[1]             # (N,)
+        # Conditional params for removing dim 2 -> tilde params of dim 1,
+        # and vice versa (Kan & Robotti's c_kappa terms need these).
+        mu_t1  = mu2 - s12 * mu1 / s1sq
+        s_t1   = np.sqrt(max(s2sq - s12 ** 2 / s1sq, 1e-300))
+        mu_t2  = mu1 - s12 * mu2 / s2sq
+        s_t2   = np.sqrt(max(s1sq - s12 ** 2 / s2sq, 1e-300))
 
-        # cross is an ad-hoc approximation (independent-marginals mean
-        # product + a linear correlation correction), not a derivation
-        # guaranteed to satisfy the Cauchy-Schwarz bound every genuine
-        # second-moment matrix must satisfy: Psi[0,1]^2 <= Psi[0,0]*Psi[1,1].
-        # Confirmed directly (both on real TP53 production data and in a
-        # dedicated simulation, tests/cfusn_simulations equivalent in
-        # /tmp scratch): left unclipped, ~30% of individual observations
-        # violate this bound, and summing many such per-observation Psi
-        # matrices (weighted by responsibility x observed-mask, exactly
-        # what get_Delta_update_cfusn's per-dimension solve consumes) can
-        # then produce a Psi_sum with a NEGATIVE eigenvalue -- structurally
-        # impossible for a true nonneg-weighted sum of PSD matrices, and
-        # the direct cause of the M-step's Delta update occasionally
-        # blowing up by orders of magnitude (a small-but-negative
-        # eigenvalue survives even a substantial ridge-floor correction
-        # once shifted, if the M-step's numerator has a component aligned
-        # with that near-null direction). Clipping the cross term to the
-        # valid range guarantees every individual Psi[n] is PSD by
-        # construction, which guarantees any nonneg-weighted sum of them
-        # is too -- fixing the actual root cause instead of only damping
-        # its downstream numerical consequences.
-        cross_bound = 0.999 * np.sqrt(np.maximum(diag_Ps[:, 0] * diag_Ps[:, 1], 1e-300))
-        cross   = np.clip(cross, -cross_bound, cross_bound)
+        def phi1_at0(mu, s):
+            return norm.pdf(0.0, loc=mu, scale=s)
 
-        Psi             = np.zeros((N, 2, 2))
-        Psi[:, 0, 0]    = diag_Ps[:, 0]
-        Psi[:, 1, 1]    = diag_Ps[:, 1]
-        Psi[:, 0, 1]    = cross
-        Psi[:, 1, 0]    = cross
+        def F1_0(mu, s):
+            return 1 - norm.cdf(-mu / s)
+
+        def F1_1(mu, s):
+            a = -mu / s
+            return mu * F1_0(mu, s) + s * norm.pdf(a)
+
+        c00_1 = phi1_at0(mu1, s1) * F1_0(mu_t1, s_t1)
+        c00_2 = phi1_at0(mu2, s2) * F1_0(mu_t2, s_t2)
+        F10   = mu1 * L + s1sq * c00_1 + s12 * c00_2   # E[T1] numerator
+        F01   = mu2 * L + s12 * c00_1 + s2sq * c00_2   # E[T2] numerator
+
+        c10_2      = phi1_at0(mu2, s2) * F1_1(mu_t2, s_t2)
+        F20        = mu1 * F10 + s1sq * L + s12 * c10_2         # E[T1^2] numerator
+        F11_route1 = mu2 * F10 + s12 * L + s2sq * c10_2         # E[T1 T2] via kappa=(1,0)
+
+        c01_1      = phi1_at0(mu1, s1) * F1_1(mu_t1, s_t1)
+        F02        = mu2 * F01 + s12 * c01_1 + s2sq * L         # E[T2^2] numerator
+        F11_route2 = mu1 * F01 + s1sq * c01_1 + s12 * L         # E[T1 T2] via kappa=(0,1)
+
+        eta          = np.stack([F10 / L, F01 / L], axis=1)
+        # Both routes derive the same true cross moment via independent
+        # recursion paths; averaging cancels floating-point drift between
+        # them (they agree to ~1e-17 in validation, so this is not masking
+        # a real discrepancy).
+        cross        = 0.5 * (F11_route1 + F11_route2) / L
+        diag0        = F20 / L
+        diag1        = F02 / L
+
+        # Defense-in-depth: when a component's shape drifts so far that the
+        # true positive-orthant probability L rounds to (numerically
+        # indistinguishable from) 0, F10/F20/etc./L divisions produce
+        # unbounded garbage. A NAIVE element-wise clip on eta/Psi -- clamping
+        # each entry independently to a fixed range -- does NOT guarantee
+        # the resulting Psi stays a valid second-moment matrix: e.g.
+        # clamping a garbage-negative diagonal down to -CLIP**2 instead of
+        # up to 0 (E[Ti^2] can never be negative) produces a Psi with a
+        # large-magnitude negative eigenvalue, which is exactly the
+        # mechanism that made the M-step's Delta update blow up on
+        # degenerate near-zero-L rows (confirmed via a direct reproducer:
+        # mean=[184.5,-35.4], corr=0.986, true orthant probability
+        # numerically 0 -> old symmetric clip gave Psi=[[1e8,1e8],
+        # [1e8,-1e8]], eigenvalues [-1.41e8, 1.41e8]). Fix: clip the
+        # diagonal to [0, CLIP**2] (its true valid range) and the
+        # off-diagonal to the Cauchy-Schwarz bound |Psi01|<=sqrt(Psi00*Psi11)
+        # derived FROM the (already-clipped) diagonal -- this guarantees
+        # every returned Psi is PSD by construction, not just individually
+        # bounded, mirroring the same PSD-guarantee approach used for the
+        # old approximate formula's cross term.
+        CLIP = 1e4
+        eta   = np.nan_to_num(eta, nan=0.0, posinf=CLIP, neginf=-CLIP)
+        eta   = np.clip(eta, -CLIP, CLIP)
+        diag0 = np.nan_to_num(diag0, nan=0.0, posinf=CLIP ** 2, neginf=0.0)
+        diag1 = np.nan_to_num(diag1, nan=0.0, posinf=CLIP ** 2, neginf=0.0)
+        diag0 = np.clip(diag0, 0.0, CLIP ** 2)
+        diag1 = np.clip(diag1, 0.0, CLIP ** 2)
+        cross = np.nan_to_num(cross, nan=0.0, posinf=CLIP ** 2, neginf=-CLIP ** 2)
+        cross_bound = np.sqrt(diag0 * diag1)
+        cross = np.clip(cross, -cross_bound, cross_bound)
+
+        Psi          = np.zeros((N, 2, 2))
+        Psi[:, 0, 0] = diag0
+        Psi[:, 1, 1] = diag1
+        Psi[:, 0, 1] = cross
+        Psi[:, 1, 0] = cross
         return eta, Psi
 
     # ── q != 2: original MC path unchanged ──────────────────────────────
@@ -508,9 +626,103 @@ def get_Gamma_update(updated_loc, updated_Delta, observations, responsibilities,
 
 # ── CFUSN M-step helpers — vectorized over p ────────────────────────────────
 
+def _regularized_spd(A, floor=1e-10):
+    """Symmetrize and floor the eigenvalues of A so it can be solved against.
+
+    Needed because Gamma_oo for a given missingness pattern can be genuinely
+    near-singular on real data (collinear assay dimensions), not just
+    numerically noisy.
+    """
+    A = 0.5 * (np.asarray(A, dtype=float) + np.asarray(A, dtype=float).T)
+    eig = np.linalg.eigvalsh(A)
+    if eig.min() < floor:
+        A = A + (floor - eig.min() + floor) * np.eye(A.shape[0])
+    return A
+
+
+def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
+    """Posterior moments of the COMPLETE data vector x under missingness.
+
+    The M-step maximises Q = E[log p(x, T) | x_obs], so when entries are
+    missing it needs posterior moments of the full x, not just its observed
+    part. Conditional on T=t we have x ~ N(mu + Delta t, Gamma), so for a row
+    with observed dims o and missing dims m:
+
+        x_m | x_o, t ~ N(a_m + B_m t,  C_mm)
+        K    = Gamma_mo Gamma_oo^-1
+        a_m  = mu_m + K (x_o - mu_o)
+        B_m  = Delta_m - K Delta_o
+        C_mm = Gamma_mm - K Gamma_om
+
+    This is linear in t, so E[x | x_o] = a + B eta and the second moments
+    follow by the tower property, reusing eta = E[T | x_o] and
+    Psi = E[TT' | x_o] (already computed against the correct observed-dims
+    marginal by get_truncated_normal_moments_cfusn).
+
+    Why this matters: summing only over observed entries -- available-case
+    estimation -- is the exact M-step ONLY when Gamma is diagonal, because it
+    discards precisely the observed-missing cross terms that Gamma^-1 couples.
+    With a full Gamma it does not maximise Q, so EM loses its ascent guarantee
+    and the observed-data likelihood can decrease. Confirmed directly: on data
+    where the available-case M-step decreased the likelihood at iteration 1,
+    forcing Gamma diagonal restored monotone convergence.
+
+    Returns (Ex, Ext, Exx) with shapes (N, p), (N, p, q), (N, p, p).
+    """
+    observations = np.atleast_2d(np.asarray(observations, dtype=float))
+    N, p = observations.shape
+    q = eta.shape[1]
+    mu = np.asarray(mu, dtype=float)
+    Delta = density_utils._ensure_matrix_delta(Delta)
+    Gamma = np.asarray(Gamma, dtype=float)
+
+    a = np.where(np.isnan(observations), 0.0, observations)
+    B = np.zeros((N, p, q))
+    C = np.zeros((N, p, p))
+    q_idx = np.arange(q)
+
+    obs_mask = ~np.isnan(observations)
+    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
+    for pi, pattern in enumerate(patterns):
+        idx = np.where(inverse == pi)[0]
+        o = np.where(pattern)[0]
+        m = np.where(~pattern)[0]
+        if len(m) == 0:
+            continue                       # fully observed: a = x, B = 0, C = 0
+        if len(o) == 0:
+            # Nothing observed: fall back to the component's own prior moments.
+            a[np.ix_(idx, m)] = mu[m]
+            B[np.ix_(idx, m, q_idx)] = Delta[m]
+            C[np.ix_(idx, m, m)] = Gamma[np.ix_(m, m)]
+            continue
+
+        G_oo = _regularized_spd(Gamma[np.ix_(o, o)])
+        K = np.linalg.solve(G_oo, Gamma[np.ix_(m, o)].T).T        # (|m|, |o|)
+        a[np.ix_(idx, m)] = mu[m] + (observations[np.ix_(idx, o)] - mu[o]) @ K.T
+        B[np.ix_(idx, m, q_idx)] = Delta[m] - K @ Delta[o]
+        C_mm = Gamma[np.ix_(m, m)] - K @ Gamma[np.ix_(o, m)]
+        C[np.ix_(idx, m, m)] = 0.5 * (C_mm + C_mm.T)
+
+    B_eta = np.einsum('npq,nq->np', B, eta)
+    Ex = a + B_eta
+    Ext = a[:, :, None] * eta[:, None, :] + np.einsum('npi,nij->npj', B, Psi)
+    Exx = (a[:, :, None] * a[:, None, :]
+           + a[:, :, None] * B_eta[:, None, :]
+           + B_eta[:, :, None] * a[:, None, :]
+           + np.einsum('npi,nij,nqj->npq', B, Psi, B)
+           + C)
+    return Ex, Ext, Exx
+
+
 def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
-                               n_mc=500, rng=None, sample_weights=None):
-    """CFUSN location M-step. Returns (mu_new, eta, Psi) — moments reused downstream."""
+                               n_mc=500, rng=None, sample_weights=None,
+                               return_completed=False):
+    """CFUSN location M-step. Returns (mu_new, eta, Psi) — moments reused downstream.
+
+    With ``return_completed=True`` also returns the completed-data moments
+    (or None when nothing is missing) so the Delta/Gamma steps can reuse them
+    instead of recomputing the per-pattern conditionals three times.
+    """
     Delta      = density_utils._ensure_matrix_delta(Delta)
     eta, Psi   = get_truncated_normal_moments_cfusn(
         observations, mu, Delta, Gamma, n_mc=n_mc, rng=rng
@@ -520,23 +732,332 @@ def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
     z      = responsibilities                         # (N,)
     z_eff  = z if sample_weights is None else z * sample_weights
 
-    # KEY FIX: single matrix op replaces per-dimension loop
-    # Delta_eta[j, d] = sum_r Delta[d, r] * eta[j, r]
-    Delta_eta = eta @ Delta.T                         # (N, p)
-    obs_z     = obs * z_eff[:, None]                  # (N, p)
-    numer     = (obs_z * (x_fill - Delta_eta)).sum(0) # (p,)
-    denom     = obs_z.sum(0)                           # (p,)
-    mu_new    = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12), mu)
+    if obs.all():
+        # Complete data: available-case masking is exact, so this path is left
+        # exactly as it was (bit-identical results for fully-observed inputs).
+        #
+        # KEY FIX: single matrix op replaces per-dimension loop
+        # Delta_eta[j, d] = sum_r Delta[d, r] * eta[j, r]
+        Delta_eta = eta @ Delta.T                         # (N, p)
+        obs_z     = obs * z_eff[:, None]                  # (N, p)
+        numer     = (obs_z * (x_fill - Delta_eta)).sum(0) # (p,)
+        denom     = obs_z.sum(0)                           # (p,)
+        mu_new    = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12), mu)
+        completed = None
+    else:
+        completed = _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi)
+        Ex = completed[0]
+        # mu maximising Q is the full-vector weighted mean of E[x] - Delta E[T]
+        # (Gamma^-1 cancels for an unconstrained mu, exactly as in the complete
+        # -data case -- but E[x] must be the COMPLETED x, not the observed part).
+        denom = float(z_eff.sum())
+        if denom > 1e-12:
+            mu_new = (z_eff[:, None] * (Ex - eta @ Delta.T)).sum(0) / denom
+        else:
+            mu_new = mu
 
+    if return_completed:
+        return mu_new, eta, Psi, completed
     return mu_new, eta, Psi
 
 
+# Minimum Gamma eigenvalue, as a fraction of the data's own mean per-dimension
+# variance. Guards the classic unbounded-likelihood degeneracy of
+# Gaussian/skew-normal mixtures: LL rises without bound as a component's
+# covariance collapses onto a lower-dimensional subspace. Measured directly on
+# simulated data whose TRUE Gamma is 0.3*I (min eigenvalue 0.3): an
+# unconstrained fit under 50% MCAR drove min eig(Gamma) to 1.06e-08 while the
+# likelihood was still climbing after 30,000 iterations and never met the 1e-8
+# convergence test -- EM working correctly on an ill-posed objective.
+#
+# Deliberately scaled to the GLOBAL data variance, not the component's own
+# responsibility-weighted variance: a component-local scale shrinks as the
+# component collapses, so the bound would chase the degeneracy down instead of
+# containing it (the same failure mode documented for the Delta magnitude cap
+# below). Set low (1e-6) because real data can have genuinely near-singular
+# Gamma from assay collinearity -- confirmed on real TP53, where every
+# component legitimately has a near-zero eigenvalue -- so this must only catch
+# outright collapse, not real structure.
+MIN_GAMMA_EIGVAL_FRAC = 1e-6
+
+
+# Inverse-Wishart (ridge) penalty on Gamma -- the smooth alternative to the hard
+# eigenvalue floor below. With an IW(Psi, nu) prior the penalised M-step stays
+# closed form:
+#
+#     Gamma = (S_c + Psi) / (n_c + nu + p + 1)
+#
+# where S_c is the responsibility-weighted second-moment sum this update already
+# computes and n_c = sum of responsibilities. Unlike clipping, this makes the
+# OBJECTIVE bounded rather than truncating the parameter space: there is a real
+# interior maximum, so EM converges to it instead of grinding along a boundary.
+# It also shrinks automatically with n_c -- a component with plenty of effective
+# mass is barely affected, a collapsing one is pulled back hardest.
+#
+# Psi = GAMMA_RIDGE_FRAC * (mean per-dim variance) * I, nu = p + 2 (weakly
+# informative, finite prior mean). The implied smallest eigenvalue is
+# ~Psi/(n_c + nu + p + 1), i.e. it adapts to component mass rather than being a
+# fixed constant like MIN_GAMMA_EIGVAL_FRAC.
+GAMMA_RIDGE_FRAC = 1e-3
+
+# Which regularisation the multivariate M-step applies to Gamma.
+# False -> hard eigenvalue floor (_floor_gamma_eigenvalues); True -> IW ridge.
+#
+# Default True: the hard floor turned out to be load-bearing rather than
+# insurance -- on real TP53 every component came to rest exactly on it
+# (1.000e-06 for all 6 at K=6, 2 of 3 at K=3), so the fitted covariance was
+# determined by the constant rather than by the data. The ridge left Gamma
+# data-determined (1.8e-05 - 4.6e-05) with zero pinned components in every
+# arm tested, at the cost of slightly lower raw likelihood, which is the
+# expected price of shrinkage.
+USE_GAMMA_RIDGE = True
+
+
+def _ridge_gamma(Gamma_new, n_eff, observations, frac=GAMMA_RIDGE_FRAC, nu=None):
+    """Inverse-Wishart MAP shrinkage of a Gamma M-step candidate.
+
+    ``Gamma_new`` is the unpenalised candidate S_c / n_c, so the penalised
+    estimate is recovered as (Gamma_new * n_c + Psi) / (n_c + nu + p + 1).
+
+    Monotonicity: this is the exact maximiser of the penalised Q, so EM remains
+    monotone in (Q + log prior). The reported observed-data likelihood is NOT
+    the objective being maximised any more -- see the caller for why that
+    matters for val_ll-based model selection.
+    """
+    G = 0.5 * (np.asarray(Gamma_new, dtype=float) + np.asarray(Gamma_new, dtype=float).T)
+    p = G.shape[0]
+    if nu is None:
+        nu = p + 2
+    with np.errstate(invalid="ignore"):
+        scale = float(np.nanmean(np.nanvar(np.atleast_2d(observations), axis=0)))
+    if not np.isfinite(scale) or scale <= 0:
+        return G
+    n_eff = max(float(n_eff), 0.0)
+    Psi = frac * scale * np.eye(p)
+    return (G * n_eff + Psi) / (n_eff + nu + p + 1)
+
+
+def gamma_log_prior_total(component_params, observations, multivariate=True):
+    """Total log IW(Psi, nu) prior over every component's Gamma.
+
+    Returns 0.0 when the ridge is disabled, so callers can add this
+    unconditionally and stay bit-identical in the floor/no-ridge configuration.
+
+    This is the term that makes the ridge's objective differ from the raw
+    observed-data likelihood: the penalised M-step maximises
+    (log L + this), so a monotonicity check run against log L alone will see
+    spurious decreases -- which is exactly what happened before this existed
+    (a ridge fit failing with "Likelihood decreased by 3.9e+00" at iteration 8
+    while the penalised objective was still increasing).
+
+        log p(Gamma) = -(nu + p + 1)/2 * log|Gamma| - 1/2 * tr(Psi Gamma^-1)
+
+    (dropping the Gamma-independent normalising constant, which cancels in
+    every iteration-to-iteration comparison.)
+    """
+    if not USE_GAMMA_RIDGE or not multivariate:
+        return 0.0
+    with np.errstate(invalid="ignore"):
+        scale = float(np.nanmean(np.nanvar(np.atleast_2d(observations), axis=0)))
+    if not np.isfinite(scale) or scale <= 0:
+        return 0.0
+    total = 0.0
+    for prm in component_params:
+        if len(prm) < 3:
+            continue
+        G = np.asarray(prm[2], dtype=float)
+        if G.ndim != 2:
+            continue
+        G = 0.5 * (G + G.T)
+        p_dim = G.shape[0]
+        nu = p_dim + 2
+        Psi = GAMMA_RIDGE_FRAC * scale * np.eye(p_dim)
+        sign, logdet = np.linalg.slogdet(G)
+        if sign <= 0 or not np.isfinite(logdet):
+            return -np.inf
+        try:
+            tr_term = float(np.trace(np.linalg.solve(G, Psi)))
+        except np.linalg.LinAlgError:
+            return -np.inf
+        total += -0.5 * (nu + p_dim + 1) * logdet - 0.5 * tr_term
+    return float(total)
+
+
+def _regularize_gamma_candidate(Gamma_new, n_eff, observations):
+    """Dispatch to whichever Gamma regularisation is enabled."""
+    if USE_GAMMA_RIDGE:
+        return _ridge_gamma(Gamma_new, n_eff, observations)
+    return _floor_gamma_eigenvalues(Gamma_new, observations)
+
+
+def _floor_gamma_eigenvalues(Gamma, observations, frac=MIN_GAMMA_EIGVAL_FRAC):
+    """Clip Gamma's eigenvalues from below at frac * (mean per-dim variance).
+
+    Monotonicity-safe: for a covariance M-step of the form
+    Q ∝ -0.5[log|Gamma| + tr(Gamma^-1 S)], the maximiser subject to a minimum
+    eigenvalue constraint is exactly S with its eigenvalues clipped at that
+    minimum (standard result for constrained Gaussian-mixture MLE). The update
+    here returns precisely such an S, so clipping yields the constrained
+    maximiser rather than an arbitrary projection -- ECM ascent is preserved on
+    the constrained parameter space.
+    """
+    Gamma = 0.5 * (np.asarray(Gamma, dtype=float) + np.asarray(Gamma, dtype=float).T)
+    with np.errstate(invalid="ignore"):
+        scale = float(np.nanmean(np.nanvar(np.atleast_2d(observations), axis=0)))
+    if not np.isfinite(scale) or scale <= 0:
+        return Gamma
+    floor = frac * scale
+    eig, vec = np.linalg.eigh(Gamma)
+    if eig.min() >= floor:
+        return Gamma
+    return vec @ np.diag(np.maximum(eig, floor)) @ vec.T
+
+
+# How the Delta magnitude cap's per-dimension bound is scaled.
+#   "local"  -- SAFETY_FACTOR * sqrt(component's own responsibility-weighted
+#               variance). Original behaviour. Flaw: that variance is exactly
+#               what shrinks when a component's Gamma collapses, so the bound
+#               tightens as the component degenerates and the cap ends up
+#               binding routinely instead of rarely (measured on real TP53:
+#               70% of component-iterations at K=3, up to 95% at K=2).
+#   "global" -- SAFETY_FACTOR * sqrt(the DATA's per-dimension variance), which
+#               does not move as a component collapses. Same reasoning as
+#               _floor_gamma_eigenvalues scaling to global rather than
+#               component-local variance.
+DELTA_CAP_SCALE = "local"
+
+# Include the (1 - 2/pi) truncated-normal variance factor in the cap's
+# positive-definiteness bound.
+#
+# The original bound came from the standard factor-analysis identity
+# Sigma = Lambda Lambda' + Psi, i.e. Gamma_dd = cov_dd - ||Delta_d||^2, which
+# holds when the latent factors have UNIT variance. CFUSN's factor is truncated
+# to the positive orthant -- T ~ TN_q(0, I, R_+^q), a half-normal with
+# E[T] = sqrt(2/pi) and Var(T) = 1 - 2/pi ~ 0.3634 -- so the correct identity is
+#
+#     Var(X_d) = Gamma_dd + (1 - 2/pi) * ||Delta_d||^2
+#
+# and positive Gamma_dd requires ||Delta_d|| < sqrt(Var_d / (1 - 2/pi)), i.e.
+# 1.66 * sqrt(Var_d). Assuming Var(T) = 1 makes the bound sqrt(0.3634) = 0.603x
+# too small, so the cap clamped at ~57% of the positive-definiteness limit it
+# cites as its own justification -- which is why it bound on 64-98% of
+# component-iterations on real data under every scaling tried. Verified
+# numerically: regressing empirical Var(X_d) on ||Delta_d||^2 across 8
+# (Delta, Gamma) settings gives c = 0.355-0.365 vs (1 - 2/pi) = 0.3634.
+#
+# Set False to reproduce the original (too strict) bound.
+DELTA_CAP_PD_CORRECTION = True
+
+
+def _global_var_d(observations):
+    """Per-dimension variance of the data itself (NaN-aware), used by the
+    "global" cap scaling so the bound does not shrink with a collapsing
+    component."""
+    with np.errstate(invalid="ignore"):
+        v = np.nanvar(np.atleast_2d(np.asarray(observations, dtype=float)), axis=0)
+    return np.where(np.isfinite(v), v, 0.0)
+
+
+def _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev=None, global_var_d=None):
+    """Defense-in-depth magnitude cap; see get_Delta_update_cfusn for the full
+    rationale on why the bound is SAFETY_FACTOR * sqrt(local variance).
+
+    Two behaviours:
+
+    - ``Delta_prev`` given (the production path): a binding cap REJECTS the
+      candidate and keeps the previous Delta for this component. This is
+      monotonicity-safe -- Q decomposes as a sum over components and the M-step
+      is a sequence of conditional maximisations (ECM), so leaving one block at
+      its previous value is a no-op and still gives Q_new >= Q_old.
+    - ``Delta_prev`` None (legacy): rescale the offending rows. Retained for
+      callers that have no previous Delta to fall back on, but note that a
+      rescaled Delta is neither the maximiser nor the previous value, which is
+      exactly why it can DECREASE the observed-data likelihood (confirmed: a
+      fit failing with a 1.51e-04 decrease at iteration 1476 converged
+      monotonically once the rescale was removed).
+
+    Returns (Delta, capped) where ``capped`` reports whether the cap bound.
+    """
+    SAFETY_FACTOR = 0.95
+    var_d = weighted_var_d
+    if DELTA_CAP_SCALE == "global" and global_var_d is not None:
+        var_d = global_var_d
+    # Positive-definiteness limit. For X = mu + Delta T + e with
+    # T ~ TN_q(0, I, R_+^q), Var(T_i) = 1 - 2/pi, so
+    #     Var(X_d) = Gamma_dd + (1 - 2/pi) * ||Delta_d||^2
+    # and Gamma_dd > 0 requires ||Delta_d|| < sqrt(Var_d / (1 - 2/pi))
+    #                                       = 1.66 * sqrt(Var_d).
+    # The original bound omitted the (1 - 2/pi) factor and so clamped at
+    # 0.95*sqrt(Var_d) -- about 57% of the actual limit, which is why the cap
+    # bound on 64-98% of component-iterations on real data under every
+    # scaling. Verified numerically: regressing Var_emp on ||Delta_d||^2
+    # across 8 (Delta, Gamma) settings gives c = 0.355-0.365 vs
+    # (1 - 2/pi) = 0.3634.
+    var_d = np.maximum(var_d, 0.0)
+    if DELTA_CAP_PD_CORRECTION:
+        var_d = var_d / (1.0 - 2.0 / np.pi)
+    max_norm_d = SAFETY_FACTOR * np.sqrt(var_d)
+    row_norms = np.linalg.norm(Delta_new, axis=1)
+    over = row_norms > max_norm_d
+    if not over.any():
+        return Delta_new, False
+    if Delta_prev is not None:
+        return np.asarray(Delta_prev, dtype=float), True
+    scale = np.where(over, max_norm_d / np.maximum(row_norms, 1e-12), 1.0)
+    return Delta_new * scale[:, None], True
+
+
+def _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q, Delta_prev=None,
+                            global_var_d=None):
+    """Delta M-step from completed-data moments (missing-data case).
+
+    With E[x] completed, every row contributes to every dimension, so the
+    per-dimension (p separate q x q) solves of the available-case path collapse
+    to a single q x q solve -- the same system the complete-data M-step solves.
+    """
+    Ex, Ext, Exx = completed
+    RIDGE_FLOOR = 1e-3   # same floor/rationale as the available-case path below
+
+    # numer[d, r] = sum_n z_n (E[x_n t_n']_{d,r} - mu_d eta_{n,r})
+    numer = (np.einsum('n,ndr->dr', z_eff, Ext)
+             - np.outer(mu_new, (z_eff[:, None] * eta).sum(0)))
+    Psi_sum = np.einsum('n,nij->ij', z_eff, Psi)          # (q, q)
+
+    eig = np.linalg.eigvalsh(0.5 * (Psi_sum + Psi_sum.T))
+    if eig.min() < RIDGE_FLOOR:
+        Psi_sum = Psi_sum + (RIDGE_FLOOR - eig.min() + RIDGE_FLOOR) * np.eye(q)
+    try:
+        Delta_new = np.linalg.solve(Psi_sum, numer.T).T   # (p, q)
+    except np.linalg.LinAlgError:
+        Delta_new = numer / np.maximum(np.diag(Psi_sum), 1e-12)[None, :]
+
+    # Same defense-in-depth magnitude cap as the available-case path (see its
+    # comment block for the full rationale); the per-dimension local variance
+    # is now the completed second moment E[(x_d - mu_d)^2] rather than an
+    # observed-only variance.
+    denom = float(z_eff.sum())
+    if denom > 1e-8:
+        var_rows = (np.einsum('ndd->nd', Exx)
+                    - 2.0 * Ex * mu_new[None, :]
+                    + (mu_new ** 2)[None, :])                # (N, p)
+        weighted_var_d = (z_eff[:, None] * var_rows).sum(0) / denom
+    else:
+        weighted_var_d = np.zeros(p)
+    Delta_new, _capped = _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev,
+                                          global_var_d=global_var_d)
+    return Delta_new
+
+
 def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
-                           sample_weights=None):
+                           sample_weights=None, completed=None, Delta_prev=None):
     """CFUSN Delta M-step.  Returns (p, q).
 
     KEY FIX: replace per-d einsum loop with two batched einsums, then
     solve per-dimension (p=2 → only 2 solves of 2×2 systems).
+
+    ``completed`` is the (Ex, Ext, Exx) tuple from _completed_data_moments,
+    supplied only when the data has missing entries; when it is None the
+    original available-case path runs unchanged (exact for complete data).
     """
     obs    = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
@@ -544,6 +1065,11 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
     z_eff  = z if sample_weights is None else z * sample_weights
     N, p   = observations.shape
     q      = eta.shape[1]
+
+    if completed is not None:
+        return _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q,
+                                       Delta_prev=Delta_prev,
+                                       global_var_d=_global_var_d(observations))
 
     obs_z    = obs * z_eff[:, None]                   # (N, p)
     residuals = x_fill - mu_new                       # (N, p)
@@ -624,31 +1150,69 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
     # limitation -- the skew-normal family's ~0.995 ceiling already caps
     # it, with or without this guard; that case needs a different
     # likelihood (e.g. genuinely censored/truncated), not a larger Delta.
-    SAFETY_FACTOR = 0.95
     denom_d = obs_z.sum(axis=0)  # (p,)
     weighted_var_d = np.where(
         denom_d > 1e-8,
         (obs_z * residuals ** 2).sum(axis=0) / np.maximum(denom_d, 1e-8),
         0.0,
     )
-    max_norm_d = SAFETY_FACTOR * np.sqrt(np.maximum(weighted_var_d, 0.0))
-    row_norms = np.linalg.norm(Delta_new, axis=1)
-    over = row_norms > max_norm_d
-    if over.any():
-        scale = np.where(over, max_norm_d / np.maximum(row_norms, 1e-12), 1.0)
-        Delta_new = Delta_new * scale[:, None]
+    Delta_new, _capped = _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev,
+                                          global_var_d=_global_var_d(observations))
 
     return Delta_new
 
 
+def _gamma_update_completed(mu_new, Delta_new, z_eff, eta, Psi, completed):
+    """Gamma M-step from completed-data moments (missing-data case).
+
+    Gamma = (1/sum z) * sum_n z_n E[u u'],  u = x - mu - Delta t, expanded into
+    the completed sufficient statistics:
+
+        E[uu'] = E[xx'] - E[xt']D' - D E[tx'] + D Psi D'
+                 - mu E[x]' - E[x] mu' + mu E[t]'D' + D E[t] mu' + mu mu'
+
+    The E[xx'] term carries the Cov[x_miss | x_obs] correction from
+    _completed_data_moments, which is exactly what available-case masking drops.
+    """
+    Ex, Ext, Exx = completed
+    denom = float(z_eff.sum())
+    if denom <= 1e-12:
+        return np.zeros((len(mu_new), len(mu_new)))
+
+    S_xx = np.einsum('n,nab->ab', z_eff, Exx)
+    S_xt = np.einsum('n,nar->ar', z_eff, Ext)
+    S_x  = np.einsum('n,na->a', z_eff, Ex)
+    S_tt = np.einsum('n,nij->ij', z_eff, Psi)
+    S_t  = np.einsum('n,ni->i', z_eff, eta)
+
+    D = Delta_new
+    Gamma_new = (
+        S_xx
+        - S_xt @ D.T - D @ S_xt.T
+        + D @ S_tt @ D.T
+        - np.outer(mu_new, S_x) - np.outer(S_x, mu_new)
+        + np.outer(mu_new, S_t @ D.T) + np.outer(D @ S_t, mu_new)
+        + denom * np.outer(mu_new, mu_new)
+    ) / denom
+    return 0.5 * (Gamma_new + Gamma_new.T)
+
+
 def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, eta, Psi,
-                           sample_weights=None):
+                           sample_weights=None, completed=None):
     """CFUSN Gamma M-step.  Returns (p, p).
 
     KEY FIX: precompute Psi_minus once; use vectorized outer-product ops
     for term1 and a single batched einsum for term2, replacing repeated
     per-(d1,d2) einsums inside the double loop.
+
+    ``completed`` is supplied only when the data has missing entries; when it
+    is None the original available-case path runs unchanged.
     """
+    if completed is not None:
+        z = responsibilities
+        z_eff = z if sample_weights is None else z * sample_weights
+        return _gamma_update_completed(mu_new, Delta_new, z_eff, eta, Psi, completed)
+
     obs    = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
     z      = responsibilities
@@ -684,15 +1248,41 @@ def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, et
 # Restricted MSN (q=1) multivariate update rules (kept for backward compat)
 # ══════════════════════════════════════════════
 
+def _mv_completed_moments(observations, mu, Delta, Gamma):
+    """q=1 wrapper around _completed_data_moments.
+
+    The restricted MSN is just the CFUSN with q=1, so the same completed-data
+    moments apply with eta = v (N,1) and Psi = w (N,1,1). See
+    _completed_data_moments for why available-case masking is not the exact
+    M-step whenever Gamma is non-diagonal -- that flaw was present in this q=1
+    path exactly as it was in the CFUSN one.
+    """
+    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
+    eta = v[:, None]                                  # (N, 1)
+    Psi = w[:, None, None]                            # (N, 1, 1)
+    completed = _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi)
+    return v, w, eta, Psi, completed
+
+
 def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma,
                            sample_weights=None):
     """mu update for q=1 restricted MSN. Delta is (p,) vector."""
-    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     obs = ~np.isnan(observations)
-    x_fill = np.where(obs, observations, 0.0)
-    Delta_vec = np.asarray(Delta).ravel()
-    m = x_fill - v[:, None] * Delta_vec[None, :]
     r = responsibilities if sample_weights is None else responsibilities * sample_weights
+    Delta_vec = np.asarray(Delta).ravel()
+
+    if not obs.all():
+        v, w, eta, Psi, completed = _mv_completed_moments(observations, mu, Delta, Gamma)
+        Ex = completed[0]
+        denom = float(r.sum())
+        if denom <= 1e-12:
+            return np.asarray(mu, dtype=float)
+        return (r[:, None] * (Ex - v[:, None] * Delta_vec[None, :])).sum(0) / denom
+
+    # Complete data: available-case masking is exact -- original path, unchanged.
+    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
+    x_fill = np.where(obs, observations, 0.0)
+    m = x_fill - v[:, None] * Delta_vec[None, :]
     z = r[:, None]
     numer = (m * z * obs).sum(axis=0)
     denom = (z * obs).sum(axis=0)
@@ -702,11 +1292,23 @@ def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma,
 def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, Gamma,
                        sample_weights=None):
     """Delta update for q=1 restricted MSN. Returns (p,) vector."""
-    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     obs = ~np.isnan(observations)
+    z = responsibilities if sample_weights is None else responsibilities * sample_weights
+
+    if not obs.all():
+        v, w, eta, Psi, completed = _mv_completed_moments(observations, mu, Delta, Gamma)
+        Ex, Ext, Exx = completed
+        # Delta_d = sum_n z (E[x_d t] - mu_d E[t]) / sum_n z E[t^2]; with the
+        # completed moments every row informs every dimension, so the
+        # denominator is a single scalar rather than one per dimension.
+        numer = (z[:, None] * Ext[:, :, 0]).sum(0) - updated_mu * float((z * v).sum())
+        denom = float((z * w).sum())
+        return numer / max(denom, 1e-12)
+
+    # Complete data: available-case masking is exact -- original path, unchanged.
+    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     x_fill = np.where(obs, observations, 0.0)
     residuals = x_fill - updated_mu[None, :]
-    z = responsibilities if sample_weights is None else responsibilities * sample_weights
     numer = (z[:, None] * v[:, None] * residuals * obs).sum(axis=0)
     denom = (z[:, None] * w[:, None] * obs).sum(axis=0)
     return numer / np.maximum(denom, 1e-12)
@@ -715,12 +1317,19 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
 def get_Gamma_update_mv(updated_mu, updated_Delta, observations, responsibilities, mu, Delta, Gamma,
                         sample_weights=None):
     """Gamma update for q=1 restricted MSN. Returns (p, p)."""
-    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     N, K = observations.shape
     obs = ~np.isnan(observations)
-    x_fill = np.where(obs, observations, 0.0)
     z = responsibilities if sample_weights is None else responsibilities * sample_weights
     updated_Delta = np.asarray(updated_Delta).ravel()
+
+    if not obs.all():
+        v, w, eta, Psi, completed = _mv_completed_moments(observations, mu, Delta, Gamma)
+        return _gamma_update_completed(updated_mu, updated_Delta.reshape(-1, 1),
+                                       z, eta, Psi, completed)
+
+    # Complete data: available-case masking is exact -- original path, unchanged.
+    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
+    x_fill = np.where(obs, observations, 0.0)
     residuals = x_fill - updated_mu[None, :]
     Gamma_new = np.zeros((K, K))
     for d1 in range(K):
@@ -1394,6 +2003,10 @@ def _em_update_multivariate(
             sample_weights=sample_weights,
         )
 
+        # Same covariance-collapse regularisation as the CFUSN path.
+        _n_eff = float((z if sample_weights is None else z * sample_weights).sum())
+        Gamma_cand = _regularize_gamma_candidate(Gamma_cand, _n_eff, observations)
+
         if stabilize:
             Gamma_cand = separation.regularize_gamma(Gamma_cand, xlims, **kwargs)
 
@@ -1495,18 +2108,33 @@ def _em_update_cfusn(
 
         # --- M-step using Lin (2009) equations ---
         # Step 1: location + compute eta, Psi
-        mu_cand, eta, Psi = get_location_update_cfusn(
+        # `completed` is None for fully-observed data (the M-step is then
+        # exactly as before); otherwise it carries the completed-data moments
+        # so all three steps maximise Q rather than an available-case proxy.
+        mu_cand, eta, Psi, completed = get_location_update_cfusn(
             observations, z, mu_old, Delta_old, Gamma_old, n_mc=n_mc, rng=rng,
-            sample_weights=sample_weights,
+            sample_weights=sample_weights, return_completed=True,
         )
 
         # Step 2: Delta (p, q)
         Delta_cand = get_Delta_update_cfusn(mu_cand, observations, z, eta, Psi,
-                                            sample_weights=sample_weights)
+                                            sample_weights=sample_weights,
+                                            completed=completed,
+                                            Delta_prev=Delta_old)
 
         # Step 3: Gamma (p, p)
         Gamma_cand = get_Gamma_update_cfusn(mu_cand, Delta_cand, observations, z, eta, Psi,
-                                            sample_weights=sample_weights)
+                                            sample_weights=sample_weights,
+                                            completed=completed)
+
+        # Bound the unbounded-likelihood degeneracy (a component's covariance
+        # collapsing onto a lower-dimensional subspace). Applied to every
+        # multivariate fit, not just constrained ones: separation.regularize_gamma
+        # below is gated behind `stabilize`, and _psd_floor_or_reject only
+        # rescues an already non-PSD matrix, so unconstrained fits -- this
+        # pipeline's default -- previously had no covariance floor at all.
+        _n_eff = float((z if sample_weights is None else z * sample_weights).sum())
+        Gamma_cand = _regularize_gamma_candidate(Gamma_cand, _n_eff, observations)
 
         # Covariance ridge: floor the scale so a sharpened component can't
         # collapse to a near-degenerate spike.

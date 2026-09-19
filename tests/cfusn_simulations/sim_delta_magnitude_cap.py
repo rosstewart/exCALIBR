@@ -7,6 +7,12 @@ left over after the two root-cause fixes upstream of it (Psi PSD-violation
 clipping in _mc_truncated_mvn_moments, and the raised RIDGE_FLOOR in this
 same function), WITHOUT clipping genuinely large true skew in clean data?
 
+NOTE: the Psi PSD-violation clip referenced below has since been superseded
+-- _mc_truncated_mvn_moments's q=2 path is now the EXACT closed form (Kan &
+Robotti 2017), which is PSD by construction and needs no such clip. This
+script's Delta-row-norm cap is a separate, still-relevant defense-in-depth
+fix and is unaffected.
+
 Context: those two fixes eliminated outright numerical blowups (was up to
 ~1.7e9 on real TP53 data), but a smaller, non-catastrophic tail remained
 (real TP53 K=6 data: max Delta row-norm ~47, 13/960 checked fits exceeding
@@ -73,7 +79,7 @@ N_BOOTSTRAPS_REAL = 20
 
 
 def uncapped_get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
-                                    sample_weights=None):
+                                    sample_weights=None, completed=None):
     """The current production formula MINUS the magnitude cap -- i.e. just
     the Psi-PSD-fix + ridge-floor fixes -- used here as the "without cap"
     comparison arm (production's actual get_Delta_update_cfusn already has

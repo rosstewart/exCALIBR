@@ -59,6 +59,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 SAMPLE_NUM_PLP = 0
 SAMPLE_NUM_BLB = 1
+SAMPLE_NUM_GNOMAD = 2
 SAMPLE_NUM_SYNON = 3
 
 _DEFAULT_DATAFRAME = (
@@ -83,21 +84,31 @@ def _fit_variant(scoreset, dataset_name, variant, prior, score_range_points,
                 "status": "skipped", "reason": "no P/LP sample"}
 
     blb_col = _col_idx_for_sample_num(scoreset, SAMPLE_NUM_BLB)
+    gnomad_col = _col_idx_for_sample_num(scoreset, SAMPLE_NUM_GNOMAD)
     synon_col = _col_idx_for_sample_num(scoreset, SAMPLE_NUM_SYNON)
     plp_scores = scoreset.scores[scoreset.sample_assignments[:, plp_col]]
 
-    # "all_"-prefixed variants fit the GMM's component parameters on every
-    # variant's score in the dataset (regardless of sample membership),
+    # "all_"-prefixed variants fit the GMM's component parameters on
+    # scoreset.scores directly, i.e. every variant that has *some* sample
+    # membership (Scoreset's own keep_mask has already dropped pure
+    # unlabeled/VUS-only rows by this point -- see
+    # src/assay_calibration/data_utils/dataset.py's Scoreset.__init__),
     # rather than only the pooled P/LP + benign scores; the pooling scheme
     # for benign_scores/weights below is unaffected by this prefix.
     fit_scope = "all" if variant.startswith("all_") else "labeled"
     pooling = variant[len("all_"):] if fit_scope == "all" else variant
 
     if pooling == "plp_blb":
-        if blb_col is None:
+        if blb_col is not None:
+            benign_scores = scoreset.scores[scoreset.sample_assignments[:, blb_col]]
+        elif gnomad_col is not None:
+            # No B/LB sample for this dataset (e.g. TARDBP_Bolognesi_Faure_2019)
+            # -- fall back to gnomAD/population as the benign-control pool
+            # rather than skipping the dataset entirely.
+            benign_scores = scoreset.scores[scoreset.sample_assignments[:, gnomad_col]]
+        else:
             return {"dataset_name": dataset_name, "variant": variant,
-                     "status": "skipped", "reason": "no B/LB sample"}
-        benign_scores = scoreset.scores[scoreset.sample_assignments[:, blb_col]]
+                     "status": "skipped", "reason": "no B/LB or gnomAD sample"}
     elif pooling == "plp_blb_synon":
         parts = []
         if blb_col is not None:
@@ -372,13 +383,23 @@ def main():
                        help="Skip generating <name>_<variant>_visualization.png "
                             "(calibration/lr_values/variants are always written)")
     parser.add_argument("--n-jobs", type=int, default=-1)
+    parser.add_argument("--dataset", default=None,
+                       help="Restrict to a single dataset (by 'Dataset' column value); "
+                            "results are merged into the existing "
+                            "simple_gmm_baseline_results.json in --output-dir rather than "
+                            "overwriting it, so this can be used to re-fit one dataset after "
+                            "a code change without rerunning the whole baseline.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     sep = "\t" if args.dataframe.endswith((".tsv.gz", ".tsv")) else ","
-    df = pd.read_csv(args.dataframe, sep=sep)
+    df = pd.read_csv(args.dataframe, sep=sep, low_memory=False)
 
     datasets = df["Dataset"].unique()
+    if args.dataset:
+        datasets = [ds for ds in datasets if ds == args.dataset]
+        if not datasets:
+            raise SystemExit(f"--dataset {args.dataset!r} not found in {args.dataframe}")
     print(f"Datasets: {len(datasets)}")
     partitions = {ds: df[df["Dataset"] == ds] for ds in datasets}
 
@@ -400,6 +421,11 @@ def main():
 
     flat = [r for rs in results if rs for r in rs]
     out_path = os.path.join(args.output_dir, "simple_gmm_baseline_results.json")
+    if args.dataset and os.path.exists(out_path):
+        with open(out_path) as f:
+            existing = json.load(f)
+        refit_names = {r["dataset_name"] for r in flat}
+        flat = [r for r in existing if r["dataset_name"] not in refit_names] + flat
     with open(out_path, "w") as f:
         json.dump(flat, f, indent=2)
 

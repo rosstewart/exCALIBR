@@ -2,12 +2,13 @@ import numpy as np
 from typing import Union
 
 
-def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
-    original = kwargs.get("original", False)
-    strict = kwargs.get("strict", False)
-    C_max = kwargs.get("C_max", 100000)
-    verbose = kwargs.get("verbose", False)
-    C_vals = np.arange(1, C_max + 1)
+def _tavtigian_fails(C_vals: np.ndarray, prior: float, original: bool, strict: bool,
+                      verbose: bool = False):
+    """Total rule-violation count for each candidate C in C_vals -- the
+    per-candidate objective get_tavtigian_constant minimizes. Factored out
+    so it can be reused for both a coarse (wide-range, log-spaced) and a
+    fine (dense integer) search pass; see get_tavtigian_constant.
+    """
     pathogenic_posteriors = np.round(
         np.stack(
             list(map(lambda C: pathogenicRulesPosterior(C, prior, original), C_vals)),
@@ -53,14 +54,54 @@ def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
     fails = (
         pathogenic_fails + likely_pathogenic_fails + benign_fails + likely_benign_fails
     )
-    star_idx = np.argmin(fails)
-    C_star = C_vals[star_idx]
     if verbose:
+        star_idx = np.argmin(fails)
         print(likely_pathogenic_posteriors[star_idx])
         print(pathogenic_posteriors[star_idx])
         print(likely_benign_posteriors[star_idx])
         print(benign_posteriors[star_idx])
-    return C_star
+    return fails
+
+
+def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
+    original = kwargs.get("original", False)
+    strict = kwargs.get("strict", False)
+    verbose = kwargs.get("verbose", False)
+    # Explicit C_max => legacy behavior: a single dense linear scan over
+    # [1, C_max], exactly as before (kept for reproducibility/callers that
+    # pin a specific search range).
+    C_max = kwargs.get("C_max", None)
+
+    if C_max is not None:
+        C_vals = np.arange(1, C_max + 1)
+        fails = _tavtigian_fails(C_vals, prior, original, strict, verbose)
+        return C_vals[np.argmin(fails)]
+
+    # No C_max given: adaptive two-stage search with no hard ceiling. A
+    # dense linear scan up to a fixed cap (previously 100000) silently
+    # truncates the true optimum for very low/high priors, where the
+    # best-fit C* can run into the millions or more -- this showed up as
+    # visibly wrong, capped-looking C*(p) behavior at the extremes of the
+    # prior range. Instead: (1) a coarse log-spaced scan across a huge
+    # range (1 to 10^15) to locate the right order of magnitude, then (2) a
+    # dense integer scan in a window around that coarse optimum to pin down
+    # the exact best integer, same precision as the old dense scan.
+    coarse_vals = np.unique(np.round(np.logspace(0, 15, 600)).astype(np.int64))
+    coarse_vals = coarse_vals[coarse_vals >= 1]
+    coarse_fails = _tavtigian_fails(coarse_vals, prior, original, strict)
+    best_i = int(np.argmin(coarse_fails))
+    lo = coarse_vals[max(best_i - 1, 0)]
+    hi = coarse_vals[min(best_i + 1, len(coarse_vals) - 1)]
+
+    fine_vals = np.arange(max(1, lo), hi + 1)
+    if len(fine_vals) > 250_000:
+        # Window too wide for a dense integer scan (only possible far out
+        # in the log grid, where neighboring points are themselves far
+        # apart) -- fall back to a denser log-spaced sub-scan of the same
+        # window instead of scanning every integer in it.
+        fine_vals = np.unique(np.round(np.geomspace(max(1, lo), hi, 250_000)).astype(np.int64))
+    fine_fails = _tavtigian_fails(fine_vals, prior, original, strict, verbose)
+    return int(fine_vals[np.argmin(fine_fails)])
 
 
 def pathogenicRulesPosterior(C: int, prior: float, original: bool) -> np.ndarray:

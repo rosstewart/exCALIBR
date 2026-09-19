@@ -103,7 +103,7 @@ import numpy as np
 import pandas as pd
 
 from analysis import config
-from analysis.discovery import discover_outputs, load_all_variants, resolve_component
+from analysis.discovery import discover_outputs, load_all_variants, resolve_component, resolve_dataset_tsv_name
 from analysis.author_labels import attach_author_labels
 from analysis.confusion import (
     build_confusion_matrix,
@@ -143,6 +143,7 @@ def figure_subdirs(figure_dir: Path) -> dict:
         "acmgscaler": figure_dir / "clinvar_comparisons" / "acmgscaler",
         "gmm_baseline": figure_dir / "clinvar_comparisons" / "gmm_baseline",
         "skew_locked": figure_dir / "clinvar_comparisons" / "skew_locked",
+        "manual_prior": figure_dir / "clinvar_comparisons" / "manual_prior",
         "pathomechanism": figure_dir / "clinvar_comparisons" / "pathomechanism",
         "clingen": figure_dir / "clingen_comparisons",
         "path_percentile": figure_dir / "path_percentile_ablation",
@@ -542,6 +543,13 @@ else:
 #                       This notebook never invokes Rscript itself; a dataset
 #                       missing its CSV is treated as "could not be
 #                       calibrated" (e.g. <10 P or <10 B labeled variants).
+#   excalibr_prior_0.1 : the canonical pipeline rerun with the prior fixed
+#                       at 0.1 instead of auto-fit
+#                       (analysis.config.MANUAL_PRIOR_OUTPUT_DIR) -- a full
+#                       ExCALIBR-shaped output tree, so discovered/loaded
+#                       via analysis.discovery, and compared over every
+#                       dataset (not just the acmgscaler-matched subset the
+#                       3-way grid further down uses).
 #   gmm_plp_blb / gmm_plp_blb_synon :
 #                       simple 2-component GMM baseline, prior=0.1, two
 #                       control-pooling variants (P/LP+B/LB only, vs.
@@ -579,6 +587,7 @@ comparison_matches = {}  # method_label -> (matched_excalibr, matched_other, mat
 _COMPARISON_SUBDIR_KEY = {
     "acmgscaler": "acmgscaler",
     "skew_locked": "skew_locked",
+    "excalibr_prior_0.1": "manual_prior",
     "gmm_plp_blb": "gmm_baseline",
     "gmm_plp_blb_synon": "gmm_baseline",
     "gmm_all_plp_blb": "gmm_baseline",
@@ -650,14 +659,13 @@ def _compare_vs_excalibr(conf_raw, method_label, vus_raw=None):
 # --- manual-prior ExCALIBR rerun (prior=0.1 fixed, not auto-fit) ---
 # Loaded here (rather than down in 3a3 alongside skew-locked) so it's
 # available for the 3-way ExCALIBR/acmgscaler/manual-prior grid right below.
-# analysis.config.MANUAL_PRIOR_OUTPUT_DIR is currently a TEMP PLACEHOLDER
-# PATH -- this rerun doesn't exist on disk yet, so this cell just prints a
-# warning and leaves manual_prior_conf_raw as None until it's populated.
+# If analysis.config.MANUAL_PRIOR_OUTPUT_DIR doesn't exist, this cell just
+# prints a warning and leaves manual_prior_conf_raw as None.
 # Same full ExCALIBR-shaped output tree as OUTPUT_DIR/SKEW_LOCKED_OUTPUT_DIR,
 # so discovered/loaded via analysis.discovery exactly like a normal
-# pipeline run, not analysis.comparison_methods. use_oob=False to match the
-# skew-locked/GMM-baseline convention below (flip to True once/if this rerun
-# carries oob_* columns).
+# pipeline run, not analysis.comparison_methods. use_oob=True: this rerun's
+# *_variants.csv carries oob_points/oob_n_boots/oob_prior columns, same as
+# the canonical pipeline's own output.
 manual_prior_conf_raw = None
 if not config.warn_if_missing(config.MANUAL_PRIOR_OUTPUT_DIR, "ExCALIBR manual-prior (0.1) comparison"):
     mp_tree, mp_model_selections, mp_calibrations = discover_outputs(Path(config.MANUAL_PRIOR_OUTPUT_DIR))
@@ -666,12 +674,31 @@ if not config.warn_if_missing(config.MANUAL_PRIOR_OUTPUT_DIR, "ExCALIBR manual-p
         methods_filter=None, datasets_filter=datasets, calibrations=mp_calibrations, min_controls=0,
     )
     manual_prior_conf_raw = []
+    manual_prior_vus_raw = []
     for dataset in datasets:
         df_mp = mp_df[mp_df["dataset"] == dataset] if not mp_df.empty else mp_df
         manual_prior_conf_raw.append(
-            build_confusion_matrix(df_mp, use_oob=False, label=f"{dataset}/manual_prior_0.1")
+            build_confusion_matrix(df_mp, use_oob=True, label=f"{dataset}/manual_prior_0.1")
             if not df_mp.empty else None
         )
+        # No points_col override: this rerun is a full ExCALIBR output tree,
+        # so the default standard_points/oob_points path applies unchanged --
+        # same reason build_confusion_matrix above needs no special handling.
+        manual_prior_vus_raw.append(
+            build_vus_coverage(df_mp, use_oob=True, label=f"{dataset}/manual_prior_0.1")
+            if not df_mp.empty else None
+        )
+
+    # Head-to-head ExCALIBR vs. ExCALIBR-with-prior-0.1 over EVERY dataset,
+    # independent of the 3-way grid below (which is restricted to the
+    # datasets acmgscaler could also calibrate). Same two-figure treatment
+    # every other comparison method gets: all_datasets pads any dataset the
+    # manual-prior rerun doesn't cover into the IR column so both panels
+    # share a denominator, matched_datasets drops it. Unlike acmgscaler, a
+    # missing dataset here means the rerun simply doesn't include it (not
+    # that a prior of 0.1 was uncalibratable), so matched_datasets is the
+    # more honest of the two whenever the counts below differ.
+    _compare_vs_excalibr(manual_prior_conf_raw, "excalibr_prior_0.1", vus_raw=manual_prior_vus_raw)
 
 # --- acmgscaler ---
 # Precomputed by run_acmgscaler_all.py (analysis.config.ACMGSCALER_OUTPUT_DIR)
@@ -680,6 +707,7 @@ if not config.warn_if_missing(config.MANUAL_PRIOR_OUTPUT_DIR, "ExCALIBR manual-p
 # that dataset (e.g. <10 P or <10 B controls), not "not computed yet"; run
 # run_acmgscaler_all.py separately (it parallelizes across datasets via
 # joblib) if ACMGSCALER_OUTPUT_DIR is stale or unset.
+acmgscaler_conf_raw = None  # populated below; stays None if ACMGSCALER_OUTPUT_DIR is missing (see section 3b)
 if not config.warn_if_missing(config.ACMGSCALER_OUTPUT_DIR, "acmgscaler comparison"):
     acmgscaler_conf_raw = []
     acmgscaler_vus_raw = []
@@ -744,6 +772,7 @@ if not config.warn_if_missing(config.ACMGSCALER_OUTPUT_DIR, "acmgscaler comparis
         print("  SKIP 3-way ExCALIBR/acmgscaler/manual-prior grid: manual-prior output not available")
 
 # --- simple GMM baseline, both pooling variants ---
+gmm_conf_raw_by_variant = {}  # variant -> per-dataset conf_raw list, for section 3b's combined table
 if config.GMM_BASELINE_OUTPUT_DIR:
     for variant in config.GMM_BASELINE_VARIANTS:
         gmm_conf_raw = []
@@ -762,6 +791,7 @@ if config.GMM_BASELINE_OUTPUT_DIR:
                 if df_gmm is not None else None
             )
         _compare_vs_excalibr(gmm_conf_raw, f"gmm_{variant}", vus_raw=gmm_vus_raw)
+        gmm_conf_raw_by_variant[variant] = gmm_conf_raw
 else:
     print("  SKIP GMM baseline comparison: analysis.config.GMM_BASELINE_OUTPUT_DIR not set")
 
@@ -774,14 +804,16 @@ else:
 # ExCALIBR-shaped output tree (`analysis.config.SKEW_LOCKED_OUTPUT_DIR`) --
 # discovered/loaded with `analysis.discovery` exactly like `OUTPUT_DIR`
 # itself, not `analysis.comparison_methods`. Its `*_variants.csv` files
-# already carry `auth_label` (no `attach_author_labels` needed) but no
-# `oob_*` columns, so matrices are built with `use_oob=False`, same as the
-# GMM baseline. Compared against the primary method with the same
-# `_compare_vs_excalibr` helper used above, so its matched-datasets
+# already carry `auth_label` (no `attach_author_labels` needed) and
+# `oob_points`/`oob_n_boots`/`oob_prior` columns, so matrices are built with
+# `use_oob=True`, same as the canonical pipeline. Compared against the
+# primary method with the same `_compare_vs_excalibr` helper used above, so
+# its matched-datasets
 # aggregate performance is picked up automatically by 3b, and its evidence
 # distribution is added alongside section 4's.
 
 # %%
+skew_locked_conf_raw = None  # populated below; stays None if SKEW_LOCKED_OUTPUT_DIR is missing (see section 3b)
 if not config.warn_if_missing(config.SKEW_LOCKED_OUTPUT_DIR, "skew-locked ExCALIBR comparison"):
     skew_tree, skew_model_selections, skew_calibrations = discover_outputs(Path(config.SKEW_LOCKED_OUTPUT_DIR))
     skew_df = load_all_variants(
@@ -793,11 +825,11 @@ if not config.warn_if_missing(config.SKEW_LOCKED_OUTPUT_DIR, "skew-locked ExCALI
     for dataset in datasets:
         df_sk = skew_df[skew_df["dataset"] == dataset] if not skew_df.empty else skew_df
         skew_locked_conf_raw.append(
-            build_confusion_matrix(df_sk, use_oob=False, label=f"{dataset}/skew_locked")
+            build_confusion_matrix(df_sk, use_oob=True, label=f"{dataset}/skew_locked")
             if not df_sk.empty else None
         )
         skew_locked_vus_raw.append(
-            build_vus_coverage(df_sk, use_oob=False, label=f"{dataset}/skew_locked")
+            build_vus_coverage(df_sk, use_oob=True, label=f"{dataset}/skew_locked")
             if not df_sk.empty else None
         )
     _compare_vs_excalibr(skew_locked_conf_raw, "skew_locked", vus_raw=skew_locked_vus_raw)
@@ -832,8 +864,24 @@ if not skew_df.empty and not config.warn_if_missing(config.SKEW_LOCKED_BOOTSTRAP
     _regular_boot = _load_bootstrap_json(config.PRECOMPUTED_FITS)
     _skew_boot = _load_bootstrap_json(config.SKEW_LOCKED_BOOTSTRAP_RESULTS)
 
+    # OUTPUT_DIR/PRECOMPUTED_FITS carry a few datasets (e.g. F9_Popp_2025_model,
+    # LDLR_Tabet_2025_presence_VLDL, PALB2_Boonen_2026_SGE) added after the
+    # bootstrap-count-reduction sweep (config.BOOTSTRAP_REDUCTION_OUTPUT_DIR,
+    # the canonical 88-dataset set used elsewhere in this notebook) was
+    # generated. Restrict this comparison to that same 88-dataset set for
+    # consistency, resolving the sweep's old/renamed directory names to
+    # their current canonical names the same way build_dataset_df does.
+    from tests.benchmark_bootstrap_reduction import _KNOWN_NAME_ALIASES as _bsr_aliases
+    _bsr_dir = Path(config.BOOTSTRAP_REDUCTION_OUTPUT_DIR)
+    _canonical_88 = {
+        _bsr_aliases.get(d.name, d.name)
+        for d in _bsr_dir.iterdir() if d.is_dir() and any(d.glob("level_*"))
+    }
+
     _ll_rows = []
     for dataset in datasets:
+        if dataset not in _canonical_88:
+            continue
         if dataset not in _regular_boot or dataset not in _skew_boot:
             continue
         available_comps = list(tree.get(dataset, {}).keys())
@@ -848,31 +896,54 @@ if not skew_df.empty and not config.warn_if_missing(config.SKEW_LOCKED_BOOTSTRAP
             set(reg_by_seed) & set(skew_by_seed),
             key=lambda s: int(s),
         )
-        diffs = [
-            skew_by_seed[s][n_c]["val_ll"] - reg_by_seed[s][n_c]["val_ll"]
-            for s in common_seeds
-            # .get(n_c) rather than "in" -- a seed can have an n_c key present
-            # but mapped to None (that bootstrap's fit for this component
-            # count failed to converge), which "in" alone doesn't catch.
+        # .get(n_c) rather than "in" -- a seed can have an n_c key present
+        # but mapped to None (that bootstrap's fit for this component count
+        # failed to converge), which "in" alone doesn't catch.
+        valid_seeds = [
+            s for s in common_seeds
             if reg_by_seed[s].get(n_c) is not None and skew_by_seed[s].get(n_c) is not None
         ]
-        if not diffs:
+        if not valid_seeds:
             continue
-        diffs = np.array(diffs)
-        q25, q50, q75 = np.percentile(diffs, [25, 50, 75])
+        reg_vals = np.array([reg_by_seed[s][n_c]["val_ll"] for s in valid_seeds])
+        skew_vals = np.array([skew_by_seed[s][n_c]["val_ll"] for s in valid_seeds])
+        diffs = skew_vals - reg_vals
+
+        # Raw val_ll is on a different scale per dataset (dataset size,
+        # likelihood magnitude), so the diff isn't comparable across
+        # datasets any more than benchmark_num_fits_dataframe.py's raw
+        # train_ll delta was -- same fix as compute_delta_std_column's
+        # delta_std: normalize by this dataset's own regular-run
+        # bootstrap-to-bootstrap SD of val_ll before pooling across
+        # datasets.
+        reg_std = reg_vals.std()
+        if reg_std == 0 or not np.isfinite(reg_std):
+            continue
+        diffs_std = diffs / reg_std
+        q25, q50, q75 = np.percentile(diffs_std, [25, 50, 75])
         _ll_rows.append({
-            "dataset": dataset, "n_c": n_c, "n_bootstraps": len(diffs),
-            "median_diff": q50, "iqr_lo": q25, "iqr_hi": q75, "iqr_width": q75 - q25,
+            "dataset": dataset, "n_c": n_c, "n_bootstraps": len(diffs_std),
+            "median_diff_std": q50, "iqr_lo": q25, "iqr_hi": q75, "iqr_width": q75 - q25,
         })
 
     del _regular_boot, _skew_boot  # both are full 89-dataset JSONs, free memory once done
 
     ll_diff_df = pd.DataFrame(_ll_rows)
     if not ll_diff_df.empty:
-        ll_diff_df = ll_diff_df.sort_values("median_diff").reset_index(drop=True)
+        ll_diff_df = ll_diff_df.sort_values("median_diff_std").reset_index(drop=True)
         print(f"\n{'=' * 80}\nSKEW-LOCKED vs REGULAR: per-bootstrap val_ll difference "
-              f"(skew_locked - regular), by selected component\n{'=' * 80}")
+              f"(skew_locked - regular) / regular-run bootstrap SD, by selected component\n{'=' * 80}")
         print(ll_diff_df.to_string(index=False))
+
+        # Aggregate across datasets: median-of-medians (each dataset counted
+        # once, not pooling every dataset's raw bootstrap seeds together).
+        _agg_vals = ll_diff_df["median_diff_std"].to_numpy(dtype=float)
+        _agg_p25, _agg_p50, _agg_p75 = np.percentile(_agg_vals, [25, 50, 75])
+        print(f"\nAll datasets (n={len(_agg_vals)}): median-of-medians "
+              f"(Δ val_ll / regular-run bootstrap SD) = {_agg_p50:.4f} [{_agg_p25:.4f}, {_agg_p75:.4f}]")
+
+        from analysis.robustness import plot_skew_locked_vs_regular_ll_boxplot
+        plot_skew_locked_vs_regular_ll_boxplot(ll_diff_df, figure_dir=FIGURE_SUBDIRS["skew_locked"])
     else:
         print("  SKIP skew-locked vs regular val_ll comparison: no dataset had matching bootstrap data")
 else:
@@ -894,6 +965,7 @@ ll_diff_df
 # cell prints a warning and skips until it's populated.
 
 # %%
+pathomech_conf_raw_aligned = None  # populated below; stays None if PATHOMECHANISM_OUTPUT_DIR is missing (see section 3b)
 if not config.warn_if_missing(config.PATHOMECHANISM_OUTPUT_DIR, "pathomechanism comparison"):
     pm_tree, pm_model_selections, pm_calibrations = discover_outputs(Path(config.PATHOMECHANISM_OUTPUT_DIR))
     pm_df_all = load_all_variants(
@@ -902,6 +974,16 @@ if not config.warn_if_missing(config.PATHOMECHANISM_OUTPUT_DIR, "pathomechanism 
     )
     pm_method = sorted(pm_df_all["method"].unique())[0] if not pm_df_all.empty else None
     pm_df = pm_df_all[pm_df_all["method"] == pm_method] if pm_method else pm_df_all
+
+    # `datasets`-aligned (not pathomech_datasets' union below) so this lines
+    # up index-for-index with conf_by_method[primary_method]/skew_locked_conf_raw
+    # for section 3b's ExCALIBR/skew-locked/pathomechanism table.
+    pathomech_conf_raw_aligned = [
+        build_confusion_matrix(
+            pm_df[pm_df["dataset"] == ds], use_oob=True, label=f"{ds}/pathomech_boundary",
+        ) if not pm_df[pm_df["dataset"] == ds].empty else None
+        for ds in datasets
+    ]
 
     pathomech_datasets = sorted(set(datasets) | set(pm_df["dataset"].unique()))
     canonical_conf, pathomech_conf = [], []
@@ -1135,6 +1217,32 @@ if not config.warn_if_missing(config.BOOTSTRAP_REDUCTION_OUTPUT_DIR, "bootstrap-
         if err is not None:
             print(f"  SKIP {dataset_name}: {err}")
 
+    # Standard classification metrics (accuracy/coverage/sensitivity/
+    # specificity/DOR/MCC) per (dataset, bootstrap-count level), pooled
+    # (median [IQR]) across datasets at each level -- the tabular
+    # complement to the [p5,p50,p95] LR+-curve figures just rendered above.
+    from analysis.robustness import (
+        compute_bootstrap_reduction_confusion_metrics, bootstrap_reduction_metrics_table,
+    )
+    from analysis.manuscript_stats import latex_bootstrap_reduction_metrics_table
+
+    print(f"  Computing bootstrap-reduction standard metrics across {_mp.cpu_count()} CPUs...")
+    _bsr_metric_results = _Parallel(n_jobs=-1, batch_size=1, backend="loky")(
+        _delayed(compute_bootstrap_reduction_confusion_metrics)(
+            dataset_name, br_dir / dataset_name, bsr_dataset_configs, config.DATASET_TSV,
+            bsr_per_dataset_df[dataset_name],
+        )
+        for dataset_name in bsr_datasets
+    )
+    _bsr_metric_rows = [row for rows in _bsr_metric_results for row in rows]
+    if _bsr_metric_rows:
+        _bsr_metrics_df = pd.DataFrame(_bsr_metric_rows)
+        _bsr_table_df = bootstrap_reduction_metrics_table(_bsr_metrics_df)
+        _bsr_latex = latex_bootstrap_reduction_metrics_table(_bsr_table_df)
+        save_latex_table(_bsr_latex, FIGURE_SUBDIRS["tables"] / "bootstrap_reduction_metrics.tex")
+    else:
+        print("  SKIP bootstrap-reduction metrics table: no dataset produced a usable confusion matrix")
+
 # %% [markdown]
 # ### 3a7. Fit-number (restart-count) comparison
 #
@@ -1145,13 +1253,38 @@ if not config.warn_if_missing(config.BOOTSTRAP_REDUCTION_OUTPUT_DIR, "bootstrap-
 
 # %%
 if not config.warn_if_missing(config.FIT_NUMBER_COMPARISON_SUMMARY_CSV, "fit-number comparison"):
-    from analysis.robustness import plot_fit_number_comparison_curve
+    from analysis.robustness import (
+        plot_fit_number_comparison_curve, compute_delta_std_column, summarize_delta_std_table,
+    )
 
     fit_number_summary = pd.read_csv(config.FIT_NUMBER_COMPARISON_SUMMARY_CSV)
     print(f"Loaded {len(fit_number_summary)} rows, "
           f"{fit_number_summary['dataset'].nunique()} datasets, "
           f"num_fits levels: {sorted(fit_number_summary['num_fits'].unique())}")
     plot_fit_number_comparison_curve(fit_number_summary, figure_dir=FIGURE_DIR, label="all_datasets")
+
+    # LL-metrics table: delta_std (dimensionless, in units of each
+    # (dataset, n_c)'s own restart-to-restart SD -- see
+    # compute_delta_std_column's docstring for why raw "delta" alone isn't
+    # comparable across datasets), median [P25, P75] across every
+    # (dataset, n_c) row at each restart-count level -- the tabular twin of
+    # the curve just plotted above.
+    if not config.warn_if_missing(
+        config.FIT_NUMBER_COMPARISON_TRAIN_LLS_JSON, "fit-number comparison train_lls.json (for delta_std)",
+    ):
+        from analysis.manuscript_stats import latex_fit_number_comparison_table
+
+        fit_number_summary = compute_delta_std_column(
+            fit_number_summary, config.FIT_NUMBER_COMPARISON_TRAIN_LLS_JSON,
+        )
+        _fit_number_levels = [
+            l for l in (1, 5, 10, 20, 30, 40, 50, 100) if l in set(fit_number_summary["num_fits"].unique())
+        ]
+        _fit_number_table_df = summarize_delta_std_table(
+            fit_number_summary, levels=_fit_number_levels, metric="delta_std",
+        )
+        _fit_number_latex = latex_fit_number_comparison_table(_fit_number_table_df, metric="delta_std")
+        save_latex_table(_fit_number_latex, FIGURE_SUBDIRS["tables"] / "fit_number_comparison_metrics.tex")
 
 # %% [markdown]
 # ### 3a8. SpliceAI threshold / VEP splice-consequence filter ablation
@@ -1183,15 +1316,87 @@ if not config.warn_if_missing(config.SPLICE_ABLATION_ROOT, "splice ablation anal
         plot_splice_ablation_curve(splice_ablation_summary, figure_dir=FIGURE_DIR, label="all_datasets")
 
 # %% [markdown]
-# ### 3b. Aggregate performance report + manuscript LaTeX table
+# ### 3a8b. Splice ablation: pooled aggregate performance + population drift
 #
-# `print_aggregate_performance` (src/assay_calibration/plot_utils/utils.py)
-# sums the confusion matrices above and prints the full text report (per
-# dataset + aggregate accuracy/sensitivity/specificity/MCC/LR+/DOR for both
-# ExCALIBR and author annotations). `latex_performance_table_clinvar` turns
-# those same computed metrics into the manuscript's LaTeX table — every
-# number in it comes from the confusion matrices built above, nothing
-# hardcoded.
+# Two condition-level summary tables, both pooling every dataset into a
+# single combined confusion matrix per condition (like section 3b's
+# aggregate performance report, but with "condition" as the row axis
+# instead of one aggregate row):
+#  - **Table A** (`compute_splice_ablation_aggregate_summary`): each
+#    condition's own population + own calibration -- the full end-to-end
+#    comparison, including how much the P/LP/B/LB/gnomAD/Synonymous
+#    population itself drifts per condition (`pct_change_n_*` columns).
+#  - **Table B** (`compute_splice_ablation_fixed_population_summary`):
+#    `thresh_0.2`'s population held fixed, every other condition's own
+#    calibration re-applied to it -- isolates the calibration-threshold
+#    effect from population composition drift (Table A's percent changes
+#    mix both effects together; Table B's don't).
+# Both compare against `thresh_0.2` by default, matching
+# `Scoreset.splicing_filter`'s own hardcoded defaults (spliceai_threshold=0.2,
+# vep_splice_filter=True).
+
+# %%
+from analysis.splice_ablation import (
+    compute_splice_ablation_aggregate_summary, compute_splice_ablation_fixed_population_summary,
+)
+from analysis.manuscript_stats import (
+    latex_splice_ablation_summary_table, latex_splice_ablation_fixed_population_table,
+)
+
+if not config.warn_if_missing(config.SPLICE_ABLATION_ROOT, "splice ablation aggregate summary"):
+    splice_ablation_agg_summary = compute_splice_ablation_aggregate_summary(
+        config.SPLICE_ABLATION_ROOT, dataset_configs=dataset_configs,
+    )
+    if not splice_ablation_agg_summary.empty:
+        print(splice_ablation_agg_summary.to_string(index=False))
+        _splice_ablation_latex = latex_splice_ablation_summary_table(splice_ablation_agg_summary)
+        save_latex_table(_splice_ablation_latex, FIGURE_SUBDIRS["tables"] / "splice_ablation_summary.tex")
+
+    splice_ablation_fixed_pop_summary = compute_splice_ablation_fixed_population_summary(
+        config.SPLICE_ABLATION_ROOT, dataset_configs=dataset_configs,
+    )
+    if not splice_ablation_fixed_pop_summary.empty:
+        print(splice_ablation_fixed_pop_summary.to_string(index=False))
+        _splice_ablation_fixed_pop_latex = latex_splice_ablation_fixed_population_table(
+            splice_ablation_fixed_pop_summary,
+        )
+        save_latex_table(
+            _splice_ablation_fixed_pop_latex,
+            FIGURE_SUBDIRS["tables"] / "splice_ablation_fixed_population_summary.tex",
+        )
+
+# %% [markdown]
+# ### 3b. Aggregate performance report + manuscript LaTeX tables
+#
+# **ExCALIBR vs. author** (unchanged): `print_aggregate_performance`
+# (src/assay_calibration/plot_utils/utils.py) sums the confusion matrices
+# above and prints the full text report (per dataset + aggregate accuracy/
+# sensitivity/specificity/MCC/LR+/DOR for both ExCALIBR and author
+# annotations). `latex_performance_table_clinvar` turns those same computed
+# metrics into the manuscript's LaTeX table — every number in it comes from
+# the confusion matrices built above, nothing hardcoded. Also now includes
+# the both-determinate variant (section 3a1b's `both_det_excalibr`/
+# `both_det_author`, previously only a confusion figure) as its own table.
+#
+# **ExCALIBR vs. every other comparison method**: `latex_performance_table_multi`
+# (analysis/manuscript_stats.py) generalizes that same dynamic-table approach
+# to an arbitrary number of methods (not just one "Author Annotations"
+# column), via `compute_aggregate_metrics_multi` (pools each method's
+# confusion matrices over the intersection of datasets where every method in
+# the table produced one). Three grouped tables, matching how these methods
+# are actually meant to be compared:
+#   - ExCALIBR vs. acmgscaler vs. ExCALIBR with prior manually fixed at 0.1
+#     (`manual_prior_conf_raw`, section 3a2) -- isolates whether acmgscaler's
+#     disagreement with ExCALIBR tracks the prior choice itself.
+#   - ExCALIBR vs. skew-locked vs. the pathomechanism-aware prior mode
+#     (section 3a3 / 3a4b).
+#   - ExCALIBR vs. all four GMM baseline pooling variants together
+#     (`config.GMM_BASELINE_VARIANTS`, section 3a2).
+# Every table's "Datasets calibratable" row shows each method's own
+# non-None-matrix count out of the full dataset count -- not just the
+# intersection size the metrics below it are pooled over (stated in the
+# caption) -- so it's visible per-method whether/how much a method's own
+# calibratable subset differs from the others'.
 
 # %%
 from src.assay_calibration.plot_utils.utils import print_aggregate_performance
@@ -1201,15 +1406,43 @@ _auth_pairs = [
     (d, a, n) for d, a, n in zip(conf_by_method[primary_method], auths, datasets)
     if d is not None and a is not None
 ]
+danz_agg_metrics = auth_agg_metrics = None
 if _auth_pairs:
     _danzs_auth, _auths_auth, _names_auth = zip(*_auth_pairs)
     danz_agg_metrics, auth_agg_metrics, individual_metrics_df = print_aggregate_performance(
         list(_danzs_auth), list(_auths_auth), list(_names_auth),
     )
-    _clinvar_perf_latex = latex_performance_table_clinvar(danz_agg_metrics, auth_agg_metrics)
-    save_latex_table(_clinvar_perf_latex, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance.tex")
 else:
     print("  SKIP aggregate performance report: no datasets with both ExCALIBR and author matrices")
+
+# Same aggregate report, restricted to the both-determinate subset (section
+# 3a1b's both_det_excalibr/both_det_author -- variants where BOTH ExCALIBR
+# and the author actually made a determinate call; the IR column is
+# all-zero on both sides by construction).
+_auth_pairs_both_det = [
+    (d, a, n) for d, a, n in zip(both_det_excalibr, both_det_author, datasets)
+    if d is not None and a is not None
+]
+danz_agg_both_det = auth_agg_both_det = None
+if _auth_pairs_both_det:
+    _danzs_bd, _auths_bd, _names_bd = zip(*_auth_pairs_both_det)
+    danz_agg_both_det, auth_agg_both_det, _ = print_aggregate_performance(
+        list(_danzs_bd), list(_auths_bd), list(_names_bd),
+    )
+else:
+    print("  SKIP aggregate performance report (both-determinate): no dataset had any determinate-determinate call")
+
+# Merged table: "All variants" + "Both determinate" side by side (one
+# ExCALIBR/Author column pair each) instead of two separate 2-column
+# tables/files.
+_clinvar_perf_groups = []
+if danz_agg_metrics is not None:
+    _clinvar_perf_groups.append(("All variants", danz_agg_metrics, auth_agg_metrics))
+if danz_agg_both_det is not None:
+    _clinvar_perf_groups.append(("Both determinate", danz_agg_both_det, auth_agg_both_det))
+if _clinvar_perf_groups:
+    _clinvar_perf_latex = latex_performance_table_clinvar(_clinvar_perf_groups)
+    save_latex_table(_clinvar_perf_latex, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance.tex")
 
 # Same aggregate report + LaTeX table, F9/TP53 excluded -- reuses the
 # conf_no_f9_tp53/auth_no_f9_tp53/datasets_no_f9_tp53 lists built in 3a1
@@ -1223,7 +1456,7 @@ if _auth_pairs_no_f9_tp53:
     danz_agg_no_f9_tp53, auth_agg_no_f9_tp53, _ = print_aggregate_performance(
         list(_danzs_a), list(_auths_a), list(_names_a),
     )
-    _latex_no_f9_tp53 = latex_performance_table_clinvar(danz_agg_no_f9_tp53, auth_agg_no_f9_tp53)
+    _latex_no_f9_tp53 = latex_performance_table_clinvar([("All variants", danz_agg_no_f9_tp53, auth_agg_no_f9_tp53)])
     save_latex_table(_latex_no_f9_tp53, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance_no_f9_tp53.tex")
 else:
     print("  SKIP aggregate performance report (F9/TP53 excluded): no datasets with both matrices")
@@ -1234,7 +1467,7 @@ if deduped_matrix_for_author is not None and deduped_author_matrix is not None:
     danz_agg_deduped, auth_agg_deduped, _ = print_aggregate_performance(
         [deduped_matrix_for_author], [deduped_author_matrix], ["gene_deduped"],
     )
-    _latex_deduped = latex_performance_table_clinvar(danz_agg_deduped, auth_agg_deduped)
+    _latex_deduped = latex_performance_table_clinvar([("All variants", danz_agg_deduped, auth_agg_deduped)])
     save_latex_table(_latex_deduped, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance_gene_deduped.tex")
 else:
     print("  SKIP aggregate performance report (gene-deduped): no matrix on one or both sides")
@@ -1245,20 +1478,120 @@ if deduped_matrix_for_author_no_f9_tp53 is not None and deduped_author_matrix_no
     danz_agg_deduped_no_f9_tp53, auth_agg_deduped_no_f9_tp53, _ = print_aggregate_performance(
         [deduped_matrix_for_author_no_f9_tp53], [deduped_author_matrix_no_f9_tp53], ["gene_deduped"],
     )
-    _latex_deduped_no_f9_tp53 = latex_performance_table_clinvar(danz_agg_deduped_no_f9_tp53, auth_agg_deduped_no_f9_tp53)
+    _latex_deduped_no_f9_tp53 = latex_performance_table_clinvar(
+        [("All variants", danz_agg_deduped_no_f9_tp53, auth_agg_deduped_no_f9_tp53)],
+    )
     save_latex_table(
         _latex_deduped_no_f9_tp53, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance_gene_deduped_no_f9_tp53.tex",
     )
 else:
     print("  SKIP aggregate performance report (gene-deduped, F9/TP53 excluded): no matrix on one or both sides")
 
-# Same aggregate report, restricted to the subset of datasets each comparison
-# method (acmgscaler, the gmm baselines) could actually be calibrated on --
-# `comparison_matches` was populated by `_compare_vs_excalibr` in 3a2, keyed
-# by method_label -> (matched_excalibr, matched_other, matched_datasets).
-for _method_label, (_matched_excalibr, _matched_other, _matched_names) in comparison_matches.items():
-    print(f"\n{'-' * 80}\nExCALIBR vs {_method_label} (matched datasets, n={len(_matched_names)})\n{'-' * 80}")
-    print_aggregate_performance(_matched_excalibr, _matched_other, _matched_names)
+from analysis.manuscript_stats import compute_aggregate_metrics_multi, latex_performance_table_multi
+
+# --- ExCALIBR vs acmgscaler vs ExCALIBR (prior=0.1), on datasets acmgscaler could calibrate ---
+if acmgscaler_conf_raw is not None and manual_prior_conf_raw is not None:
+    _agg, _own, _n_matched = compute_aggregate_metrics_multi(
+        {
+            "excalibr": conf_by_method[primary_method],
+            "acmgscaler": acmgscaler_conf_raw,
+            "excalibr_prior_0.1": manual_prior_conf_raw,
+        },
+        datasets,
+    )
+    _latex = latex_performance_table_multi(
+        _agg,
+        {"excalibr": "ExCALIBR", "acmgscaler": "ACMGScaler", "excalibr_prior_0.1": "ExCALIBR (prior=0.1)"},
+        _own, len(datasets), _n_matched,
+        caption=r"Performance comparison of out-of-bag \excalibr-calibrated evidence vs. "
+                r"ACMGScaler (Badonyi \& Marsh 2025) and \excalibr\ re-calibrated with a fixed "
+                r"prior of 0.1.",
+        label="tab:acmgscaler_prior01_performance",
+    )
+    save_latex_table(_latex, FIGURE_SUBDIRS["tables"] / "excalibr_vs_acmgscaler_vs_prior01_performance.tex")
+else:
+    print("  SKIP acmgscaler/prior=0.1 performance table: acmgscaler or manual-prior output unavailable")
+
+# --- ExCALIBR vs skew-locked vs pathomechanism-aware prior vs GMM baselines,
+# all in ONE table -- matches section 3b2's comparison_boxplots grouping
+# below (same rationale: their calibratable datasets are nearly identical,
+# so one comparison group/table with everything side by side is more
+# informative than three near-identical dataset scopes split across
+# panels). `_ablation_baseline_matrices` is built once here and reused by
+# 3b2's panel_groups instead of being reconstructed there, so the table and
+# figure can't disagree about which methods/variants are included. Only
+# "plp_blb" and "all_plp_blb" GMM variants shown (not their "_synon"
+# siblings, which just add Synonymous to the benign pool and are strictly
+# no better) -- still computed/available in gmm_conf_raw_by_variant for
+# anyone who wants their own pairwise comparison.
+_ablation_baseline_matrices = {"excalibr": conf_by_method[primary_method]}
+_ablation_baseline_labels = {"excalibr": "ExCALIBR"}
+if skew_locked_conf_raw is not None:
+    _ablation_baseline_matrices["skew_locked"] = skew_locked_conf_raw
+    _ablation_baseline_labels["skew_locked"] = "Skew-locked ExCALIBR"
+if pathomech_conf_raw_aligned is not None:
+    _ablation_baseline_matrices["pathomechanism"] = pathomech_conf_raw_aligned
+    _ablation_baseline_labels["pathomechanism"] = "Pathomechanism-aware prior"
+_gmm_display = {"plp_blb": "GMM (P/LP+B/LB)", "all_plp_blb": "GMM (all P/LP+B/LB)"}
+for _variant, _conf in gmm_conf_raw_by_variant.items():
+    if _variant in ("plp_blb", "all_plp_blb"):
+        _ablation_baseline_matrices[f"gmm_{_variant}"] = _conf
+        _ablation_baseline_labels[f"gmm_{_variant}"] = _gmm_display[_variant]
+
+if len(_ablation_baseline_matrices) > 1:
+    _agg, _own, _n_matched = compute_aggregate_metrics_multi(_ablation_baseline_matrices, datasets)
+    _latex = latex_performance_table_multi(
+        _agg, _ablation_baseline_labels, _own, len(datasets), _n_matched,
+        caption=r"Performance comparison of out-of-bag \excalibr-calibrated evidence vs. the "
+                r"skew-locked calibration, the pathomechanism-aware prior/likelihood-ratio variant, "
+                r"and two simple two-component GMM calibration baselines (prior=0.1), differing only "
+                r"in which variants are pooled as benign controls.",
+        label="tab:ablation_baseline_performance",
+    )
+    save_latex_table(_latex, FIGURE_SUBDIRS["tables"] / "excalibr_vs_ablations_baselines_performance.tex")
+else:
+    print("  SKIP skew-locked/pathomechanism/GMM baseline performance table: no comparison output available")
+
+# %% [markdown]
+# ### 3b2. Per-dataset diagnostics: box plots + stacked FP/FN/indeterminate breakdown
+#
+# Section 3b's tables pool every dataset into one summed confusion matrix per
+# method -- the right format for the manuscript, but it hides (a) whether a
+# method's accuracy/coverage is consistent across datasets or dominated by a
+# couple of large ones, and (b) which datasets actually drive the pooled
+# FP/FN/indeterminate counts. Both figures below (`analysis.comparison_diagnostics`)
+# reuse the exact same per-dataset confusion-matrix lists as section 3b --
+# no new data loading, only new aggregation/plotting -- and read section 3b's
+# own `compute_aggregate_metrics_multi` dict directly for their aggregate
+# reference numbers, so neither figure can disagree with the tables.
+#
+# GMM baseline(s), skew-locked, and pathomechanism are merged into one group
+# here -- reusing 3b's `_ablation_baseline_matrices` directly (same methods/
+# GMM variants) so this figure can't disagree with that table about which
+# comparisons are included.
+
+# %%
+from analysis.comparison_diagnostics import plot_comparison_boxplots, plot_comparison_stacked_bars
+
+_panel_groups = {}
+if any(a is not None for a in auths):
+    _panel_groups["ExCALIBR vs. Author"] = {"excalibr": conf_by_method[primary_method], "author": auths}
+if acmgscaler_conf_raw is not None and manual_prior_conf_raw is not None:
+    _panel_groups["ExCALIBR vs. ACMGScaler vs. ExCALIBR (prior=0.1)"] = {
+        "excalibr": conf_by_method[primary_method], "acmgscaler": acmgscaler_conf_raw,
+        "excalibr_prior_0.1": manual_prior_conf_raw,
+    }
+if len(_ablation_baseline_matrices) > 1:
+    _panel_groups["ExCALIBR vs. GMM / Skew-locked / Pathomechanism"] = _ablation_baseline_matrices
+
+if _panel_groups:
+    fig_box = plot_comparison_boxplots(_panel_groups, datasets, len(datasets))
+    save_and_show(fig_box, FIGURE_SUBDIRS["manuscript"] / "comparison_boxplots.png")
+
+    fig_stack = plot_comparison_stacked_bars(_panel_groups, datasets)
+    save_and_show(fig_stack, FIGURE_SUBDIRS["manuscript"] / "comparison_stacked_bars.png")
+else:
+    print("  SKIP per-dataset diagnostic figures: no comparison group had usable matrices")
 
 # %% [markdown]
 # ### 3c. Per-dataset FP / FN breakdown (ranked)
@@ -1409,7 +1742,7 @@ else:
 # %%
 from analysis.clingen import (
     build_clingen_confusion, build_gene_deduped_clingen_confusion,
-    convert_3x2_to_2x3, plot_2x3_confusions_nature,
+    convert_3x2_to_2x3, plot_2x3_confusions_nature, plot_clingen_confusion_stacked,
 )
 from analysis.manuscript_stats import latex_performance_table_clingen
 
@@ -1418,36 +1751,78 @@ print(f"ClinGen scope: {len(datasets_with_author)}/{len(datasets)} datasets have
 
 CLINGEN_DATASETS = datasets_with_author  # explicit, adjustable — narrow if desired
 
-CLINGEN_VARIANTS = [
-    ("clingen_confusion", "gene-deduped=False, PS3/BS3 stripped=True", False, True),
-    ("clingen_confusion_gene_deduped", "gene-deduped=True, PS3/BS3 stripped=True", True, True),
-    ("clingen_confusion_with_ps3bs3", "gene-deduped=False, PS3/BS3 stripped=False", False, False),
-    ("clingen_confusion_gene_deduped_with_ps3bs3", "gene-deduped=True, PS3/BS3 stripped=False", True, False),
+# One call to build_clingen_confusion per strip_functional_evidence value,
+# not one per (gene-dedup x strip) combination -- gene-dedup is a pure
+# post-processing step over already-extracted per-variant ClinGen evidence
+# (build_gene_deduped_clingen_confusion works directly off `clingen_records`),
+# so a second build_clingen_confusion call with the same strip value would
+# just redo the exact same, expensive per-dataset work (this function
+# reloads a fresh Scoreset from `df_ds`/PipelineConfig for *every* dataset in
+# CLINGEN_DATASETS, not only the four _clinvar_2018-suffixed genes -- that's
+# needed to align each variant's raw ClinGen evidence-code string, which
+# isn't present in the already-loaded df_primary/df_variants at all) for a
+# result it then throws away.
+CLINGEN_STRIP_VARIANTS = [
+    (True, "clingen_confusion", "clingen_confusion_gene_deduped", "PS3/BS3 stripped"),
+    (False, "clingen_confusion_with_ps3bs3", "clingen_confusion_gene_deduped_with_ps3bs3", "PS3/BS3 kept"),
 ]
 
-for tag, desc, gene_dedup, strip_ps3bs3 in CLINGEN_VARIANTS:
-    print(f"\n--- ClinGen confusion ({desc}) ---")
+clingen_genes_default = None  # captured from the "clingen_confusion" (per-assay, PS3/BS3-stripped) variant below
+# Non-gene-deduped PS3/BS3-stripped/kept conf_dicts, collected here and fed
+# into the combined 4-panel figure + merged table below instead of each
+# getting its own separate figure/table.
+_clingen_nondedup_conf_dicts = {}
+
+for strip_ps3bs3, tag, dedup_tag, strip_desc in CLINGEN_STRIP_VARIANTS:
+    print(f"\n--- ClinGen confusion ({strip_desc}) ---")
     clingen_confusion, clingen_genes, clingen_records = build_clingen_confusion(
         df_primary, DATASET_TSV, CLINGEN_DATASETS, use_oob=True,
         tree=tree, model_selections=model_selections, calibrations=calibrations,
         strip_functional_evidence=strip_ps3bs3,
     )
-    if gene_dedup:
-        clingen_confusion, clingen_genes = build_gene_deduped_clingen_confusion(clingen_records)
+    if strip_ps3bs3:
+        clingen_genes_default = clingen_genes
 
-    if clingen_genes:
-        fig = plot_2x3_confusions_nature({
-            'auth': convert_3x2_to_2x3(clingen_confusion['auth']),
-            'excalibr': convert_3x2_to_2x3(clingen_confusion['excalibr']),
-        })
-        save_and_show(fig, FIGURE_SUBDIRS["clingen"] / f"{tag}.png")
-        _clingen_perf_latex = latex_performance_table_clingen({
-            'excalibr': convert_3x2_to_2x3(clingen_confusion['excalibr']),
-            'auth': convert_3x2_to_2x3(clingen_confusion['auth']),
-        })
-        save_latex_table(_clingen_perf_latex, FIGURE_SUBDIRS["tables"] / f"{tag}_performance.tex")
+    if not clingen_genes:
+        print(f"  SKIP ClinGen confusion ({strip_desc}): no genes with usable ClinGen evidence codes in scope")
     else:
-        print(f"  SKIP ClinGen confusion ({desc}): no genes with usable ClinGen evidence codes in scope")
+        conf_dict = {
+            'excalibr': convert_3x2_to_2x3(clingen_confusion['excalibr']),
+            'auth': convert_3x2_to_2x3(clingen_confusion['auth']),
+        }
+        _clingen_nondedup_conf_dicts[tag] = conf_dict
+
+    # Gene-deduplicated variant, reusing the same `clingen_records` instead
+    # of a second build_clingen_confusion call (see comment above).
+    dedup_confusion, dedup_genes = build_gene_deduped_clingen_confusion(clingen_records)
+    if not dedup_genes:
+        print(f"  SKIP ClinGen confusion (gene-deduped, {strip_desc}): no genes with usable ClinGen evidence codes in scope")
+        continue
+    dedup_conf_dict = {
+        'excalibr': convert_3x2_to_2x3(dedup_confusion['excalibr']),
+        'auth': convert_3x2_to_2x3(dedup_confusion['auth']),
+    }
+    fig = plot_2x3_confusions_nature(dedup_conf_dict)
+    save_and_show(fig, FIGURE_SUBDIRS["clingen"] / f"{dedup_tag}.png")
+    _clingen_perf_latex = latex_performance_table_clingen([("ClinGen", dedup_conf_dict)])
+    save_latex_table(_clingen_perf_latex, FIGURE_SUBDIRS["tables"] / f"{dedup_tag}_performance.tex")
+
+# Combined (non-gene-deduped) PS3/BS3-excluded + PS3/BS3-included figure and
+# table -- replaces the two separate 2-panel figures/2-column tables these
+# used to get with one 4-panel figure (A/B = PS3/BS3 excluded, C/D = PS3/BS3
+# included) and one merged 4-column table.
+if "clingen_confusion" in _clingen_nondedup_conf_dicts and "clingen_confusion_with_ps3bs3" in _clingen_nondedup_conf_dicts:
+    _conf_stripped = _clingen_nondedup_conf_dicts["clingen_confusion"]
+    _conf_kept = _clingen_nondedup_conf_dicts["clingen_confusion_with_ps3bs3"]
+    fig = plot_clingen_confusion_stacked(_conf_stripped, _conf_kept)
+    save_and_show(fig, FIGURE_SUBDIRS["clingen"] / "clingen_confusion_combined.png")
+    _clingen_perf_latex = latex_performance_table_clingen([
+        ("PS3/BS3 excluded", _conf_stripped),
+        ("PS3/BS3 included", _conf_kept),
+    ])
+    save_latex_table(_clingen_perf_latex, FIGURE_SUBDIRS["tables"] / "clingen_confusion_performance.tex")
+else:
+    print("  SKIP combined ClinGen confusion figure/table: one or both non-gene-deduped variants unavailable")
 
 # %% [markdown]
 # ### 4d. Evidence-level comparison + assay-level statistics
@@ -1471,18 +1846,24 @@ excalibr_path_counts, excalibr_ben_counts = compute_excalibr_evidence_counts(
 print(f"ExCALIBR datasets reaching pathogenic evidence ±X: {excalibr_path_counts}")
 print(f"ExCALIBR datasets reaching benign evidence ±X: {excalibr_ben_counts}")
 
+# Cache for section 7's build_gene_performance_scatter (its combined
+# gene_brnich_OR figure needs this same {excalibr,auth}_{path,ben}_counts
+# shape) -- avoids relying on the legacy datasets_reached_evidence/*.pkl
+# files, which no longer exist on disk. Only populated below if
+# OP_EVIDENCE_CODES_CSV is present (auth_path_counts/auth_ben_counts need it).
+evidence_counts_cache = None
+
 if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-code CSV (author side)"):
     from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
 
     df_op = pd.read_csv(config.OP_EVIDENCE_CODES_CSV)
     levels = [1, 2, 4, 8]
 
-    # OP_EVIDENCE_CODES_CSV now carries raw OddsAbnormal_clinvar_18_25 /
-    # OddsNormal_clinvar_18_25 odds-of-pathogenicity values (plus a
-    # per-dataset prior) instead of precomputed "Evidence Code
-    # Abnormal"/"Evidence Code Normal" PS3/BS3 tier strings -- classify tiers
-    # here using the same Tavtigian-constant thresholds
-    # (C**(level/8), fixed prior=0.1, matching ExCALIBR's own
+    # OP_EVIDENCE_CODES_CSV carries raw OddsAbnormal/OddsNormal
+    # odds-of-pathogenicity values (plus a per-dataset prior) instead of
+    # precomputed "Evidence Code Abnormal"/"Evidence Code Normal" PS3/BS3
+    # tier strings -- classify tiers here using the same Tavtigian-constant
+    # thresholds (C**(level/8), fixed prior=0.1, matching ExCALIBR's own
     # thresholds_from_prior elsewhere in this codebase) rather than the
     # row's own prior column. OddsAbnormal is a direct odds-of-pathogenicity
     # (higher = stronger PS3 evidence); OddsNormal is computed within the
@@ -1498,8 +1879,8 @@ if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-c
         op_rows = df_op[df_op.Dataset == ds]
         if op_rows.empty:
             continue
-        odds_abnormal = pd.to_numeric(op_rows["OddsAbnormal_clinvar_18_25"].iloc[0], errors="coerce")
-        odds_normal = pd.to_numeric(op_rows["OddsNormal_clinvar_18_25"].iloc[0], errors="coerce")
+        odds_abnormal = pd.to_numeric(op_rows["OddsAbnormal"].iloc[0], errors="coerce")
+        odds_normal = pd.to_numeric(op_rows["OddsNormal"].iloc[0], errors="coerce")
 
         if pd.notna(odds_abnormal):
             for lvl in sorted(levels, reverse=True):
@@ -1517,6 +1898,12 @@ if not config.warn_if_missing(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence-c
                     break
     auth_path_counts = {k: len(v) for k, v in auth_path_counts.items()}
     auth_ben_counts = {k: len(v) for k, v in auth_ben_counts.items()}
+    evidence_counts_cache = {
+        "excalibr_path_counts": excalibr_path_counts,
+        "excalibr_ben_counts": excalibr_ben_counts,
+        "auth_path_counts": auth_path_counts,
+        "auth_ben_counts": auth_ben_counts,
+    }
     fig, _ = plot_evidence_comparison(
         excalibr_path_counts, excalibr_ben_counts, auth_path_counts, auth_ben_counts,
     )
@@ -1531,9 +1918,9 @@ if not config.warn_if_missing(config.ASSAY_METHOD_MAP_CSV, "assay method map (da
 
     fig, ax, _, _ = plot_dataset_point_heatmap(
         dataset_info_df_full, all_danz_oob_full,
-        assay_method_map=assay_method_map, sort_by='model_system',
+        assay_method_map=assay_method_map, sort_by='assay_type',
     )
-    save_and_show(fig, FIGURE_SUBDIRS["manuscript"] / "points_heatmap_sort_model_system.png")
+    save_and_show(fig, FIGURE_SUBDIRS["manuscript"] / "points_heatmap_sort_assay_type.png")
 
 # %% [markdown]
 # ## 5. Per-dataset calibration figures
@@ -1558,7 +1945,7 @@ else:
 # %% [markdown]
 # ## 5b. Four-dataset model-fit comparison figure (main text Figure "fig:fits")
 #
-# Reproduces the BRCA1/GCK/PTEN/CRX 2x2 model-fit comparison figure
+# Reproduces the BRCA1/LDLR/TP53/CRX 2x2 model-fit comparison figure
 # (`model_fits_comparison.png` in the paper). This was previously only
 # produced by the standalone `test/plot_MSH2_ex.py`, via
 # `plot_four_datasets_publication` (`src/assay_calibration/plot_utils/utils.py`)
@@ -1578,8 +1965,8 @@ from src.assay_calibration.plot_utils.utils import plot_four_datasets_publicatio
 
 FOUR_PANEL_DATASETS = [
     "BRCA1_Findlay_2018_clinvar_2018",
-    "GCK_Gersing_2024_abundance",
-    "PTEN_Mighell_2018_clinvar_2018",
+    "LDLR_Tabet_2025_abundance",
+    "TP53_Kato_2003_MDM2nWT_clinvar_2018",
     "CRX_Shepherdson_2024",
 ]
 
@@ -1636,8 +2023,8 @@ if not config.warn_if_missing(config.EXCALIBR_DATASETS_TABLE_CSV, "Yang distance
 #
 # Unlike the table above (pre-reduced medians from a batch-computed CSV),
 # this recomputes the full per-bootstrap Yang-distance distribution live for
-# just the same 4 datasets used in section 5b's Figure "fig:fits" (BRCA1/GCK/
-# PTEN/CRX) -- the manuscript's own `fig:dists` shows exactly this scope, not
+# just the same 4 datasets used in section 5b's Figure "fig:fits" (BRCA1/LDLR/
+# TP53/CRX) -- the manuscript's own `fig:dists` shows exactly this scope, not
 # all datasets, so recomputing the other ~76 datasets' full distributions
 # here would be wasted cost. Reuses `_four_panel_loader` from section 5b so
 # both figures are guaranteed to be built from the identical underlying fit.
@@ -1683,9 +2070,9 @@ figure4_driver.build_figure4(
 # Supplementary to Figure 4 in the legacy script, but not one of its panels --
 # kept separate (`analysis.extra_gene_fits`) so `analysis/figure4/driver.py`
 # can be handed to someone reproducing just Figure 4 without also needing
-# these. Currently a no-op (prints a warning and skips): depends on a
-# `fit_hist_snv_plot` module that only exists as an import statement in the
-# legacy script, see that module's own TODO.
+# these. `build_extra_gene_fits` is dataset-agnostic; the dataset list is
+# specified here. BARD1 uses `minimal=True` (matching the legacy script),
+# which hides some panel elements shown for the other two.
 
 # %%
 from analysis.extra_gene_fits import build_extra_gene_fits
@@ -1693,6 +2080,11 @@ from analysis.extra_gene_fits import build_extra_gene_fits
 build_extra_gene_fits(
     OUTPUT_DIR, DATASET_TSV, PRECOMPUTED_FITS, DATASET_CONFIGS_PATH,
     FIGURE_SUBDIRS["manuscript"],
+    dataset_specs=[
+        ("RAD51D_IGVF", "rad51d"),
+        ("XRCC2_IGVF", "xrcc2"),
+        ("BARD1_IGVF", "bard1", True),
+    ],
 )
 
 # %%
@@ -1709,10 +2101,23 @@ extended_data_appendix.build_appendix_pdf(
     plot_thresholds=True,
 )
 
+# Second copy with F9/TP53 datasets dropped -- same `datasets` list filtered
+# by gene prefix, for whichever downstream use (e.g. sharing without the
+# separate-classifier-model F9/TP53 pages) wants them excluded.
+_datasets_no_f9_tp53_appendix = [d for d in datasets if d.split("_")[0] not in ("F9", "TP53")]
+extended_data_appendix.build_appendix_pdf(
+    dataset_list=_datasets_no_f9_tp53_appendix,
+    output_path=FIGURE_SUBDIRS["manuscript"] / "extended_data_appendix_no_f9_tp53.pdf",
+    plot_thresholds=True,
+)
+
 # %%
 from analysis import gene_performance_scatter
 
-gene_performance_scatter.build_gene_performance_scatter(output_dir=OUTPUT_DIR, figure_dir=FIGURE_SUBDIRS["manuscript"])
+gene_perf_result = gene_performance_scatter.build_gene_performance_scatter(
+    output_dir=OUTPUT_DIR, figure_dir=FIGURE_SUBDIRS["manuscript"],
+    evidence_counts=evidence_counts_cache,
+)
 
 # %% [markdown]
 # ## 8. Dataset description table
@@ -1817,57 +2222,17 @@ vus_evidence_df
 # here and reused by both `_compute_manuscript_summary` calls below.
 
 # %%
-import json as _json
-from joblib import Parallel as _Parallel, delayed as _delayed
-from analysis.discovery import (
-    resolve_dataset_tsv_name, resolve_component, _filter_dataset_df, load_master_df, _resolve_n_jobs,
-)
-from src.assay_calibration.pipeline.config import PipelineConfig as _PipelineConfig
-from src.assay_calibration.pipeline.utils import load_dataset_from_df as _load_dataset_from_df
-from src.assay_calibration.pipeline.variant_evidence import get_all_variant_groups
+# `_build_all_variant_groups_for_dataset` used to be defined inline here --
+# it's now `analysis.all_variant_evidence.build_all_variant_groups_table`
+# (reused, unchanged behavior, by analysis/run_build_all_variant_evidence_tables.py
+# and the variant-assay/variant-aggregate table section right below), so this
+# cell is now just the call site.
+from analysis.all_variant_evidence import build_all_variant_groups_table
 
-
-def _build_all_variant_groups_for_dataset(dataset, df_ds):
-    comp = resolve_component(dataset, list(tree[dataset].keys()), model_selections, dataset_configs)
-    cal_path = (calibrations or {}).get(dataset, {}).get(primary_method, {}).get(comp)
-    if cal_path is None:
-        return []
-    with open(cal_path) as f:
-        calibration = _json.load(f)
-    clinvar_release = "2018" if "_clinvar_2018" in dataset else "2025"
-    pcfg = _PipelineConfig(
-        dataset_csv=str(DATASET_TSV), dataset_name=dataset, output_dir="/tmp", clinvar_release=clinvar_release,
-    )
-    scoreset = _load_dataset_from_df(df_ds, pcfg)
-    rows = get_all_variant_groups(scoreset, calibration["point_ranges"])
-    for r in rows:
-        r["dataset"] = dataset
-        r["gene"] = dataset.split("_")[0]
-        r["sample"] = None
-    return rows
-
-
-# Slice each dataset's own (small) master-TSV subset ONCE here, in this
-# process, before dispatching to joblib workers -- mirrors load_all_variants'
-# own comment on why this matters: reading DATASET_TSV per-worker instead
-# (inside the parallel function) means every worker process independently
-# re-reads/re-parses the entire multi-GB master TSV from disk.
-_all_groups_datasets = sorted(df_primary_dedup["dataset"].unique())
-_df_full_for_all_groups = load_master_df(DATASET_TSV)
-_all_groups_df_ds = {}
-for _ds in _all_groups_datasets:
-    try:
-        _all_groups_df_ds[_ds] = _filter_dataset_df(_df_full_for_all_groups, _ds, DATASET_TSV)
-    except Exception as e:
-        print(f"  WARNING: could not slice {_ds} for all-variant-groups: {e}")
-del _df_full_for_all_groups
-
-_all_groups_results = _Parallel(n_jobs=_resolve_n_jobs(-1))(
-    _delayed(_build_all_variant_groups_for_dataset)(ds, _all_groups_df_ds[ds])
-    for ds in _all_groups_datasets if ds in _all_groups_df_ds
-)
-df_all_groups = pd.DataFrame(
-    [row for rows in _all_groups_results for row in rows]
+df_all_groups = build_all_variant_groups_table(
+    tree=tree, model_selections=model_selections, dataset_configs=dataset_configs,
+    calibrations=calibrations, dataset_tsv=str(DATASET_TSV),
+    datasets=sorted(df_primary_dedup["dataset"].unique()), primary_method=primary_method,
 )
 print(f"All-variant-groups population: {len(df_all_groups):,} rows across "
       f"{df_all_groups['dataset'].nunique()} datasets (vs {len(df_primary_dedup):,} rows in the "
@@ -2050,8 +2415,9 @@ def _compute_manuscript_summary(excluded_genes: set, label: str, use_gene_dedup:
     }
 
 
+manuscript_summary_all_genes = _compute_manuscript_summary(set(), label="all genes")
 manuscript_summary_df = pd.DataFrame([
-    _compute_manuscript_summary(set(), label="all genes"),
+    manuscript_summary_all_genes,
     _compute_manuscript_summary(EXCLUDED_GENES, label=f"excluding {sorted(EXCLUDED_GENES)}"),
     _compute_manuscript_summary(set(), label="all genes (VEM stats)", use_gene_dedup=False),
     _compute_manuscript_summary(
@@ -2059,6 +2425,81 @@ manuscript_summary_df = pd.DataFrame([
     ),
 ])
 manuscript_summary_df
+
+# %% [markdown]
+# ## 10a. Variant-assay / variant-aggregate / predictor-only evidence tables
+#
+# Reshapes `df_all_groups` (section 10's own in-bag, keep_mask-independent
+# population) into the two CSVs `test/create_all_variant_evidence_csv.ipynb`
+# / `test/make_variant_aggregate_evidence_table.ipynb` used to hand-roll from
+# ad hoc pickle/glob-loaded external files:
+#
+# - **variant-assay**: one row per (variant, dataset) -- every variant every
+#   assay measured, in-bag only (no OOB anywhere in these tables -- see
+#   `analysis/all_variant_evidence.py`'s module docstring for why).
+# - **variant-aggregate**: one row per physical variant, collapsing the
+#   variant-assay rows across assays (abs-max-if-same-sign merge; assays that
+#   disagree in sign are dropped as conflicting rather than reported as
+#   zero/no-evidence).
+#
+# Also builds a **predictor-only** table (AlphaMissense/MutPred2/REVEL
+# calibration scores, stripped of the stale functional-evidence columns baked
+# into `config.PREDICTOR_EVIDENCE_SOURCE_CSV`) meant to be joined against the
+# variant-aggregate table above later (not done here) instead of the older
+# functional evidence that source CSV already carries.
+
+# %%
+from analysis.all_variant_evidence import (
+    build_dataframe_with_points, build_predictor_only_table,
+    build_variant_aggregate_table, build_variant_assay_table,
+    merge_variant_aggregate_with_predictors,
+)
+from analysis.discovery import load_master_df
+
+# One row per INPUT dataframe row, not per measured variant -- an aa-level
+# measurement contributes a row at each of its nucleotide routes, so the
+# table can be joined on coordinates without silently missing ~2/3 of them.
+# `df_all_groups` above keeps its own measurement grain (the "variant effect
+# measurements" count) untouched.
+df_input_master = load_master_df(str(DATASET_TSV))
+variant_assay_df = build_variant_assay_table(df_all_groups, df_input=df_input_master)
+variant_assay_path = FIGURE_SUBDIRS["tables"] / "variant_assay_specific_evidence.csv.gz"
+variant_assay_df.to_csv(variant_assay_path, index=False, compression="gzip")
+print(f"Variant-assay table: {len(variant_assay_df):,} entries, "
+      f"{variant_assay_df['dataset'].nunique()} datasets, "
+      f"{variant_assay_df['gene_symbol'].nunique()} genes -> {variant_assay_path}")
+
+variant_aggregate_df = build_variant_aggregate_table(variant_assay_df)
+variant_aggregate_path = FIGURE_SUBDIRS["tables"] / "variant_aggregated_functional_evidence.csv.gz"
+variant_aggregate_df.to_csv(variant_aggregate_path, index=False, compression="gzip")
+print(f"Variant-aggregate table: {len(variant_aggregate_df):,} unique variants, "
+      f"{variant_aggregate_df['gene_symbol'].nunique()} genes -> {variant_aggregate_path}")
+
+df_with_points = build_dataframe_with_points(df_input_master, variant_assay_df)
+df_with_points_path = FIGURE_SUBDIRS["tables"] / "dataframe_with_points.csv.gz"
+df_with_points.to_csv(df_with_points_path, index=False, compression="gzip")
+print(f"Dataframe-with-points: {len(df_with_points):,} rows "
+      f"({int(df_with_points['excalibr_points'].notna().sum()):,} with evidence) -> {df_with_points_path}")
+
+if config.warn_if_missing(config.PREDICTOR_EVIDENCE_SOURCE_CSV, "predictor-only evidence table"):
+    predictor_only_df = pd.DataFrame()
+else:
+    predictor_only_df = build_predictor_only_table()
+    predictor_only_path = FIGURE_SUBDIRS["tables"] / "predictor_only_evidence.csv.gz"
+    predictor_only_df.to_csv(predictor_only_path, index=False, compression="gzip")
+    print(f"Predictor-only table: {len(predictor_only_df):,} rows -> {predictor_only_path}")
+
+    variant_aggregate_with_predictors_df = merge_variant_aggregate_with_predictors(
+        variant_aggregate_df, predictor_only_df,
+    )
+    variant_aggregate_with_predictors_path = (
+        FIGURE_SUBDIRS["tables"] / "variant_aggregated_experimental_predictive_evidence.csv.gz"
+    )
+    variant_aggregate_with_predictors_df.to_csv(
+        variant_aggregate_with_predictors_path, index=False, compression="gzip",
+    )
+    print(f"Variant-aggregate x predictor table: {len(variant_aggregate_with_predictors_df):,} rows "
+          f"-> {variant_aggregate_with_predictors_path}")
 
 # %% [markdown]
 # ## 11. Mode of inheritance (AD vs AR) performance comparison
@@ -2085,6 +2526,7 @@ manuscript_summary_df
 # %%
 from scipy import stats as sps
 from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+from analysis.manuscript_stats import latex_moi_comparison_table
 
 _MOI_METRICS = ["dor_standard", "accuracy", "coverage", "mcc", "sensitivity", "specificity"]
 _MOI_METRIC_LABELS = {
@@ -2151,6 +2593,9 @@ def _compute_moi_comparison(drop_dual_genes: bool, label: str):
         ar_finite = ar_vals[np.isfinite(ar_vals)]
         n_inf_ad = len(ad_vals) - len(ad_finite)
         n_inf_ar = len(ar_vals) - len(ar_finite)
+        if n_inf_ad or n_inf_ar:
+            print(f"  {_MOI_METRIC_LABELS[metric]}: excluded {n_inf_ad} non-finite AD value(s), "
+                  f"{n_inf_ar} non-finite AR value(s) from mean/median/p-value")
         if len(ad_finite) and len(ar_finite):
             p_value = sps.mannwhitneyu(ad_finite, ar_finite, alternative="two-sided").pvalue
         else:
@@ -2159,18 +2604,30 @@ def _compute_moi_comparison(drop_dual_genes: bool, label: str):
             "metric": _MOI_METRIC_LABELS[metric],
             "mean_AD": np.mean(ad_finite) if len(ad_finite) else None,
             "mean_AR": np.mean(ar_finite) if len(ar_finite) else None,
-            "mean_diff": (np.mean(ad_finite) - np.mean(ar_finite))
-                         if len(ad_finite) and len(ar_finite) else None,
             "median_AD": np.median(ad_finite) if len(ad_finite) else None,
             "median_AR": np.median(ar_finite) if len(ar_finite) else None,
             "n_AD": len(ad_finite),
             "n_AR": len(ar_finite),
-            "n_dor_inf_AD": n_inf_ad if metric == "dor_standard" else None,
-            "n_dor_inf_AR": n_inf_ar if metric == "dor_standard" else None,
             "p_value": p_value,
         })
     moi_comparison_df = pd.DataFrame(summary_rows)
-    print(f"\n{moi_comparison_df.round(4).to_string(index=False)}")
+    # DOR is on a much larger, non-percentage scale than the other metrics
+    # (accuracy/coverage/mcc/sensitivity/specificity, all in [0, 1]) -- round
+    # it to whole numbers instead of 4 decimal places, which is far more
+    # digits than DOR's scale ever needs.
+    _moi_display_df = moi_comparison_df.copy()
+    _dor_row = _moi_display_df["metric"] == "DOR"
+    _dor_cols = ["mean_AD", "mean_AR", "median_AD", "median_AR"]
+    _moi_display_df.loc[_dor_row, _dor_cols] = _moi_display_df.loc[_dor_row, _dor_cols].round(0)
+    _moi_display_df.loc[~_dor_row, _dor_cols] = _moi_display_df.loc[~_dor_row, _dor_cols].round(4)
+    _moi_display_df["p_value"] = _moi_display_df["p_value"].round(4)
+    print(f"\n{_moi_display_df.to_string(index=False)}")
+
+    _moi_latex = latex_moi_comparison_table(moi_comparison_df, label=label)
+    save_latex_table(
+        _moi_latex,
+        FIGURE_SUBDIRS["tables"] / f"moi_comparison{'_dual_dropped' if drop_dual_genes else '_dual_counted'}.tex",
+    )
 
     ad_pooled_matrix = build_deduped_confusion_matrix(deduped_variants[deduped_variants["gene"].isin(ad_genes)])
     ar_pooled_matrix = build_deduped_confusion_matrix(deduped_variants[deduped_variants["gene"].isin(ar_genes)])
@@ -2188,3 +2645,66 @@ def _compute_moi_comparison(drop_dual_genes: bool, label: str):
 
 moi_comparison_dual_counted_df = _compute_moi_comparison(drop_dual_genes=False, label="dual-MOI genes counted in both groups")
 moi_comparison_dual_dropped_df = _compute_moi_comparison(drop_dual_genes=True, label="dual-MOI genes dropped")
+
+# %% [markdown]
+# ## 12. Manuscript LaTeX macros
+#
+# Recomputes every `\newcommand{\NumXxx}{...}` headline number hardcoded in
+# `tavtigian_sims/excalibr.tex` / `supplement.tex` from this run's own
+# `tree`/`datasets`/`gene_perf_result`/`manuscript_summary_all_genes`, so
+# they can be diffed against (and pasted over) the checked-in values instead
+# of hand-counted. Source of each number:
+#   - NumDatasetsMalvika / NumGenes  : `tree` (every dataset discover_outputs
+#     found in OUTPUT_DIR, before `DEFAULT_EXCLUDED_DATASETS` is applied)
+#   - NumDatasets / NumGenesCalibrated : `datasets` (section 1's df-derived
+#     list, i.e. after `DEFAULT_EXCLUDED_DATASETS` drops the F9/TP53-meta/
+#     SFPQ datasets)
+#   - NumSynonymousDatasets : datasets with >=1 variant whose `sample` label
+#     includes "Synonymous"
+#   - NumAuthorAnnotatedDatasets / NumAuthorAnnotatedGenes /
+#     NumAuthorAnnotatedGenesDeterminate : `gene_perf_result["gene_results"]`
+#     (section 7's `build_gene_performance_scatter`, panel A's per-gene
+#     accuracy comparison) -- "Determinate" excludes genes where ExCALIBR's
+#     accuracy was 0 (all-indeterminate assignments, e.g. CRX/CARD11)
+#   - NumAuthorAnnotatedGenesClinGen : `clingen_genes_default` (section 4c's
+#     per-assay, PS3/BS3-stripped ClinGen confusion -- the CLINGEN_VARIANTS
+#     entry matching the manuscript's "255 P/LP and 21 B/LB variants" figure)
+#   - NumGenesCalibrated (Results/Abstract "\NumGenesCalibrated genes, all
+#     meeting fit quality criteria") : same as NumGenesCalibrated above
+#   - NumBootstraps : fixed pipeline constant, doesn't vary by run
+#   - NumDatasetsBrnichNA : `manuscript_summary_all_genes` (section 10, "all
+#     genes" scope -- the OddsPath-gap datasets figure quoted in Results is
+#     not `EXCLUDED_GENES`-filtered)
+
+# %%
+from analysis.plot_common import sample_matches as _sample_matches_macros
+
+_tree_genes = {d.split("_")[0] for d in tree}
+_datasets_genes = {d.split("_")[0] for d in datasets}
+_num_synonymous_datasets = df.loc[_sample_matches_macros(df, "Synonymous"), "dataset"].nunique()
+
+_gene_results_all = gene_perf_result.get("gene_results", [])
+_gene_results_determinate = [
+    r for r in _gene_results_all
+    if r["danz_accuracy"] not in (0, float("inf")) and r["auth_accuracy"] not in (0, float("inf"))
+]
+
+_num_author_annotated_genes_clingen = len(clingen_genes_default) if clingen_genes_default else None
+
+LATEX_MACROS = {
+    "NumDatasetsMalvika": len(tree),
+    "NumDatasets": len(datasets),
+    "NumSynonymousDatasets": _num_synonymous_datasets,
+    "NumAuthorAnnotatedDatasets": len(gene_perf_result.get("dataset_names", datasets_with_author)),
+    "NumAuthorAnnotatedGenes": len(_gene_results_all),
+    "NumAuthorAnnotatedGenesDeterminate": len(_gene_results_determinate),
+    "NumAuthorAnnotatedGenesClinGen": _num_author_annotated_genes_clingen,
+    "NumGenes": len(_tree_genes),
+    "NumGenesCalibrated": len(_datasets_genes),
+    "NumBootstraps": "1,000",
+    "NumDatasetsBrnichNA": manuscript_summary_all_genes["n_additional_oddspath_gap_datasets"],
+}
+
+print(f"\n{'=' * 80}\nMANUSCRIPT LATEX MACROS (paste into excalibr.tex / supplement.tex)\n{'=' * 80}")
+for name, value in LATEX_MACROS.items():
+    print(f"\\newcommand{{\\{name}}}{{{value} }}")

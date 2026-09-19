@@ -31,6 +31,7 @@ DEFAULT_EXCLUDED_DATASETS = {
     "F9_Popp_2025_model",
     "TP53_Fayer_2021_meta_clinvar_2018",
     "SFPQ_IGVF",
+    "LDLR_Tabet_2025_presence_VLDL",
 }
 
 # benign_method suffix attached directly after n_c in output filenames, e.g.
@@ -387,7 +388,8 @@ def _merge_oob_columns(df: pd.DataFrame, oob_csv_path: Optional[Path]) -> pd.Dat
 
 
 def _run_scoreset_job(dataset: str, method: str, comp: str, cal_path: Path, df_ds: pd.DataFrame,
-                       oob_csv_path: Optional[Path] = None):
+                       oob_csv_path: Optional[Path] = None,
+                       spliceai_threshold: Optional[float] = 0.2, vep_splice_filter: bool = True):
     """Module-level (not a closure) so joblib/cloudpickle only ever pickles
     the *one* dataset slice passed in as `df_ds` for this call, matching
     hpc/prepare.py's `partitions[ds]` pattern -- a nested/closure-based
@@ -396,14 +398,18 @@ def _run_scoreset_job(dataset: str, method: str, comp: str, cal_path: Path, df_d
     silently thrash (huge duplicated payloads) instead of running in
     parallel."""
     try:
-        df = _build_variant_table_for_scoreset(dataset, df_ds, cal_path, oob_csv_path)
+        df = _build_variant_table_for_scoreset(
+            dataset, df_ds, cal_path, oob_csv_path, spliceai_threshold, vep_splice_filter,
+        )
         return dataset, method, comp, df, None
     except Exception as e:
         return dataset, method, comp, None, e
 
 
 def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_path: Path,
-                                       oob_csv_path: Optional[Path] = None) -> pd.DataFrame:
+                                       oob_csv_path: Optional[Path] = None,
+                                       spliceai_threshold: Optional[float] = 0.2,
+                                       vep_splice_filter: bool = True) -> pd.DataFrame:
     """Worker-safe: builds one dataset's scoreset + variant table from an
     already-filtered, single-dataset slice of the master dataframe (small --
     safe to pickle to a joblib worker process) plus one calibration JSON.
@@ -415,6 +421,17 @@ def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_pat
     the in-bag standard_points/classification, auth_label, and is_vus
     columns fresh from the scoreset, then optionally merges in oob_* columns
     from *oob_csv_path* via _merge_oob_columns.
+
+    `spliceai_threshold`/`vep_splice_filter` default to Scoreset.splicing_
+    filter's own hardcoded defaults -- every existing caller of
+    load_all_variants (main pipeline, robustness, skew-locked) keeps
+    rebuilding the SAME default-filtered population it always has.
+    analysis.splice_ablation is the one caller that needs these threaded
+    through to something other than the default, since its whole point is
+    that each condition's Scoreset should reflect THAT condition's own
+    splice-filter setting -- without this, every condition silently rebuilt
+    the identical default population here regardless of which condition's
+    calibration.json was being applied to it.
     """
     from src.assay_calibration.pipeline.config import PipelineConfig
     from src.assay_calibration.pipeline.utils import load_dataset_from_df
@@ -427,6 +444,7 @@ def _build_variant_table_for_scoreset(dataset: str, df_ds: pd.DataFrame, cal_pat
     pcfg = PipelineConfig(
         dataset_csv="", dataset_name=dataset, output_dir="/tmp",
         clinvar_release=clinvar_release,
+        spliceai_threshold=spliceai_threshold, vep_splice_filter=vep_splice_filter,
     )
     scoreset = load_dataset_from_df(df_ds, pcfg)
     df = compute_variant_table(scoreset=scoreset, calibration=calibration, config=pcfg)
@@ -438,6 +456,8 @@ def build_variants_from_scoreset(
     cal_path: Path,
     dataset_tsv: str,
     oob_csv_path: Optional[Path] = None,
+    spliceai_threshold: Optional[float] = 0.2,
+    vep_splice_filter: bool = True,
 ) -> pd.DataFrame:
     """Single-dataset convenience wrapper around _build_variant_table_for_scoreset
     for datasets that have no *_variants.csv on disk at all (e.g. runs made
@@ -452,7 +472,9 @@ def build_variants_from_scoreset(
     """
     df_full = load_master_df(dataset_tsv)
     df_ds = _filter_dataset_df(df_full, dataset, dataset_tsv)
-    return _build_variant_table_for_scoreset(dataset, df_ds, cal_path, oob_csv_path)
+    return _build_variant_table_for_scoreset(
+        dataset, df_ds, cal_path, oob_csv_path, spliceai_threshold, vep_splice_filter,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -470,11 +492,19 @@ def load_all_variants(
     include_all: bool = False,
     recompute_points: bool = False,
     dataset_tsv: Optional[str] = None,
+    spliceai_threshold: Optional[float] = 0.2,
+    vep_splice_filter: bool = True,
 ) -> pd.DataFrame:
     """Load all variants into a single long-format DataFrame.
 
     Columns: variant_id, score, sample, standard_points, auth_label, is_vus,
              dataset, method, component
+
+    `spliceai_threshold`/`vep_splice_filter` are forwarded to every rebuilt
+    Scoreset (see _build_variant_table_for_scoreset) -- default to
+    Scoreset.splicing_filter's own hardcoded defaults, matching every
+    caller's existing behavior. Only analysis.splice_ablation needs these
+    set to something else per condition.
     (plus oob_* columns when the saved *_variants.csv has them)
 
     The variant table (score, sample, standard_points/classification,
@@ -588,7 +618,9 @@ def load_all_variants(
             # call's arguments independently, so every worker receives just
             # its one dataset's slice, never the other datasets' data.
             results = Parallel(n_jobs=n_jobs, verbose=5)(
-                delayed(_run_scoreset_job)(dataset, method, comp, cal_path, df_ds, oob_path)
+                delayed(_run_scoreset_job)(
+                    dataset, method, comp, cal_path, df_ds, oob_path, spliceai_threshold, vep_splice_filter,
+                )
                 for dataset, method, comp, cal_path, oob_path, df_ds in good_jobs
             )
             for dataset, method, comp, df, err in results:

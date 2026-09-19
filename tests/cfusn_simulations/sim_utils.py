@@ -1832,3 +1832,235 @@ def compute_pooled_delta_vec(X):
         delta = a / np.sqrt(1 + a ** 2)
         vec[d] = delta * scale
     return vec
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Redundancy-collapse utilities (TEST ONLY -- not wired into production
+# init/fitting). Unsupervised (correlation- and variance-explained-only;
+# deliberately does NOT use sample labels to decide what to collapse --
+# tying a data-structure/preprocessing decision to the same labels used
+# for downstream evaluation is a real methodological risk, and simplicity
+# was explicitly preferred over a supervised residual-informativeness
+# check). See the Phase 6 plan (redundancy-collapse for correlated
+# dimensions) for full context and the TP53/LABEL-seq validation this was
+# built against.
+# ──────────────────────────────────────────────────────────────────────
+
+def _pairwise_corr_matrix(scores, min_co_observed=20):
+    """(p, p) NaN-aware pairwise Pearson correlation matrix. NaN entries
+    where fewer than min_co_observed rows have both dims observed."""
+    N, p = scores.shape
+    corr = np.full((p, p), np.nan)
+    np.fill_diagonal(corr, 1.0)
+    for i in range(p):
+        for j in range(i + 1, p):
+            x, y = scores[:, i], scores[:, j]
+            mask = ~np.isnan(x) & ~np.isnan(y)
+            if mask.sum() >= min_co_observed:
+                r = np.corrcoef(x[mask], y[mask])[0, 1]
+                corr[i, j] = corr[j, i] = r
+    return corr
+
+
+def detect_redundant_blocks(scores, corr_threshold=0.85, min_total_dims_for_auto=None,
+                             min_co_observed=20):
+    """Unsupervised candidate-block detection: connected components of the
+    graph where an edge connects dims i,j iff |corr(i,j)| > corr_threshold
+    (on co-observed rows only, NaN-tolerant). Purely a function of the
+    scores' own correlation structure -- no labels involved.
+
+    min_total_dims_for_auto : if given, this "automatic, correlation-
+    threshold + dimensionality gate" mechanism only fires when the gene
+    set's total dimension count (scores.shape[1]) is at or above this
+    cutoff -- with few total dimensions, correlated-but-distinct biology is
+    more plausible and the payoff from collapsing is smaller, so automation
+    stays off (returns []) and falls back to manual/no collapsing. Pass
+    None for the simpler "automatic, correlation-threshold only" mechanism.
+
+    Returns a list of blocks, each a sorted list of >=2 dimension indices.
+    (Manual opt-in -- the third mechanism -- needs no function: the caller
+    just supplies their own block list directly to collapse_block/
+    RedundancyCollapseTransform below.)
+    """
+    N, p = scores.shape
+    if min_total_dims_for_auto is not None and p < min_total_dims_for_auto:
+        return []
+    corr = _pairwise_corr_matrix(scores, min_co_observed=min_co_observed)
+    adj = np.abs(corr) > corr_threshold
+    np.fill_diagonal(adj, False)
+    adj = np.nan_to_num(adj, nan=0.0).astype(bool)
+
+    visited = np.zeros(p, dtype=bool)
+    blocks = []
+    for i in range(p):
+        if visited[i] or not adj[i].any():
+            continue
+        stack = [i]
+        comp = set()
+        while stack:
+            node = stack.pop()
+            if node in comp:
+                continue
+            comp.add(node)
+            visited[node] = True
+            for n in np.where(adj[node])[0]:
+                if n not in comp:
+                    stack.append(int(n))
+        if len(comp) >= 2:
+            blocks.append(sorted(comp))
+    return blocks
+
+
+def choose_block_k(scores, block_dims, variance_threshold=0.95, min_complete_rows=20):
+    """Smallest k (1 <= k < len(block_dims)) whose top-k PCA components
+    (fit on rows where the whole block is observed) explain >=
+    variance_threshold of the block's own variance. Returns
+    len(block_dims) (i.e. "don't collapse, no reduction achieved") if even
+    that variance bar can't be hit below full dimensionality, or if there
+    isn't enough complete data to fit a stable covariance -- a block that
+    needs many components to hit a high variance bar isn't very collapsible
+    to begin with, which is the intended protection against over-reduction.
+    """
+    sub = scores[:, block_dims]
+    complete_mask = ~np.isnan(sub).any(axis=1)
+    block_size = len(block_dims)
+    if complete_mask.sum() < max(min_complete_rows, block_size + 2):
+        return block_size
+    X = sub[complete_mask]
+    Xc = X - X.mean(axis=0)
+    cov = np.cov(Xc, rowvar=False)
+    eigvals = np.linalg.eigvalsh(cov)[::-1]
+    eigvals = np.clip(eigvals, 0, None)
+    total = eigvals.sum()
+    if total < 1e-12:
+        return block_size
+    cumvar = np.cumsum(eigvals) / total
+    k = int(np.searchsorted(cumvar, variance_threshold) + 1)
+    return min(k, block_size)
+
+
+class RedundancyCollapseTransform:
+    """Fitted, reusable linear projection for one redundant block: maps raw
+    scores in `block_dims` to a k-dim collapsed representation (top-k PCA,
+    fit on rows where the whole block is observed), and back-projects
+    fitted CFUSN component params from the collapsed space to an
+    APPROXIMATE per-raw-dimension marginal for interpretability.
+
+    The back-projection is NOT a full reconstruction: PCA permanently
+    discards the orthogonal-complement directions beyond the retained k
+    components, and the fitted model never sees those directions at all.
+    `back_project_marginal` only reflects the part of each raw dimension's
+    behavior explained by the k retained components -- callers/plots using
+    it should label it as an approximation, not a real fit in the original
+    space.
+    """
+
+    def __init__(self, block_dims, k, mean_, evecs):
+        self.block_dims = list(block_dims)
+        self.k = k
+        self.mean_ = mean_          # (block_size,)
+        self.evecs = evecs          # (block_size, k)
+
+    @classmethod
+    def fit(cls, scores, block_dims, k, min_complete_rows=20):
+        sub = scores[:, block_dims]
+        complete_mask = ~np.isnan(sub).any(axis=1)
+        if complete_mask.sum() < max(min_complete_rows, len(block_dims) + 2):
+            raise ValueError(
+                f"Not enough complete rows ({complete_mask.sum()}) to fit a "
+                f"stable {k}-component projection for block {block_dims}"
+            )
+        X = sub[complete_mask]
+        mean_ = X.mean(axis=0)
+        Xc = X - mean_
+        cov = np.cov(Xc, rowvar=False)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        order = np.argsort(eigvals)[::-1][:k]
+        evecs = eigvecs[:, order]
+        return cls(block_dims, k, mean_, evecs)
+
+    def transform(self, scores):
+        """Raw (N, p_full) scores -> (N, k) collapsed values. Rows where
+        any block dim is NaN get NaN collapsed values (consistent with the
+        rest of this codebase's missingness handling -- no imputation)."""
+        sub = scores[:, self.block_dims]
+        mask = ~np.isnan(sub).any(axis=1)
+        out = np.full((scores.shape[0], self.k), np.nan)
+        out[mask] = (sub[mask] - self.mean_) @ self.evecs
+        return out
+
+    def apply_to_scores(self, scores, remaining_dims):
+        """Convenience: build the full collapsed scoreset (k collapsed cols
+        + the untouched remaining_dims), matching what fitting/scoring
+        needs. remaining_dims should exclude self.block_dims."""
+        collapsed = self.transform(scores)
+        return np.hstack([collapsed, scores[:, remaining_dims]])
+
+    def back_project_marginal(self, mu_k, delta_k, gamma_diag_k):
+        """mu_k: (k,) fitted component mean in collapsed space.
+        delta_k: (k, q) fitted Delta in collapsed space.
+        gamma_diag_k: (k,) fitted Gamma diagonal in collapsed space
+            (off-diagonal Gamma structure among the k collapsed dims is not
+            back-projected here -- only the marginal variance per raw dim).
+
+        Returns (mu_raw, delta_raw, var_raw): approximate per-raw-dimension
+        (block_size,), (block_size, q), (block_size,) marginal parameters,
+        reflecting ONLY the retained k-component subspace -- see class
+        docstring for the caveat.
+        """
+        mu_raw = self.mean_ + self.evecs @ mu_k
+        delta_raw = self.evecs @ delta_k
+        var_raw = np.einsum('ik,k,ik->i', self.evecs, gamma_diag_k, self.evecs)
+        return mu_raw, delta_raw, var_raw
+
+
+def _bron_kerbosch(R, P, X, adj, cliques):
+    """Standard Bron-Kerbosch (no pivoting -- fine at this scale, <=~20
+    dims): enumerates all maximal cliques of an undirected graph given as
+    an adjacency dict {node: set(neighbors)}."""
+    if not P and not X:
+        if len(R) >= 2:
+            cliques.append(sorted(R))
+        return
+    for v in list(P):
+        _bron_kerbosch(R | {v}, P & adj[v], X & adj[v], adj, cliques)
+        P = P - {v}
+        X = X | {v}
+
+
+def detect_redundant_blocks_clique(scores, corr_threshold=0.85, min_total_dims_for_auto=None,
+                                    min_co_observed=20):
+    """Like detect_redundant_blocks, but requires every pair of dims WITHIN
+    a block to individually clear corr_threshold (a maximal clique on the
+    thresholded correlation graph), not just a connected path.
+
+    This matters: connected-components allows transitive chaining (A-B and
+    B-C both cleared the threshold, so A,B,C get merged into one block even
+    if A and C aren't correlated at all) -- confirmed on real TP53 data to
+    produce a MUCH larger, more heterogeneous merged block than intended at
+    moderate thresholds (0.7-0.75 merged 13-14 of 16 dims into one block,
+    worse than the original hand-picked 8-dim grouping this was meant to
+    generalize). The clique requirement is strictly more conservative:
+    every dim in a returned block is confirmed pairwise-redundant with
+    every other dim in that same block, not merely transitively linked.
+
+    Returns a list of maximal cliques of size >= 2 (may overlap -- unlike
+    connected components, which always partition the dims into disjoint
+    groups, two maximal cliques can share a dim; the caller should decide
+    how to handle overlaps, e.g. prefer the larger/highest-average-
+    correlation clique for any dim claimed by more than one).
+    """
+    N, p = scores.shape
+    if min_total_dims_for_auto is not None and p < min_total_dims_for_auto:
+        return []
+    corr = _pairwise_corr_matrix(scores, min_co_observed=min_co_observed)
+    adj = {i: set() for i in range(p)}
+    for i in range(p):
+        for j in range(p):
+            if i != j and np.isfinite(corr[i, j]) and abs(corr[i, j]) > corr_threshold:
+                adj[i].add(j)
+
+    cliques = []
+    _bron_kerbosch(set(), set(range(p)), set(), adj, cliques)
+    cliques.sort(key=len, reverse=True)
+    return cliques

@@ -376,17 +376,31 @@ def _initial_weights_mv(obs, obs_mask, sample_idx, mu0, Delta0, Gamma0, S):
 
 
 @functools.partial(jax.jit, static_argnums=(3, 4, 5))
-def batch_init_cfusn(obs, obs_mask, sample_idx, S, K, q, key):
+def batch_init_cfusn(obs, obs_mask, sample_idx, S, K, q, key, q1_mask=None):
     """Batched CFUSN init (unconstrained, non-anchored only).
 
     obs: (batch, N, p); obs_mask: (batch, N, p) bool; sample_idx: (batch, N);
     key: JAX PRNGKey for this batch.  q must equal 2.
+    q1_mask: (batch,) bool -- True for restarts that should be initialized
+    as an exact q=1-equivalent fit (single dominant-eigenvector Delta
+    column, second column zero) even though every restart in the batch
+    uses uniform q=2-shaped tensors (needed to mix q=1/q=2 restarts in one
+    batch -- see fit.py::generate_fit_jobs). Delta is computed BOTH ways
+    (q=1-then-padded and native q=2) for every row and selected per-row via
+    `where`, rather than branching, to keep static shapes for jit. This
+    gives masked rows a properly single-direction-focused init (the same
+    top-eigenvector-plus-skew-sign algorithm as q=2's own columns, just
+    with q=1), not q=2's two-column init with a column zeroed after the
+    fact. `batch_em_cfusn.py`'s M-step re-applies this same mask after
+    every iteration so it persists through EM, not just at init.
 
     Returns mu0 (batch,K,p), Delta0 (batch,K,p,q), Gamma0 (batch,K,p,p),
             W0 (batch,S,K), init_failed (batch,) bool.
     """
     assert q == 2, "batch_init_cfusn only supports q=2"
     batch, N, p = obs.shape
+    if q1_mask is None:
+        q1_mask = jnp.zeros((batch,), dtype=bool)
 
     # Global covariance (fallback for small clusters)
     global_cov = _nan_aware_cov(obs, obs_mask, jnp.ones((batch, N), dtype=jnp.bool_), p)
@@ -413,7 +427,11 @@ def batch_init_cfusn(obs, obs_mask, sample_idx, S, K, q, key):
         cov_k = jnp.where(small[:, None, None], global_cov_per_cluster, cov_k)
 
         key_k = jax.random.fold_in(key, k)
-        Delta_k = _init_delta_matrix_jax(cov_k, obs, obs_mask, in_k, q, key_k)
+        Delta_k_q2 = _init_delta_matrix_jax(cov_k, obs, obs_mask, in_k, q, key_k)
+        Delta_k_q1 = _init_delta_matrix_jax(cov_k, obs, obs_mask, in_k, 1, key_k)
+        Delta_k_q1_padded = jnp.concatenate(
+            [Delta_k_q1, jnp.zeros_like(Delta_k_q1)], axis=-1)
+        Delta_k = jnp.where(q1_mask[:, None, None], Delta_k_q1_padded, Delta_k_q2)
 
         Gamma_k = cov_k - jnp.matmul(Delta_k, jnp.swapaxes(Delta_k, -1, -2))
         Gamma_k = 0.5 * (Gamma_k + jnp.swapaxes(Gamma_k, -1, -2))

@@ -60,6 +60,84 @@ def _unstandardize_component_params(component_params, mean, std):
     return unscaled
 
 
+# Sanity bound for _mv_fit_is_degenerate. Deliberately far above any
+# legitimate fitted value on standardized score dimensions (production TP53
+# fits post-magnitude-cap top out around row-norm ~4.5, confirmed directly
+# against a real saved production result: max row-norm 1.995 across all 6
+# components) but well below the confirmed runaway regime (row norms
+# ~150-270) -- not tuned tightly, just enough headroom to not false-positive
+# on real skew while still catching genuine divergence.
+#
+# A Gamma near-singularity/condition-number check was tried and dropped: it
+# false-positived on that same real production result (every component
+# legitimately has a near-zero Gamma eigenvalue there, most likely real
+# collinearity among TP53's 16 correlated dims, not a bug) -- no absolute or
+# simple relative eigenvalue threshold is robust across datasets with
+# different natural collinearity, so Delta magnitude alone is the check.
+_DEGENERATE_DELTA_ROW_NORM = 20.0
+
+
+def _mv_fit_is_degenerate(component_params):
+    """True if any component's Delta indicates EM ran away to a
+    self-consistent but nonsensical regime (non-finite or absurd magnitude)
+    -- see execute_fit_job's call site for the reproducer and root-cause
+    discussion. Only meaningful for CFUSN (mu, Delta, Gamma) component
+    tuples; callers must gate this on mv=True.
+    """
+    for p in component_params:
+        if len(p) < 3:
+            continue
+        _, Delta, Gamma = p
+        Delta = np.asarray(Delta, dtype=float)
+        Gamma = np.asarray(Gamma, dtype=float)
+        if not (np.all(np.isfinite(Delta)) and np.all(np.isfinite(Gamma))):
+            return True
+        # q=1 Delta is 1-D (P,) -- one scalar per dimension, not a matrix of
+        # rows to take a vector norm over; q>=2 Delta is (P,q) -- use the
+        # per-dimension row norm across latent directions instead.
+        row_mags = np.abs(Delta) if Delta.ndim == 1 else np.linalg.norm(Delta, axis=-1)
+        if row_mags.max() > _DEGENERATE_DELTA_ROW_NORM:
+            return True
+    return False
+
+
+def _pad_component_params_to_q(component_params, target_q):
+    """Zero-pad each component's Delta up to target_q latent columns.
+
+    EXACT, not approximate: a q=1 CFUSN component (Delta=[d]) is the same
+    distribution as a q=2 component with Delta=[d, 0]. Proof: Omega =
+    Gamma + Delta@Delta.T is identical either way (the zero column
+    contributes nothing to the outer product); the truncated-normal block
+    D = I - Delta'*Omega_inv*Delta becomes block-diagonal (the zero
+    column decouples completely, giving an untruncated standard normal
+    in that direction); the bivariate CDF term then factors as
+    Phi_1(eta_1; d_11) * Phi_1(0; 1) = Phi_1(eta_1; d_11) * 0.5; and q=2's
+    2^q=4 density prefactor exactly cancels that extra factor of 0.5
+    against q=1's own prefactor of 2. Net log-density is identical to
+    q=1's own restricted-MSN formula (spot-checked numerically against
+    cfusn_logpdf_alternate).
+
+    Used so a winning q=1 restart (from mixed q=1/q=2 restart selection,
+    see generate_fit_jobs) can be returned in uniform q=2 shape -- every
+    downstream consumer of component_params only ever sees the shape it
+    already expects, with no changes needed anywhere else.
+    """
+    padded = []
+    for p in component_params:
+        if len(p) < 3:
+            padded.append(p)
+            continue
+        mu, Delta, Gamma = p
+        Delta = np.atleast_1d(np.asarray(Delta, dtype=float))
+        if Delta.ndim == 1:
+            Delta = Delta[:, None]
+        if Delta.shape[1] < target_q:
+            pad = np.zeros((Delta.shape[0], target_q - Delta.shape[1]))
+            Delta = np.hstack([Delta, pad])
+        padded.append((mu, Delta, Gamma))
+    return padded
+
+
 def tryToFit(observations, sample_indicators, num_components, constrained,
              init_method, init_constraint_adjustment, multivariate=False, **kwargs):
     try:
@@ -766,13 +844,33 @@ class Fit:
         init_constraint_adjustment = "scale"
         init_constraint_adjustments = np.full(NUM_FITS, init_constraint_adjustment)
 
-        _latent_q_jobs = kwargs.get("latent_q", 2)
+        _nominal_latent_q = kwargs.get("latent_q", 2)
 
         jobs = []
         for i in range(NUM_FITS):
             for num_components in component_range:
                 if mv:
-                    n_patterns = min((2 ** _latent_q_jobs) ** num_components, 100)
+                    # Mixed q=1/q=2 restarts: alternate by fit_idx parity
+                    # whenever the caller asked for latent_q>=2. A q=1
+                    # restart is mathematically an exact special case of
+                    # q=2 (its second Delta column is zero -- see
+                    # _pad_component_params_to_q's docstring for the
+                    # algebraic proof), so mixing in cheaper, always-stable
+                    # q=1 restarts alongside q=2 ones gives best-of-pool
+                    # selection a safety net against q=2's real EM-runaway
+                    # risk on weakly-identified/over-parameterized data
+                    # (see _mv_fit_is_degenerate), at zero cost to fits
+                    # that genuinely need 2 directions (validated in
+                    # tests/cfusn_simulations/sim_mixed_q1q2_strategy.py:
+                    # never worse than all-q=2, measurably better when the
+                    # truth only needs 1 direction). execute_fit_job pads
+                    # a winning q=1 restart back up to nominal_latent_q
+                    # shape before it's ever returned, so every downstream
+                    # consumer keeps seeing uniform q=2-shaped output.
+                    job_q = (1 if (_nominal_latent_q >= 2 and i % 2 == 0)
+                              else _nominal_latent_q)
+                    n_patterns = min((2 ** job_q) ** num_components, 100)
+                    kwargs["latent_q"] = job_q
                 else:
                     n_patterns = 2 ** num_components
                 kwargs["lambdaIndex"] = i % n_patterns
@@ -796,6 +894,7 @@ class Fit:
                     "init_constraint_adjustment": init_constraint_adjustments[i],
                     "multivariate": mv,
                     "calibrated_dims": calibrated_dims,
+                    "nominal_latent_q": _nominal_latent_q if mv else None,
                     "kwargs": kwargs.copy(),
                 }
                 jobs.append(job)
@@ -840,6 +939,47 @@ class Fit:
                     "val_ll": -np.inf,
                     "calibrated_dims": job.get("calibrated_dims"),
                 }
+
+            # Guard: EM can occasionally run away to a self-consistent but
+            # nonsensical parameter regime (confirmed via a direct
+            # reproducer: mu drifting to ~200-280, Delta row norms ~150-270,
+            # Gamma collapsing to near-singular in one direction) that isn't
+            # caught by the likelihood-decrease check (the runaway iterates
+            # can still be locally likelihood-improving) or by the
+            # responsibility-weighted Delta magnitude cap in
+            # get_Delta_update_cfusn (that cap tracks the same exploding
+            # local variance, so it chases the divergence rather than
+            # containing it). Such a fit returns "successfully" with
+            # finite, PSD-valid, but wildly implausible parameters -- since
+            # best-of-num_fits selection picks by val_ll alone, an unlucky
+            # restart set (e.g. small num_fits, or every restart landing in
+            # a similar runaway) can let this get selected as "the" fit.
+            # Treat it the same as init_failed: -inf val_ll excludes it from
+            # selection without otherwise disrupting the job's control flow.
+            if mv and _mv_fit_is_degenerate(params):
+                return {
+                    "dataset_name": job.get("dataset_name"),
+                    "bootstrap_seed": job["bootstrap_seed"],
+                    "num_components": job["num_components"],
+                    "fit_idx": job["fit_idx"],
+                    "fit": result,
+                    "val_ll": -np.inf,
+                    "calibrated_dims": job.get("calibrated_dims"),
+                }
+
+            # Mixed q=1/q=2 restarts (see generate_fit_jobs): if this
+            # restart's own latent_q came back lower than the job's
+            # nominal latent_q, pad it up to nominal shape now -- an exact
+            # (not approximate) representation, see
+            # _pad_component_params_to_q's docstring -- so every
+            # downstream consumer of this result only ever sees the
+            # uniform q=2-shaped output it already expects. A genuine
+            # pure-q=1 job (nominal_latent_q==1, no mixing requested) is
+            # untouched.
+            nominal_q = job.get("nominal_latent_q")
+            if mv and nominal_q is not None and get_q(params) < nominal_q:
+                params = _pad_component_params_to_q(params, nominal_q)
+                result["component_params"] = params
 
             val_ll = None
             if job["val_observations"] is not None:

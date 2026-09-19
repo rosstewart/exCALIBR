@@ -112,7 +112,7 @@ DATASET_MEASUREMENTS_CSV = _env(
 )
 ASSAY_METHOD_MAP_CSV = _env(
     "EXCALIBR_ASSAY_METHOD_MAP_CSV",
-    "/data/ross/assay_calibration/dataframe/var_effect_measurements_dataset.csv",
+    "/data/ross/assay_calibration/dataframe/excalibr_datasets_oldnames.csv",
 )
 
 # ClinGen Gene-Disease Validity curations (mode-of-inheritance per gene) --
@@ -211,7 +211,7 @@ SKEW_LOCKED_OUTPUT_DIR = _env(
 # produces this tree via `hpc/prepare.py pillar_project
 # --spliceai-threshold/--disable-vep-splice-filter`.
 SPLICE_ABLATION_ROOT = _env(
-    "EXCALIBR_SPLICE_ABLATION_ROOT", "/data/ross/assay_calibration/explorer_jobs_pp_spliceAIthresh"
+    "EXCALIBR_SPLICE_ABLATION_ROOT", "/data/ross/assay_calibration/spliceAIthresh"
 )
 
 # "Manual-prior" ExCALIBR -- canonical pipeline rerun with the per-dataset
@@ -290,6 +290,28 @@ BOOTSTRAP_REDUCTION_OUTPUT_DIR = _env(
 FIT_NUMBER_COMPARISON_SUMMARY_CSV = _env(
     "EXCALIBR_FIT_NUMBER_COMPARISON_SUMMARY_CSV",
     "/data/ross/assay_calibration/hyperparam_sweep_oldclinvar/benchmark_num_fits_dataframe/summary.csv",
+)
+# Sibling file (same directory) keyed "{dataset}|{n_c}c" -> list of every
+# valid restart's own train_ll -- used by analysis.robustness.compute_delta_std_column
+# to turn summary.csv's raw "delta" (train_ll units, not comparable across
+# datasets) into a dimensionless number of restart-to-restart SDs.
+FIT_NUMBER_COMPARISON_TRAIN_LLS_JSON = _env(
+    "EXCALIBR_FIT_NUMBER_COMPARISON_TRAIN_LLS_JSON",
+    "/data/ross/assay_calibration/hyperparam_sweep_oldclinvar/benchmark_num_fits_dataframe/train_lls.json",
+)
+
+
+# Pre-merged predictor+functional evidence CSV (AlphaMissense/MutPred2/REVEL
+# calibration scores/points, both domain_aggregate and single_gene scope,
+# already joined against an OLDER variant-aggregated functional evidence
+# table) -- analysis.all_variant_evidence.build_predictor_only_table strips
+# this down to a predictor-only table (drops the stale functional-evidence
+# columns and any row with no predictor score at all), meant to be re-joined
+# against analysis.all_variant_evidence.build_variant_aggregate_table's own
+# (freshly computed) output later.
+PREDICTOR_EVIDENCE_SOURCE_CSV = _env(
+    "EXCALIBR_PREDICTOR_EVIDENCE_SOURCE_CSV",
+    "/data/ross/assay_calibration/IGVFFI1443TQDN.csv.gz",
 )
 
 

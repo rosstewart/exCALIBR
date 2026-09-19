@@ -28,9 +28,11 @@ import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 
 from analysis.acmg_evidence_codes import classify_acmg
+from analysis.confusion import _dor_coverage_text
 from analysis.discovery import load_master_df
 from analysis.multi_scoreset import genomic_variant_key, _merge_points, _merge_author_labels
 from analysis.plot_common import effective_points, save_and_show
+from src.assay_calibration.plot_utils.utils import compute_classification_metrics
 
 # Functional-assay ACMG codes stripped before reclassifying — keeping these
 # would make the "ground truth" partly derived from the same kind of
@@ -336,17 +338,84 @@ def convert_3x2_to_2x3(mat_3x2: np.ndarray) -> np.ndarray:
     ])
 
 
+_BLUE_COLORS = ['#F0F8FC', '#99C8DC', '#7AB5D1', '#4B91A6', '#2E6B7E']
+_RED_COLORS = ['#FCF0F2', '#E6B1B8', '#D68F99', '#B85C6B', '#943744']
+_GRAY_COLORS = ['#F5F5F5', '#CCCCCC', '#999999', '#666666']
+
+
+def _plot_clingen_confusion_panel(ax, mat: np.ndarray, title: str, letter: str,
+                                   xlabel: str = "", ylabel: str = "", show_yticklabels: bool = True):
+    """One ClinGen confusion heatmap panel (ClinGen classification x
+    evidence-direction/functional-annotation), shared by the 2-panel
+    (`plot_2x3_confusions_nature`) and 4-panel (`plot_clingen_confusion_stacked`)
+    figures -- identical per-panel visuals (heatmap colors, DOR/determinate-%
+    caption, ticks) either way."""
+    blue_cmap = LinearSegmentedColormap.from_list("blue_gradient", _BLUE_COLORS)
+    red_cmap = LinearSegmentedColormap.from_list("red_gradient", _RED_COLORS)
+    gray_cmap = LinearSegmentedColormap.from_list("gray_gradient", _GRAY_COLORS)
+
+    rows, cols = mat.shape
+    for i in range(rows):
+        row_max = mat[i].max()
+        for j in range(cols):
+            value = mat[i, j]
+            cmap = blue_cmap if j == 0 else (gray_cmap if j == 1 else red_cmap)
+            norm = value / row_max if row_max > 0 else 0
+            color = cmap(norm)
+
+            ax.add_patch(mpatches.Rectangle(
+                (j, i), 1, 1, facecolor=color, edgecolor='white', linewidth=2.5,
+            ))
+
+            text_color = 'white' if norm > 0.45 else 'black'
+            if j == 1:
+                text_color = 'white' if norm > 0.7 else 'black'
+
+            ax.text(
+                j + 0.5, i + 0.5, f"{value:,}",
+                ha='center', va='center', fontsize=16, color=text_color,
+            )
+
+    ax.set_xlim(0, cols)
+    ax.set_ylim(0, rows)
+    ax.invert_yaxis()
+    ax.set_aspect('equal')
+
+    ax.set_facecolor('#F9F9F9')
+    ax.set_title(title, fontsize=18, fontweight='bold', pad=10)
+
+    # DOR + determinate-% caption, matching make_confusion_figure's own
+    # panels (analysis/confusion.py) -- this heatmap previously showed
+    # raw counts only, with no DOR or determinate-% for controls.
+    metrics = compute_classification_metrics(pd.DataFrame(mat))
+    ax.text(
+        0.5, -0.20, _dor_coverage_text(metrics["dor_standard"], 100 * metrics["coverage"], None),
+        transform=ax.transAxes, fontsize=11, ha="center", va="top", color="#555555",
+    )
+
+    ax.set_xticks([0.5, 1.5, 2.5])
+    if "ExCALIBR" in title:
+        ax.set_xticklabels(['Benign', 'Indeterminate', 'Pathogenic'], fontsize=12)
+    else:
+        ax.set_xticklabels(['Normal', 'Indeterminate', 'Abnormal'], fontsize=12)
+
+    ax.set_yticks([0.5, 1.5])
+    if show_yticklabels:
+        ax.set_yticklabels(['P/LP', 'B/LB'][::-1], fontsize=13)
+    else:
+        ax.set_yticklabels([])
+    ax.tick_params(length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    ax.text(-0.10, 1.11, f"({letter})", transform=ax.transAxes, fontsize=18, fontweight='bold', va='top')
+    ax.set_xlabel(xlabel, fontsize=14)
+    ax.set_ylabel(ylabel, fontsize=14)
+
+
 def plot_2x3_confusions_nature(conf_dict: Dict[str, np.ndarray], figsize=(13, 4)):
     """Moved verbatim from test/plot_author_calibration_confusion.py — no
     visual changes."""
-    blue_colors = ['#F0F8FC', '#99C8DC', '#7AB5D1', '#4B91A6', '#2E6B7E']
-    red_colors = ['#FCF0F2', '#E6B1B8', '#D68F99', '#B85C6B', '#943744']
-    gray_colors = ['#F5F5F5', '#CCCCCC', '#999999', '#666666']
-
-    blue_cmap = LinearSegmentedColormap.from_list("blue_gradient", blue_colors)
-    red_cmap = LinearSegmentedColormap.from_list("red_gradient", red_colors)
-    gray_cmap = LinearSegmentedColormap.from_list("gray_gradient", gray_colors)
-
     fig = plt.figure(figsize=figsize)
 
     left_margin = 0.08
@@ -359,71 +428,62 @@ def plot_2x3_confusions_nature(conf_dict: Dict[str, np.ndarray], figsize=(13, 4)
     ax_auth = fig.add_axes([left_margin + plot_width + space_left, bottom_margin,
                             plot_width, 1 - bottom_margin - top_margin])
 
-    axes = {
-        "ExCALIBR Evidence": (ax_ex, conf_dict['excalibr']),
-        "Author Annotations": (ax_auth, conf_dict['auth']),
-    }
+    _plot_clingen_confusion_panel(ax_ex, conf_dict['excalibr'], "ExCALIBR Evidence", "A",
+                                   xlabel='Evidence Direction', ylabel='ClinGen Classification')
+    _plot_clingen_confusion_panel(ax_auth, conf_dict['auth'], "Author Annotations", "B",
+                                   xlabel='Functional Annotation', ylabel='')
 
-    def plot_heatmap(mat, ax):
-        rows, cols = mat.shape
+    return fig
 
-        for i in range(rows):
-            row_max = mat[i].max()
-            for j in range(cols):
-                value = mat[i, j]
-                if j == 0:
-                    cmap = blue_cmap
-                elif j == 1:
-                    cmap = gray_cmap
-                elif j == 2:
-                    cmap = red_cmap
 
-                norm = value / row_max if row_max > 0 else 0
-                color = cmap(norm)
+def plot_clingen_confusion_stacked(
+    conf_dict_top: Dict[str, np.ndarray], conf_dict_bottom: Dict[str, np.ndarray],
+    bottom_title_suffix: str = "\n(with PS3/BS3)",
+    figsize=(13, 10),
+):
+    """4-panel version of `plot_2x3_confusions_nature`: (A) ExCALIBR / (B)
+    Author on top (`conf_dict_top`, typically PS3/BS3-stripped -- the
+    circularity-avoiding default), (C) ExCALIBR / (D) Author below
+    (`conf_dict_bottom`, typically PS3/BS3-kept, for the circularity check
+    of how much of ClinGen's own "ground truth" already derives from
+    functional-assay evidence) -- same two confusion dicts previously shown
+    as two separate 2-panel figures (`clingen_confusion.png` and
+    `clingen_confusion_with_ps3bs3.png`), stacked into one figure so both
+    scopes are visible together. The bottom row's panel titles get
+    `bottom_title_suffix` appended (e.g. "ExCALIBR Evidence (with PS3/BS3)")
+    instead of a separate floating row label -- `_plot_clingen_confusion_panel`
+    keys its ExCALIBR-vs-author x-tick-label choice off the literal
+    substring "ExCALIBR" in the title, so the suffix must come after it.
+    """
+    fig = plt.figure(figsize=figsize)
 
-                rect = mpatches.Rectangle(
-                    (j, i), 1, 1, facecolor=color, edgecolor='white', linewidth=2.5,
-                )
-                ax.add_patch(rect)
+    left_margin = 0.08
+    top_margin = 0.08
+    bottom_margin = 0.09
+    # Each panel's DOR/determinate-% caption sits ~20% of the panel's own
+    # height below its axes (see _plot_clingen_confusion_panel), and the
+    # next row's title + panel-letter sit ~11% above its axes -- on top of
+    # each other's text without a wide enough gap between rows here (unlike
+    # the single-row 2-panel figure, where there's no second row below to
+    # collide with). row_gap has to clear both.
+    row_gap = 0.24
+    plot_width = 0.35
+    space_left = 0.05
+    row_height = (1 - top_margin - bottom_margin - row_gap) / 2
+    bottom_row_y = bottom_margin
+    top_row_y = bottom_margin + row_height + row_gap
 
-                text_color = 'white' if norm > 0.45 else 'black'
-                if j == 1:
-                    text_color = 'white' if norm > 0.7 else 'black'
+    ax_ex_top = fig.add_axes([left_margin, top_row_y, plot_width, row_height])
+    ax_auth_top = fig.add_axes([left_margin + plot_width + space_left, top_row_y, plot_width, row_height])
+    ax_ex_bottom = fig.add_axes([left_margin, bottom_row_y, plot_width, row_height])
+    ax_auth_bottom = fig.add_axes([left_margin + plot_width + space_left, bottom_row_y, plot_width, row_height])
 
-                ax.text(
-                    j + 0.5, i + 0.5, f"{value:,}",
-                    ha='center', va='center', fontsize=16, color=text_color,
-                )
-
-        ax.set_xlim(0, cols)
-        ax.set_ylim(0, rows)
-        ax.invert_yaxis()
-        ax.set_aspect('equal')
-
-    for title, (ax, mat) in axes.items():
-        plot_heatmap(mat, ax)
-
-        ax.set_facecolor('#F9F9F9')
-        ax.set_title(title, fontsize=18, fontweight='bold', pad=10)
-
-        ax.set_xticks([0.5, 1.5, 2.5])
-        if "ExCALIBR" in title:
-            ax.set_xticklabels(['Benign', 'Indeterminate', 'Pathogenic'], fontsize=12)
-        else:
-            ax.set_xticklabels(['Normal', 'Indeterminate', 'Abnormal'], fontsize=12)
-
-        ax.set_yticks([0.5, 1.5])
-        ax.set_yticklabels(['P/LP', 'B/LB'][::-1], fontsize=13)
-        ax.tick_params(length=0)
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-    ax_ex.text(-0.10, 1.11, "(A)", transform=ax_ex.transAxes, fontsize=18, fontweight='bold', va='top')
-    ax_auth.text(-0.10, 1.11, "(B)", transform=ax_auth.transAxes, fontsize=18, fontweight='bold', va='top')
-
-    ax_ex.set_xlabel('Evidence Direction', fontsize=14)
-    ax_ex.set_ylabel('ClinGen Classification', fontsize=14)
-    ax_auth.set_xlabel('Functional Annotation', fontsize=14)
-    ax_auth.set_ylabel('')
+    _plot_clingen_confusion_panel(ax_ex_top, conf_dict_top['excalibr'], "ExCALIBR Evidence", "A",
+                                   ylabel='ClinGen Classification')
+    _plot_clingen_confusion_panel(ax_auth_top, conf_dict_top['auth'], "Author Annotations", "B", ylabel='')
+    _plot_clingen_confusion_panel(ax_ex_bottom, conf_dict_bottom['excalibr'], f"ExCALIBR Evidence{bottom_title_suffix}",
+                                   "C", xlabel='Evidence Direction', ylabel='ClinGen Classification')
+    _plot_clingen_confusion_panel(ax_auth_bottom, conf_dict_bottom['auth'], f"Author Annotations{bottom_title_suffix}",
+                                   "D", xlabel='Functional Annotation', ylabel='')
 
     return fig

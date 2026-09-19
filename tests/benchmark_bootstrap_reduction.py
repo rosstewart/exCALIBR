@@ -75,6 +75,7 @@ _KNOWN_NAME_ALIASES = {
     "CHEK2_McCarthy_Leo_2024": "CHEK2_McCarthy-Leo_2024",
     "LDLR_Tabet_2025_LDL_uptake": "LDLR_Tabet_2025_uptake",
     "LDLR_Tabet_2025_LDLR_cell_surface_abundance": "LDLR_Tabet_2025_abundance",
+    "BRCA2_Huang_2026": "BRCA2_Huang_2025_SGE",
 }
 
 

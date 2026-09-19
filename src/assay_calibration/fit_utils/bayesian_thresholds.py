@@ -500,6 +500,60 @@ def continuous_lr_thresholds(prior: float,
             for name, q in merged.items()}
 
 
+def _clamp_prior_at_reference(prior: float, reference_prior: float = 0.5) -> Dict[str, float]:
+    """Per-boundary *effective prior* to use so no threshold is ever more
+    permissive than it would be at ``reference_prior``.
+
+    Contrast with ``_floor_targets_at_prior``: that function clamps the
+    *target* to the gene's own prior, preventing a threshold from requiring
+    wrong-direction evidence. This clamps the *prior fed into the LR+
+    solver* to a fixed reference point, capping how lax the threshold can
+    get -- a different failure mode (excess permissiveness, not direction
+    reversal).
+
+    Since LR+(q, p) = q(1-p)/(p(1-q)) is monotonic in p (decreasing for
+    benign-direction targets, increasing for pathogenic-direction ones),
+    benign-direction boundaries (B, LB) use ``max(prior, reference_prior)``
+    -- frozen at the stricter reference-prior value for prior <=
+    reference_prior, unclamped above -- and pathogenic-direction boundaries
+    (LP, P) use ``min(prior, reference_prior)``, the mirror image.
+    """
+    p = float(prior)
+    r = float(reference_prior)
+    return {"B": max(p, r), "LB": max(p, r), "LP": min(p, r), "P": min(p, r)}
+
+
+def reference_clamped_lr_thresholds(prior: float,
+                                    targets: Dict[str, float] = None,
+                                    reference_prior: float = 0.5) -> Dict[str, float]:
+    """Like ``continuous_lr_thresholds``, but each boundary's LR+ threshold
+    is solved at the prior clamped via ``_clamp_prior_at_reference`` instead
+    of at the gene's own prior directly -- so no boundary is ever more
+    permissive than its value at ``reference_prior``. See
+    ``_clamp_prior_at_reference`` for the mechanism.
+    """
+    merged = {**DEFAULT_TARGETS, **(targets or {})}
+    eff_prior = _clamp_prior_at_reference(prior, reference_prior)
+    return {name: float(bayes_lr_for_posterior(q, eff_prior[name]))
+            for name, q in merged.items()}
+
+
+def reference_clamped_posterior(prior: float,
+                                targets: Dict[str, float] = None,
+                                reference_prior: float = 0.5) -> Dict[str, float]:
+    """Posterior actually implied, at the gene's true prior, by the
+    reference-clamped LR+ threshold from ``reference_clamped_lr_thresholds``.
+
+    Equals the nominal target wherever the clamp is inactive (prior on the
+    unclamped side of ``reference_prior`` for that boundary's direction),
+    and departs from the flat target line once the clamp engages -- this is
+    the quantity to plot against prior to show where/how much the clamped
+    variant diverges from Posterior-exact.
+    """
+    lr = reference_clamped_lr_thresholds(prior, targets, reference_prior)
+    return {name: float(bayes_posterior_from_lr(v, prior)) for name, v in lr.items()}
+
+
 def continuous_classify(lr_plus: ArrayLike,
                         prior: float,
                         targets: Dict[str, float] = None,

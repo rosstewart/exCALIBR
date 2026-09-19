@@ -26,6 +26,10 @@ from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
 
 # Model-system label normalization (mirrors analysis/gene_table.py).
+# "not applicable" is a distinct, genuine category (e.g. a meta-analysis
+# combining assays run in different model systems, where no single model
+# system value is meaningful) -- not the same thing as "other"/unknown, which
+# is reserved for datasets that simply have no model_system value recorded.
 _MODEL_SYSTEM_MAP = {
     'immortalized human cells': 'immortalized human cells',
     'murine primary cells': 'murine primary cells',
@@ -33,6 +37,18 @@ _MODEL_SYSTEM_MAP = {
     'other': 'other',
     'Not Applicable': 'not applicable',
 }
+
+
+def _looks_like_meta_analysis(dataset: str) -> bool:
+    """Name-based meta-analysis signal (e.g. TP53_Fortuno_2021_Kato_meta,
+    TP53_Giacomelli_2018_combined_score, HMBS_van_Loggerenberg_2023_combined)
+    -- used instead of inferring "this is a meta-analysis" purely from
+    missing vamp_sge/model_system metadata, which wrongly classified any
+    genuinely unknown/not-yet-curated dataset (e.g. a newly added assay with
+    no metadata-file entry yet) as a meta-analysis just because its fields
+    also happened to be blank, instead of "Other"."""
+    lowered = dataset.lower()
+    return 'meta' in lowered or 'combined' in lowered
 
 
 def normalize_assay_method_map(assay_method_map, dataset_descriptions=None):
@@ -69,14 +85,23 @@ def normalize_assay_method_map(assay_method_map, dataset_descriptions=None):
                 _cfg.DATASET_DESCRIPTIONS_CSV, low_memory=False,
             )
 
-    desc_model, desc_disease = {}, {}
+    desc_model = {}
     if dataset_descriptions is not None:
         for _, r in dataset_descriptions.iterrows():
             key = r.get('Dataset_tag')
             if pd.isna(key):
                 continue
             desc_model[key] = r.get('Model_system')
-            desc_disease[key] = r.get('Assay Disease Relevance')
+
+    # Disease *type* (cancer/cardiovascular/rare disease/metabolic, matching
+    # this module's DISEASE_CODES/disease_order) has no source column in
+    # dataset_descriptions.csv -- its "Assay Disease Relevance" column is a
+    # germline-vs-somatic distinction, not a disease category, and using it
+    # here left every dataset's disease type unmatched (falling back to the
+    # "Other"/gray default). The actual per-gene disease category used
+    # elsewhere in this codebase is gene_performance_scatter.py's
+    # GENE_DISEASE_MAP -- reuse that directly, keyed by gene.
+    from analysis.gene_performance_scatter import GENE_DISEASE_MAP
 
     rows = []
     for _, row in assay_method_map.iterrows():
@@ -98,12 +123,16 @@ def normalize_assay_method_map(assay_method_map, dataset_descriptions=None):
         if gene is None or (isinstance(gene, float) and pd.isna(gene)):
             gene = str(ds).split('_')[0]
 
+        disease = GENE_DISEASE_MAP.get(gene)
+        if disease is not None:
+            disease = disease.lower()
+
         rows.append({
             'dataset': ds,
             'gene': gene,
             'vamp_sge': vamp_sge,
             'model_system': model_system,
-            'disease': desc_disease.get(ds),
+            'disease': disease,
             'IGVF_produced': row.get('IGVF') == 'Yes',
         })
     return pd.DataFrame(rows)
@@ -161,7 +190,7 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
     }
     MODEL_SYSTEM_CODES = {
         'immortalized human cells': 'H', 'murine primary cells': 'M', 'yeast': 'Y',
-        'other': 'O', 'not applicable': 'N', None: 'N', np.nan: 'N',
+        'other': 'O', 'not applicable': 'N', None: 'O', np.nan: 'O',
     }
     DISEASE_CODES = {
         'cancer': 'C', 'cardiovascular': 'V', 'cardio': 'V', 'rare disease': 'R',
@@ -183,17 +212,58 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
             vamp_val = row.get('vamp_sge', None)
             model_val = row.get('model_system', None)
 
-            if (pd.isna(vamp_val) or vamp_val == '' or vamp_val == 'not applicable') and \
-               (pd.isna(model_val) or model_val == 'not applicable'):
+            # "not applicable" (explicitly recorded) is a real, distinct
+            # model-system value -- e.g. a meta-analysis combining assays run
+            # in different systems, where no single model system applies --
+            # not the same thing as model_val simply being NaN/missing
+            # (e.g. a newly added dataset with no metadata-file entry yet),
+            # which should fall back to "other" instead.
+            is_blank_vamp = pd.isna(vamp_val) or vamp_val in ('', 'not applicable')
+            if is_blank_vamp and (model_val == 'not applicable' or _looks_like_meta_analysis(dataset)):
                 vamp_val = 'Meta-analysis'
-            elif pd.isna(vamp_val) or vamp_val == '' or vamp_val == 'not applicable':
+            elif is_blank_vamp:
                 vamp_val = 'Other'
 
             vamp_sge_map[dataset] = vamp_val
-            model_system_map[dataset] = model_val if not pd.isna(model_val) else 'not applicable'
+            model_system_map[dataset] = 'other' if pd.isna(model_val) else model_val
             disease_map[dataset] = row.get('disease', None)
             igvf_map[dataset] = row.get('IGVF_produced', False)
             gene_map[dataset] = row.get('gene', 'Other')
+
+        # ASSAY_METHOD_MAP_CSV/DATASET_DESCRIPTIONS_CSV are keyed by the old,
+        # pre-rename "reported" dataset names (e.g. "BARD1_unpublished"), but
+        # `dataset_info_df` (built from the live pipeline output) uses the
+        # current renamed names (e.g. "BARD1_IGVF") -- see
+        # analysis/discovery.py's DATASET_RENAMES / new_dataset_names.csv for
+        # the same old/new split elsewhere. Without this, every renamed
+        # dataset's `.get(dataset, default)` lookup below misses and silently
+        # falls back to the blank/"Other"/False default -- this was leaving
+        # most rows' assay type/model system/disease blank and dropping the
+        # IGVF marker for every "_IGVF"-suffixed dataset (all of which are
+        # renames of an "_unpublished" old name). Register each row a second
+        # time under its current name too, so lookups succeed either way.
+        from analysis.author_labels import load_name_mapping
+        from analysis import config as _cfg
+        old_to_new, _ = load_name_mapping(str(_cfg.DATASET_TSV))
+        for old_name, new_name in old_to_new.items():
+            if old_name in vamp_sge_map and new_name not in vamp_sge_map:
+                vamp_sge_map[new_name] = vamp_sge_map[old_name]
+                model_system_map[new_name] = model_system_map[old_name]
+                disease_map[new_name] = disease_map[old_name]
+                igvf_map[new_name] = igvf_map[old_name]
+                gene_map[new_name] = gene_map[old_name]
+
+    def _resolve_key(dataset, mapping, default):
+        """`dataset` as-is, else with a "_clinvar_2018" suffix stripped
+        (BRCA1/MSH2/PTEN/TP53's live pipeline names carry this suffix; the
+        old assay-method-map/dataset-descriptions CSVs -- and therefore the
+        old-name/new-name bridge above -- never do), else `default`."""
+        if dataset in mapping:
+            return mapping[dataset]
+        stripped = dataset.replace("_clinvar_2018", "")
+        if stripped in mapping:
+            return mapping[stripped]
+        return default
 
     dataset_proportions, dataset_names = [], []
     vamp_sge_vals, model_system_vals, disease_vals, is_igvf, genes = [], [], [], [], []
@@ -211,11 +281,11 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
         dataset_proportions.append(proportions)
         dataset_names.append(dataset)
 
-        vamp_sge_vals.append(vamp_sge_map.get(dataset, 'Other'))
-        model_system_vals.append(model_system_map.get(dataset, 'not applicable'))
-        disease_vals.append(disease_map.get(dataset, None))
-        is_igvf.append(igvf_map.get(dataset, False))
-        genes.append(gene_map.get(dataset, row.get('gene', 'Other')))
+        vamp_sge_vals.append(_resolve_key(dataset, vamp_sge_map, 'Other'))
+        model_system_vals.append(_resolve_key(dataset, model_system_map, 'other'))
+        disease_vals.append(_resolve_key(dataset, disease_map, None))
+        is_igvf.append(_resolve_key(dataset, igvf_map, False))
+        genes.append(_resolve_key(dataset, gene_map, row.get('gene', 'Other')))
 
         vt_idx = new_vt_idx
 
@@ -397,7 +467,7 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
     for idx, dataset in enumerate(proportion_df.index):
         y_pos = idx
         vamp_code = VAMP_SGE_CODES.get(sort_df.iloc[idx]['_vamp_sge'], 'O')
-        model_code = MODEL_SYSTEM_CODES.get(sort_df.iloc[idx]['_model_system'], 'N')
+        model_code = MODEL_SYSTEM_CODES.get(sort_df.iloc[idx]['_model_system'], 'O')
         disease_code = DISEASE_CODES.get(sort_df.iloc[idx]['_disease'], 'O')
 
         vamp_color = VAMP_SGE_COLORS[vamp_code]
@@ -520,15 +590,19 @@ def compute_assay_evidence_stats(dataset_info_df, all_danz_assignments, assay_me
         vamp_val = row.get('vamp_sge', None)
         model_val = row.get('model_system', None)
 
-        if (pd.isna(vamp_val) or vamp_val in ('', 'not applicable')) and \
-           (pd.isna(model_val) or model_val == 'not applicable'):
+        # See plot_dataset_point_heatmap's identical fix: "not applicable"
+        # (explicitly recorded, e.g. a meta-analysis with no single model
+        # system) is a distinct value from model_val simply being NaN/missing
+        # (e.g. a newly added dataset with no metadata-file entry yet).
+        is_blank_vamp = pd.isna(vamp_val) or vamp_val in ('', 'not applicable')
+        if is_blank_vamp and (model_val == 'not applicable' or _looks_like_meta_analysis(ds)):
             vamp_val = 'Meta-analysis'
-        elif pd.isna(vamp_val) or vamp_val in ('', 'not applicable'):
+        elif is_blank_vamp:
             vamp_val = 'Other'
 
         meta[ds] = {
             'assay_type': vamp_val,
-            'model_system': model_val if not pd.isna(model_val) else 'not applicable',
+            'model_system': 'other' if pd.isna(model_val) else model_val,
             'disease': row.get('disease', 'Other'),
             'gene': row.get('gene', ds.split('_')[0]),
         }
