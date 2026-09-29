@@ -27,6 +27,7 @@ After running, submit with:
   bash hpc/submit_array.sh <output_dir>
 """
 
+import copy
 import sys
 import os
 import json
@@ -135,11 +136,38 @@ def _resolve_n_jobs(n_jobs: int, sample_slice: "pd.DataFrame | None" = None) -> 
 # =============================================================================
 
 def _strip_minimal(job: dict) -> dict:
-    return {k: job[k] for k in (
+    out = {k: job[k] for k in (
         "job_id", "bootstrap_seed", "fit_idx", "num_components",
         "constrained", "init_method", "init_constraint_adjustment", "kwargs",
         "nominal_latent_q",
     )}
+    # greedy_restarts (Fit.generate_fit_jobs) tags a seed job with metadata
+    # hpc/run_array_task.py needs to drive that mode's further candidate
+    # rounds -- absent for every other job, so this is a no-op elsewhere.
+    if "greedy_meta" in job:
+        out["greedy_meta"] = job["greedy_meta"]
+    return out
+
+
+def _count_eventual_fits(minimal_jobs: list) -> int:
+    """Total fits one label's job list will eventually run.
+
+    Equal to len(minimal_jobs) unless greedy_restarts tagged some of them:
+    a q1/q2 job under that scheme is only a SEED (Fit.generate_fit_jobs emits
+    exactly one per mode), and hpc/run_array_task.py generates its
+    `n_slots` further candidates at execution time -- so the literal list
+    length would undercount, and run_array_task.py's `remaining` bookkeeping
+    (seeded from this total) would fire prematurely and drop every candidate
+    past the seed. Counted analytically here instead.
+    """
+    total = 0
+    for j in minimal_jobs:
+        gm = j.get("greedy_meta")
+        if gm is not None and gm["mode"] != "gaussian":
+            total += 1 + gm.get("n_slots", 0)
+        else:
+            total += 1
+    return total
 
 
 def _shared_data(jobs: list) -> dict | None:
@@ -758,10 +786,28 @@ def _discover_gene_groups(df, max_dimensions=None, manual_groups=None):
     return result
 
 
+def _cluster_suffixed_label(dataset_label: str, cluster_idx: int) -> str:
+    """Insert "_clusterN" (N = cluster_idx+1, 1-based; cluster_idx==0 keeps
+    the label unsuffixed -- the most-informative cluster IS "the gene" for
+    backward compatibility) right before the dataset label's "_mv" marker,
+    so "BRCA2_mv" -> "BRCA2_cluster2_mv" and "BRCA2_mv_clinvar_2018" ->
+    "BRCA2_cluster2_mv_clinvar_2018" (suffix inserted at the FIRST "_mv",
+    not appended at the end, since some labels have trailing content after
+    "_mv" already)."""
+    if cluster_idx == 0:
+        return dataset_label
+    marker = "_mv"
+    pos = dataset_label.find(marker)
+    if pos == -1:
+        return f"{dataset_label}_cluster{cluster_idx + 1}"
+    return f"{dataset_label[:pos]}_cluster{cluster_idx + 1}{dataset_label[pos:]}"
+
+
 def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
                                   component_range, constraint_modes, latent_q, init_strategy,
                                   min_overlap_rows=30, sample_balance_beta=None,
-                                  extra_cjob_fields=None, master_seed=DEFAULT_MASTER_SEED):
+                                  extra_cjob_fields=None, master_seed=DEFAULT_MASTER_SEED,
+                                  greedy_restarts=False):
     """Shared bootstrap x component x constraint job-generation loop, backed
     by Fit.generate_fit_jobs. Used by every multivariate pipeline in this
     file: the integrated-dataframe multi-assay genes (BRCA1/PTEN/MSH2/
@@ -775,8 +821,46 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
     guarantee against sparse-dimension signal loss (FGFR/TP53/LABEL-seq/
     CARD11/predictor-mv/combined, per the consolidation plan) should pass
     ``min_overlap_rows=1`` explicitly.
+
+    If ``ms``'s assay dimensions split into more than one disjoint,
+    qualifying (>=2 dims) connected component under
+    Fit._select_all_calibration_clusters, this fits EVERY qualifying
+    cluster separately (not just the largest/most informative one, which is
+    all that used to happen implicitly inside Fit.generate_fit_jobs) --
+    confirmed necessary for e.g. BRCA2 under --gene-set integrated, whose
+    8 dims split into a 3-dim and a 4-dim cluster, previously silently
+    losing whichever one Fit.generate_fit_jobs's internal
+    _select_calibration_dims call didn't pick. The most informative cluster
+    keeps `dataset_label`/`save_dir` unsuffixed (so single-cluster genes --
+    the common case -- are completely unaffected); additional clusters get
+    "_cluster2"/"_cluster3"/... inserted (see `_cluster_suffixed_label`).
     """
     from src.assay_calibration.fit_utils.fit import Fit
+
+    observations = np.asarray(ms.scores, dtype=float)
+    clusters = []
+    if observations.ndim == 2 and observations.shape[1] > 1:
+        clusters = Fit._select_all_calibration_clusters(observations, min_overlap_rows=min_overlap_rows)
+    if len(clusters) > 1:
+        all_jobs = []
+        for cluster_idx, dims in enumerate(clusters):
+            cluster_ms = copy.deepcopy(ms)
+            from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
+            select_dims(cluster_ms, dims)
+            cluster_label = _cluster_suffixed_label(dataset_label, cluster_idx)
+            cluster_save_dir = save_dir if cluster_idx == 0 else f"{save_dir}_cluster{cluster_idx + 1}"
+            cluster_extra_fields = dict(extra_cjob_fields or {})
+            cluster_extra_fields["assay_datasets"] = list(cluster_ms.dataset_names)
+            print(f"  {dataset_label}: cluster {cluster_idx + 1}/{len(clusters)} "
+                  f"({len(dims)} dims: {list(cluster_ms.dataset_names)}) -> {cluster_label}")
+            all_jobs.extend(_generate_bootstrap_fit_jobs(
+                cluster_ms, cluster_label, gene, cluster_save_dir, N_BOOTSTRAPS, NUM_FITS,
+                component_range, constraint_modes, latent_q, init_strategy,
+                min_overlap_rows=min_overlap_rows, sample_balance_beta=sample_balance_beta,
+                extra_cjob_fields=cluster_extra_fields, master_seed=master_seed,
+                greedy_restarts=greedy_restarts,
+            ))
+        return all_jobs
 
     constrained_flags = []
     if "con" in constraint_modes:
@@ -801,7 +885,14 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                 }
                 if sample_balance_beta is not None:
                     fit_kwargs["sample_balance_beta"] = sample_balance_beta
-                if NUM_FITS is not None:
+                if greedy_restarts:
+                    fit_kwargs["greedy_restarts"] = True
+                elif NUM_FITS is not None:
+                    # num_fits and greedy_restarts are alternative restart
+                    # policies -- greedy_restarts ignores num_fits entirely
+                    # (Fit.generate_fit_jobs derives its own restart count
+                    # from num_components/latent_q), so only pass num_fits
+                    # when greedy_restarts isn't active.
                     fit_kwargs["num_fits"] = NUM_FITS
                 try:
                     jobs = fitter.generate_fit_jobs(
@@ -827,7 +918,7 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             "bootstrap_seed": bs,
             "shared_data": shared,
             "multivariate": True,
-            "num_fits_total": sum(len(v) for v in jobs_by_key.values()),
+            "num_fits_total": sum(_count_eventual_fits(v) for v in jobs_by_key.values()),
         }
         if extra_cjob_fields:
             cjob.update(extra_cjob_fields)
@@ -840,7 +931,8 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
 def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS, NUM_FITS,
                                 clinvar_release, component_range, constraint_modes,
                                 latent_q, init_strategy, population_type,
-                                master_seed=DEFAULT_MASTER_SEED, regularization_type=None):
+                                master_seed=DEFAULT_MASTER_SEED, regularization_type=None,
+                                greedy_restarts=False):
     from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
 
     gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
@@ -866,7 +958,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
         ms, gene_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
         component_range, constraint_modes, latent_q, init_strategy,
         extra_cjob_fields={"assay_datasets": list(ms.dataset_names)},
-        master_seed=master_seed,
+        master_seed=master_seed, greedy_restarts=greedy_restarts,
     )
 
 
@@ -947,7 +1039,12 @@ def _build_gene_set_ms_map(gene_set, args):
     raise ValueError(f"Unknown --gene-set {gene_set!r}")
 
 
-def _apply_redundancy_collapse(gene_ms_map, args):
+# Default redundancy-collapse preset for --gene-set tp53. See
+# _apply_redundancy_collapse for why this is on by default for TP53 only.
+TP53_DEFAULT_COLLAPSE_PRESET = "tp53_kato_pca2"
+
+
+def _apply_redundancy_collapse(gene_ms_map, args, gene_set=None):
     """Apply --redundancy-collapse-block (manual, production-safe) and/or
     --redundancy-collapse-auto (diagnostic-only, prints a warning) to every
     gene's ms in-place. No-op if neither is set. See
@@ -960,6 +1057,32 @@ def _apply_redundancy_collapse(gene_ms_map, args):
     block_names = getattr(args, "redundancy_collapse_block", None)
     k_override = getattr(args, "redundancy_collapse_k", None)
     preset = getattr(args, "redundancy_collapse_preset", None)
+
+    # TP53 production default: the 8 Kato_2003 readouts are close to
+    # collinear, so fitting all 16 dimensions spends p(p+1)/2 = 136 covariance
+    # parameters per component on a panel that carries far less independent
+    # information than that. Collapsing them to 2 PCs (16 -> 10 dims, 136 -> 55
+    # covariance parameters) measurably reduces the degeneracy this causes:
+    # at K=6 every component's Gamma came to rest on the regularisation bound
+    # with the full 16 dims, versus 3 of 6 after the collapse.
+    #
+    # Applied only when the caller specified no collapse of their own, so an
+    # explicit --redundancy-collapse-preset/-block still wins, and only for
+    # --gene-set tp53 (the 'integrated' TP53 path names the same dims
+    # differently; apply_preset resolves suffixes per-gene, but leaving that
+    # path alone keeps this change scoped to the dedicated TP53 ingestion).
+    # gene_set is passed explicitly by the caller because it is NOT always on
+    # args: the `multivariate` subcommand has args.gene_set, but `mv-all`
+    # iterates args.pipelines and passes the current one down. Reading it off
+    # args would silently skip this default for every mv-all run, so TP53 would
+    # collapse one way and not the other.
+    _gs = gene_set if gene_set is not None else getattr(args, "gene_set", None)
+    if (preset is None and not block_names and _gs == "tp53"
+            and not getattr(args, "no_default_redundancy_collapse", False)):
+        preset = TP53_DEFAULT_COLLAPSE_PRESET
+        print(f"  [redundancy-collapse] --gene-set tp53: applying default preset "
+              f"{preset!r} (pass --no-default-redundancy-collapse to fit all "
+              f"16 dimensions instead)")
     if preset is not None and block_names:
         print(f"  [redundancy-collapse] --redundancy-collapse-preset={preset} ignored "
               f"since --redundancy-collapse-block was also given explicitly")
@@ -1042,7 +1165,29 @@ def _load_and_filter_gene_ms_map(gene_set, args):
         excluded = {g.upper() for g in args.exclude_genes}
         gene_ms_map = {g: ms for g, ms in gene_ms_map.items() if g.upper() not in excluded}
 
-    _apply_redundancy_collapse(gene_ms_map, args)
+    # TP53 has its own dedicated --gene-set tp53 ingestion (9,911 variants, 16D
+    # -> 10D collapsed), which is the canonical TP53 calibration. The
+    # 'integrated' pipeline also carries a TP53 entry
+    # (TP53_mv_clinvar_2018: 1,774 variants, 15D, ClinVar-2018 labels) built
+    # from the shared multi-assay dataframe. Running both fits TP53 twice from
+    # two different ingestions, and the integrated one is among the most
+    # expensive genes in the set at 15 dimensions.
+    #
+    # NOTE these are NOT the same dataset -- different variant set, label
+    # vintage and dimensionality -- so this skips a distinct calibration, it
+    # does not merely deduplicate. Pass --include-integrated-tp53 to keep it,
+    # and note an explicit --genes TP53 also wins (the filter above has
+    # already restricted the map by then).
+    if (gene_set == "integrated" and not args.genes
+            and not getattr(args, "include_integrated_tp53", False)):
+        dropped = [g for g in gene_ms_map if g.upper().startswith("TP53")]
+        for g in dropped:
+            gene_ms_map.pop(g)
+        if dropped:
+            print(f"  [integrated] skipping {', '.join(dropped)} -- TP53 is calibrated "
+                  f"via its own --gene-set tp53 (pass --include-integrated-tp53 to keep)")
+
+    _apply_redundancy_collapse(gene_ms_map, args, gene_set=gene_set)
 
     print(f"\n[{gene_set}] {len(gene_ms_map)} genes:")
     for gene, ms in sorted(gene_ms_map.items()):
@@ -1083,6 +1228,7 @@ def _generate_jobs_for_gene_ms_map(gene_set, gene_ms_map, args):
             min_overlap_rows=1,  # pattern_stratified_bootstrap already guards sparse dims
             extra_cjob_fields={"gene_set": gene_set, "assay_datasets": list(ms.dataset_names)},
             master_seed=args.seed,
+            greedy_restarts=getattr(args, "greedy_restarts", False),
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1138,6 +1284,23 @@ def _load_and_filter_gene_groups(args):
         excluded = {g.upper() for g in args.exclude_genes}
         gene_groups = {g: v for g, v in gene_groups.items() if g.upper() not in excluded}
 
+    # Skip the integrated pipeline's own TP53 group by default -- TP53 is
+    # calibrated through its dedicated --gene-set/--pipelines tp53 ingestion.
+    # This is the integrated path's counterpart to the same default in
+    # _load_and_filter_gene_ms_map; integrated does NOT go through that
+    # function (mv_all routes it to _generate_integrated_jobs instead, and
+    # _MV_ALL_GENE_SET_PIPELINES deliberately omits it), so the rule has to
+    # exist in both places or it silently applies to only half the entry
+    # points. See that function for why this skips a distinct calibration
+    # rather than deduplicating.
+    if not args.genes and not getattr(args, "include_integrated_tp53", False):
+        dropped = [g for g in gene_groups if g.upper().startswith("TP53")]
+        for g in dropped:
+            gene_groups.pop(g)
+        if dropped:
+            print(f"  [integrated] skipping {', '.join(dropped)} -- TP53 is calibrated "
+                  f"via its own tp53 pipeline (pass --include-integrated-tp53 to keep)")
+
     print(f"\nFound {len(gene_groups)} gene groups:")
     for g, ds in sorted(gene_groups.items()):
         print(f"  {g} ({len(ds)} assays): {ds}")
@@ -1176,6 +1339,7 @@ def _generate_integrated_jobs(df, gene_groups, args):
             population_type=args.population_type,
             master_seed=args.seed,
             regularization_type=getattr(args, "regularization_type", None),
+            greedy_restarts=getattr(args, "greedy_restarts", False),
         )
         for gene, datasets in gene_groups.items()
     )
@@ -1263,6 +1427,7 @@ def _generate_predictor_mv_jobs(by_gene, args):
             min_overlap_rows=1,  # pattern_stratified_bootstrap already guards sparse dims
             sample_balance_beta=args.sample_balance_beta,
             master_seed=args.seed,
+            greedy_restarts=getattr(args, "greedy_restarts", False),
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1543,7 +1708,16 @@ def main():
                               "fgfr/tp53/card11/combined.")
     p_multi.add_argument("--n-bootstraps", type=int, default=1000)
     p_multi.add_argument("--num-fits", type=int, default=100,
-                         help="Override dynamic NUM_FITS (default: 100)")
+                         help="Override dynamic NUM_FITS (default: 100). "
+                              "Ignored when --greedy-restarts is set.")
+    p_multi.add_argument("--greedy-restarts", action="store_true",
+                         help="Replace the fixed single-pattern-per-mode "
+                              "restart with an adaptive sign-pattern search "
+                              "(1 Gaussian restart + 1+K one-direction "
+                              "restarts + 1+2K two-direction restarts, "
+                              "coordinate ascent by held-out log-likelihood; "
+                              "CPU only, ignored on --device gpu). Off by "
+                              "default -- opt in per run.")
     p_multi.add_argument("--list-only", action="store_true",
                          help="Print gene groups and exit")
     p_multi.add_argument("--gene-set", default="integrated",
@@ -1584,6 +1758,18 @@ def main():
                               "Kato_2003 panel -> 2 PCA components (redundancy_collapse.py's "
                               "PRESETS dict). Ignored (with a warning) if --redundancy-collapse-"
                               "block is also given explicitly.")
+    p_multi.add_argument("--include-integrated-tp53", action="store_true",
+                         help="Keep the integrated pipeline's own TP53 entry "
+                              "(TP53_mv_clinvar_2018, 15D, ClinVar-2018 labels). Skipped "
+                              "by default because TP53 is calibrated via --gene-set tp53; "
+                              "the two are different ingestions, not duplicates.")
+    p_multi.add_argument("--no-default-redundancy-collapse", action="store_true",
+                         help="Disable the automatic TP53 collapse. --gene-set tp53 "
+                              "applies " + repr(TP53_DEFAULT_COLLAPSE_PRESET) + " by "
+                              "default (8 Kato_2003 dims -> 2 PCs, 16 -> 10 total); "
+                              "pass this to fit all 16 dimensions instead. No effect "
+                              "for other gene sets, or when an explicit "
+                              "--redundancy-collapse-preset/-block is given.")
     p_multi.add_argument("--redundancy-collapse-block", nargs="+", default=None,
                          help="Manually collapse this named block of highly-correlated "
                               "dimensions (names must match the gene's own dataset_names, "
@@ -1636,7 +1822,11 @@ def main():
     p_pred.add_argument("--init-strategy", default="kmeans",
                         choices=["anchored", "kmeans"])
     p_pred.add_argument("--n-bootstraps", type=int, default=1000)
-    p_pred.add_argument("--num-fits", type=int, default=100)
+    p_pred.add_argument("--num-fits", type=int, default=100,
+                        help="Ignored when --greedy-restarts is set.")
+    p_pred.add_argument("--greedy-restarts", action="store_true",
+                        help="See `multivariate --help` for the same flag; "
+                             "identical behavior here.")
     p_pred.add_argument("--sample-balance-beta", type=float, default=0,
                         help="Sample-balanced M-step β ∈ [0,1] (default: 0)")
     p_pred.set_defaults(func=run_predictor_mv)
@@ -1666,13 +1856,22 @@ def main():
                        help="Restrict every pipeline to these genes (default: each "
                             "pipeline's own full gene set)")
     p_mv_all.add_argument("--exclude-genes", nargs="+", default=None)
+    p_mv_all.add_argument("--include-integrated-tp53", action="store_true",
+                       help="Keep the integrated pipeline's TP53 entry; skipped by "
+                            "default since --pipelines tp53 covers it (see the "
+                            "multivariate subcommand's flag of the same name).")
     p_mv_all.add_argument("--components", nargs="+", type=int, default=[4])
     p_mv_all.add_argument("--constraints", nargs="+",
                        choices=["con", "unc", "both"], default=["unc"])
     p_mv_all.add_argument("--init-strategy", default="kmeans",
                        choices=["kmeans", "anchored"])
     p_mv_all.add_argument("--n-bootstraps", type=int, default=1000)
-    p_mv_all.add_argument("--num-fits", type=int, default=100)
+    p_mv_all.add_argument("--num-fits", type=int, default=100,
+                          help="Ignored when --greedy-restarts is set.")
+    p_mv_all.add_argument("--greedy-restarts", action="store_true",
+                          help="See `multivariate --help` for the same flag; "
+                               "identical behavior here, applied to every "
+                               "pipeline in --pipelines.")
     p_mv_all.add_argument("--sample-balance-beta", type=float, default=0,
                        help="[predictor-mv] Sample-balanced M-step β ∈ [0,1] (default: 0)")
     p_mv_all.add_argument("--max-dimensions", type=int, default=None,

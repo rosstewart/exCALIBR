@@ -294,7 +294,8 @@ def kmeans_init_mv(X, **kwargs):
         latent_q : int (default 1) — latent dimension q
         lambdaIndex : int — encodes sign patterns for all clusters; for q=2,
             cluster c uses pattern (lambdaIndex // 4**c) % 4, with bits mapping
-            to +/-1 per latent direction. Defaults to 0.
+            to +/-1 per latent direction (bit 0 -> +1, so index 0 applies no
+            flips and keeps the data-driven sign). Defaults to 0.
 
     Returns
     -------
@@ -391,7 +392,15 @@ def kmeans_init_mv(X, **kwargs):
                     # an n_sign_per_cluster-ary digit at position c.
                     cluster_pattern_idx = (lambdaIndex // (n_sign_per_cluster ** c)) % n_sign_per_cluster
                     cluster_sign_pattern = np.array([
-                        ((cluster_pattern_idx >> j) & 1) * 2 - 1
+                        # Bit 0 -> +1 (no flip), bit 1 -> -1 (flip), so that
+                        # lambdaIndex 0 is the all-(+1) "trust the data-driven
+                        # sign" pattern. It used to be the reverse, which made
+                        # index 0 invert the data sign on every cluster and
+                        # column -- the worst available starting point, and the
+                        # one production reaches first. The all-(+1) pattern was
+                        # otherwise unreachable at K=4, q=2, since it needs
+                        # lambdaIndex=255 and n_patterns is capped at 100.
+                        1 - ((cluster_pattern_idx >> j) & 1) * 2
                         for j in range(latent_q)
                     ])
                     # CFUSN: Delta is (p, q) matrix.
@@ -696,7 +705,8 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
         else:
             cluster_pattern_idx = (lambdaIndex // (n_sign_per_cluster ** c)) % n_sign_per_cluster
             cluster_sign_pattern = np.array([
-                ((cluster_pattern_idx >> j) & 1) * 2 - 1
+                # See kmeans_init_mv: index 0 is the all-(+1) no-flip pattern.
+                1 - ((cluster_pattern_idx >> j) & 1) * 2
                 for j in range(latent_q)
             ])
             Delta = _init_delta_matrix(

@@ -2,7 +2,7 @@
 """
 Sankey figure for the VCEP VUS-reclassification analysis (analysis/
 run_vus_reclassification.py's output). Two panels, reusing the project's own
-vendored Sankey plotter (`mv_analysis/sankey_plot.py::
+vendored Sankey plotter (`mv_analysis/sankey_plot_flat.py::
 plot_categorical_sankey`), copied there from tavtigian_sims (untracked):
 
   (A) original ClinVar/ClinGen classification -> residual classification
@@ -25,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from mv_analysis.sankey_plot import STRENGTH_COLOR, BND_COLOR as _BND_COLOR, plot_categorical_sankey
+from mv_analysis.sankey_plot_flat import STRENGTH_COLOR, BND_COLOR as _BND_COLOR, plot_categorical_sankey
 
 OUTPUT_DIR = "/data/ross/assay_calibration/multivariate/experimental_staged_fit"
 

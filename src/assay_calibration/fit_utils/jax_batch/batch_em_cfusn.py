@@ -71,7 +71,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.scipy.stats import norm as jnorm
-from jax.scipy.special import logsumexp
+from jax.scipy.special import logsumexp, log_ndtr
 
 _LOG2PI = float(jnp.log(2 * jnp.pi))
 _LOG2 = float(jnp.log(2.0))
@@ -96,6 +96,224 @@ def _bvn_cdf(h, k, rho, n_quad=24):
     return jnorm.cdf(h) * jnorm.cdf(k) + integral / (2 * jnp.pi)
 
 
+# ── Shared log-space orthant probability and moment ratios ─────────────────
+#
+# These are line-for-line ports of cfusn/update_steps.py's
+# _log_bvn_orthant_quad / _log_phi_at0 / _log_f1_0 / _log_f1_1, deliberately
+# using the SAME algorithm rather than a second one that has to be kept in
+# agreement. The previous arrangement -- Owen's T on CPU, a Drezner
+# rho-integral here -- was not a mirror at all: it clipped rho at 0.999 vs the
+# CPU's 0.999999, floored 1-t^2 at 1e-8 with no CPU analogue, used 24 nodes,
+# and in the deep tail returned Phi(h)Phi(k) + integral with both terms
+# underflowed to 0. Keep these in sync with update_steps.py by construction:
+# if one changes, change the other identically.
+#
+# Constants must match update_steps.py exactly.
+_LOG_SQRT_2PI = 0.5 * float(_np.log(2.0 * _np.pi))
+_BVN_QUAD_NODES = 64
+_BVN_QUAD_PANELS = 4
+_BVN_QUAD_LOG_RANGE = 140.0
+_F1_1_ASYMPTOTIC_T = 25.0
+
+# Gauss-Legendre nodes are data-independent, so resolve them at trace time with
+# numpy rather than carrying them as traced values.
+_GL_NODES, _GL_WEIGHTS = _np.polynomial.legendre.leggauss(_BVN_QUAD_NODES)
+
+
+# Owen's T, and the Owen's-T form of Phi_2, so the GPU can run the SAME hybrid
+# as the CPU. JAX has no owens_t primitive, so it is computed by quadrature on a
+# bounded interval -- validated against scipy.special.owens_t (the function the
+# CPU actually calls) rather than against a second guess at the same thing:
+#
+#     regime              max abs err
+#     |a| <= 1              4.2e-17
+#     1 < |a| <= 50         1.1e-16
+#     |a| > 50              5.6e-17
+#     |a| huge (1e9)        8.3e-17
+#     |h| huge              0.0
+#     |h| tiny, |a| huge    7.0e-12   <- the one loose corner; T is O(0.25)
+#                                        there, so ~3e-11 relative
+#     h == 0 / a == 0       <= 2.8e-17
+#
+# Two branches, both bounded-interval, chosen so each is used only where it is
+# machine-precision (n=64 x 6 panels; a crossover at |a| = 50 is where they
+# overlap -- see the measurements that fixed it there):
+#   |a| <= 50 : T = (1/2pi) int_0^{arctan a} exp(-h^2 sec^2(th)/2) dth
+#   |a| >  50 : T = 0.5*Phi(-|h|) - (1/2pi) int_0^{arctan(1/a)}
+#                                            exp(-h^2/(2 sin^2(ph))) dph
+#               i.e. the complement of T(h, inf) = 0.5*Phi(-|h|); the remaining
+#               interval shrinks like 1/a, so large a is easy rather than hard.
+# T is odd in a.
+_OWENS_T_NODES = 64
+_OWENS_T_PANELS = 6
+_OWENS_T_XOVER = 50.0
+_OWENS_MIN_RELIABLE = 1e-10          # must match update_steps.py
+_OT_NODES, _OT_WEIGHTS = _np.polynomial.legendre.leggauss(_OWENS_T_NODES)
+
+
+def _owens_t_panel_sum(h, upper, kind):
+    x = jnp.asarray(_OT_NODES)
+    w = jnp.asarray(_OT_WEIGHTS)
+    tot = jnp.zeros(jnp.broadcast_shapes(jnp.shape(h), jnp.shape(upper)))
+    for i in range(_OWENS_T_PANELS):
+        lo = upper * i / _OWENS_T_PANELS
+        hi = upper * (i + 1) / _OWENS_T_PANELS
+        half = 0.5 * (hi - lo)
+        mid = 0.5 * (hi + lo)
+        th = mid[..., None] + half[..., None] * x
+        if kind == "sec":
+            e = jnp.exp(-0.5 * h[..., None] ** 2 / jnp.cos(th) ** 2)
+        else:
+            e = jnp.exp(-0.5 * h[..., None] ** 2
+                        / jnp.maximum(jnp.sin(th) ** 2, 1e-300))
+        tot = tot + half * jnp.sum(w * e, axis=-1)
+    return tot / (2.0 * jnp.pi)
+
+
+def _owens_t(h, a):
+    """Owen's T(h, a). Mirrors scipy.special.owens_t, which the CPU calls."""
+    sgn = jnp.sign(a)
+    aa = jnp.abs(a)
+    small = aa <= _OWENS_T_XOVER
+    # clamp each branch's argument so the unselected branch cannot produce a
+    # nan/inf that would propagate through the where
+    direct = _owens_t_panel_sum(h, jnp.arctan(jnp.where(small, aa, 1.0)), "sec")
+    compl = (0.5 * jnorm.cdf(-jnp.abs(h))
+             - _owens_t_panel_sum(
+                 h, jnp.arctan(1.0 / jnp.where(small, _OWENS_T_XOVER, aa)), "sin"))
+    return sgn * jnp.where(small, direct, compl)
+
+
+def _bvn_cdf_owens(h, k, rho):
+    """Phi_2(h, k; rho) via Owen's T. Mirrors update_steps._bvn_cdf_owens,
+    including the h==0/k==0 substitution in BOTH numerator and denominator (a
+    literal zero there silently zeroes the correlation term)."""
+    denom = jnp.sqrt(jnp.maximum(1.0 - rho ** 2, 1e-300))
+    h_safe = jnp.where(h == 0, 1e-12, h)
+    k_safe = jnp.where(k == 0, 1e-12, k)
+    a1 = (k_safe - rho * h_safe) / (h_safe * denom)
+    a2 = (h_safe - rho * k_safe) / (k_safe * denom)
+    hk = h * k
+    delta = jnp.where(jnp.logical_or(hk > 0,
+                                     jnp.logical_and(hk == 0, h + k >= 0)),
+                      0.0, 0.5)
+    return (0.5 * (jnorm.cdf(h) + jnorm.cdf(k))
+            - _owens_t(h, a1) - _owens_t(k, a2) - delta)
+
+
+def _log_bvn_cdf(h, k, rho):
+    """log Phi_2(h, k; rho): the SAME hybrid as update_steps._log_bvn_cdf.
+
+    Owen's T above L = 1e-10 (accurate at high |rho|, where the quadrature is
+    weakest), the log-space quadrature below (accurate arbitrarily deep, where
+    Owen's T catastrophically cancels). Both branches are evaluated for every
+    element -- jnp.where cannot skip work -- so the tail form is clamped to stay
+    finite where it is not selected.
+    """
+    fast = _bvn_cdf_owens(h, k, rho)
+    log_fast = jnp.log(jnp.maximum(fast, 1e-300))
+    log_quad = _log_bvn_orthant_quad(h, k, rho)
+    return jnp.where(fast > _OWENS_MIN_RELIABLE, log_fast, log_quad)
+
+
+def _log_bvn_orthant_quad(h, k, rho,
+                          log_range=_BVN_QUAD_LOG_RANGE):
+    """log P(Z1 <= h, Z2 <= k), standard bivariate normal, correlation rho.
+
+    Mirrors update_steps._log_bvn_orthant_quad. Cancellation-free: every term in
+    the accumulation is positive, so relative accuracy survives arbitrarily deep
+    into the tail.
+
+        P = int_0^inf phi(z) * Phi((k' - rho z)/sqrt(1-rho^2)) dz,  z = h' - u
+
+    with (h', k') ordered so the more negative variable is the outer one.
+    rho is an array here (per-observation), where the CPU takes a shared scalar;
+    the arithmetic is otherwise identical.
+    """
+    x = jnp.asarray(_GL_NODES)
+    w = jnp.asarray(_GL_WEIGHTS)
+
+    lo_v = jnp.minimum(h, k)
+    hi_v = jnp.maximum(h, k)
+    sd = jnp.sqrt(jnp.maximum(1.0 - rho * rho, 1e-300))
+
+    H = jnp.maximum(-lo_v, 0.0)
+    U = jnp.sqrt(H ** 2 + 2.0 * log_range) - H
+    U = jnp.maximum(U, 1e-3)
+    U = jnp.where(lo_v > 0, jnp.maximum(U, 12.0), U)
+
+    parts = []
+    for i in range(_BVN_QUAD_PANELS):
+        e0 = i / _BVN_QUAD_PANELS
+        e1 = (i + 1) / _BVN_QUAD_PANELS
+        half = 0.5 * U * (e1 - e0)
+        mid = 0.5 * U * (e1 + e0)
+        u = mid[..., None] + half[..., None] * x
+        z = lo_v[..., None] - u
+        log_phi = -0.5 * z * z - _LOG_SQRT_2PI
+        log_Phi = log_ndtr((hi_v[..., None] - rho[..., None] * z) / sd[..., None])
+        log_w = jnp.log(jnp.maximum(w * half[..., None], 1e-300))
+        parts.append(logsumexp(log_w + log_phi + log_Phi, axis=-1))
+    return logsumexp(jnp.stack(parts, axis=-1), axis=-1)
+
+
+def _log_phi_at0(mu, s):
+    """log of the N(mu, s^2) density at 0. Mirrors update_steps._log_phi_at0."""
+    return -0.5 * (mu / s) ** 2 - jnp.log(s) - _LOG_SQRT_2PI
+
+
+def _log_f1_0(mu, s):
+    """log P(X > 0) = log Phi(mu/s). Mirrors update_steps._log_f1_0.
+
+    NOT 1 - Phi(-mu/s): that form annihilates once -mu/s > 8.
+    """
+    return log_ndtr(mu / s)
+
+
+def _log_f1_1(mu, s):
+    """log E[X 1{X>0}] for X ~ N(mu, s^2). Mirrors update_steps._log_f1_1.
+
+    Three regimes, same thresholds as the CPU:
+      t >= -1      direct t*Phi(t) + phi(t) -- no cancellation, no overflow.
+      -T < t < -1  factor out phi(t), bracket 1 + t*u, u = Phi(t)/phi(t).
+                   u ~ exp(t^2/2) so this OVERFLOWS for t beyond about +38 and
+                   must never be applied to positive t (that bug returned inf
+                   and destroyed real fits on the CPU side).
+      t <= -T      asymptotic series for the bracket.
+
+    Evaluated with jnp.where rather than boolean indexing, so all three
+    expressions are computed for every element -- hence each is clamped to stay
+    finite on the branches where it is not selected, otherwise a NaN/inf from an
+    unselected branch would propagate through the where.
+    """
+    t = mu / s
+    T = _F1_1_ASYMPTOTIC_T
+
+    # direct branch (used for t >= -1)
+    g_direct = (t * jnp.exp(log_ndtr(t))
+                + jnp.exp(-0.5 * t ** 2 - _LOG_SQRT_2PI))
+    log_direct = jnp.log(jnp.maximum(g_direct, 1e-300))
+
+    # bracket branch (used for -T < t < -1); clamp the exponent so the
+    # unselected positive-t elements cannot overflow to inf
+    expo = jnp.minimum(log_ndtr(t) + 0.5 * t ** 2 + _LOG_SQRT_2PI, 300.0)
+    u = jnp.exp(expo)
+    log_mid = (-0.5 * t ** 2 - _LOG_SQRT_2PI
+               + jnp.log(jnp.maximum(1.0 + t * u, 1e-300)))
+
+    # series branch (used for t <= -T); guard 1/t^2 at t == 0
+    t_safe = jnp.where(jnp.abs(t) < 1.0, -1.0, t)
+    it2 = 1.0 / (t_safe * t_safe)
+    series = it2 * (1.0 + it2 * (-3.0 + it2 * (15.0 + it2
+                    * (-105.0 + it2 * 945.0))))
+    log_far = (-0.5 * t ** 2 - _LOG_SQRT_2PI
+               + jnp.log(jnp.maximum(series, 1e-300)))
+
+    out = jnp.where(t >= -1.0, log_direct,
+                    jnp.where(t > -T, log_mid, log_far))
+    return out + jnp.log(s)
+
+
 def _augment_omega(Omega, obs_mask):
     """Omega: (..., p, p); obs_mask: (..., p) bool. Decouple missing dims
     with a large placeholder variance so every observation gets a
@@ -110,6 +328,16 @@ def _augment_omega(Omega, obs_mask):
     diag_miss = miss[..., :, None] * eye
     return jnp.where(keep, Omega, 0.0) + _BIG_M * diag_miss
 
+
+# Ported to match cfusn/update_steps.py's log-space rewrite (fixed tail
+# cancellation in Phi_2, F1_0 = 1 - Phi(-t) annihilation, the t*Phi(t) + phi(t)
+# cancellation, and division by a possibly-zero L). The shared helpers above are
+# the SAME algorithm as the CPU path, not a second one -- see their comment.
+#
+# NOT YET EXECUTED: there is no JAX in this environment, so this port is
+# validated only by a numpy-backed shim that runs these formulas against the CPU
+# implementation. Before trusting the GPU path, run tests/test_batch_em_parity.py
+# on a JAX machine.
 
 def _component_moments_and_logpdf(observations, obs_mask, mu, Delta, Gamma):
     """observations/obs_mask: (batch, N, p); mu: (batch, p); Delta: (batch, p, 2);
@@ -136,10 +364,14 @@ def _component_moments_and_logpdf(observations, obs_mask, mu, Delta, Gamma):
     log_phi = -0.5 * (p * _LOG2PI + logdet + maha)
 
     std = jnp.sqrt(jnp.diagonal(D, axis1=-2, axis2=-1))                # (batch,N,2)
-    corr = jnp.clip(D[..., 0, 1] / (std[..., 0] * std[..., 1] + 1e-15), -0.999, 0.999)
-    log_Phi = jnp.log(jnp.maximum(
-        _bvn_cdf(means[..., 0] / std[..., 0], means[..., 1] / std[..., 1], corr), 1e-300
-    ))
+    corr = jnp.clip(D[..., 0, 1] / (std[..., 0] * std[..., 1] + 1e-15),
+                -0.999999, 0.999999)   # matches update_steps.py
+    # Same stable log orthant probability as the moments use below; the old
+    # _bvn_cdf underflowed to 0 here in the tail and then got floored to 1e-300,
+    # silently truncating the density for exactly the observations whose
+    # moments were also wrong.
+    log_Phi = _log_bvn_cdf(means[..., 0] / std[..., 0],
+                           means[..., 1] / std[..., 1], corr)
     log_pdf = 2 * _LOG2 + log_phi + log_Phi
     log_pdf = jnp.where(jnp.isfinite(log_pdf), log_pdf, -jnp.inf)
 
@@ -159,46 +391,35 @@ def _component_moments_and_logpdf(observations, obs_mask, mu, Delta, Gamma):
     s12 = corr * s1 * s2
 
     alpha1, alpha2 = -mu1 / s1, -mu2 / s2
-    # Direct single-call form (sign-flip identity), not the four-term
-    # difference -- avoids catastrophic cancellation in the truncation-heavy
-    # tail; mirrors update_steps.py's NumPy fix (see its docstring for the
-    # real production failure mode this was root-causing, and the floor
-    # magnitude change that goes with it).
-    L = _bvn_cdf(-alpha1, -alpha2, corr)
-    L = jnp.maximum(L, 1e-300)
+    # Everything below is a RATIO to L, and those ratios stay finite as L -> 0,
+    # so work in logs and never form L itself. Mirrors update_steps.py's
+    # log-space recursion exactly -- see the shared helpers above for why the
+    # value-space form was unusable (median relative error 2.3e+05 and a
+    # non-positive result 64% of the time once L < 1e-16).
+    log_L = _log_bvn_cdf(-alpha1, -alpha2, corr)
 
     mu_t1 = mu2 - s12 * mu1 / s1sq
     s_t1 = jnp.sqrt(jnp.maximum(s2sq - s12 ** 2 / s1sq, 1e-300))
     mu_t2 = mu1 - s12 * mu2 / s2sq
     s_t2 = jnp.sqrt(jnp.maximum(s1sq - s12 ** 2 / s2sq, 1e-300))
 
-    def _phi1_at0(mu, s):
-        return jnorm.pdf(0.0, loc=mu, scale=s)
+    log_p1 = _log_phi_at0(mu1, s1)
+    log_p2 = _log_phi_at0(mu2, s2)
+    r00_1 = jnp.exp(log_p1 + _log_f1_0(mu_t1, s_t1) - log_L)
+    r00_2 = jnp.exp(log_p2 + _log_f1_0(mu_t2, s_t2) - log_L)
 
-    def _F1_0(mu, s):
-        return 1 - jnorm.cdf(-mu / s)
+    e1 = mu1 + s1sq * r00_1 + s12 * r00_2
+    e2 = mu2 + s12 * r00_1 + s2sq * r00_2
 
-    def _F1_1(mu, s):
-        a = -mu / s
-        return mu * _F1_0(mu, s) + s * jnorm.pdf(a)
+    r10_2 = jnp.exp(log_p2 + _log_f1_1(mu_t2, s_t2) - log_L)
+    r01_1 = jnp.exp(log_p1 + _log_f1_1(mu_t1, s_t1) - log_L)
 
-    c00_1 = _phi1_at0(mu1, s1) * _F1_0(mu_t1, s_t1)
-    c00_2 = _phi1_at0(mu2, s2) * _F1_0(mu_t2, s_t2)
-    F10 = mu1 * L + s1sq * c00_1 + s12 * c00_2
-    F01 = mu2 * L + s12 * c00_1 + s2sq * c00_2
-
-    c10_2 = _phi1_at0(mu2, s2) * _F1_1(mu_t2, s_t2)
-    F20 = mu1 * F10 + s1sq * L + s12 * c10_2
-    F11_route1 = mu2 * F10 + s12 * L + s2sq * c10_2
-
-    c01_1 = _phi1_at0(mu1, s1) * _F1_1(mu_t1, s_t1)
-    F02 = mu2 * F01 + s12 * c01_1 + s2sq * L
-    F11_route2 = mu1 * F01 + s1sq * c01_1 + s12 * L
-
-    eta = jnp.stack([F10 / L, F01 / L], axis=-1)                       # (batch,N,2)
-    cross = 0.5 * (F11_route1 + F11_route2) / L
-    diag0 = F20 / L
-    diag1 = F02 / L
+    eta = jnp.stack([e1, e2], axis=-1)                                 # (batch,N,2)
+    diag0 = mu1 * e1 + s1sq + s12 * r10_2                              # E[T1^2]
+    diag1 = mu2 * e2 + s12 * r01_1 + s2sq                              # E[T2^2]
+    x_route1 = mu2 * e1 + s12 + s2sq * r10_2                           # kappa=(1,0)
+    x_route2 = mu1 * e2 + s1sq * r01_1 + s12                           # kappa=(0,1)
+    cross = 0.5 * (x_route1 + x_route2)
 
     # Defense-in-depth against a component's shape drifting so far that L
     # rounds to (numerically indistinguishable from) 0 -- mirrors
@@ -372,15 +593,16 @@ def _ridge_gamma_jax(Gamma_new, n_eff, data_var):
     return (Gamma_new * n + Psi) / (n + nu + p + 1)
 
 
-def _m_step(observations, obs_mask, resp, mu, Delta, Gamma, etas, psis, q1_col_mask=None):
+def _m_step(observations, obs_mask, resp, mu, Delta, Gamma, etas, psis, col_mask=None):
     """One CFUSN M-step for all K components (unconstrained only).
     mu:(batch,K,p) Delta:(batch,K,p,2). etas/psis: from OLD params (§ E-step).
-    q1_col_mask: (batch,2), [1,0] for q1-mode rows else [1,1] -- see
-    fit_batch_cfusn's docstring. Applied to Delta_new_c BEFORE it's used in
-    the Gamma update (not just on the final returned Delta), so a q1-mode
-    row's Gamma reflects only its single active direction's residual
-    variance, matching genuine independent q=1 EM exactly rather than
-    transiently crediting the soon-to-be-discarded second column.
+    col_mask: (batch,2), [1,0] for q1-mode rows, [0,0] for Gaussian-mode
+    rows, else [1,1] -- see fit_batch_cfusn's docstring. Applied to
+    Delta_new_c BEFORE it's used in the Gamma update (not just on the final
+    returned Delta), so a masked row's Gamma reflects only its active
+    direction(s)' residual variance, matching genuine independent lower-q
+    EM exactly rather than transiently crediting the soon-to-be-discarded
+    column(s).
     """
     K, p = mu.shape[1], mu.shape[2]
     q = Delta.shape[-1]
@@ -429,8 +651,8 @@ def _m_step(observations, obs_mask, resp, mu, Delta, Gamma, etas, psis, q1_col_m
         Psi_sum = Psi_sum + bump[:, None, None] * jnp.eye(q)
         Delta_new_c = jnp.linalg.solve(
             Psi_sum[:, None, :, :], numer[..., None]).squeeze(-1)         # (batch,p,q)
-        if q1_col_mask is not None:
-            Delta_new_c = Delta_new_c * q1_col_mask[:, None, :]
+        if col_mask is not None:
+            Delta_new_c = Delta_new_c * col_mask[:, None, :]
 
         # Defense-in-depth magnitude cap, with the (1 - 2/pi) PD correction:
         # Var(x_d) = Gamma_dd + (1 - 2/pi)||Delta_d||^2, so Gamma_dd > 0 needs
@@ -484,7 +706,7 @@ def _interpolate(old, new, alpha):
     static_argnames=("max_em_iters", "n_backtrack"),
 )
 def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
-                     mu0, Delta0, Gamma0, W0, q1_mask=None,
+                     mu0, Delta0, Gamma0, W0, mode=None,
                      max_em_iters=10000, n_backtrack=10):
     """Batched, unconstrained-only CFUSN (q=2) EM fit.
 
@@ -493,15 +715,18 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
     sample_idx : (batch, N) int.
     mu0 : (batch, K, p); Delta0 : (batch, K, p, 2); Gamma0 : (batch, K, p, p).
     W0 : (batch, n_samples, K).
-    q1_mask : (batch,) bool, or None (= all False). Mixed q=1/q=2 restarts
+    mode : (batch,) int, or None (= all 0). Mixed q=1/q=2/Gaussian restarts
         (see fit.py::generate_fit_jobs): every restart uses uniform q=2-
-        shaped tensors, but rows marked True here must behave as an exact
-        q=1-equivalent fit throughout EM, not just at init -- so the
-        second Delta column is re-zeroed after every M-step update (a q=1
-        component IS a q=2 component with a zero second column; see
+        shaped tensors, but rows marked here must behave as a lower-q-
+        equivalent fit throughout EM, not just at init -- so the relevant
+        Delta column(s) are re-zeroed after every M-step update (a q=1
+        component IS a q=2 component with a zero second column, and a
+        Gaussian component IS one with BOTH columns zero; see
         fit.py::_pad_component_params_to_q's docstring for the algebraic
-        proof). Without this, an M-step would immediately start moving a
-        "q=1-mode" restart's second column away from zero, silently
+        proof, applied once for q=1 and twice for Gaussian). 0 = full q=2,
+        1 = q=1-equivalent (second column zeroed), 2 = Gaussian-equivalent
+        (both columns zeroed). Without this, an M-step would immediately
+        start moving a masked restart's column(s) away from zero, silently
         turning it into an ordinary unconstrained q=2 restart after one
         iteration.
 
@@ -510,13 +735,15 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
     backtrack on a plain likelihood decrease rather than failing outright).
     """
     batch = mu0.shape[0]
-    if q1_mask is None:
-        q1_mask = jnp.zeros((batch,), dtype=bool)
-    # (batch, 2): [1,0] for q1-mode rows, [1,1] otherwise -- multiplying
-    # Delta by this after every M-step keeps the masked column at exactly
-    # zero for the rest of EM (col 1, the untouched "real" direction, is
-    # always kept).
-    q1_col_mask = jnp.where(q1_mask[:, None], jnp.array([1.0, 0.0]), jnp.array([1.0, 1.0]))
+    if mode is None:
+        mode = jnp.zeros((batch,), dtype=jnp.int32)
+    # (batch, 2): [1,0] for q1-mode rows, [0,0] for Gaussian-mode rows,
+    # [1,1] otherwise -- multiplying Delta by this after every M-step keeps
+    # the masked column(s) at exactly zero for the rest of EM.
+    col_mask = jnp.where(
+        (mode == 1)[:, None], jnp.array([1.0, 0.0]),
+        jnp.where((mode == 2)[:, None], jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0])),
+    )
 
     def cond(state):
         it, *_, done = state
@@ -530,7 +757,7 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
         resp = jnp.moveaxis(resp, 2, 1)
 
         mu2, Delta2, Gamma2 = _m_step(observations, obs_mask, resp, mu, Delta, Gamma,
-                                       etas, psis, q1_col_mask=q1_col_mask)
+                                       etas, psis, col_mask=col_mask)
         log_pdfs2, _, _ = _densities_all_components(observations, obs_mask, mu2, Delta2, Gamma2)
         W2, ll2 = _weights_and_ll(log_pdfs2, sample_idx, W, n_samples)
 

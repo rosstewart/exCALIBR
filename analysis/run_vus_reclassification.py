@@ -33,7 +33,8 @@ from analysis.vus_reclassification import (
 )
 
 OUTPUT_DIR = "/data/ross/assay_calibration/multivariate/experimental_staged_fit"
-CANONICAL_RESULTS = "/data/ross/assay_calibration/multivariate/jobs_all_1000b_8f_v2/bootstrap_results_v3.json.gz"
+CANONICAL_RESULTS = ("/data/ross/assay_calibration/multivariate/pre_092026_em_fixes/"
+                      "jobs_all_1000b_8f_v2/bootstrap_results_v3.json.gz")
 
 RUN_KWARGS = dict(path_percentile=5, min_valid_boots=1, reestimate_marginal_weights=False,
                   enforce_marginal_monotonicity=False, liberal_marginal_monotonicity=False)

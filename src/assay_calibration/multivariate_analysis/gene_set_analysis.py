@@ -40,6 +40,7 @@ def build_gene_set_analysis(
     dataset_suffix: str = "_mv",
     auxiliary_pathogenic_indices: Optional[list] = None,
     benign_method: str = "avg",
+    gene_set: Optional[str] = None,
     mvcal_kwargs: Optional[dict] = None,
 ) -> MVCalibrationAnalysis:
     """Build (but do not run) an MVCalibrationAnalysis for one gene's fits.
@@ -54,7 +55,24 @@ def build_gene_set_analysis(
     "FGFR1_mv"). ``dataset_suffix`` still applies where dataset_name is
     left as None (e.g. predictor-mv's "_predictors_mv" convention already
     matches its own dataset_suffix by construction).
+
+    ``gene_set``, if given as "combined", forces ``benign_method="benign"``
+    (unless the caller already overrode ``benign_method`` to something
+    other than the "avg" default) -- for the combined gene-set, Synonymous-
+    labeled rows structurally never have predictor-dimension scores (no
+    predictor carries a synonymous concept at all), so under
+    partial_pattern_mode="trust_global" (the mode every production caller
+    actually uses -- "gate" only exists as MVCalibrationAnalysis's own
+    unused internal default), "avg" unconditionally blends Synonymous into
+    the benign reference for every pattern, including ones touching a
+    predictor dimension -- "gate" is the only mode that gates this per-
+    pattern, and nothing in production uses "gate". Predictor-only gene-sets
+    need no equivalent override: their ms structurally never has a non-
+    empty Synonymous column at all (PredictorScoreset only has 3 sample-
+    role columns), so "avg" is already a no-op there.
     """
+    if gene_set == "combined" and benign_method == "avg":
+        benign_method = "benign"
     return MVCalibrationAnalysis(
         ms, gene, fits_json_path,
         pathogenic_idx=0, benign_idx=1, gnomad_idx=2, synonymous_idx=3,
@@ -74,6 +92,7 @@ def run_gene_set_analysis(
     dataset_suffix: str = "_mv",
     auxiliary_pathogenic_indices: Optional[list] = None,
     benign_method: str = "avg",
+    gene_set: Optional[str] = None,
     mvcal_kwargs: Optional[dict] = None,
     **run_kwargs,
 ) -> MVCalibrationAnalysis:
@@ -81,13 +100,14 @@ def run_gene_set_analysis(
 
     ``run_kwargs`` are forwarded to ``MVCalibrationAnalysis.run(...)``
     (e.g. ``path_percentile``, ``min_valid_boots``,
-    ``reestimate_marginal_weights``).
+    ``reestimate_marginal_weights``). See build_gene_set_analysis's
+    docstring for what ``gene_set="combined"`` does to ``benign_method``.
     """
     analysis = build_gene_set_analysis(
         ms, gene, fits_json_path,
         dataset_name=dataset_name, dataset_suffix=dataset_suffix,
         auxiliary_pathogenic_indices=auxiliary_pathogenic_indices,
-        benign_method=benign_method, mvcal_kwargs=mvcal_kwargs,
+        benign_method=benign_method, gene_set=gene_set, mvcal_kwargs=mvcal_kwargs,
     )
     analysis.run(**run_kwargs)
     return analysis
@@ -102,6 +122,7 @@ def run_gene_set_analysis_cached(
     dataset_suffix: str = "_mv",
     auxiliary_pathogenic_indices: Optional[list] = None,
     benign_method: str = "avg",
+    gene_set: Optional[str] = None,
     mvcal_kwargs: Optional[dict] = None,
     force_recompute: bool = False,
     **run_kwargs,
@@ -117,12 +138,17 @@ def run_gene_set_analysis_cached(
     result: the gene, the fits file's identity (path + mtime + size, so a
     re-fit/re-aggregate invalidates old cache entries automatically), and
     every run_kwargs value (path_percentile, partial_pattern_mode, etc.).
+    See build_gene_set_analysis's docstring for what ``gene_set="combined"``
+    does to ``benign_method`` -- included in the cache key via
+    ``benign_method``'s own already-resolved value, not ``gene_set`` itself,
+    so a stale cache entry from before this override existed is correctly
+    invalidated (the resolved benign_method differs).
     """
     analysis = build_gene_set_analysis(
         ms, gene, fits_json_path,
         dataset_name=dataset_name, dataset_suffix=dataset_suffix,
         auxiliary_pathogenic_indices=auxiliary_pathogenic_indices,
-        benign_method=benign_method, mvcal_kwargs=mvcal_kwargs,
+        benign_method=benign_method, gene_set=gene_set, mvcal_kwargs=mvcal_kwargs,
     )
 
     os.makedirs(cache_dir, exist_ok=True)
@@ -135,7 +161,7 @@ def run_gene_set_analysis_cached(
         "dataset_name": dataset_name,
         "dataset_suffix": dataset_suffix,
         "auxiliary_pathogenic_indices": auxiliary_pathogenic_indices,
-        "benign_method": benign_method,
+        "benign_method": analysis.benign_method,
         "run_kwargs": sorted(run_kwargs.items()),
     })
     key = hashlib.sha1(key_material.encode()).hexdigest()[:16]

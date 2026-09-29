@@ -125,7 +125,17 @@ def _init_cfusn(full_job):
     latent_q = kwargs.get("latent_q", 2)
     if latent_q > 1:
         initial_params = _ensure_cfusn_params(initial_params, latent_q)
-    # Mixed q=1/q=2 restarts (see Fit.generate_fit_jobs): this spec's own
+    if kwargs.get("force_gaussian"):
+        # Gaussian-mode restart (see Fit.generate_fit_jobs): zero Delta
+        # immediately, matching cfusn/fit.py::single_fit's own
+        # force_gaussian init handling -- the M-step re-zeros it every
+        # iteration regardless (batch_em_cfusn.py's masking), but starting
+        # there directly avoids a spurious first-iteration likelihood swing.
+        initial_params = [
+            (mu_, np.zeros_like(np.asarray(Delta_)), Gamma_)
+            for mu_, Delta_, Gamma_ in initial_params
+        ]
+    # Mixed q=1/q=2/Gaussian restarts (see Fit.generate_fit_jobs): this spec's own
     # init is computed at its own (possibly lower) latent_q -- correct and
     # matches the CPU path exactly, since kmeans_init_mv is the same
     # function the CPU path calls -- but the batch this feeds into
@@ -366,20 +376,30 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
     # Fall back to CPU init for anchored jobs (kmeans_init_mv_anchored too
     # complex to batch on GPU; anchored is a minority in practice)
     any_anchored = any(s[0].get("init_method") == "anchored" for s in specs)
-    # Mixed q=1/q=2 restarts (see fit.py::generate_fit_jobs): every restart
-    # in a chunk uses uniform q=2-shaped tensors regardless of its own
-    # logical q, so latent_q for the batched call is always the chunk-wide
-    # nominal q (2). q1_mask marks which rows should behave as an exact
-    # q=1-equivalent fit -- both at init (batch_init_cfusn) and every M-step
-    # (batch_em_cfusn.fit_batch_cfusn) -- not a genuinely lower-q tensor.
-    per_spec_q = [int(s[0].get("kwargs", {}).get("latent_q", 2)) for s in specs]
+    # Mixed q=1/q=2/Gaussian restarts (see fit.py::generate_fit_jobs): every
+    # restart in a chunk uses uniform q=2-shaped tensors regardless of its
+    # own logical mode, so latent_q for the batched call is always the
+    # chunk-wide nominal q (2). `mode` per row: 0 = full q=2, 1 = q=1-
+    # equivalent (second Delta column zero), 2 = Gaussian-equivalent (both
+    # Delta columns zero) -- applied both at init (batch_init_cfusn) and
+    # every M-step (batch_em_cfusn.fit_batch_cfusn), not a genuinely
+    # lower-q tensor.
+    def _spec_mode(spec_kwargs, nominal_q):
+        if spec_kwargs.get("force_gaussian"):
+            return 2
+        if int(spec_kwargs.get("latent_q", 2)) < nominal_q:
+            return 1
+        return 0
+
+    per_spec_kwargs = [s[0].get("kwargs", {}) for s in specs]
+    per_spec_q = [int(kw.get("latent_q", 2)) for kw in per_spec_kwargs]
     nominal_q = int(specs[0][0].get("nominal_latent_q") or max(per_spec_q))
-    q1_mask_np = np.array([q < nominal_q for q in per_spec_q], dtype=bool)
+    mode_np = np.array([_spec_mode(kw, nominal_q) for kw in per_spec_kwargs], dtype=np.int32)
     if use_gpu_init and not any_anchored:
         fit_seeds = [s[0].get("kwargs", {}).get("fit_seed") or 0 for s in specs]
         key = jax.random.PRNGKey(int(np.array(fit_seeds, dtype=np.uint32).sum()))
         mu0, Delta0, Gamma0, W0, init_failed = batch_init_cfusn(
-            obs, obs_mask, sample_idx, S, K, nominal_q, key, jnp.asarray(q1_mask_np))
+            obs, obs_mask, sample_idx, S, K, nominal_q, key, jnp.asarray(mode_np))
         results = []
     else:
         # Legacy sequential CPU init
@@ -412,13 +432,15 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
         ]))
         specs = valid_specs
         # Recompute for valid_specs only (some may have dropped out above);
-        # _init_cfusn already initializes each spec at its own true latent_q
-        # and pads to nominal_q (interop.py::_init_cfusn) before this
-        # stacks them, so q1_mask here is only needed to keep the M-step
-        # masking column 2 for the rest of EM, not to change the init.
-        per_spec_q = [int(s[0].get("kwargs", {}).get("latent_q", 2)) for s in valid_specs]
+        # _init_cfusn already initializes each spec at its own true mode
+        # (latent_q and/or force_gaussian) and pads to nominal_q
+        # (interop.py::_init_cfusn) before this stacks them, so `mode` here
+        # is only needed to keep the M-step masking the right columns for
+        # the rest of EM, not to change the init.
+        per_spec_kwargs = [s[0].get("kwargs", {}) for s in valid_specs]
+        per_spec_q = [int(kw.get("latent_q", 2)) for kw in per_spec_kwargs]
         nominal_q = int(valid_specs[0][0].get("nominal_latent_q") or max(per_spec_q))
-        q1_mask_np = np.array([q < nominal_q for q in per_spec_q], dtype=bool)
+        mode_np = np.array([_spec_mode(kw, nominal_q) for kw in per_spec_kwargs], dtype=np.int32)
 
     cfusn_kw = {}
     if max_em_iters is not None:
@@ -426,7 +448,7 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
     mu, Delta, Gamma, W, failed, it_final, done = batch_em_cfusn.fit_batch_cfusn(
         obs, obs_mask, sample_idx, S,
         mu0, Delta0, Gamma0, W0,
-        q1_mask=jnp.asarray(q1_mask_np),
+        mode=jnp.asarray(mode_np),
         **cfusn_kw,
     )
     mu, Delta, Gamma, W, failed, done = map(np.asarray, (mu, Delta, Gamma, W, failed, done))

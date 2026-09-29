@@ -249,8 +249,12 @@ def _export_panel_c(output_dir: str, dataset_tsv: str, dataset_configs_path: str
     danz_agg = sum(d for d, _ in paired)
     auth_agg = sum(a for _, a in paired)
 
-    vus_pct_danz = _aggregate_coverage_pct(vus)
-    vus_pct_auth = _aggregate_coverage_pct(auth_vus)
+    # Paired the same way: build_author_vus_coverage returns None strictly more
+    # often than build_vus_coverage, so unpaired pooling would give the
+    # ExCALIBR VUS rate datasets the author side never saw -- and disagree
+    # with analyze_pipeline_output.py's own build_figure4 call, which pairs.
+    vus_pct_danz = _aggregate_coverage_pct(vus, partner=auth_vus)
+    vus_pct_auth = _aggregate_coverage_pct(auth_vus, partner=vus)
 
     out_path = bundle_dir / "panel_c.json"
     save_panel_c_bundle(str(out_path), danz_agg, auth_agg, len(paired), vus_pct_danz, vus_pct_auth)

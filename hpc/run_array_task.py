@@ -46,7 +46,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.assay_calibration.fit_utils.fit import Fit
+from src.assay_calibration.fit_utils.fit import Fit, next_greedy_lambda
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,14 @@ from src.assay_calibration.fit_utils.fit import Fit
 # ---------------------------------------------------------------------------
 
 def _run_one_fit(fit_spec):
-    """Execute a single fit job and return (bootstrap_seed, label, save_dir, fit_idx, result)."""
+    """Execute a single fit job and return (bootstrap_seed, label, save_dir, fit_idx, result).
+
+    Signature and return shape are unchanged by the greedy-restart search
+    below (see GreedyUnit) -- a dynamically-generated candidate job is a
+    plain dict indistinguishable in shape from a job Fit.generate_fit_jobs
+    emitted directly, so this function, the GPU path (run_gpu(fit_specs)),
+    and fit_specs' tuple shape all stay exactly as they were.
+    """
     full_job, bootstrap_seed, label, save_dir = fit_spec
     fit_idx = full_job.get("fit_idx")
     try:
@@ -63,6 +70,84 @@ def _run_one_fit(fit_spec):
         print(f"  ✗ fit failed (bootstrap={bootstrap_seed}, label={label}): {e}")
         result = None
     return bootstrap_seed, label, save_dir, fit_idx, result
+
+
+# ---------------------------------------------------------------------------
+# Greedy adaptive sign-pattern search state
+# ---------------------------------------------------------------------------
+
+class GreedyUnit:
+    """One (bootstrap, component-count label, save_dir, mode) sign-pattern
+    search, for mode in {"q1", "q2"} (Gaussian restarts have no sign to
+    search, so they're never a unit -- see the fits_per_bootstrap comment
+    below).
+
+    Mirrors the validated reference implementation's inner loop (run_greedy
+    in tests/cfusn_simulations/sim_init_enumeration_vs_datadriven.py:153-188):
+    starting from the seed job's own lambdaIndex (already run, not
+    regenerated here), each call to next_spec() flips one more
+    (component, skewness-direction) sign relative to the best pattern found
+    so far; record_result() keeps that flip only if it improved the held-out
+    log-likelihood. Cost is exactly `n_slots` further fits (one pass, no
+    early stopping -- matches the decided restart budget of 1 + K*q total
+    per mode).
+
+    Lives only in this process for the lifetime of one array task -- no
+    cross-array-task persistence is needed, since hpc/prepare.py's manifest
+    slicing already puts one bootstrap's entire multi-K job set in exactly
+    one array file.
+    """
+
+    __slots__ = ("key", "base_job", "n_patterns", "n_slots", "cur_lambda",
+                "best_val_ll", "slot_ptr", "next_fit_idx", "done",
+                "pending_lambda")
+
+    def __init__(self, key, base_job, n_patterns, n_slots, fit_idx_start):
+        self.key = key
+        self.base_job = base_job
+        self.n_patterns = n_patterns
+        self.n_slots = n_slots
+        self.cur_lambda = 0            # the seed's own pattern: all-(+1), no flips
+        self.best_val_ll = -np.inf
+        self.slot_ptr = 0
+        self.next_fit_idx = fit_idx_start
+        self.done = False
+        self.pending_lambda = 0        # lambdaIndex of the seed job, already run
+
+    def record_result(self, val_ll):
+        """Keep the just-completed candidate's pattern iff it improved on
+        every previous candidate seen by this unit (including the seed)."""
+        if val_ll > self.best_val_ll:
+            self.best_val_ll = val_ll
+            self.cur_lambda = self.pending_lambda
+
+    def next_spec(self):
+        """Return (job_dict, fit_idx) for the next sign-flip candidate, or
+        None once every slot has been tried."""
+        if self.done:
+            return None
+        while self.slot_ptr < self.n_slots:
+            slot = self.slot_ptr
+            self.slot_ptr += 1
+            cand = next_greedy_lambda(self.cur_lambda, slot, self.n_patterns)
+            if cand is None:
+                continue
+            job = dict(self.base_job)
+            job["kwargs"] = dict(self.base_job["kwargs"])
+            job["kwargs"]["lambdaIndex"] = cand
+            fit_idx = self.next_fit_idx
+            self.next_fit_idx += 1
+            job["fit_idx"] = fit_idx
+            # Deterministic per-candidate seed derived from the seed job's own
+            # fit_seed -- no need for master_seed here (sign-pattern search is
+            # already fully determined by lambdaIndex; this only seeds
+            # whatever incidental randomness a single EM run itself uses).
+            base_seed = self.base_job["kwargs"].get("fit_seed") or 0
+            job["kwargs"]["fit_seed"] = (base_seed + fit_idx * 2654435761) % (2**31 - 1)
+            self.pending_lambda = cand
+            return job, fit_idx
+        self.done = True
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +183,18 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
     skip_datasets = _load_skip_datasets(output_dir)
     n_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
 
-    total_fits = sum(j["num_fits_total"] for j in jobs)
-    print(f"Array task {array_idx}: {len(jobs)} bootstraps, {total_fits} fits, {n_cpus} CPUs")
-
     # ── Build flat list of fit specs, skipping already-completed components ──
+    # Every job Fit.generate_fit_jobs emits is still a fully self-contained,
+    # ready-to-execute dict (unchanged contract). The only new wrinkle: under
+    # greedy restarts, a q1/q2 job's "jobs_{K}c" entry is a SEED (lambdaIndex=0)
+    # rather than the only restart of that mode -- it still runs exactly like
+    # any other job here, but also gets a GreedyUnit that drives further
+    # candidate rounds once its result comes back (see below).
     fit_specs = []
     fits_per_bootstrap: dict = defaultdict(int)   # (bs_seed, save_dir) → pending count
+    units: dict = {}                              # (bs_seed, label, save_dir, mode) → GreedyUnit
+    seed_unit_key: dict = {}                       # (bs_seed, label, save_dir, fit_idx) → unit key, seeds only
+    _next_dynamic_fit_idx: dict = defaultdict(lambda: 3)  # (bs_seed, label, save_dir) → next free fit_idx
 
     for cjob in jobs:
         dataset_name = cjob["dataset_name"]
@@ -138,25 +229,61 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
             if label in existing and existing[label] is not None:
                 continue                                  # already complete
 
+            sd_str = str(save_dir)
             for minimal_job in cjob[nc_key]:
                 full_job = {**minimal_job, **shared,
                             "dataset_name": dataset_name,
-                            "save_dir": str(save_dir)}
+                            "save_dir": sd_str}
                 if is_mv:
                     full_job["multivariate"] = True
                 # Remove stale multivariate kwarg if present
                 if "kwargs" in full_job:
                     full_job["kwargs"].pop("multivariate", None)
 
-                fit_specs.append((full_job, bs_seed, label, str(save_dir)))
-                fits_per_bootstrap[(bs_seed, str(save_dir))] += 1
+                fit_idx = full_job.get("fit_idx")
+                fit_specs.append((full_job, bs_seed, label, sd_str))
+
+                gm = minimal_job.get("greedy_meta")
+                if gm is not None and gm["mode"] != "gaussian" and gm.get("n_slots", 0) > 0:
+                    # A q1/q2 seed job: 1 (this seed) + n_slots further
+                    # candidates will eventually run for this unit, all
+                    # counted up front so `remaining` reflects the true total
+                    # before any of them have actually been generated.
+                    ukey = (bs_seed, label, sd_str, gm["mode"])
+                    fi_key = (bs_seed, label, sd_str)
+                    units[ukey] = GreedyUnit(
+                        key=ukey, base_job=full_job,
+                        n_patterns=gm["n_patterns"], n_slots=gm["n_slots"],
+                        fit_idx_start=_next_dynamic_fit_idx[fi_key],
+                    )
+                    _next_dynamic_fit_idx[fi_key] += gm["n_slots"]
+                    seed_unit_key[(bs_seed, label, sd_str, fit_idx)] = ukey
+                    fits_per_bootstrap[(bs_seed, sd_str)] += 1 + gm["n_slots"]
+                else:
+                    fits_per_bootstrap[(bs_seed, sd_str)] += 1
 
     if not fit_specs:
         print("All fits already completed — nothing to do.")
         return
 
-    print(f"Submitting {len(fit_specs)} fits across {len(fits_per_bootstrap)} bootstrap(s) "
-          f"(device={device})")
+    is_greedy_run = len(units) > 0
+    total_fits = sum(fits_per_bootstrap.values())
+    print(f"Array task {array_idx}: {len(jobs)} bootstraps, {total_fits} fits "
+          f"({len(fit_specs)} seeds{', greedy adaptive search' if is_greedy_run else ''}), "
+          f"{n_cpus} CPUs")
+    if is_greedy_run and device == "gpu":
+        # The GPU path (run_gpu below) batches a flat fit_specs list through
+        # jax_batch and has no mechanism to generate a GreedyUnit's later
+        # rounds -- it will run only the 3 seed jobs per (bootstrap, K) and
+        # never search further. Flagged loudly rather than silently
+        # under-delivering; adapting the search to JAX's batched/jitted
+        # execution model is separate follow-up work, not attempted here.
+        print("  WARNING: --greedy-restarts has no effect on --device gpu -- "
+              "only the seed sign pattern will run for each mode, with no "
+              "adaptive search. Use --device cpu for the adaptive search.")
+
+    print(f"Submitting {len(fit_specs)} seed fits across {len(fits_per_bootstrap)} "
+          f"bootstrap(s) (device={device})")
 
     # ── Run fits, track best per (bootstrap, label, save_dir) ──
     # Result order isn't guaranteed (ProcessPoolExecutor.as_completed() is
@@ -169,21 +296,7 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
     cap_hits: dict = defaultdict(int)            # (bs_seed, label, save_dir) → cap hit count
     remaining = dict(fits_per_bootstrap)
 
-    if device == "gpu":
-        from src.assay_calibration.fit_utils.jax_batch.interop import run_gpu
-        results_iter = run_gpu(fit_specs)
-    else:
-        def _cpu_results():
-            with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
-                futures = [ex.submit(_run_one_fit, spec) for spec in fit_specs]
-                for fut in concurrent.futures.as_completed(futures):
-                    try:
-                        yield fut.result()
-                    except Exception as e:
-                        print(f"  Future raised: {e}")
-        results_iter = _cpu_results()
-
-    for bs_seed, label, save_dir, fit_idx, result in results_iter:
+    def _finalize(bs_seed, label, save_dir, fit_idx, result):
         val_ll = (result.get("val_ll", -np.inf) if result else -np.inf)
         sort_key = (val_ll, -(fit_idx if fit_idx is not None else 0))
         key = (bs_seed, label, save_dir)
@@ -222,6 +335,65 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
             total_cap = sum(cap_hits.get((bs_seed, lbl, save_dir), 0) for lbl in new_results)
             cap_str = f"  ⚠ {total_cap} cap hits" if total_cap > 0 else ""
             print(f"  ✓ bootstrap {bs_seed} → {save_path.parent.name}  [{', '.join(components)}]{cap_str}")
+        return val_ll
+
+    if device == "gpu" or not is_greedy_run:
+        # Original flat submit-all-then-collect path, byte-for-byte
+        # unchanged (including for greedy=False mv/univariate jobs, which
+        # never populate `units`).
+        if device == "gpu":
+            from src.assay_calibration.fit_utils.jax_batch.interop import run_gpu
+            results_iter = run_gpu(fit_specs)
+        else:
+            def _cpu_results():
+                with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
+                    futures = [ex.submit(_run_one_fit, spec) for spec in fit_specs]
+                    for fut in concurrent.futures.as_completed(futures):
+                        try:
+                            yield fut.result()
+                        except Exception as e:
+                            print(f"  Future raised: {e}")
+            results_iter = _cpu_results()
+
+        for bs_seed, label, save_dir, fit_idx, result in results_iter:
+            _finalize(bs_seed, label, save_dir, fit_idx, result)
+        return
+
+    # ── CPU + greedy: event-driven rolling frontier over one persistent pool ──
+    # Not a hard round barrier: each unit advances independently as its own
+    # jobs complete, so a short search (small K) doesn't stall behind a long
+    # one (large K) and CPU utilization stays high across the whole task,
+    # while every candidate still only depends on that SAME unit's own prior
+    # result, never on any other unit's.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
+        pending: dict = {}   # future → unit key (or None for non-greedy jobs)
+        for spec in fit_specs:
+            full_job, bs_seed, label, sd_str = spec
+            fit_idx = full_job.get("fit_idx")
+            ukey = seed_unit_key.get((bs_seed, label, sd_str, fit_idx))
+            pending[ex.submit(_run_one_fit, spec)] = ukey
+
+        while pending:
+            done, _ = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in done:
+                ukey = pending.pop(fut)
+                try:
+                    bs_seed, label, save_dir, fit_idx, result = fut.result()
+                except Exception as e:
+                    print(f"  Future raised: {e}")
+                    continue
+                val_ll = _finalize(bs_seed, label, save_dir, fit_idx, result)
+                if ukey is None:
+                    continue
+                unit = units[ukey]
+                unit.record_result(val_ll)
+                nxt = unit.next_spec()
+                if nxt is not None:
+                    job, _next_fit_idx = nxt
+                    next_spec_tuple = (job, bs_seed, label, save_dir)
+                    pending[ex.submit(_run_one_fit, next_spec_tuple)] = ukey
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ def _resolve_dim(dataset_names, substr):
 
 def _compute_3d_evidence_data(
     gene, x_dim, y_dim, z_dim, results_json, config="4c_unc", z_log10=True, ms_map=None,
-    run_kwargs=None,
+    run_kwargs=None, dataset_name=None,
 ):
     """Runs the MV analysis once and returns everything needed to render one or
     more views (per-sample-class point coordinates/colors, shared axis limits,
@@ -55,7 +55,7 @@ def _compute_3d_evidence_data(
     ``100 - path_percentile``)."""
     data = _compute_3d_evidence_data_multi(
         gene, x_dim, y_dim, z_dim, results_json, configs=[config], z_log10=z_log10,
-        ms_map=ms_map, run_kwargs=run_kwargs,
+        ms_map=ms_map, run_kwargs=run_kwargs, dataset_name=dataset_name,
     )
     out = dict(data)
     out["points"] = data["points_by_config"][config]
@@ -64,16 +64,23 @@ def _compute_3d_evidence_data(
 
 def _compute_3d_evidence_data_multi(
     gene, x_dim, y_dim, z_dim, results_json, configs=("3c_unc", "4c_unc", "5c_unc", "6c_unc"),
-    z_log10=True, ms_map=None, run_kwargs=None,
+    z_log10=True, ms_map=None, run_kwargs=None, dataset_name=None,
 ):
     """Same as _compute_3d_evidence_data but scores every config in `configs`
     from a SINGLE analysis.run() call (which computes all fitted configs
     internally regardless), returning a {config: points} dict instead of one
     points array -- lets a multi-config figure (or a before/after percentile
-    comparison) reuse one bootstrap-scoring pass rather than repeating it."""
+    comparison) reuse one bootstrap-scoring pass rather than repeating it.
+
+    ``dataset_name``, if given, overrides the default LABEL-seq
+    "{gene}_labelseq_mv" formula -- needed for non-LABEL-seq callers (e.g.
+    mv_analysis/phenotype_evidence.py's CARD11 use, dataset_name=
+    "CARD11_card11_mv") that pass their own `ms_map` too."""
     if ms_map is None:
         ms_map = build_labelseq_multiscoresets()
     ms = ms_map[gene]
+    if dataset_name is None:
+        dataset_name = f"{gene}_labelseq_mv"
 
     x_i = _resolve_dim(ms.dataset_names, x_dim)
     y_i = _resolve_dim(ms.dataset_names, y_dim)
@@ -82,7 +89,7 @@ def _compute_3d_evidence_data_multi(
     kwargs = {**RUN_KWARGS, **(run_kwargs or {})}
     with fast_results_json(results_json):
         analysis = build_gene_set_analysis(
-            ms, gene, results_json, dataset_name=f"{gene}_labelseq_mv",
+            ms, gene, results_json, dataset_name=dataset_name,
         )
         analysis.run(partial_pattern_mode="trust_global", **kwargs)
     points_by_config = {

@@ -33,7 +33,7 @@ from matplotlib.colors import to_rgb
 import numpy as np
 import pandas as pd
 
-from mv_analysis.sankey_plot import STRENGTH_COLOR
+from mv_analysis.sankey_plot_flat import STRENGTH_COLOR
 
 OUTPUT_DIR = "/data/ross/assay_calibration/multivariate/experimental_staged_fit"
 # Zero-P/LP ("negative-unlabeled"/NU-mode) LABEL-seq genes, established

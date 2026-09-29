@@ -178,13 +178,32 @@ def _save_cached(cache_dir, panel, gene, record):
         json.dump(record, f)
 
 
+_METRIC_FIELDS = ("mv_mcc", "uv_mcc", "mv_accuracy", "uv_accuracy", "mv_auc", "uv_auc",
+                  "n_pathogenic", "n_benign", "n_eval")
+
+
 def _row_from_cache_record(c):
-    return {"gene": c["gene"], "mv_mcc": c["mv_mcc"], "uv_mcc": c["uv_mcc"], "n_eval": c["n_eval"]}
+    return {"gene": c["gene"], **{f: c[f] for f in _METRIC_FIELDS}}
+
+
+def _valid_cache_entry(c):
+    """A cache entry is only trustworthy as-is if it's either a settled
+    non-"ok" status (failed/skipped -- schema-independent) or an "ok" record
+    that actually has every field the CURRENT schema expects. Old "ok"
+    records written before mv_accuracy/uv_accuracy/mv_auc/uv_auc/
+    n_pathogenic/n_benign were added (e.g. from an earlier run this session)
+    fail this check and are treated as a cache miss -- self-healing, no
+    manual cache-clearing needed after a schema change."""
+    if c is None:
+        return False
+    if c.get("status") != "ok":
+        return True
+    return all(f in c for f in _METRIC_FIELDS)
 
 
 def _all_ok_cached(cache_dir, panel, genes):
-    """True if every gene in `genes` already has ANY cache entry (ok, failed,
-    or skipped) -- lets callers skip an expensive bulk ms-build (e.g.
+    """True if every gene in `genes` already has ANY VALID cache entry (ok,
+    failed, or skipped) -- lets callers skip an expensive bulk ms-build (e.g.
     LABEL-seq's 17-gene, ~10min build_labelseq_multiscoresets()) entirely
     when nothing in that block actually needs (re)computing. A "failed"
     status is treated as settled, not auto-retried, on the assumption that a
@@ -193,29 +212,55 @@ def _all_ok_cached(cache_dir, panel, genes):
     code fix that might actually resolve it."""
     if cache_dir is None:
         return False
-    return all(_load_cached(cache_dir, panel, g) is not None for g in genes)
+    return all(_valid_cache_entry(_load_cached(cache_dir, panel, g)) for g in genes)
 
 
 def _cached_rows(cache_dir, panel, genes):
     rows = []
     for g in genes:
         c = _load_cached(cache_dir, panel, g)
-        if c and c.get("status") == "ok":
+        if _valid_cache_entry(c) and c.get("status") == "ok":
             rows.append(_row_from_cache_record(c))
     return rows
 
 
 def _extract_mv_uv(table):
-    """(mv_mcc, uv_mcc, n_eval) from a build_comparison_table() result, at the
-    evidence-direction threshold, MV = best MCC across configs, UV = non-conflicting
-    only (the session-standardized rule)."""
+    """Metrics dict from a build_comparison_table() result, at the
+    evidence-direction threshold, MV = best-MCC config across configs (its
+    accuracy/auc are taken from that SAME best-by-MCC row, not independently
+    re-maximized per metric), UV = non-conflicting only (the
+    session-standardized rule).
+
+    n_pathogenic/n_benign are threshold-independent raw label counts in the
+    evaluated set (see report.py's _rows_for_points) -- 0 in either means
+    MCC/AUC are mathematically undefined for that gene (compute_
+    classification_metrics silently returns 0.0 rather than NaN in that
+    case), which callers should treat as "exclude from the MCC/AUC plots"
+    rather than "genuinely zero performance". Accuracy has no such
+    degeneracy (well-defined even with one class present), so it does NOT
+    get filtered the same way."""
     sub = table[table["threshold"] == EVIDENCE_DIRECTION]
     mv_rows = sub[sub["method"].str.startswith("MV ")]
     uv_rows = sub[sub["method"] == "UV non-conflicting"]
-    mv_mcc = float(mv_rows["mcc"].max()) if not mv_rows.empty else np.nan
-    uv_mcc = float(uv_rows["mcc"].iloc[0]) if not uv_rows.empty else np.nan
-    n_eval = int(sub["total"].iloc[0]) if not sub.empty else 0
-    return mv_mcc, uv_mcc, n_eval
+
+    out = {"mv_mcc": np.nan, "mv_accuracy": np.nan, "mv_auc": np.nan,
+           "uv_mcc": np.nan, "uv_accuracy": np.nan, "uv_auc": np.nan,
+           "n_pathogenic": 0, "n_benign": 0, "n_eval": 0}
+
+    if not mv_rows.empty:
+        best = mv_rows.loc[mv_rows["mcc"].idxmax()]
+        out["mv_mcc"] = float(best["mcc"])
+        out["mv_accuracy"] = float(best["accuracy"])
+        out["mv_auc"] = float(best["auc"])
+        out["n_pathogenic"] = int(best["n_pathogenic"])
+        out["n_benign"] = int(best["n_benign"])
+    if not uv_rows.empty:
+        u = uv_rows.iloc[0]
+        out["uv_mcc"] = float(u["mcc"])
+        out["uv_accuracy"] = float(u["accuracy"])
+        out["uv_auc"] = float(u["auc"])
+    out["n_eval"] = int(sub["total"].iloc[0]) if not sub.empty else 0
+    return out
 
 
 def _gene_row(gene, gene_set, ms, results_json, dataset_name, aux_idx=None,
@@ -226,7 +271,7 @@ def _gene_row(gene, gene_set, ms, results_json, dataset_name, aux_idx=None,
     caller already confirmed a cache hit upstream (see build_panel_a's
     LABEL-seq/plain-integrated blocks) to avoid needing to build it at all."""
     cached = _load_cached(cache_dir, panel, gene)
-    if cached is not None and cached.get("status") == "ok":
+    if cached is not None and cached.get("status") == "ok" and _valid_cache_entry(cached):
         print(f"  [{gene}] cache hit (ok), skipping recompute")
         return _row_from_cache_record(cached)
 
@@ -237,13 +282,13 @@ def _gene_row(gene, gene_set, ms, results_json, dataset_name, aux_idx=None,
                 dataset_name=dataset_name, auxiliary_pathogenic_indices=aux_idx,
                 modes=["trust_global"], compare_uv=True, **RUN_KWARGS,
             )
-        mv_mcc, uv_mcc, n_eval = _extract_mv_uv(table)
-        if np.isnan(mv_mcc) or np.isnan(uv_mcc):
-            reason = f"mv_mcc={mv_mcc}, uv_mcc={uv_mcc} (missing MV or UV data)"
+        metrics = _extract_mv_uv(table)
+        if np.isnan(metrics["mv_mcc"]) or np.isnan(metrics["uv_mcc"]):
+            reason = f"mv_mcc={metrics['mv_mcc']}, uv_mcc={metrics['uv_mcc']} (missing MV or UV data)"
             print(f"  [{gene}] SKIPPED from figure: {reason}")
             _save_cached(cache_dir, panel, gene, {"gene": gene, "status": "skipped", "reason": reason})
             return None
-        record = {"gene": gene, "status": "ok", "mv_mcc": mv_mcc, "uv_mcc": uv_mcc, "n_eval": n_eval}
+        record = {"gene": gene, "status": "ok", **metrics}
         _save_cached(cache_dir, panel, gene, record)
         return _row_from_cache_record(record)
     except Exception as e:
@@ -287,7 +332,14 @@ def build_panel_a(results_json, cache_dir=None):
     if _all_ok_cached(cache_dir, "A", ["TP53"]):
         rows.extend(_cached_rows(cache_dir, "A", ["TP53"]))
     else:
-        ms = build_tp53_multiscoreset()
+        # Default-collapse TP53's Kato_2003 panel (16 -> 10 dims), matching
+        # hpc/prepare.py's TP53_DEFAULT_COLLAPSE_PRESET and
+        # config.build_multiscoresets_for_gene_set("tp53")'s default --
+        # TP53_tp53_mv's actual stored fit (e.g. under jobs_all_100b_3f_092026)
+        # was trained on the collapsed space, so scoring the raw 16-dim ms
+        # trips the fit-vs-dataset shape guard (confirmed: silently dropped
+        # this row via _gene_row's own try/except before this fix).
+        ms = config.build_multiscoresets_for_gene_set("tp53")["TP53"]
         r = _gene_row("TP53", "tp53", ms, results_json,
                       dataset_name="TP53_tp53_mv", aux_idx=_AUX_INDICES["tp53"],
                       cache_dir=cache_dir, panel="A")
@@ -300,6 +352,21 @@ def build_panel_a(results_json, cache_dir=None):
         ms = build_card11_multiscoreset()
         r = _gene_row("CARD11", "card11", ms, results_json,
                       dataset_name="CARD11_card11_mv", aux_idx=_AUX_INDICES["card11"],
+                      cache_dir=cache_dir, panel="A")
+        if r:
+            rows.append(r)
+
+    if _all_ok_cached(cache_dir, "A", ["FGFR_combined"]):
+        rows.extend(_cached_rows(cache_dir, "A", ["FGFR_combined"]))
+    else:
+        # A real gap this was missing entirely (confirmed: zero "fgfr"/"FGFR"
+        # mentions anywhere in this file before this fix) -- now that
+        # uv_sources.load_fgfr_uv_points is wired up (config.FGFR_UV_CALIB_DIR),
+        # FGFR can actually be plotted here, not just scored-and-dropped for
+        # lack of a UV comparison value.
+        ms = config.build_multiscoresets_for_gene_set("fgfr")["FGFR_combined"]
+        r = _gene_row("FGFR_combined", "fgfr", ms, results_json,
+                      dataset_name="FGFR_combined_fgfr_mv",
                       cache_dir=cache_dir, panel="A")
         if r:
             rows.append(r)
@@ -325,7 +392,7 @@ def build_panel_a(results_json, cache_dir=None):
         df_integrated = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
         for gene in PLAIN_INTEGRATED_GENES:
             cached = _load_cached(cache_dir, "A", gene)
-            if cached is not None and cached.get("status") == "ok":
+            if cached is not None and cached.get("status") == "ok" and _valid_cache_entry(cached):
                 rows.append(_row_from_cache_record(cached))
                 continue
             datasets = sorted(
@@ -390,7 +457,7 @@ def build_panel_b(results_json, cache_dir=None):
     rows = []
     for gene in COMBINED_GENES:
         cached = _load_cached(cache_dir, "B", gene)
-        if cached is not None and cached.get("status") == "ok":
+        if cached is not None and cached.get("status") == "ok" and _valid_cache_entry(cached):
             rows.append(_row_from_cache_record(cached))
             continue
         try:
@@ -418,7 +485,7 @@ def build_panel_c(results_json, cache_dir=None):
     df_integrated = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
     for gene in COMBINED_GENES:
         cached = _load_cached(cache_dir, "C", gene)
-        if cached is not None and cached.get("status") == "ok":
+        if cached is not None and cached.get("status") == "ok" and _valid_cache_entry(cached):
             rows.append(_row_from_cache_record(cached))
             continue
         datasets = sorted(df_integrated[df_integrated["Gene"] == gene]["Dataset"].unique())
@@ -451,25 +518,39 @@ _PALETTE_CMAP = LinearSegmentedColormap.from_list(
     "excalibr_mv", ["#9FBCE6", "#4C72B0", "#0B1F4B"])
 
 
-def plot_mcc_scatter_panel(ax, df, letter, title, ymin=None):
-    # Never plot a gene missing either MCC (defensive -- _gene_row already
-    # excludes these before caching, but don't trust that silently). Also
-    # drop genes where BOTH MCCs are exactly 0 -- this isn't a real "zero
-    # concordance" result, it's compute_classification_metrics's fallback
-    # value when the denominator is undefined (e.g. PAX6: only 2 B/LB
-    # variants total, so there's ~no negative-class coverage to compute
-    # specificity/MCC against on either the MV or UV side -- confirmed via
-    # its cached record and the run log's "Benign+Syn: 0.0% correct" line).
+_METRIC_AXIS_LABEL = {"mcc": "MCC", "accuracy": "Accuracy", "auc": "AUC (ROC)"}
+
+
+def plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=None):
+    """Generic version of plot_mcc_scatter_panel supporting mcc/accuracy/auc.
+
+    mcc/auc are mathematically undefined when the evaluated set has zero
+    P/LP or zero B/LB variants (compute_classification_metrics/roc_auc_score
+    can't compute sensitivity/specificity/AUC against an absent class) --
+    genes in that state get silently assigned a fallback value (0.0 for MCC,
+    NaN for AUC already handled by report.py) rather than erroring, so they
+    must be filtered out here by checking the actual class counts
+    (n_pathogenic/n_benign), not by pattern-matching the fallback value
+    itself (the old "both MCCs are exactly 0" heuristic this replaced missed
+    asymmetric cases, e.g. a gene with mv_mcc=1.0 but uv_mcc=0.0 where the UV
+    side's denominator -- not the MV side's -- was the one undefined).
+    Accuracy has no such degeneracy (well-defined with only one class
+    present, e.g. "100% accuracy" for an all-pathogenic gene the classifier
+    calls entirely correctly) and is NOT filtered this way -- this is
+    exactly why a separate accuracy panel can include genes the mcc/auc
+    panels must exclude."""
+    mv_col, uv_col = f"mv_{metric}", f"uv_{metric}"
     if not df.empty:
-        df = df.dropna(subset=["mv_mcc", "uv_mcc"])
-        df = df[~((df["mv_mcc"] == 0) & (df["uv_mcc"] == 0))]
+        df = df.dropna(subset=[mv_col, uv_col])
+        if metric in ("mcc", "auc"):
+            df = df[(df["n_pathogenic"] > 0) & (df["n_benign"] > 0)]
 
     if df.empty:
         ax.set_title(f"{title}\n(no data)", fontsize=11)
         ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
         return
 
-    lo = max(0.0, min(df["mv_mcc"].min(), df["uv_mcc"].min()) - 0.05)
+    lo = max(0.0, min(df[mv_col].min(), df[uv_col].min()) - 0.05)
     hi = 1.02
     diag_line = ax.plot([lo, hi], [lo, hi], "k--", alpha=0.35, linewidth=1.5,
                          zorder=1, label="Equal performance")[0]
@@ -484,12 +565,12 @@ def plot_mcc_scatter_panel(ax, df, letter, title, ymin=None):
 
     size = _size_for(n_vals)
 
-    ax.scatter(df["uv_mcc"], df["mv_mcc"], s=size, c="#4C72B0",
+    ax.scatter(df[uv_col], df[mv_col], s=size, c="#4C72B0",
                edgecolors="white", alpha=0.85, linewidth=1.5, zorder=3)
 
     texts = []
     for _, row in df.iterrows():
-        t = ax.text(row["uv_mcc"], row["mv_mcc"], str(row["gene"]).upper(), fontsize=8,
+        t = ax.text(row[uv_col], row[mv_col], str(row["gene"]).upper(), fontsize=8,
                     ha="center", va="center", fontweight="bold", zorder=10)
         t.set_path_effects([pe.Stroke(linewidth=2.25, foreground="white"), pe.Normal()])
         texts.append(t)
@@ -499,8 +580,9 @@ def plot_mcc_scatter_panel(ax, df, letter, title, ymin=None):
         except Exception:
             pass
 
-    ax.set_xlabel("ExCALIBR (UV, non-conflicting) MCC", fontsize=11, fontweight="bold")
-    ax.set_ylabel("ExCALIBR-MV MCC", fontsize=11, fontweight="bold")
+    axis_label = _METRIC_AXIS_LABEL[metric]
+    ax.set_xlabel(f"ExCALIBR (UV, non-conflicting) {axis_label}", fontsize=11, fontweight="bold")
+    ax.set_ylabel(f"ExCALIBR-MV {axis_label}", fontsize=11, fontweight="bold")
     ax.set_xlim(lo, hi)
     ax.set_ylim(ymin if ymin is not None else lo, hi)
     ax.grid(True, alpha=0.2)
@@ -522,11 +604,35 @@ def plot_mcc_scatter_panel(ax, df, letter, title, ymin=None):
               frameon=True, edgecolor="#999", framealpha=0.95, fontsize=7, title_fontsize=7)
 
 
+def plot_mcc_scatter_panel(ax, df, letter, title, ymin=None):
+    """Back-compat wrapper for callers whose df only ever has mv_mcc/uv_mcc/
+    n_eval (e.g. mv_cockpit.run_gene_performance_scatter, built via
+    run_results_table rather than _gene_row) -- no n_pathogenic/n_benign
+    columns are available there, so this keeps the older (imperfect, see
+    plot_metric_scatter_panel's docstring) both-exactly-zero heuristic
+    rather than erroring on missing columns."""
+    if not df.empty:
+        df = df.dropna(subset=["mv_mcc", "uv_mcc"])
+        df = df[~((df["mv_mcc"] == 0) & (df["uv_mcc"] == 0))]
+        df = df.assign(n_pathogenic=1, n_benign=1)  # bypass plot_metric_scatter_panel's own filter
+    plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=ymin)
+
+
 def build_gene_performance_figure(results_json, save_path=None, cache_dir=None):
-    """cache_dir, if given, persists each gene's (mv_mcc, uv_mcc, n_eval) to
-    disk as it's computed -- a crash, a bug fix, or an interrupted run only
-    requires rerunning genes that don't already have a successful ("ok")
-    cache entry, not the whole panel/script. See _gene_row/_cache_path."""
+    """cache_dir, if given, persists each gene's full metrics record (mcc/
+    accuracy/auc for MV+UV, n_pathogenic/n_benign/n_eval) to disk as it's
+    computed -- a crash, a bug fix, or an interrupted run only requires
+    rerunning genes that don't already have a successful ("ok") cache entry,
+    not the whole panel/script. See _gene_row/_cache_path.
+
+    Builds THREE figures, not one: MCC (save_path, the original/default),
+    plus accuracy and AUC siblings saved alongside it (same directory,
+    "_accuracy"/"_auc" inserted before the extension). MCC and AUC panels
+    exclude genes with zero P/LP or zero B/LB in the evaluated set (both are
+    mathematically undefined there); the accuracy panel does not, since
+    accuracy has no such degeneracy -- see plot_metric_scatter_panel's
+    docstring for why these need different filtering, not just different
+    y-axes on the same data."""
     print("=== Panel A: functional ===")
     df_a = build_panel_a(results_json, cache_dir=cache_dir)
     print("=== Panel B: computational predictors ===")
@@ -534,16 +640,23 @@ def build_gene_performance_figure(results_json, save_path=None, cache_dir=None):
     print("=== Panel C: combined functional+predictor ===")
     df_c = build_panel_c(results_json, cache_dir=cache_dir)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    plot_mcc_scatter_panel(axes[0], df_a, "(A)", "Functional", ymin=0.6)
-    plot_mcc_scatter_panel(axes[1], df_b, "(B)", "Computational predictors")
-    plot_mcc_scatter_panel(axes[2], df_c, "(C)", "Combined evidence")
-    plt.tight_layout()
+    panels = [("(A)", "Functional", df_a, 0.6), ("(B)", "Computational predictors", df_b, None),
+              ("(C)", "Combined evidence", df_c, None)]
 
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Saved figure to {save_path}")
+    figures = {}
+    for metric in ("mcc", "accuracy", "auc"):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        for ax, (letter, title, df, ymin) in zip(axes, panels):
+            plot_metric_scatter_panel(ax, df, letter, title, metric=metric, ymin=ymin)
+        plt.tight_layout()
+        figures[metric] = fig
+
+        if save_path:
+            p = Path(save_path)
+            metric_path = p if metric == "mcc" else p.with_name(f"{p.stem}_{metric}{p.suffix}")
+            metric_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(metric_path, dpi=300, bbox_inches="tight")
+            print(f"Saved {metric} figure to {metric_path}")
 
     for name, df in [("Functional", df_a), ("Predictors", df_b), ("Combined", df_c)]:
         if df.empty:
@@ -553,7 +666,7 @@ def build_gene_performance_figure(results_json, save_path=None, cache_dir=None):
               f"mean MV MCC {df['mv_mcc'].mean():.3f}")
         print(df.sort_values("gene").to_string(index=False))
 
-    return fig, {"A": df_a, "B": df_b, "C": df_c}
+    return figures["mcc"], {"A": df_a, "B": df_b, "C": df_c}
 
 
 # ── Panel D: TP53 RPV penetrance-score distribution ─────────────────────────

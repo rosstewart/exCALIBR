@@ -207,6 +207,33 @@ def _mvn_logcdf_batch(uppers, mean, cov):
     if q == 1:
         s = np.sqrt(max(float(np.asarray(cov).ravel()[0]), 1e-15))
         return norm.logcdf((uppers[:, 0] - mean[0]) / s)
+    if q == 2:
+        # Use the SAME Phi_2 as the E-step's truncated-normal moments.
+        #
+        # This used to fall through to scipy's multivariate_normal.cdf, which is
+        # a Genz integrator with roughly 1e-5 absolute tolerance -- fine in the
+        # bulk, but in the deep tail it disagrees with the exact Owen's-T /
+        # log-space-quadrature hybrid by a median 2.9e-03 in log (max 5.1e-02),
+        # and underflows to -inf entirely once Phi_2 drops below ~1e-300.
+        #
+        # That mattered because EM's ascent bound
+        #     L(theta) - L(theta_t) >= Q(theta|theta_t) - Q(theta_t|theta_t)
+        # compares this density against a Q built from the E-step's moments. Two
+        # different Phi_2 implementations make the two sides inconsistent, so the
+        # bound can be violated by their disagreement. Measured on
+        # mek2_labelseq_mv 4c: Q rose by 4.9e-06 while L fell by 3.9e-05 -- a
+        # discrepancy of ~1.8e-03 per tail row, matching the median gap above.
+        #
+        # Note the hybrid's accuracy fix made this WORSE, not better: sharpening
+        # one side of the comparison while leaving the other at 1e-5 widened the
+        # inconsistency. The two must be the same function, not merely both
+        # "accurate enough".
+        from .update_steps import _log_bvn_cdf   # local: update_steps imports us
+        cov = np.asarray(cov, dtype=float)
+        sd = np.sqrt(np.maximum(np.diag(cov), 1e-300))
+        rho = float(np.clip(cov[0, 1] / (sd[0] * sd[1]), -0.999999, 0.999999))
+        z = (np.asarray(uppers, dtype=float) - np.asarray(mean, dtype=float)[None, :]) / sd[None, :]
+        return _log_bvn_cdf(z[:, 0], z[:, 1], rho)
     try:
         rv   = mvn(mean=mean, cov=cov, allow_singular=True)
         vals = rv.cdf(uppers)                        # (N,) — one call, no loop

@@ -61,6 +61,12 @@ def main():
                             "single_gene_calibration_data")
     ap.add_argument("--data-dir", default=None,
                     help="[predictor-mv] defaults to --predictor-data-dir if unset")
+    ap.add_argument("--no-default-redundancy-collapse", action="store_true",
+                    help="--gene-set tp53 collapses the 8-dim Kato_2003 panel to 2 PCs "
+                         "by default (16 -> 10 dims), matching hpc/prepare.py's default "
+                         "so a fit and its analysis share one dimensionality. Pass this "
+                         "to score a fit that was trained on all 16 dimensions; "
+                         "mismatching the two trips MVCalibrationAnalysis's shape guard.")
     ap.add_argument("--rpvs-all", action="store_true")
     ap.add_argument("--kawoligo-seed", type=int, default=0)
     ap.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,

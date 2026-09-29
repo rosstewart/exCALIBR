@@ -85,7 +85,23 @@ def _largest_supported_subset(obs_key, supports_fn):
 # Four ways to handle a (P vs B) pattern where the pathogenic and/or the
 # benign/synonymous reference lacks joint coverage of a variant's observed
 # dimensions -- see the mv_calibration consolidation discussion this was
-# designed from:
+# designed from.
+#
+# ARCHIVED (2026-09): after fixing "trust_global"/"local_unmixing" to use
+# REAL per-pattern support for the benign side (previously both hardcoded
+# b_sup=True/s_sup=True unconditionally, letting an unsupported Synonymous or
+# B/LB reference silently bias the LR/prior for patterns it has zero
+# coverage on -- confirmed on real data for BRCA1/BRCA2/KCNH2/PALB2/PTEN and
+# every "combined" gene-set fit), a full ~50-gene/7-gene-set comparison
+# across all four modes showed ZERO remaining MCC disagreements and
+# best-or-tied coverage everywhere for "trust_global" -- "local_unmixing"/
+# "project" became fully redundant with it, and "gate" is now strictly worse
+# on at least one gene (lower coverage, same MCC). "trust_global" is the
+# sole production default going forward (also the only mode any real call
+# site in this repo has ever actually passed to .run()); the other three
+# implementations are kept below, reachable via compare_partial_pattern_modes
+# for diagnostics/paper comparisons, but are no longer used by default
+# anywhere.
 #   "gate"           : historical behavior, kept byte-faithful on purpose so
 #                      it's a meaningful baseline for the other three modes.
 #                      ASYMMETRIC: only benign/synonymous is pattern-checked
@@ -123,7 +139,7 @@ def _bootstrap_job(fit_raw, scores, sa,
                    p_idx, b_idx, g_idx, s_idx, benign_method,
                    partial_patterns, reestimate_marginal_weights,
                    extra_p_indices=None, pathomechanism_method=None,
-                   partial_pattern_mode="gate"):
+                   partial_pattern_mode="trust_global"):
     """Process one bootstrap fit.  Standalone so joblib loky workers don't
     need to pickle the full MVCalibrationAnalysis object.
 
@@ -306,7 +322,28 @@ def _bootstrap_job(fit_raw, scores, sa,
                             continue
                         w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
                     elif partial_pattern_mode in ("trust_global", "local_unmixing"):
-                        w_b = _benign_w(weights, b_sup=True, s_sup=True)
+                        # Use REAL per-pattern support for the benign side
+                        # (both B/LB and Synonymous), not a blind True/True --
+                        # confirmed on real data (BRCA1/BRCA2/KCNH2/PALB2/PTEN,
+                        # and every "combined" gene-set fit) that Synonymous
+                        # rows can have zero coverage on a subset of
+                        # dimensions (e.g. one functional assay added without
+                        # re-running synonymous controls, or -- for combined
+                        # -- ANY predictor dimension, since predictors have no
+                        # synonymous concept at all), in which case blindly
+                        # trusting the Synonymous weight row here injects a
+                        # spurious signal fit on essentially unrelated
+                        # dimensions into the benign reference. Only fall back
+                        # to the blind True/True when NEITHER B/LB nor
+                        # Synonymous supports this pattern at all (mirrors
+                        # "project"'s own analogous last-resort fallback
+                        # below) -- trust_global's actual defining property is
+                        # never skipping a variant, not blindly trusting an
+                        # unsupported reference class when better information
+                        # (real support) is available cheaply.
+                        w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
+                        if w_b is None:
+                            w_b = _benign_w(weights, b_sup=True, s_sup=True)
                     elif partial_pattern_mode == "project":
                         if b_side_ok and p_sup:
                             w_b = _benign_w(weights, b_sup=b_sup, s_sup=s_sup)
@@ -477,8 +514,18 @@ def _bootstrap_job(fit_raw, scores, sa,
                     return None, None
 
             elif partial_pattern_mode == "trust_global":
-                w_b = _benign_w(weight_source, b_sup=True, s_sup=True)
-                # w_p is already the global vector -- nothing else to do.
+                # See the analogous prior-EM-loop branch's comment above
+                # (search "inject a spurious signal") for why this uses real
+                # per-pattern support for the benign side instead of a blind
+                # True/True, falling back to the blind trust only when
+                # NEITHER B/LB nor Synonymous supports this pattern at all.
+                # w_p (pathogenic) is untouched -- already the global vector,
+                # unconditionally, which remains trust_global's actual
+                # defining property.
+                w_b = _benign_w(weight_source, b_sup=_sample_supports(eff_b, obs_key),
+                                 s_sup=_sample_supports(eff_s, obs_key))
+                if w_b is None:
+                    w_b = _benign_w(weight_source, b_sup=True, s_sup=True)
 
             elif partial_pattern_mode == "project":
                 if b_ok and p_ok:
@@ -1421,7 +1468,7 @@ class MVCalibrationAnalysis:
             enforce_marginal_monotonicity=True,
             liberal_marginal_monotonicity=True,
             pathomechanism_method=None,
-            partial_pattern_mode="gate",
+            partial_pattern_mode="trust_global",
             n_jobs=-1):
         """Run analysis for all configs.
 
@@ -1939,8 +1986,33 @@ class MVCalibrationAnalysis:
         Parameters
         ----------
         config          : str   — result config key (e.g. '3c_unc')
-        fixed_idx       : int   — sample-assignment column index for the aux/RPV sample
+        fixed_idx       : int   — RAW sample-assignment column index for the
+                                  aux/RPV sample, i.e. a position in
+                                  ms._sample_assignments INCLUDING empty
+                                  placeholder columns (aux_results is keyed by
+                                  this fixed index, not by the effective one).
+                                  For TP53 that is 4, not 3: an empty
+                                  'Synonymous' placeholder sits at 3 so that RPV
+                                  never lands on the benign-control role. This
+                                  is the SAME space as
+                                  visualize_fit.plot_variant_evidence_heatmap's
+                                  `sample_idx`, and the OPPOSITE of this class's
+                                  own p_idx/b_idx/g_idx/s_idx, which _eff_idx
+                                  maps into the compacted space.
         rpv_min_points  : int   — minimum aux Tavtigian points to be RPV-eligible (default 1 = supporting)
+
+        NOTE on aux percentiles: run() defaults aux_path_percentile/
+        aux_ben_percentile to path_percentile/(100-path_percentile), i.e. 5/95,
+        which is correct for a normal auxiliary PATHOGENIC sample scored against
+        benign. RPV penetrance is the exception and is conventionally scored with
+        run(..., aux_path_percentile=50, aux_ben_percentile=50): vs_P compares
+        two pathogenic-leaning classes, so a two-sided conservative haircut pulls
+        both toward the null and cannot resolve them. Measured on real TP53
+        (4c_unc, 74 boots): at 5/95 rpv_points and vsp_points collapse to a
+        DISJOINT {0,1}, making low_pen_rpv structurally unreachable -- 0 of 22
+        RPV variants classified. At 50/50 the same fit gives 15 low_pen_rpv,
+        3 benign_like, 2 plp_like, 2 intermediate. An empty low_pen_rpv class is
+        therefore a symptom of the percentile setting, not a finding.
         pen_min_points  : int   — vsp_points threshold separating low_pen_rpv from plp_like
                                   (default 0: requires vsp_points >= 1 for low_pen_rpv;
                                    vsp_points = 0 falls to intermediate)

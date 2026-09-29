@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+import numpy as np
+import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
@@ -53,25 +55,45 @@ def plot_categorical_sankey(
     ax=None, node_width: float = 0.06, gap_frac: float = 0.015,
     source_fontsize: float = 9, target_fontsize: float = 9,
     show_target_counts: bool = True, target_label_fmt=str,
+    gradient: bool = False, min_frac: float = 0.012,
 ):
     """flow_df: columns 'source', 'target', 'count'. Two columns of
     proportional stacked node bars (source at x=0, target at x=1) joined by
-    filled cubic-Bezier ribbon polygons, colored by source node -- the same
-    visual idiom as Figure5_6.Rmd's geom_sankey.
+    filled cubic-Bezier ribbon polygons -- the same visual idiom as
+    Figure5_6.Rmd's geom_sankey. Everything about node sizing, spacing and
+    label placement is unchanged regardless of `gradient`.
+
+    gradient=False (default): each ribbon is a flat fill in its source
+    node's color (original behavior).
+    gradient=True: each ribbon fades left-to-right from its source node's
+    color to its target node's color, rendered as a clipped raster (same
+    ribbon outline, just filled differently) rather than a different
+    Sankey layout.
+
+    min_frac: every nonzero flow is drawn with at least `min_frac * total`
+    thickness for LAYOUT purposes only (labels still show the true count) --
+    a raw linear scale can otherwise give a real-but-tiny category (e.g. a
+    handful of variants out of thousands) a near-zero-height node, which
+    collapses its label into its neighbors' rather than just being a thin
+    ribbon. Set to 0 to disable and use true linear proportions.
     """
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
     else:
         fig = ax.figure
 
-    mat = flow_df.pivot_table(index="source", columns="target", values="count",
-                               aggfunc="sum", fill_value=0)
-    mat = mat.reindex(index=source_order, columns=target_order, fill_value=0)
+    true_mat = flow_df.pivot_table(index="source", columns="target", values="count",
+                                    aggfunc="sum", fill_value=0)
+    true_mat = true_mat.reindex(index=source_order, columns=target_order, fill_value=0)
+    total = float(true_mat.values.sum())
+    min_flow = min_frac * total if total > 0 else 0.0
+    mat = true_mat.where(true_mat <= 0, true_mat.clip(lower=min_flow))
 
     source_totals = mat.sum(axis=1)
     target_totals = mat.sum(axis=0)
-    total = source_totals.sum()
-    gap = gap_frac * total if total > 0 else 0.0
+    true_source_totals = true_mat.sum(axis=1)
+    true_target_totals = true_mat.sum(axis=0)
+    gap = gap_frac * float(source_totals.sum()) if source_totals.sum() > 0 else 0.0
 
     def _node_positions(totals, order):
         positions = {}
@@ -98,7 +120,7 @@ def plot_categorical_sankey(
             facecolor=source_colors.get(cat, "#999999"), edgecolor="black",
             linewidth=0.8, zorder=3))
         ax.text(x0 - node_width / 2 - 0.02, (y0 + y1) / 2,
-                 f"{cat} ({int(source_totals[cat]):,})", ha="right", va="center",
+                 f"{cat} ({int(true_source_totals[cat]):,})", ha="right", va="center",
                  fontsize=source_fontsize)
 
     for cat in target_order:
@@ -110,7 +132,7 @@ def plot_categorical_sankey(
             facecolor=tcolors.get(cat, "#999999"), edgecolor="black",
             linewidth=0.8, zorder=3))
         cat_label = target_label_fmt(cat)
-        label = f"{cat_label} ({int(target_totals[cat]):,})" if show_target_counts else cat_label
+        label = f"{cat_label} ({int(true_target_totals[cat]):,})" if show_target_counts else cat_label
         ax.text(x1 + node_width / 2 + 0.02, (y0 + y1) / 2,
                  label, ha="left", va="center", fontsize=target_fontsize)
 
@@ -142,10 +164,23 @@ def plot_categorical_sankey(
                 MplPath.LINETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4,
                 MplPath.CLOSEPOLY,
             ]
-            patch = mpatches.PathPatch(
-                MplPath(verts, codes), facecolor=source_colors.get(src, "#999999"),
-                edgecolor="none", alpha=0.55, zorder=1)
-            ax.add_patch(patch)
+            ribbon_path = MplPath(verts, codes)
+            if not gradient:
+                patch = mpatches.PathPatch(
+                    ribbon_path, facecolor=source_colors.get(src, "#999999"),
+                    edgecolor="none", alpha=0.55, zorder=1)
+                ax.add_patch(patch)
+            else:
+                c_src = np.array(mcolors.to_rgb(source_colors.get(src, "#999999")))
+                c_tgt = np.array(mcolors.to_rgb(tcolors.get(tgt, "#999999")))
+                n_interp = 80
+                t = np.linspace(0, 1, n_interp)
+                grad = c_src[None, :] * (1 - t)[:, None] + c_tgt[None, :] * t[:, None]
+                grad_img = np.tile(grad[None, :, :], (2, 1, 1))
+                y_min, y_max = min(sy0, ty0), max(sy1, ty1)
+                im = ax.imshow(grad_img, extent=[xs0, xs1, y_min, y_max],
+                                origin="lower", aspect="auto", alpha=0.55, zorder=1)
+                im.set_clip_path(mpatches.PathPatch(ribbon_path, transform=ax.transData))
 
     ax.set_xlim(-0.45, 1.45)
     ax.set_ylim(-gap, max_height + gap)

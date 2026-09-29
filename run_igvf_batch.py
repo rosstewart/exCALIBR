@@ -422,6 +422,25 @@ def _load_calibration_from_disk(calib_path: Path, lr_path: Path):
         # but keep the full matrix itself as log_lr_plus.
         llr = np.asarray(lr["log_lr_plus"])
         log_lr_pct = np.nanpercentile(llr, [5, 50, 95], axis=0)
+        # This is the only point in this path where the full per-bootstrap
+        # matrix is in hand, so it is where the EXPERIMENTAL
+        # "tavtigian_evidence_point" percentile can be resolved. Note the
+        # compact format above cannot support it at all: it stores only
+        # p5/p50/p95, so the spread needed to solve for a percentile has
+        # already been discarded on disk.
+        if _EVIDENCE_POINT_RESOLVED.get("requested"):
+            x, y, reached = resolve_evidence_point_percentile(llr)
+            _EVIDENCE_POINT_RESOLVED.update(path=x, ben=y, reached=reached)
+            if not reached:
+                import warnings as _w
+                _w.warn(
+                    f"tavtigian_evidence_point: bootstrap band stays wider than one "
+                    f"evidence point ({evidence_point_log_width():.3f} log-LR) even at "
+                    f"the {x}th percentile -- this calibration does not resolve to one "
+                    f"evidence point; treat its strength cap as unsupported rather than "
+                    f"narrowing further.",
+                    stacklevel=2,
+                )
         priors_pct = [lr.get("prior")] * 3
         log_lr_plus_full = llr
 
@@ -984,6 +1003,105 @@ def generate_all_configs_viz(
             print(f"  Saved comparison: {comp_path}")
 
 
+# ── EXPERIMENTAL: evidence-point-width percentile ──────────────────────────
+# Not user-facing; no default path reaches it unless --pathogenic-percentile is
+# given the literal string below.
+EVIDENCE_POINT_MODE = "tavtigian_evidence_point"
+
+# Tavtigian constant at the 0.1 prior. Deliberately FIXED rather than taken from
+# each calibration's own fitted prior: the target is meant to be one fixed unit
+# of evidence resolution shared across datasets, so letting it float with the
+# prior would make the same nominal setting mean different things per gene --
+# and would couple the percentile choice to a quantity the percentile is itself
+# used to estimate.
+EVIDENCE_POINT_C = 350.0
+
+# Populated once a bootstrap LR matrix is seen (see _load_lr_values). Kept as a
+# module-level cell rather than threaded through every call site because this is
+# an experimental switch; a production version should pass the resolved value
+# explicitly instead of relying on resolution order.
+_EVIDENCE_POINT_RESOLVED = {"requested": False, "path": None, "ben": None,
+                            "reached": None}
+
+
+def request_evidence_point_resolution(config):
+    """Arm the resolver when the experimental sentinel was requested.
+
+    Returns True when config asked for it, so callers can tell the difference
+    between "not requested" and "requested but no full matrix was available".
+    """
+    want = (getattr(config, "pathogenic_percentile", None) == EVIDENCE_POINT_MODE)
+    _EVIDENCE_POINT_RESOLVED["requested"] = bool(want)
+    return bool(want)
+
+
+def evidence_point_percentiles(default_path=5.0, default_ben=95.0):
+    """Resolved (path, ben) percentiles, or the defaults when the sentinel was
+    never requested or never resolvable (compact lr_values format)."""
+    r = _EVIDENCE_POINT_RESOLVED
+    if r.get("requested") and r.get("path") is not None:
+        return r["path"], r["ben"]
+    return default_path, default_ben
+
+
+def evidence_point_log_width(C=EVIDENCE_POINT_C):
+    """Log-LR width of one Tavtigian evidence point.
+
+    mv_calibration._thresholds defines tau_p = C ** (pv / 8) for point value pv,
+    so adjacent point values sit ln(C)/8 apart in log-LR. That spacing is the
+    resolution the calibration is actually read at: a bootstrap band narrower
+    than this cannot move a variant between adjacent evidence points.
+    """
+    return float(np.log(C) / 8.0)
+
+
+def resolve_evidence_point_percentile(lr_matrix, C=EVIDENCE_POINT_C,
+                                      max_percentile=25.0, min_percentile=0.5):
+    """Smallest symmetric percentile pair whose median bootstrap band is within
+    one evidence point.
+
+    lr_matrix : (n_bootstraps, n_variants) log-LR, as built by Analysis.run.
+
+    Returns (path_percentile, ben_percentile, reached) where `reached` is False
+    when even `max_percentile` leaves the band wider than one evidence point --
+    i.e. the bootstrap spread exceeds what any percentile can make conservative.
+    Callers should treat reached=False as "this calibration does not resolve to
+    one evidence point", not as a licence to keep narrowing: pushing further
+    just converges on the median and reports no conservatism at all.
+    """
+    target = evidence_point_log_width(C)
+    mat = np.asarray(lr_matrix, dtype=float)
+    if mat.ndim != 2 or mat.shape[0] < 2:
+        return 5.0, 95.0, False
+
+    def band(x):
+        lo = np.nanpercentile(mat, x, axis=0)
+        hi = np.nanpercentile(mat, 100.0 - x, axis=0)
+        return float(np.nanmedian(hi - lo))
+
+    if band(min_percentile) <= target:
+        x = min_percentile
+    elif band(max_percentile) > target:
+        return max_percentile, 100.0 - max_percentile, False
+    else:
+        lo_x, hi_x = min_percentile, max_percentile
+        for _ in range(40):                       # bisection; band is monotone in x
+            mid = 0.5 * (lo_x + hi_x)
+            if band(mid) > target:
+                lo_x = mid
+            else:
+                hi_x = mid
+        x = hi_x
+    return float(x), float(100.0 - x), True
+
+
+def _percentile_or_mode(value):
+    """argparse type: a float percentile, or the experimental mode string."""
+    if isinstance(value, str) and value.strip().lower() == EVIDENCE_POINT_MODE:
+        return EVIDENCE_POINT_MODE
+    return float(value)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="IGVF Batch Calibration Pipeline",
@@ -1093,7 +1211,7 @@ def main():
                             "'Benign/Likely Benign' gnomAD Synonymous)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging (component params, flip detection, point ranges)")
-    parser.add_argument("--pathogenic-percentile", type=float, default=5.0,
+    parser.add_argument("--pathogenic-percentile", type=_percentile_or_mode, default=5.0,
                        help="Conservative (lower-bound/pathogenic-direction) percentile used for "
                             "all bootstrap LR+/threshold percentile calculations (conservative "
                             "thresholds, C-range, OOB LR percentiles, per-variant LR percentiles). "
@@ -1101,8 +1219,13 @@ def main():
                             "override that independently with --benign-percentile. Global, "
                             "batch-wide -- applies uniformly to every dataset in the run; not "
                             "settable per-dataset via --dataset-configs. "
-                            "Default: 5.0 (matches prior hardcoded 5th/95th behavior).")
-    parser.add_argument("--benign-percentile", type=float, default=None,
+                            "Default: 5.0 (matches prior hardcoded 5th/95th behavior). "
+                            "EXPERIMENTAL: may also be the string "
+                            "'tavtigian_evidence_point', which solves for the percentile "
+                            "whose bootstrap band equals one Tavtigian evidence point "
+                            "instead of using a fixed 5 -- see "
+                            "resolve_evidence_point_percentile.")
+    parser.add_argument("--benign-percentile", type=_percentile_or_mode, default=None,
                        help="Upper (benign-direction) percentile, independent of "
                             "--pathogenic-percentile. Omit to keep the historical symmetric "
                             "pairing (100 - pathogenic-percentile); set explicitly to decouple "

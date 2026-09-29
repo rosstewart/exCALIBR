@@ -2333,11 +2333,34 @@ class MultiScoreset:
 
     @property
     def sample_names(self):
+        """Names of the NON-EMPTY samples, aligned with the public
+        ``sample_assignments`` property (which drops empty columns).
+
+        NOT aligned with ``_sample_assignments`` / ``sample_counts``, which keep
+        every column including empty placeholders -- use ``raw_sample_names``
+        for those. Mixing the two silently mislabels samples whenever a
+        placeholder column exists (e.g. TP53 reserves an empty 'Synonymous'
+        column at index 3 so that RPV stays at index 4 and is never picked up
+        as the benign-control role).
+        """
         return [
             self._sample_names[i]
             for i in range(min(len(self._sample_names), len(self.sample_counts)))
             if self.sample_counts[i] > 0
         ]
+
+    @property
+    def raw_sample_names(self):
+        """Names aligned with ``_sample_assignments``/``sample_counts`` --
+        i.e. one entry per RAW column, empty placeholders included.
+
+        Use this anywhere a raw column index is being labelled;
+        ``sample_names`` is the compacted list and will be off by one for every
+        placeholder that precedes the column of interest.
+        """
+        n_raw = self._sample_assignments.shape[1]
+        return [self._sample_names[i] if i < len(self._sample_names) else f"Sample {i}"
+                for i in range(n_raw)]
 
     @property
     def xlims(self):
@@ -2688,11 +2711,34 @@ class BasicMultiScoreset:
 
     @property
     def sample_names(self):
+        """Names of the NON-EMPTY samples, aligned with the public
+        ``sample_assignments`` property (which drops empty columns).
+
+        NOT aligned with ``_sample_assignments`` / ``sample_counts``, which keep
+        every column including empty placeholders -- use ``raw_sample_names``
+        for those. Mixing the two silently mislabels samples whenever a
+        placeholder column exists (e.g. TP53 reserves an empty 'Synonymous'
+        column at index 3 so that RPV stays at index 4 and is never picked up
+        as the benign-control role).
+        """
         return [
             self._sample_names[i]
             for i in range(min(len(self._sample_names), len(self.sample_counts)))
             if self.sample_counts[i] > 0
         ]
+
+    @property
+    def raw_sample_names(self):
+        """Names aligned with ``_sample_assignments``/``sample_counts`` --
+        i.e. one entry per RAW column, empty placeholders included.
+
+        Use this anywhere a raw column index is being labelled;
+        ``sample_names`` is the compacted list and will be off by one for every
+        placeholder that precedes the column of interest.
+        """
+        n_raw = self._sample_assignments.shape[1]
+        return [self._sample_names[i] if i < len(self._sample_names) else f"Sample {i}"
+                for i in range(n_raw)]
 
     @property
     def xlims(self):

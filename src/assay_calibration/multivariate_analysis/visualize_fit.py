@@ -1083,13 +1083,24 @@ def build_heatmap_data(analysis, config):
     }
 
 def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
-                            projection='umap', pivot_dim='activity_No_treatment'):
+                            projection=None, pivot_dim='activity_No_treatment'):
     """Precompute all expensive data needed for plot_mv_calibration.
 
     Returns a dict that can be passed directly to render_mv_plot_data.
     Separating precomputation from rendering means you can tweak plot
     aesthetics (figsize, contour_levels, first_row_only, etc.) without
     rerunning the parallel bootstrap sweeps.
+
+    projection : None (default) or 'umap'
+        OPT-IN. 'umap' additionally builds an (N x N) pairwise distance matrix
+        over every variant including VUS and fits a UMAP embedding on it. On a
+        real gene that is the single most expensive step here -- TP53 is ~9,900
+        variants, so the distance matrix alone dominates the whole precompute --
+        and nothing except the UMAP panel consumes it. Everything else
+        (marginals, LR curves, evidence heatmaps, RPV quadrant, component
+        densities) is unaffected, so leave this None unless you specifically
+        want that panel. render_mv_plot_data degrades gracefully when
+        umap_data is absent.
     """
     r = analysis.results.get(config)
     if r is None:
@@ -1442,7 +1453,7 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
 
 
 def precompute_mv_plot_data_cached(analysis, config, cache_dir, n_grid=120, pad=0.5,
-                                   n_jobs=-1, projection='umap',
+                                   n_jobs=-1, projection=None,
                                    pivot_dim='activity_No_treatment',
                                    force_recompute=False):
     """Cached wrapper around precompute_mv_plot_data.
@@ -1768,7 +1779,13 @@ def plot_variant_evidence_heatmap(precomputed, sample_idx=0,
     Parameters
     ----------
     precomputed  : dict from precompute_mv_plot_data
-    sample_idx   : int or list of int — sample column(s) to display
+    sample_idx   : int or list of int — RAW sample column(s) to display.
+                   Raw means positions in ms._sample_assignments, INCLUDING empty
+                   placeholder columns -- not the compacted ms.sample_assignments
+                   view. For TP53 that makes RPV index 4, not 3. This is the same
+                   space score_rpv_penetrance's `fixed_idx` uses, but the opposite
+                   of MVCalibrationAnalysis's p_idx/b_idx/g_idx/s_idx, which are
+                   effective (compacted) indices produced by _eff_idx.
     variant_ids  : list of str, optional — explicit variant list (ignores sample_idx)
     figsize      : (w, h) or None (auto)
     cell_fontsize: font size inside cells
@@ -1803,7 +1820,14 @@ def plot_variant_evidence_heatmap(precomputed, sample_idx=0,
     pt_norm     = TwoSlopeNorm(vmin=-max_pt, vcenter=0, vmax=max_pt)
 
     dataset_names    = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
-    _sn_raw          = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    # RAW names: this block indexes ms._sample_assignments (fixed column
+    # positions, empty placeholders included), so labels must come from
+    # raw_sample_names -- ms.sample_names is the COMPACTED list and is off by
+    # one per preceding placeholder (TP53: empty 'Synonymous' at 3 shifts RPV
+    # from raw 4 to compacted 3, so sample_idx=3 would print 'RPV' while
+    # actually reading the empty column).
+    _sn_raw          = (getattr(ms, 'raw_sample_names', None)
+                        or getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT)
     sample_names_all = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}'
                         for i in range(S_raw)]
 
@@ -2255,7 +2279,10 @@ def plot_rpv_quadrant(precomputed, fixed_idx=None,
     aux_tau_p = aux_res.get('tau_p_log', tau_p)
     aux_tau_b = aux_res.get('tau_b_log', tau_b)
 
-    _sn_raw  = sample_names or getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    # RAW names -- see plot_variant_evidence_heatmap's note; this block also
+    # indexes ms._sample_assignments.
+    _sn_raw  = (sample_names or getattr(ms, 'raw_sample_names', None)
+                or getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT)
     S_raw    = _sa_raw.shape[1]
     sample_names_all = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}'
                         for i in range(S_raw)]
@@ -2471,7 +2498,8 @@ def inspect_variant(variant_id, precomputed, figsize=None):
     max_pt      = max(analysis.point_values)
 
     dataset_names = getattr(ms, 'dataset_names', [f'Dim {d}' for d in range(D)])
-    _sn_raw       = getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT
+    _sn_raw       = (getattr(ms, 'raw_sample_names', None)
+                     or getattr(ms, 'sample_names', None) or SAMPLE_NAMES_DEFAULT)
     sample_names_all = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}' for i in range(S)]
 
     _eff_to_fixed = {}

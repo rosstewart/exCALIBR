@@ -35,6 +35,10 @@
     "n_c": "3c",
     "benign_method": "benign"
   },
+  "BRCA2_Huang_2025_SGE_VarCallScore": {
+    "n_c": "3c",
+    "benign_method": "benign"
+  },
   "BRCA2_IGVF": {
     "n_c": "3c",
     "benign_method": "benign"

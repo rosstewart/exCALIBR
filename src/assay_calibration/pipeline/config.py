@@ -323,6 +323,21 @@ class PipelineConfig:
         # benign_percentile (both valid percentiles in (0, 100)) -- e.g.
         # pathogenic_percentile=50 is now allowed as long as benign_percentile
         # is set independently (e.g. to 95) rather than defaulting to 50.
+        # EXPERIMENTAL sentinel: "tavtigian_evidence_point" defers the choice of
+        # percentile until a bootstrap LR matrix exists, then solves for the pair
+        # whose median band equals one evidence point (run_igvf_batch.
+        # resolve_evidence_point_percentile). It cannot be resolved here because
+        # the matrix does not exist at config time, so it is carried through as a
+        # string and every numeric consumer must resolve it first.
+        if isinstance(self.pathogenic_percentile, str):
+            if self.pathogenic_percentile != "tavtigian_evidence_point":
+                raise ValueError(
+                    f"pathogenic_percentile string must be "
+                    f"'tavtigian_evidence_point', got {self.pathogenic_percentile!r}"
+                )
+            if self.benign_percentile is None:
+                self.benign_percentile = self.pathogenic_percentile
+            return
         if not (0 < self.pathogenic_percentile < 100):
             raise ValueError(
                 f"pathogenic_percentile must be in (0, 100), got {self.pathogenic_percentile}"

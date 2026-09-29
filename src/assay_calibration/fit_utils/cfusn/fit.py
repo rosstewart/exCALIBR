@@ -59,7 +59,18 @@ def single_fit(
     observations, sample_indicators, N_components, constrained,
     init_method, init_constraint_adjustment, multivariate=False, **kwargs
 ):
-    MAX_EM_ITERS = kwargs.get("max_em_iters", 10000)
+    # Iteration cap. Multivariate fits get a much larger budget than
+    # univariate: with the exact q=2 E-step's tail accuracy fixed, MV fits that
+    # used to thrash in a numerically-degenerate regime now genuinely converge,
+    # and some need far more than 10000 iterations to get there (measured on
+    # kras_labelseq_mv 4c: 1166 iterations before the fix, still climbing
+    # monotonically at 10001 after it, i.e. the old cap was binding). Hitting
+    # the cap is no longer destructive -- the fit returns the best iterate it
+    # reached -- so a larger budget buys convergence rather than risking a
+    # worse answer. Univariate fits converge in far fewer iterations and are
+    # left on the historical cap so their behaviour is unchanged.
+    _default_max_iters = 50000 if multivariate else 10000
+    MAX_EM_ITERS = kwargs.get("max_em_iters", _default_max_iters)
     verbose = kwargs.get("verbose", True)
     check_submerged_duration = kwargs.get("check_submerged_duration", False)
     MIN_SCALE = 1e-100
@@ -69,6 +80,9 @@ def single_fit(
     # these are set from.
     PLATEAU_REL_TOL = 1e-8
     OVERSHOOT_REL_TOL = 1e-5
+    # Above this relative decrease the iterate itself is presumed corrupt (not
+    # merely overshot) and the fit is failed outright rather than rolled back.
+    CATASTROPHIC_REL_TOL = 1e-1
     mv = multivariate
     latent_q = kwargs.get("latent_q", 2)
     constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
@@ -192,11 +206,31 @@ def single_fit(
         if mv and latent_q > 1:
             initial_params = _ensure_cfusn_params(initial_params, latent_q)
 
+        if mv and kwargs.get("force_gaussian"):
+            # Force the very first E-step to already see Delta=0, not
+            # whatever nonzero value kmeans/method-of-moments init produced
+            # -- the M-step will zero it out from iteration 1 onward
+            # regardless (see _em_update_cfusn/_em_update_multivariate's
+            # force_gaussian handling), but starting there directly avoids
+            # a spurious first-iteration likelihood swing between a
+            # nonzero-Delta E-step and the immediately-following zeroed one.
+            initial_params = [
+                (mu_, np.zeros_like(Delta_), Gamma_)
+                for mu_, Delta_, Gamma_ in initial_params
+            ]
+
         W = get_sample_weights(
             observations, sample_indicators, initial_params, W, multivariate=mv
         )
 
     em_kwargs = {}
+
+    # Collector for M-step guard events (currently: Gamma candidates rejected
+    # as indefinite). Reported in the result so a fit whose components were
+    # frozen by repeated rejections is visible to best-fit selection rather
+    # than silently competing on val_ll alone.
+    guard_stats = {}
+    em_kwargs["_guard_stats"] = guard_stats
     em_kwargs["constraint_mode"] = constraint_mode
     em_kwargs["rng"] = rng
     em_kwargs["force_gaussian"] = kwargs.get("force_gaussian", False)
@@ -204,6 +238,11 @@ def single_fit(
         em_kwargs["n_mc_truncated"] = kwargs.get("n_mc_truncated", 500)
     if sample_weights_per_obs is not None:
         em_kwargs["sample_weights"] = sample_weights_per_obs
+
+    # Set when the EM loop stopped on a real (non-plateau) overshoot and rolled
+    # back to the previous iterate; surfaced in the result dict so a rolled-back
+    # fit is visibly different from one that converged normally.
+    overshoot_stopped = None
 
     history = [dict(component_params=initial_params, weights=W)]
     # Initial likelihood: no em_iteration has run yet so we must evaluate explicitly.
@@ -250,6 +289,17 @@ def single_fit(
 
     likelihoods = np.append(likelihoods, ll)
     objectives = np.append(objectives, ll + _penalty(updated_component_params))
+
+    # Best-iterate tracking. EM is monotone in `objectives`, so for a healthy
+    # fit the best iterate IS the last one and this is a no-op. It matters on
+    # the exit paths where that does not hold: a sub-PLATEAU_REL_TOL decrease
+    # falls through the decrease check without reverting, and the fit then
+    # stops on the early-stopping test right below it (same 1e-8 threshold, on
+    # |delta|), so without this we would return an iterate known to be worse
+    # than one we already had. Cheap insurance that the returned parameters are
+    # the best ones the fit ever reached, whichever exit it takes.
+    best_obj = objectives[-1]
+    best_state = (updated_component_params, updated_weights, len(objectives))
 
     if verbose:
         q_label = f" (CFUSN q={latent_q})" if mv and latent_q > 1 else ""
@@ -311,6 +361,11 @@ def single_fit(
             likelihoods = np.append(likelihoods, ll)
             objectives = np.append(objectives, ll + _penalty(updated_component_params))
 
+            if objectives[-1] > best_obj:
+                best_obj = objectives[-1]
+                best_state = (updated_component_params, updated_weights,
+                              len(objectives))
+
             # Separation (tempering + repulsion) deliberately trades likelihood
             # for non-overlap, so the penalised objective is not EM-monotone in
             # the raw LL. Skip the decrease check for separation fits and accept
@@ -335,15 +390,36 @@ def single_fit(
                 #                       low-separation real data. Treat it as
                 #                       convergence: revert to the last good
                 #                       iterate and stop.
-                #   >= OVERSHOOT_REL_TOL genuine M-step overshoot, and it shows
-                #                       up early (measured: 3.4e-3 @ iter 4,
-                #                       2.0e-4 @ iter 20). Still a failed fit --
-                #                       the caller retries with another seed.
+                #   >= OVERSHOOT_REL_TOL genuine M-step overshoot (measured:
+                #                       3.4e-3 @ iter 4, 2.0e-4 @ iter 20).
+                #                       Also revert-and-stop, but flagged --
+                #                       see the branch below for why.
+                #   >= CATASTROPHIC_REL_TOL parameter divergence; the iterate is
+                #                       presumed corrupt, so fail the fit and
+                #                       let the caller retry with another seed.
                 rel_decrease = decrease / max(abs(objectives[-2]), 1e-300)
                 if rel_decrease >= OVERSHOOT_REL_TOL:
-                    raise ValueError(
-                        f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
-                    )
+                    # A decrease this large is a real M-step overshoot, but that
+                    # does NOT make the fit worthless: history[-1] was reached by
+                    # a monotone sequence and holds the best objective seen, so
+                    # raising here threw away every iteration of it. Measured on
+                    # a real production run: of 40 discarded restarts, 16 (40%)
+                    # died after 1000+ iterations and 6 past iteration 5000 --
+                    # essentially converged fits rejected for one bad final step,
+                    # then handed -inf so best-of-num_fits could never select
+                    # them. With num_fits=3 that silently drops a third of the
+                    # restart budget.
+                    #
+                    # So keep the last good iterate unless the blow-up is severe
+                    # enough that it is likely corrupt too (same run: early
+                    # failures reached decreases of 2.04e+06, which is parameter
+                    # divergence rather than a step-size problem). Only those
+                    # still fail the fit.
+                    if rel_decrease >= CATASTROPHIC_REL_TOL:
+                        raise ValueError(
+                            f"Iteration {it}: Likelihood decreased by {decrease:.2e}"
+                        )
+                    overshoot_stopped = (it, float(decrease), float(rel_decrease))
                 if rel_decrease > PLATEAU_REL_TOL:
                     # history[-1] was appended at the top of this iteration and
                     # holds the params whose LL is likelihoods[-2] -- i.e. the
@@ -374,6 +450,17 @@ def single_fit(
                     )
                 if rel_change < 1e-8:
                     break
+
+        # Return the best iterate rather than the last. These agree for a
+        # monotone fit; they differ when the loop exited on a small decrease
+        # (see best_state's definition above), and there the last iterate is
+        # strictly worse than one we already computed. Truncate the LL/objective
+        # series to match so the reported likelihood describes the parameters
+        # actually returned.
+        if best_state is not None and objectives[-1] < best_obj:
+            updated_component_params, updated_weights, best_len = best_state
+            likelihoods = likelihoods[:best_len]
+            objectives = objectives[:best_len]
 
         if not constrained and check_submerged_duration:
             violated = constraints.multicomponent_density_constraint_violated(
@@ -407,10 +494,21 @@ def single_fit(
             kmeans=kmeans, xlims=xlims, times_submerged=[]
         )
 
+    if overshoot_stopped is not None:
+        _it, _dec, _rel = overshoot_stopped
+        warnings.warn(
+            f"EM stopped on a likelihood overshoot at iteration {_it} "
+            f"(decrease {_dec:.2e}, relative {_rel:.2e}); reverted to the "
+            f"previous iterate. The fit is usable but did not converge "
+            f"normally."
+        )
+
     return dict(
         component_params=updated_component_params,
         weights=updated_weights,
         likelihoods=likelihoods,
+        overshoot_stopped=overshoot_stopped,
+        guard_stats=dict(guard_stats),
         history=history,
         kmeans=kmeans,
         xlims=xlims,

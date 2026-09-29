@@ -58,12 +58,60 @@ from tests.cfusn_simulations.sim_utils import (
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
-# Sample classes: index 0 = pathogenic (minority), 1 = benign.
+# Sample classes: index 0 = pathogenic, 1 = benign. The LR is always the
+# class-0 mixture against the class-1 mixture, so these indices hold for every
+# class configuration below.
 PATH_CLASS, BEN_CLASS = 0, 1
+
 # Mixing weights per sample class over the K=2 shared components
 # (component 0 = "benign-like", component 1 = "pathogenic-like").
-COMP_PROBS = np.array([[0.15, 0.85],    # pathogenic sample class
-                       [0.95, 0.05]])   # benign sample class
+#
+# "simple": two classes, moderate imbalance. This does NOT exercise what
+# sample_specific_bootstrap and pattern_stratified_bootstrap were built for --
+# both target heavy imbalance with very low control counts (<5-10), and at 60
+# pathogenic a resample barely distorts the class.
+#
+# "tp53": the real calibration's class structure, read off
+# build_tp53_multiscoreset rather than assumed. Its sample_names are
+# ['P/LP', 'B/LB', 'gnomAD', 'RPV'] -- note SAMPLE_NAMES in tp53.py also lists
+# 'Synonymous', which is NOT present in the built MultiScoreset. Sizes
+# [235, 88, 408, 12] are the one-hot-resolved counts on the labelled subset
+# (makeOneHot redistributes multi-labelled rows, so the raw column totals
+# [271, 134, 487, 22] are larger).
+#
+# Component weights follow each class's measured position: mean standardised
+# score over the eight co-observed Kato dims is P/LP -1.241, RPV -0.575,
+# gnomAD +0.001, B/LB +0.586. So RPV is pathogenic-LEANING but intermediate,
+# not a benign class -- and it is the 12-member one, which is the whole reason
+# for this configuration: a dozen variants spread over several missingness
+# patterns drive pattern_stratified's (class x pattern) strata toward
+# singletons, and singletons skip resampling entirely (fit_utils/fit.py:163-165).
+CLASS_CONFIGS = {
+    "simple": dict(
+        comp_probs=np.array([[0.15, 0.85],     # pathogenic
+                             [0.95, 0.05]]),   # benign
+        sizes=None,                            # from --n-path/--n-benign
+        names=("pathogenic", "benign"),
+    ),
+    "tp53": dict(
+        comp_probs=np.array([[0.15, 0.85],     # P/LP
+                             [0.95, 0.05],     # B/LB
+                             [0.97, 0.03],     # gnomAD (population)
+                             [0.55, 0.45]]),   # RPV (pathogenic-leaning, n=12)
+        sizes=np.array([235, 88, 408, 12]),
+        names=("P/LP", "B/LB", "gnomAD", "RPV"),
+    ),
+}
+COMP_PROBS = CLASS_CONFIGS["simple"]["comp_probs"]
+
+
+def _class_spec(class_config, n_path, n_ben):
+    """(comp_probs, sizes, names) for the named class configuration."""
+    cfg = CLASS_CONFIGS[class_config]
+    sizes = cfg["sizes"]
+    if sizes is None:
+        sizes = np.array([n_path, n_ben])
+    return cfg["comp_probs"], np.asarray(sizes), cfg["names"]
 N_COMPONENTS = 2
 MASTER_SEED = 12345
 
@@ -119,12 +167,17 @@ def _missingness_spec(p, condition):
     if condition == "block_tp53like":
         # One co-observed block (like TP53's always-together 8-readout assay)
         # plus 1-2 individually very sparse dims (KawOligo-like).
+        # Fractions measured against real TP53 rather than guessed: its Kato
+        # block is co-observed on most labelled variants, while KawOligo is
+        # ~99% missing. An earlier version capped the sparsest dims at 0.90,
+        # which is materially milder than the real thing -- and the sparse
+        # extreme is exactly where bootstrap variance is expected to blow up.
         if p >= 4:
             blocks = [list(range(0, max(2, p // 2))), [p - 1], [p - 2]]
-            fracs = [0.25, 0.90, 0.90]
+            fracs = [0.25, 0.99, 0.93]
         else:
             blocks = [[0], [p - 1]]
-            fracs = [0.25, 0.90]
+            fracs = [0.25, 0.99]
         return ("block", (blocks, fracs))
     raise ValueError(f"unknown missingness condition: {condition}")
 
@@ -147,8 +200,19 @@ def _restore_empty_rows(X_missing, X_full, rng):
     empty = np.isnan(X_missing).all(axis=1)
     if not empty.any():
         return X_missing
+    # Restore a dimension chosen in PROPORTION to how often each dimension is
+    # observed, not uniformly. A variant that carries a single measurement has
+    # it in a commonly-run assay, not a rare one -- and uniform choice actively
+    # destroys the structure this condition exists to model: at p=4
+    # block_tp53like it inflated the sparsest dimension's coverage from the
+    # intended ~7 rows (0.99 missing) to 58, an 8x distortion concentrated
+    # exactly on the dimension under study.
+    obs_freq = (~np.isnan(X_missing)).sum(axis=0).astype(float)
+    if obs_freq.sum() <= 0:
+        obs_freq = np.ones(X_missing.shape[1])
+    probs = obs_freq / obs_freq.sum()
     for i in np.where(empty)[0]:
-        d = rng.randint(X_missing.shape[1])
+        d = int(rng.choice(X_missing.shape[1], p=probs))
         X_missing[i, d] = X_full[i, d]
     return X_missing
 
@@ -165,7 +229,8 @@ def _apply_missingness(X, spec, rng):
     return _restore_empty_rows(out, X, rng)
 
 
-def make_condition_data(p, condition, n_path, n_ben, n_query, data_seed):
+def make_condition_data(p, condition, n_path, n_ben, n_query, data_seed,
+                        class_config="simple"):
     """Fixed dataset + fixed query set for one (p, missingness) condition.
 
     The query set is drawn once from the TRUE mixture (50/50 over components)
@@ -175,10 +240,9 @@ def make_condition_data(p, condition, n_path, n_ben, n_query, data_seed):
     pattern stratification is supposed to matter.
     """
     params = build_true_params(p)
+    comp_probs, sizes, _names = _class_spec(class_config, n_path, n_ben)
     rng = np.random.RandomState(data_seed)
-    X, sa, _ = sample_cfusn_mixture(
-        params, COMP_PROBS, np.array([n_path, n_ben]), rng
-    )
+    X, sa, _ = sample_cfusn_mixture(params, comp_probs, sizes, rng)
     spec = _missingness_spec(p, condition)
     X = _apply_missingness(X, spec, rng)
 
@@ -299,10 +363,10 @@ def run_one_bootstrap(task):
     """One resample + refit + LR evaluation. Module-level and picklable so it
     can run under ProcessPoolExecutor."""
     (p, condition, strategy, boot_idx,
-     n_path, n_ben, n_query, data_seed, max_em_iters) = task
+     n_path, n_ben, n_query, data_seed, max_em_iters, class_config) = task
 
     X, sa, Xq, Xq_missing = make_condition_data(
-        p, condition, n_path, n_ben, n_query, data_seed
+        p, condition, n_path, n_ben, n_query, data_seed, class_config=class_config
     )
     mv = p >= 2
 
@@ -398,7 +462,7 @@ def percentile_sensitivity(mat):
 
 def run_condition(p, condition, strategy, args, executor=None):
     tasks = [(p, condition, strategy, b, args.n_path, args.n_benign,
-              args.n_query, args.data_seed, args.max_em_iters)
+              args.n_query, args.data_seed, args.max_em_iters, args.class_config)
              for b in range(args.n_bootstraps)]
     if executor is None:
         results = [run_one_bootstrap(t) for t in tasks]
@@ -409,7 +473,8 @@ def run_condition(p, condition, strategy, args, executor=None):
     n_valid, n_failed = len(good), len(results) - len(good)
 
     X, _, _, Xq_missing = make_condition_data(
-        p, condition, args.n_path, args.n_benign, args.n_query, args.data_seed
+        p, condition, args.n_path, args.n_benign, args.n_query, args.data_seed,
+        class_config=args.class_config
     )
     row = dict(p=p, missingness=condition, strategy=strategy,
                n_valid=n_valid, n_failed=n_failed, **pattern_diagnostics(X))
@@ -465,6 +530,142 @@ def flag_high_variance(rows, flag_multiple):
 
 # ── Reporting ───────────────────────────────────────────────────────────────
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# Real-TP53 arm
+# ══════════════════════════════════════════════════════════════════════════
+# A bootstrap-variance study needs no ground truth -- it resamples, refits and
+# measures spread -- so it can run directly on the real matrix, with TP53's own
+# class imbalance, collinearity and missingness patterns instead of synthetic
+# approximations of them. Log-LR is evaluated on the REAL variants, which is
+# exactly how mv_calibration builds its lr_matrix, so the percentile-sensitivity
+# numbers apply to the actual calibration.
+
+def load_real_tp53(collapse):
+    """(X, sa, dim_names) for real TP53, preprocessed exactly as production does.
+
+    collapse=True applies redundancy_collapse's 'tp53_kato_pca2' preset, folding
+    the 8 co-observed Kato readouts into 2 PCs (16 dims -> 10). That preset is
+    manual opt-in -- nothing in the pipeline applies it by default.
+    """
+    from src.assay_calibration.multivariate_data.tp53 import build_tp53_multiscoreset
+    from src.assay_calibration.fit_utils.fit import makeOneHot
+
+    ms = build_tp53_multiscoreset()
+    if collapse:
+        from src.assay_calibration.multivariate_data import redundancy_collapse as rc
+        rc.apply_preset({"TP53": ms}, "tp53_kato_pca2")
+    X = np.asarray(ms.scores, dtype=float)
+    sa_raw = np.asarray(ms.sample_assignments)
+    keep = sa_raw.any(axis=1)          # calibration fits labelled variants only
+    X, sa_raw = X[keep], sa_raw[keep]
+    sa = makeOneHot(sa_raw, rng=np.random.RandomState(0))
+    mean = np.nanmean(X, axis=0)
+    std = np.nanstd(X, axis=0)
+    std = np.where(std < 1e-8, 1.0, std)
+    names = list(getattr(ms, "dataset_names", []) or [])
+    return (X - mean) / std, sa, names
+
+
+def run_one_real_bootstrap(task):
+    """One resample + refit + log-LR over the real variants."""
+    strategy, boot_idx, collapse, n_components, max_em_iters = task
+    X, sa, _ = load_real_tp53(collapse)
+    boot_seed = derive_bootstrap_seed(MASTER_SEED, boot_idx)
+    try:
+        train_idx, _ = draw_indices(strategy, X, sa, boot_seed)
+    except ValueError:
+        return dict(ok=False)
+    result = tryToFit(
+        X[train_idx], sa[train_idx], num_components=n_components, constrained=False,
+        init_method="kmeans", init_constraint_adjustment="scale",
+        multivariate=True, latent_q=2, check_monotonic=False, num_fits=1,
+        fit_seed=derive_fit_seed(MASTER_SEED, boot_idx, n_components, 0),
+        verbose=False, verbose_init=False, max_em_iters=max_em_iters,
+    )
+    params = result.get("component_params", [])
+    weights = result.get("weights")
+    if not params or any(len(pp) == 0 for pp in params) or weights is None:
+        return dict(ok=False)
+    return dict(ok=True, log_lr=_log_lr(params, weights, X, True),
+                path_weight=_pathogenic_weight(weights))
+
+
+def _spread_by_observed(mat, n_obs):
+    """Spread metrics bucketed by how many dimensions each variant has observed.
+
+    This is the direct test of whether bootstrap variance explodes on
+    poorly-measured variants: a calibration can look stable on average while
+    being wildly unstable exactly where the data is thinnest.
+    """
+    out = []
+    edges = [(1, 1), (2, 3), (4, 7), (8, 99)]
+    lo_p = np.nanpercentile(mat, 5, axis=0)
+    hi_p = np.nanpercentile(mat, 95, axis=0)
+    q25 = np.nanpercentile(mat, 25, axis=0)
+    q75 = np.nanpercentile(mat, 75, axis=0)
+    for lo, hi in edges:
+        sel = (n_obs >= lo) & (n_obs <= hi)
+        if not sel.any():
+            continue
+        med = np.nanmedian(mat, axis=0)
+        abs_lr = np.abs(med)[sel]
+        band_sel = (hi_p - lo_p)[sel]
+        # Absolute band alone is misleading across buckets: a well-measured
+        # variant's log-LR is a product over many dimensions, so it is both
+        # larger and noisier in absolute terms. rel_band normalises by the
+        # evidence magnitude so buckets are comparable.
+        out.append(dict(obs_dims=f"{lo}-{hi}" if lo != hi else f"{lo}",
+                        n_variants=int(sel.sum()),
+                        median_band=float(np.nanmedian(band_sel)),
+                        median_iqr=float(np.nanmedian((q75 - q25)[sel])),
+                        median_abs_log_lr=float(np.nanmedian(abs_lr)),
+                        rel_band=float(np.nanmedian(
+                            band_sel / np.maximum(abs_lr, 1e-6)))))
+    return out
+
+
+def run_real_arm(args, executor=None):
+    X, sa, names = load_real_tp53(args.real == "tp53_collapsed")
+    n_obs = (~np.isnan(X)).sum(axis=1)
+    p = X.shape[1]
+    print(f"\n=== REAL TP53 ({'Kato-PCA collapsed' if args.real == 'tp53_collapsed' else 'uncollapsed'}) ===")
+    print(f"  variants={len(X)}  dims={p}  classes={sa.sum(0).tolist()}  "
+          f"K={args.real_k}")
+    print(f"  patterns={len(np.unique(~np.isnan(X), axis=0))}  "
+          f"observed-dims per variant: min={n_obs.min()} median={int(np.median(n_obs))} "
+          f"max={n_obs.max()}  fully-observed={int((n_obs == p).sum())}")
+    if names:
+        print(f"  dims: {', '.join(names)}")
+
+    rows, bucket_rows = [], []
+    for strategy in args.strategies:
+        tasks = [(strategy, b, args.real == "tp53_collapsed", args.real_k,
+                  args.max_em_iters) for b in range(args.n_bootstraps)]
+        results = ([run_one_real_bootstrap(t) for t in tasks] if executor is None
+                   else list(executor.map(run_one_real_bootstrap, tasks)))
+        good = [r for r in results if r.get("ok")]
+        if not good:
+            print(f"  {strategy:>18}: no valid fits")
+            continue
+        mat = np.vstack([r["log_lr"] for r in good])
+        w = np.array([r["path_weight"] for r in good])
+        row = dict(p=p, missingness=f"real_{args.real}", strategy=strategy,
+                   n_valid=len(good), n_failed=len(results) - len(good),
+                   path_weight_std=float(np.nanstd(w)),
+                   path_weight_cv=float(np.nanstd(w) / max(abs(np.nanmean(w)), 1e-12)),
+                   **_spread_metrics(mat))
+        rows.append(row)
+        print(f"  {strategy:>18}: valid={row['n_valid']:>3} "
+              f"band={row['median_band']:.3f} iqr={row['median_iqr']:.3f} "
+              f"signbad={row['sign_unstable_frac']:.3f}")
+        for b in _spread_by_observed(mat, n_obs):
+            bucket_rows.append(dict(strategy=strategy, **b))
+            print(f"        obs_dims={b['obs_dims']:>5} n={b['n_variants']:>4}  "
+                  f"band={b['median_band']:>8.3f}  iqr={b['median_iqr']:>7.3f}  "
+                  f"|logLR|={b['median_abs_log_lr']:>8.3f}  rel_band={b['rel_band']:>7.2f}")
+    return rows, bucket_rows
+
 def _report(rows, baseline, flag_multiple):
     print(f"\n{'═' * 110}")
     print("  BOOTSTRAP LR VARIANCE by (dimensionality × missingness × strategy)")
@@ -519,7 +720,13 @@ def _write_csv(rows, stem):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--p-grid", type=int, nargs="+", default=[1, 2, 4, 16])
+    parser.add_argument("--p-grid", type=int, nargs="+", default=[1, 2, 4, 10])
+    parser.add_argument("--class-config", choices=sorted(CLASS_CONFIGS), default="tp53",
+                        help="Sample-class structure. 'tp53' mirrors the real "
+                             "calibration's [P/LP, B/LB, gnomAD, RPV] = "
+                             "[235, 88, 408, 12] layout (the 12-member RPV class "
+                             "is what exercises the stratified bootstraps); "
+                             "'simple' is two classes from --n-path/--n-benign.")
     parser.add_argument("--missingness", nargs="+", default=list(MISSINGNESS_CONDITIONS),
                         choices=list(MISSINGNESS_CONDITIONS))
     parser.add_argument("--strategies", nargs="+",
@@ -531,6 +738,13 @@ def main():
     parser.add_argument("--n-query", type=int, default=200)
     parser.add_argument("--data-seed", type=int, default=20260918)
     parser.add_argument("--flag-multiple", type=float, default=3.0)
+    parser.add_argument("--real", choices=["none", "tp53", "tp53_collapsed"],
+                        default="none",
+                        help="Run the real-TP53 arm instead of the synthetic grid. "
+                             "'tp53_collapsed' applies redundancy_collapse's "
+                             "tp53_kato_pca2 preset (16 dims -> 10).")
+    parser.add_argument("--real-k", type=int, default=3,
+                        help="Number of mixture components for the real arm.")
     parser.add_argument("--max-em-iters", type=int, default=10000,
                         help="EM iteration ceiling per fit. Fits that hit it are "
                              "truncated rather than converged; under heavy "
@@ -543,8 +757,22 @@ def main():
 
     print(f"p grid={args.p_grid} (p=1 -> scalar path, p>=2 -> CFUSN q=2)")
     print(f"missingness={args.missingness}  strategies={args.strategies}")
+    _cp, _sz, _nm = _class_spec(args.class_config, args.n_path, args.n_benign)
+    print(f"class_config={args.class_config}  classes="
+          f"{dict(zip(_nm, _sz.tolist()))}")
     print(f"n_bootstraps={args.n_bootstraps}  n_path={args.n_path}  "
           f"n_benign={args.n_benign}  n_query={args.n_query}  n_jobs={args.n_jobs}\n")
+
+    if args.real != "none":
+        if args.n_jobs and args.n_jobs != 1:
+            with ProcessPoolExecutor(max_workers=None if args.n_jobs < 0 else args.n_jobs) as ex:
+                real_rows, bucket_rows = run_real_arm(args, ex)
+        else:
+            real_rows, bucket_rows = run_real_arm(args, None)
+        _write_csv(real_rows, f"sim_bootstrap_variance_real_{args.real}")
+        _write_csv(bucket_rows, f"sim_bootstrap_variance_real_{args.real}_byobs")
+        print()
+        return
 
     if args.n_jobs and args.n_jobs != 1:
         with ProcessPoolExecutor(max_workers=None if args.n_jobs < 0 else args.n_jobs) as ex:

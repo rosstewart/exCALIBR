@@ -32,10 +32,17 @@ def build_functional_scoresets(
     datasets: List[str],
     clinvar_release: str = "2026",
     population_type: str = "gnomAD",
+    regularization_type: Optional[str] = None,
 ) -> List[Scoreset]:
     """Build one Scoreset per Dataset value for ``gene`` (same construction
     hpc/prepare.py's ``_process_multivariate_gene`` uses for its functional
     dimensions, minus the fitting step).
+
+    ``regularization_type`` (default None, i.e. Scoreset's own default):
+    pass "all_assayed" to retain VUS/unlabeled rows (Scoreset's default
+    keep_mask drops any row without a P/LP/B/LB/gnomAD/Synonymous
+    sample_assignment) -- needed by callers that want to score true
+    ClinVar-VUS variants under the combined functional+predictor fit.
     """
     df_gene = df[df["Gene"] == gene]
     scoresets = []
@@ -45,6 +52,7 @@ def build_functional_scoresets(
             clinvar_release=clinvar_release,
             min_clinvar_star=1,
             population_type=population_type,
+            regularization_type=regularization_type,
         )
         if sum(1 for _ in ds.samples) < 2:
             continue
@@ -155,6 +163,55 @@ def split_predictor_clinvar_leakage(
     return predictor_scoreset
 
 
+def select_variants(ms, mask: np.ndarray) -> None:
+    """Restrict `ms` (a BasicMultiScoreset/MultiPredictorFunctionalScoreset)
+    IN PLACE to exactly the rows where `mask` is True. `mask` is indexed
+    against ms.kept_variants/ms.scores/ms.n_variants (i.e. AFTER the "at
+    least one dimension observed" filter `_build()` already applies -- NOT
+    against the raw pre-union `_all_ids`/`_scores_matrix`/`_missing_mask`).
+
+    Row/variant analog of redundancy_collapse.py::select_dims's column
+    restriction -- same direct-mutation style, just restricting rows instead
+    of columns. Also keeps `_keep_mask` (defined against the full,
+    pre-filter `_all_ids` length) internally consistent with the narrowed
+    `kept_variants`/`scores`, since `keep_mask`/`full_scores` are still a
+    public part of BasicMultiScoreset's API even though nothing in this
+    module's own callers reads them.
+
+    Used by build_combined_multiscoreset's `require_both_modalities` to
+    implement "intersection across modalities, union within modality" for
+    the combined gene-set: a variant observed in ANY functional assay AND
+    ANY predictor is kept; a variant observed in only one modality (e.g. all
+    3 predictor dims but zero functional dims, or vice versa) is dropped
+    from the combined fit/scoring population entirely -- it still
+    contributes to that modality's own functional-only/predictor-only union
+    fit, just not to "combined".
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape[0] != ms.n_variants:
+        raise ValueError(
+            f"mask length {mask.shape[0]} does not match ms.n_variants {ms.n_variants}"
+        )
+
+    old_keep_idx = np.where(ms._keep_mask)[0]
+    new_keep_mask = ms._keep_mask.copy()
+    new_keep_mask[old_keep_idx[~mask]] = False
+    ms._keep_mask = new_keep_mask
+
+    ms._variants_kept = [v for v, m in zip(ms._variants_kept, mask) if m]
+    ms._scores = ms._scores[mask]
+    ms._missing = ms._missing[mask]
+    ms._sample_assignments = ms._sample_assignments[mask]
+    ms.n_variants = ms._scores.shape[0]
+    ms._xlims = tuple(
+        (float(np.nanmin(ms._scores[:, d])), float(np.nanmax(ms._scores[:, d])))
+        for d in range(ms._scores.shape[1])
+    )
+    ms.global_score_min = tuple(lo for lo, _hi in ms._xlims)
+    ms.global_score_max = tuple(hi for _lo, hi in ms._xlims)
+    ms.sample_counts = ms._sample_assignments.sum(axis=0)
+
+
 def build_combined_multiscoreset(
     gene: str,
     functional_scoresets: List[Scoreset],
@@ -162,6 +219,7 @@ def build_combined_multiscoreset(
     predictor_data_dir: str,
     predictors: Optional[List[str]] = None,
     functionally_assayed_variants: Optional[Set[str]] = None,
+    require_both_modalities: bool = True,
 ) -> Optional[MultiPredictorFunctionalScoreset]:
     """Join gene's predictor dimensions (REVEL/MP2/AM) with its functional
     dimensions into one MultiPredictorFunctionalScoreset.
@@ -170,6 +228,21 @@ def build_combined_multiscoreset(
     variants), if given, splits predictor-CSV P/LP/B/LB leakage (see
     split_predictor_clinvar_leakage) for variants that have functional data
     -- predictor-only variants are unaffected and keep their own label.
+
+    ``require_both_modalities`` (default True): drop any variant that isn't
+    observed in AT LEAST ONE predictor dimension AND AT LEAST ONE functional
+    dimension (union within each modality, intersection across modalities;
+    see select_variants). Without this, MultiPredictorFunctionalScoreset's
+    underlying BasicMultiScoreset uses a plain union of IDs across every
+    input scoreset -- confirmed on real BRCA1 data (6 dims: 3 predictor + 3
+    functional) that this lets single-modality rows dominate: only 60/2835
+    variants (2.1%) had every dimension observed, while 1833 (64.6%) had all
+    3 predictor dims but ZERO functional dims, and 383 (13.5%) had
+    functional data but ZERO predictor dims -- 78% of the "combined"
+    population was actually single-modality evidence, contaminating a fit
+    that's supposed to isolate cross-modality (functional x predictor)
+    correlation structure. Pass False to restore the old union-only
+    behavior.
 
     Returns None if no predictor CSVs are available for ``gene``.
     """
@@ -189,9 +262,18 @@ def build_combined_multiscoreset(
             split_predictor_clinvar_leakage(ps, functionally_assayed_variants)
     predictor_names = [PREDICTOR_DATASET_NAMES.get(p, p) for p in have]
 
-    return MultiPredictorFunctionalScoreset.from_predictor_and_functional(
+    combined = MultiPredictorFunctionalScoreset.from_predictor_and_functional(
         predictor_scoresets,
         functional_scoresets,
         predictor_names=predictor_names,
         functional_names=list(functional_dataset_names),
     )
+
+    if require_both_modalities:
+        n_predictor_dims = len(predictor_scoresets)
+        observed = ~combined.missing
+        has_predictor = observed[:, :n_predictor_dims].any(axis=1)
+        has_functional = observed[:, n_predictor_dims:].any(axis=1)
+        select_variants(combined, has_predictor & has_functional)
+
+    return combined

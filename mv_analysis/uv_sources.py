@@ -42,6 +42,7 @@ Per-gene-set UV data sources
   spot-check match rate for a new gene before trusting it blindly.
 - fgfr: UV calibrations are pending; always returns None.
 """
+import functools
 import json
 import re
 import sys
@@ -130,8 +131,16 @@ def _load_card11_uv_matrix(ms):
 
 # ── labelseq ─────────────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=1)
+def _cached_labelseq_dataframe():
+    # Deterministic function of its (default) args -- reused across every
+    # LABEL-seq gene in a process instead of re-parsing the raw flat file
+    # (large; a real cost) once per gene.
+    return build_labelseq_dataframe()
+
+
 def _load_labelseq_uv_matrix(gene, ms):
-    df_labelseq = build_labelseq_dataframe()
+    df_labelseq = _cached_labelseq_dataframe()
     datasets, mat = build_uv_points_matrix(ms, gene, df_labelseq, config.LABELSEQ_UV_CALIB_DIR)
     if not datasets:
         return None
@@ -335,19 +344,93 @@ def load_predictor_mv_uv_points(gene, ms, predictor_data_dir=None, uv_calib_dir=
     return names, np.vstack(rows)
 
 
+FGFR_SOURCE_PATH = "/data/ross/assay_calibration/FGFR/dataframe_processed.csv.gz"
+# Matches export_fgfr_uv_inputs.py's DIMENSIONS exactly -- these are the 3
+# assays that dir's calibration was fit against, on log-transformed scores
+# (dir name "uv_calib_logscores").
+_FGFR_DIMENSIONS = {"activation": "score_activation", "pemr": "score_pemr", "futr": "score_futr"}
+
+
 def load_fgfr_uv_points(gene, ms):
-    return None
+    """UV bridging for FGFR's 3 assay-derived calibrations (activation/pemr/
+    futr). No re-fitting -- reuses the already-computed point_ranges in
+    each assay's {dim}_3c_calibration.json under config.FGFR_UV_CALIB_DIR.
+
+    The exported {dim}_variants.csv files in that directory carry only
+    positional "variant_N" ids (Scoreset.to_csv() never writes a variant-
+    identity column -- confirmed dataset.py:465-488), so instead of trying
+    to recover identity from them, this rebuilds each assay's Scoreset LIVE
+    from the real source data (FGFR_SOURCE_PATH, the same file
+    export_fgfr_uv_inputs.py itself reads), using the exact same
+    construction (log_transform=True, matching "uv_calib_logscores"'s
+    naming) -- a freshly-built Scoreset naturally carries real variant
+    identity via its own `.dataframe` (aa_ref/aa_pos/aa_alt, Chrom/
+    hg38_start/ref_allele/alt_allele), so no positional reconstruction is
+    needed at all. Points are computed from point_ranges via
+    classify_score_from_point_ranges (the canonical classifier -- do not
+    trust the exported CSV's own `standard_points`, which can be stale
+    relative to point_ranges, same caveat as everywhere else in this file).
+    """
+    from src.assay_calibration.data_utils.dataset import Scoreset
+    from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+
+    calib_dir = Path(config.FGFR_UV_CALIB_DIR)
+    df = pd.read_csv(FGFR_SOURCE_PATH, low_memory=False)
+    df_pooled = df.copy()
+    df_pooled["Dataset"] = "FGFR_combined"
+    clinvar_release = resolve_clinvar_release("FGFR1")
+    key_index = {vk: i for i, vk in enumerate(ms._variants_kept)}
+
+    names, rows = [], []
+    for dim, score_col in _FGFR_DIMENSIONS.items():
+        cal_path = calib_dir / f"{dim}_3c_calibration.json"
+        if not cal_path.exists():
+            continue
+        with open(cal_path) as f:
+            point_ranges = json.load(f)["point_ranges"]
+
+        ds = Scoreset(df_pooled, score_col=score_col, clinvar_release=clinvar_release,
+                       min_clinvar_star=1, population_type="gnomAD", log_transform=True)
+
+        row = np.full(ms.n_variants, np.nan)
+        for r in ds.dataframe.itertuples(index=False):
+            score = getattr(r, score_col, None)
+            if score is None or pd.isna(score):
+                continue
+            idx = None
+            # ms._variants_kept keys are (paralog_gene, chrom:int, start:int,
+            # ref, alt) tuples -- confirmed via a real FGFR ms
+            # (('FGFR1', 8, 38418232, 'C', 'T'), ...). The per-row paralog
+            # (not the `gene` function arg, which is "FGFR_combined") and
+            # native int chrom/start are required for the lookup to hit.
+            row_gene = getattr(r, "Gene", None)
+            chrom, start = getattr(r, "Chrom", None), getattr(r, "hg38_start", None)
+            ref, alt = getattr(r, "ref_allele", None), getattr(r, "alt_allele", None)
+            if pd.notna(row_gene) and pd.notna(chrom) and pd.notna(start) and pd.notna(ref) and pd.notna(alt):
+                idx = key_index.get((row_gene, int(chrom), int(start), ref, alt))
+            if idx is None:
+                aa_ref, aa_pos, aa_alt = getattr(r, "aa_ref", None), getattr(r, "aa_pos", None), getattr(r, "aa_alt", None)
+                if pd.notna(aa_ref) and pd.notna(aa_pos) and pd.notna(aa_alt):
+                    idx = key_index.get(f"{aa_ref}{int(aa_pos)}{aa_alt}")
+            if idx is None:
+                continue
+            row[idx] = classify_score_from_point_ranges(score, point_ranges)
+        rows.append(row)
+        names.append(f"{dim}_FGFR")
+
+    if not rows:
+        return None
+    return names, np.vstack(rows)
 
 
 # ── combined evidence: functional + predictor UV together (Panel C) ──────
 
 def load_combined_all_evidence_uv_points(gene, ms, df_integrated=None):
     """Functional (exc_pp) and predictor (REVEL/MP2/AM) UV calibrations,
-    merged into ONE matrix so a single non-conflicting aggregation spans
-    both evidence types together -- not two separate non-conflicting
-    aggregates combined after the fact. Used for Panel C's "ExCALIBR"
-    baseline: 'what if every individually-calibrated assay AND predictor
-    for this gene were combined with one non-conflicting rule'."""
+    merged into ONE matrix listing every individual source -- used where
+    every source needs its OWN row (e.g. individual_predictor_comparison's
+    per-source breakdown), NOT for the "ExCALIBR-UV combined" scalar
+    baseline itself; see `aggregate_functional_plus_predictor` for that."""
     functional = load_combined_uv_points(gene, ms, df_integrated=df_integrated)
     predictor = load_predictor_mv_uv_points(gene, ms)
     names, mats = [], []
@@ -362,6 +445,37 @@ def load_combined_all_evidence_uv_points(gene, ms, df_integrated=None):
     if not mats:
         return None
     return names, np.vstack(mats)
+
+
+def aggregate_functional_plus_predictor(gene, ms, aggregator, df_integrated=None):
+    """The "ExCALIBR-UV combined" baseline: functional sources aggregated
+    among THEMSELVES via `aggregator` (e.g. uv_agg.aggregate_nonconflicting),
+    predictor sources aggregated among THEMSELVES the same way, then the two
+    resulting per-variant evidence arrays are ADDED -- NOT one non-conflicting
+    (or max) rule spanning every individual source as one flat pool (what
+    `load_combined_all_evidence_uv_points` + a single `aggregator(mat)` call
+    used to do here). A functional-vs-predictor disagreement no longer zeroes
+    out the whole gene's baseline the way an in-category disagreement still
+    does within each group.
+
+    Returns a `(ms.n_variants,)` array, NaN only where BOTH groups are
+    entirely missing for a variant (a group that's missing but the other
+    isn't contributes 0, i.e. "no evidence from that category", not NaN --
+    matches how a single missing source already behaves inside `aggregator`
+    itself)."""
+    functional = load_combined_uv_points(gene, ms, df_integrated=df_integrated)
+    predictor = load_predictor_mv_uv_points(gene, ms)
+    if functional is None and predictor is None:
+        return None
+
+    n = ms.n_variants if hasattr(ms, "n_variants") else ms.scores.shape[0]
+    func_agg = aggregator(functional[1]) if functional is not None else np.full(n, np.nan)
+    pred_agg = aggregator(predictor[1]) if predictor is not None else np.full(n, np.nan)
+
+    both_missing = np.isnan(func_agg) & np.isnan(pred_agg)
+    combined = np.nan_to_num(func_agg, nan=0.0) + np.nan_to_num(pred_agg, nan=0.0)
+    combined[both_missing] = np.nan
+    return combined
 
 
 # ── plain "integrated" functional-only genes (Panel A) ────────────────────

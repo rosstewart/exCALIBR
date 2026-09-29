@@ -352,3 +352,31 @@ def collapse_block(ms, block_names: Sequence[str], k: int,
     )
 
     return transform
+
+
+def select_dims(ms, dim_indices: Sequence[int]) -> None:
+    """Restrict `ms` IN PLACE to exactly the given column indices, in that
+    order -- same mutation pattern/target attributes as `collapse_block`
+    (`ms._scores`, `ms.dataset_names`, `ms.d`, `ms._missing`, `ms._xlims`),
+    just a plain column selection instead of a PCA collapse. Used by
+    hpc/prepare.py's per-disjoint-cluster job generation (see
+    `Fit._select_all_calibration_clusters`) to build one dimension-restricted
+    MultiScoreset per cluster from a single shared `ms` -- callers doing
+    this for MULTIPLE clusters from the same source `ms` must
+    `copy.deepcopy(ms)` before calling this on each copy, since it mutates
+    in place and does not itself copy.
+
+    `sample_counts`/`_variants_kept` are derived from `sample_assignments`
+    (row-level), not `scores` (column-level), and are unaffected by a
+    column-only restriction -- same caveat as `collapse_block`.
+    """
+    names = list(ms.dataset_names)
+    new_scores = ms.scores[:, list(dim_indices)]
+    ms._scores = new_scores
+    ms.dataset_names = [names[i] for i in dim_indices]
+    ms.d = new_scores.shape[1]
+    ms._missing = np.isnan(new_scores)
+    ms._xlims = tuple(
+        (float(np.nanmin(new_scores[:, d])), float(np.nanmax(new_scores[:, d])))
+        for d in range(new_scores.shape[1])
+    )

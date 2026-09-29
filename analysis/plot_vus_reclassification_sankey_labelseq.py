@@ -24,7 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from mv_analysis.sankey_plot import STRENGTH_COLOR, BND_COLOR as _BND_COLOR, plot_categorical_sankey
+from mv_analysis.sankey_plot_flat import STRENGTH_COLOR, BND_COLOR as _BND_COLOR, plot_categorical_sankey
 
 OUTPUT_DIR = "/data/ross/assay_calibration/multivariate/experimental_staged_fit"
 

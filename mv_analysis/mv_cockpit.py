@@ -24,7 +24,7 @@
 # All results-provenance (which JSON, which dataset key, which MultiScoreset
 # builder) is resolved through `mv_analysis/config.py`'s registry -- nothing
 # here hardcodes a path. `tavtigian_sims/` is NOT a dependency anywhere in
-# this file (see `mv_analysis/sankey_plot.py`, vendored out of it).
+# this file (see `mv_analysis/sankey_plot_flat.py`, vendored out of it).
 #
 # Run as a plain script (`python mv_analysis/mv_cockpit.py --gene-set
 # labelseq --fit-type canonical --analyses results-table`) for the CLI, or
@@ -53,6 +53,7 @@
 #   yet added here).
 
 # %%
+import json
 import sys
 from pathlib import Path
 
@@ -97,16 +98,22 @@ DEFAULT_RUN_KWARGS = dict(
 def resolve_fit(gene_set: str, fit_type: str, gene: str, n_components: int = 6):
     """Returns (results_json_path, dataset_name, config_hint) for one gene.
     `config_hint`, if not None, is the exact config string to use (staged-init
-    fits only ever have one config per file); canonical fits have several
-    ("Nc_unc") and the caller picks the best-MCC one itself (see
-    `pick_best_canonical_config`)."""
-    if fit_type == "canonical":
-        return config.CANONICAL_RESULTS_JSON, config.canonical_dataset_name(gene, gene_set), None
+    fits only ever have one config per file); canonical/paper fits have
+    several ("Nc_unc") and the caller picks the best-MCC one itself (see
+    `pick_best_canonical_config`).
+
+    fit_type="paper": identical to "canonical" except it resolves against
+    `config.PAPER_RESULTS_JSON` (the post-Sept-2026-EM-fixes run backing the
+    current manuscript draft) instead of `config.CANONICAL_RESULTS_JSON`
+    (pre-fix, kept only for backward-compat with older analyses)."""
+    if fit_type in ("canonical", "paper"):
+        results_json = config.PAPER_RESULTS_JSON if fit_type == "paper" else config.CANONICAL_RESULTS_JSON
+        return results_json, config.canonical_dataset_name(gene, gene_set, results_json=results_json), None
     if fit_type == "staged_init_all_assayed":
         return (config.staged_init_results_path(gene, gene_set, n_components),
                 config.staged_init_dataset_name(gene, gene_set),
                 config.staged_init_config_label(n_components))
-    raise ValueError(f"Unknown fit_type={fit_type!r}. Expected 'canonical' or 'staged_init_all_assayed'.")
+    raise ValueError(f"Unknown fit_type={fit_type!r}. Expected 'canonical', 'paper', or 'staged_init_all_assayed'.")
 
 
 def pick_best_canonical_config(gene: str, gene_set: str, ms, results_json: str, dataset_name: str,
@@ -161,38 +168,118 @@ def load_gene(gene_set: str, fit_type: str, gene: str, n_components: int = 6,
     if config_name is None:
         config_name = pick_best_canonical_config(gene, gene_set, ms, results_json, dataset_name, run_kwargs)
 
-    analysis = build_gene_set_analysis(ms, gene.lower(), results_json, dataset_name=dataset_name)
+    analysis = build_gene_set_analysis(ms, gene.lower(), results_json, dataset_name=dataset_name, gene_set=gene_set)
     analysis.run(partial_pattern_mode="trust_global", **run_kwargs)
     return ms, analysis, config_name
 
 
 # %% [markdown]
 # ## Analysis: results table (MCC/coverage/accuracy/DOR/sensitivity/specificity)
+#
+# Unlike gene_performance_scatter.py's build_panel_a/b/c (which have their
+# own disk cache, `_load_cached`/`_save_cached`/`cache_dir`, keyed to a
+# scalar (mv_mcc, uv_mcc, n_eval) summary per gene), `run_results_table`
+# previously had NO caching at all -- every call re-ran the full 100-bootstrap
+# scoring from scratch for every gene, every time, even to re-derive a table
+# that was already computed moments earlier in the same process (confirmed
+# the hard way: re-running just the VUS/Brnich/summary sections of the paper
+# notebook required redoing every gene-set's full results table first, since
+# `main()`'s in-memory `functional_table`/etc. only exist within one process).
+# Same pattern as gene_performance_scatter.py's cache, just table-shaped
+# (a list of row-dicts) instead of a single scalar record.
 
 # %%
+def _results_table_cache_path(cache_dir, gene_set, fit_type, gene, cluster_idx):
+    return Path(cache_dir) / f"table_{gene_set}_{fit_type}_{gene}_cluster{cluster_idx}.json"
+
+
+def _load_results_table_cache(cache_dir, gene_set, fit_type, gene, cluster_idx):
+    if cache_dir is None:
+        return None
+    p = _results_table_cache_path(cache_dir, gene_set, fit_type, gene, cluster_idx)
+    if p.exists():
+        with open(p) as f:
+            return json.load(f)
+    return None
+
+
+def _save_results_table_cache(cache_dir, gene_set, fit_type, gene, cluster_idx, record):
+    if cache_dir is None:
+        return
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    with open(_results_table_cache_path(cache_dir, gene_set, fit_type, gene, cluster_idx), "w") as f:
+        json.dump(record, f)
+
+
 def run_results_table(gene_set: str, fit_type: str, genes, n_components=6, run_kwargs=None,
-                       compare_uv=True, redundancy_collapse_preset=None):
+                       compare_uv=True, redundancy_collapse_preset=None, cache_dir=None):
+    """One row (or more) per gene. Genes whose assay dimensions split into
+    multiple disjoint clusters (see Fit._select_all_calibration_clusters /
+    hpc/prepare.py's per-cluster job generation, e.g. BRCA2 under
+    --gene-set integrated) get one row PER cluster variant actually present
+    in the results JSON ("gene", "gene", "cluster2", ...), tagged via a
+    "cluster" column -- not just the primary/unsuffixed one. Single-cluster
+    genes (the common case) are unaffected: exactly one row, "cluster"="gene".
+    Cluster-variant discovery is skipped for fit_type="staged_init_all_assayed"
+    (a different, unrelated axis -- see mv_analysis/config.py's
+    GENE_SETS_SUPPORTING_ALL_ASSAYED)."""
     run_kwargs = run_kwargs or DEFAULT_RUN_KWARGS
     rows = []
     for gene in genes:
         try:
             regularization_type = "all_assayed" if fit_type == "staged_init_all_assayed" else None
-            ms_map = config.build_multiscoresets_for_gene_set(
-                gene_set, genes=[gene], regularization_type=regularization_type,
-                redundancy_collapse_preset=redundancy_collapse_preset)
-            gene_key = gene.lower() if gene_set == "labelseq" else gene.upper()
-            ms = ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
-            results_json, dataset_name, config_name = resolve_fit(gene_set, fit_type, gene, n_components)
-            table, _ = build_comparison_table(
-                gene.lower(), gene_set, ms, results_json, dataset_name=dataset_name,
-                modes=["trust_global"], compare_uv=compare_uv, **run_kwargs,
-            )
-            table.insert(0, "gene", gene)
-            if config_name is not None:
-                table = table[table["config"] == config_name]
-            rows.append(table)
+            results_json, primary_dataset_name, config_name = resolve_fit(
+                gene_set, fit_type, gene, n_components)
+
+            if fit_type == "staged_init_all_assayed":
+                variants = [primary_dataset_name]
+            else:
+                variants = config.list_gene_cluster_variants(gene, gene_set, results_json=results_json)
+
+            for cluster_idx, dataset_name in enumerate(variants):
+                cached = _load_results_table_cache(cache_dir, gene_set, fit_type, gene, cluster_idx)
+                if cached is not None:
+                    if cached.get("status") == "ok":
+                        rows.append(pd.DataFrame(cached["records"]))
+                    continue
+
+                try:
+                    if fit_type == "staged_init_all_assayed":
+                        ms_map = config.build_multiscoresets_for_gene_set(
+                            gene_set, genes=[gene], regularization_type=regularization_type,
+                            redundancy_collapse_preset=redundancy_collapse_preset)
+                        gene_key = gene.lower() if gene_set == "labelseq" else gene.upper()
+                        ms = ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
+                    else:
+                        ms = config.build_ms_for_gene_cluster(gene_set, gene, cluster_idx=cluster_idx)
+                    # NOT unconditionally gene.lower() -- UV bridging
+                    # (uv_sources.py, e.g. load_predictor_mv_uv_points's
+                    # f"{predictor}_{gene}" calibration-dir lookup) is
+                    # case-sensitive against real uppercase gene names
+                    # (REVEL_TP53, not REVEL_tp53) for every gene_set except
+                    # labelseq. Confirmed via a real run: this made
+                    # compare_uv=True silently return "UV comparison
+                    # unavailable" for every predictor/combined gene despite
+                    # the underlying data bridging fine -- same casing
+                    # convention already used for gene_key just above.
+                    uv_gene = gene.lower() if gene_set == "labelseq" else gene.upper()
+                    table, _ = build_comparison_table(
+                        uv_gene, gene_set, ms, results_json, dataset_name=dataset_name,
+                        modes=["trust_global"], compare_uv=compare_uv, **run_kwargs,
+                    )
+                    table.insert(0, "gene", gene)
+                    table.insert(1, "cluster", "gene" if cluster_idx == 0 else f"cluster{cluster_idx + 1}")
+                    if config_name is not None:
+                        table = table[table["config"] == config_name]
+                    _save_results_table_cache(cache_dir, gene_set, fit_type, gene, cluster_idx,
+                                               {"status": "ok", "records": table.to_dict(orient="records")})
+                    rows.append(table)
+                except Exception as e:
+                    print(f"  [{gene}] results-table failed: {e}")
+                    _save_results_table_cache(cache_dir, gene_set, fit_type, gene, cluster_idx,
+                                               {"status": "failed", "reason": str(e)})
         except Exception as e:
-            print(f"  [{gene}] results-table failed: {e}")
+            print(f"  [{gene}] results-table failed (variant lookup): {e}")
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
@@ -378,6 +465,50 @@ def run_confusion_matrices(gene_set: str, fit_type: str, genes, n_components=6, 
 
 
 # %% [markdown]
+# ## Analysis: MV-vs-ClinVar confusion matrix, gene-set-agnostic (pooled + per-gene)
+#
+# Unlike `run_confusion_matrices` above (ClinVar AND ClinGen, but the ClinGen
+# half needs a gene-set-specific evidence-code source dataframe that only
+# exists for labelseq/integrated), this only needs `ms._sample_assignments`
+# (`build_mv_clinvar_confusion`), so it works for every gene-set -- predictor/
+# combined/card11/tp53/fgfr included.
+
+# %%
+def run_clinvar_confusion_matrix(gene_set: str, fit_type: str, genes, n_components=6,
+                                  run_kwargs=None, per_gene=False, save_path=None):
+    """(pooled_mat, fig) or (pooled_mat, per_gene_mats, fig) if per_gene=True
+    -- `per_gene_mats` is {gene: 3x2 matrix}, summing to `pooled_mat`."""
+    from analysis.clingen import convert_3x2_to_2x3, _plot_clingen_confusion_panel
+    from analysis.vus_reclassification import build_mv_clinvar_confusion
+
+    run_kwargs = run_kwargs or DEFAULT_RUN_KWARGS
+    pooled_mat = np.zeros((3, 2), dtype=int)
+    per_gene_mats = {}
+    for gene in genes:
+        try:
+            ms, analysis, config_name = load_gene(gene_set, fit_type, gene, n_components, run_kwargs)
+        except Exception as e:
+            print(f"  [{gene}] clinvar-confusion: load failed ({e})")
+            continue
+        points = np.asarray(analysis.results[config_name]["points"], dtype=float)
+        mat = build_mv_clinvar_confusion(points, ms._sample_assignments)
+        per_gene_mats[gene] = mat
+        pooled_mat += mat
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    _plot_clingen_confusion_panel(ax, convert_3x2_to_2x3(pooled_mat),
+                                   f"ExCALIBR-MV vs ClinVar ({gene_set}, {fit_type})", "",
+                                   xlabel="Evidence Direction", ylabel="ClinVar Classification")
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved {save_path}")
+    if per_gene:
+        return pooled_mat, per_gene_mats, fig
+    return pooled_mat, fig
+
+
+# %% [markdown]
 # ## Analysis: Brnich external-tool comparison ("genes reaching each evidence level")
 #
 # Ported from the original LABEL-seq analysis notebook's cell (user-supplied
@@ -518,7 +649,7 @@ def main():
     ap.add_argument("--gene-set", required=True,
                      choices=["labelseq", "integrated", "predictor", "combined", "card11", "tp53"])
     ap.add_argument("--fit-type", default="canonical",
-                     choices=["canonical", "staged_init_all_assayed"])
+                     choices=["canonical", "paper", "staged_init_all_assayed"])
     ap.add_argument("--genes", nargs="+", default=None,
                      help="Subset override; default is every gene in --gene-set's registry.")
     ap.add_argument("--n-components", type=int, default=6)

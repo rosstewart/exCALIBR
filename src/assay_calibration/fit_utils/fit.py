@@ -138,6 +138,74 @@ def _pad_component_params_to_q(component_params, target_q):
     return padded
 
 
+# Restart-mode weights for generate_fit_jobs's mixed q=1/q=2/Gaussian
+# restart pool: (gaussian, q=1, q=2) = (1, 2, 4). Motivated by each mode's
+# actual sign-pattern search space (n_patterns = min((2**q)**K, 100)):
+# Gaussian has none at all, q=1 has 2^K patterns, q=2 has 4^K -- so q=2
+# both needs the most restarts to adequately search its space AND (per
+# tests/cfusn_simulations/sim_mixed_q1q2_strategy.py and
+# sim_gaussian_restart_strategy.py) carries the highest EM-divergence risk,
+# meriting the largest share; Gaussian has no sign ambiguity to search at
+# all, meriting the smallest.
+_RESTART_MODE_WEIGHTS = (("gaussian", 1), ("q1", 2), ("q2", 4))
+
+
+def _restart_mode_sequence(n, weights_ordered=_RESTART_MODE_WEIGHTS):
+    """Deterministic sequence of `n` restart modes approximating the given
+    integer ratio at ANY prefix length -- same behavior whether n is 3, 8,
+    or 100, with no need to know the total budget in advance (smooth
+    weighted round-robin, the same algorithm used for weighted load-
+    balancing e.g. nginx's smooth-weighted round robin).
+
+    A pure weighted round-robin starves the smallest-weight category at
+    tiny n (e.g. n=3 with weights (1,2,4) would never emit the weight-1
+    category at all, since it's the "least due" by construction). Fixed by
+    seeding the first len(weights_ordered) picks as one of each category,
+    rarest-weight first (so a 1-restart budget still gets the cheap
+    Gaussian safety net, not just whichever mode has the largest weight),
+    then handing off to the round-robin -- crediting it for the seed picks
+    already made so the long-run ratio still converges correctly.
+    """
+    labels = [k for k, _ in weights_ordered]
+    total = sum(w for _, w in weights_ordered)
+    out = []
+    seed_order = sorted(labels, key=lambda k: dict(weights_ordered)[k])
+    n_seed = min(n, len(labels))
+    out.extend(seed_order[:n_seed])
+    if n <= len(labels):
+        return out
+    current = {k: -w for k, w in weights_ordered}
+    for k in out:
+        current[k] += total
+    for _ in range(n - n_seed):
+        for k, w in weights_ordered:
+            current[k] += w
+        best = max(current, key=lambda k: current[k])
+        current[best] -= total
+        out.append(best)
+    return out
+
+
+def next_greedy_lambda(cur_lambda, slot, n_patterns):
+    """One coordinate-ascent step of the sign-pattern search: flip bit `slot`
+    of `cur_lambda`, or return None if that pattern index is out of range.
+
+    Used by hpc/run_array_task.py to generate each greedy-restart mode's next
+    candidate from its own current-best pattern; mirrors the validated
+    reference implementation's inner loop (run_greedy in
+    tests/cfusn_simulations/sim_init_enumeration_vs_datadriven.py:153-188:
+    `cand = cur ^ (1 << slot); if cand >= n_patterns: continue`). `n_patterns`
+    is the same `min((2**q)**K, 100)` cap generate_fit_jobs already applies
+    elsewhere, so this only returns None in the (currently unreached, at
+    production's K=3/4) case where K*q >= n_patterns.
+
+    Pure and side-effect-free by design so it can be unit-tested against
+    run_greedy's own candidate sequence without touching any fit machinery.
+    """
+    cand = cur_lambda ^ (1 << slot)
+    return cand if cand < n_patterns else None
+
+
 def tryToFit(observations, sample_indicators, num_components, constrained,
              init_method, init_constraint_adjustment, multivariate=False, **kwargs):
     try:
@@ -640,44 +708,33 @@ class Fit:
         return 1
 
     @staticmethod
-    def _select_calibration_dims(observations, min_overlap_rows=30):
-        """Find the largest connected component of assay dimensions under
-        pairwise-overlap adjacency.
-
-        Two dimensions are adjacent if at least ``min_overlap_rows`` variants
-        have non-NaN scores in both assays simultaneously. A dimension only
-        needs to overlap with AT LEAST ONE other dimension in the selected
-        group to be included — full pairwise (clique) overlap across every
-        dimension is NOT required. The marginal-likelihood EM this fitter
-        uses (cfusn/msn "_alternate_missing" density functions) already
-        estimates cross-dimension structure through per-variant missingness,
-        so a dimension can be jointly informative via a third, shared
-        dimension even with zero rows directly shared with some other
-        member of the group (e.g. TP53's KawOligo shares no rows with
-        Funk_RFS/Kotler_RFS directly, but shares rows with every other
-        assay, and those in turn overlap Funk_RFS/Kotler_RFS — one
-        connected 16D component, not an isolated dimension).
-
-        Returns
-        -------
-        list of int
-            Column indices to use (the largest connected component, sorted).
-            Empty list means every dimension is fully isolated (no pair
-            anywhere meets ``min_overlap_rows``) — caller should fall back
-            to per-assay 1-D calibration.
-        """
+    def _overlap_matrix(observations):
+        """(D, D) int matrix: overlap[i, j] = number of rows with non-NaN
+        values in both dims i and j (0 on the diagonal). Shared by
+        `_select_all_calibration_clusters`/`_select_calibration_dims` and
+        by ad hoc overlap inspection (e.g. diagnosing why a gene's
+        dimensions split into disjoint clusters)."""
         D = observations.shape[1]
-        if D == 1:
-            return [0]
-
         overlap = np.zeros((D, D), dtype=int)
         for i in range(D):
             for j in range(i + 1, D):
                 both = ~np.isnan(observations[:, i]) & ~np.isnan(observations[:, j])
                 overlap[i, j] = overlap[j, i] = both.sum()
+        return overlap
 
-        # adjacency: edge between i and j if overlap is sufficient
-        adj = overlap >= min_overlap_rows
+    @staticmethod
+    def _connected_components(observations, min_overlap_rows=30):
+        """All connected components of assay dimensions under
+        pairwise-overlap adjacency (two dims are adjacent iff their overlap
+        clears `min_overlap_rows`) -- see `_select_all_calibration_clusters`'s
+        docstring for the "no clique required" rationale. Returns a list of
+        sets of column indices (every dimension appears in exactly one set,
+        including size-1 isolated dimensions)."""
+        D = observations.shape[1]
+        if D == 1:
+            return [{0}]
+
+        adj = Fit._overlap_matrix(observations) >= min_overlap_rows
         np.fill_diagonal(adj, True)
 
         seen: set = set()
@@ -696,14 +753,82 @@ class Fit:
                         stack.append(nb)
             seen |= comp
             components.append(comp)
+        return components
 
-        # A component of size 1 is a dimension with no qualifying overlap
-        # to anything else — not a usable multivariate group on its own.
-        multi_dim_components = [c for c in components if len(c) > 1]
-        if not multi_dim_components:
+    @staticmethod
+    def _select_all_calibration_clusters(observations, min_overlap_rows=30, min_cluster_size=2):
+        """Every qualifying disjoint connected component of assay dimensions
+        under pairwise-overlap adjacency, ranked by INFORMATIVENESS (total
+        pairwise overlap mass within the cluster), most informative first --
+        NOT by dimension count. That distinction matters: for BRCA2 under
+        --gene-set integrated, the 4-dim Sahu_2023_exon13 cluster (all pairs
+        overlap = 110, one batch) outranks-by-count the 3-dim Hu_2024/
+        Huang_2025_SGE/Sahu_2025_SGE cluster (overlaps 269/252/2543) despite
+        the latter having far more actual data -- ranking by count alone
+        would keep the worse cluster as "primary."
+
+        Two dimensions are adjacent if at least ``min_overlap_rows`` variants
+        have non-NaN scores in both assays simultaneously. A dimension only
+        needs to overlap with AT LEAST ONE other dimension in the selected
+        group to be included — full pairwise (clique) overlap across every
+        dimension is NOT required. The marginal-likelihood EM this fitter
+        uses (cfusn/msn "_alternate_missing" density functions) already
+        estimates cross-dimension structure through per-variant missingness,
+        so a dimension can be jointly informative via a third, shared
+        dimension even with zero rows directly shared with some other
+        member of the group (e.g. TP53's KawOligo shares no rows with
+        Funk_RFS/Kotler_RFS directly, but shares rows with every other
+        assay, and those in turn overlap Funk_RFS/Kotler_RFS — one
+        connected 16D component, not an isolated dimension).
+
+        ``min_cluster_size``: components smaller than this are dropped --
+        a size-1 "cluster" isn't a multivariate fit (that dimension is
+        covered by per-assay UV calibration elsewhere).
+
+        Returns
+        -------
+        list of list of int
+            One sorted list of column indices per qualifying cluster,
+            most-informative-first. Empty list means no cluster reaches
+            `min_cluster_size` (e.g. every dimension is fully isolated).
+        """
+        overlap = Fit._overlap_matrix(observations)
+        components = Fit._connected_components(observations, min_overlap_rows)
+        qualifying = [c for c in components if len(c) >= min_cluster_size]
+        if not qualifying:
             return []
 
-        return sorted(max(multi_dim_components, key=len))
+        def _informativeness(comp):
+            idx = sorted(comp)
+            return overlap[np.ix_(idx, idx)].sum()
+
+        ranked = sorted(qualifying, key=_informativeness, reverse=True)
+        return [sorted(c) for c in ranked]
+
+    @staticmethod
+    def _select_calibration_dims(observations, min_overlap_rows=30):
+        """Single most-informative connected component (see
+        `_select_all_calibration_clusters`) -- kept as a thin wrapper for
+        existing single-component call sites (`Fit.generate_fit_jobs`,
+        `mv_analysis/gene_3d_evidence.py`'s `run_evidence_3d`). Note this is
+        a genuine (small, positive) behavior change from the old
+        largest-by-DIMENSION-COUNT selection: for a gene whose most
+        dimension-populous cluster isn't its most data-rich one (confirmed
+        for BRCA2), this now correctly picks the more informative cluster
+        instead. For the vast majority of genes with only one qualifying
+        cluster, behavior is identical to before.
+
+        Returns
+        -------
+        list of int
+            Column indices to use (sorted). Empty list means every
+            dimension is fully isolated (no pair anywhere meets
+            ``min_overlap_rows``) — caller should fall back to per-assay
+            1-D calibration.
+        """
+        clusters = Fit._select_all_calibration_clusters(
+            observations, min_overlap_rows=min_overlap_rows, min_cluster_size=2)
+        return clusters[0] if clusters else []
 
     # ──────────────────────────────────────
     # Job generation for distributed fitting
@@ -845,35 +970,148 @@ class Fit:
         init_constraint_adjustments = np.full(NUM_FITS, init_constraint_adjustment)
 
         _nominal_latent_q = kwargs.get("latent_q", 2)
+        # Mixed q=1/q=2/Gaussian restarts, whenever the caller asked for
+        # latent_q>=2: a q=1 restart is mathematically an exact special
+        # case of q=2 (its second Delta column is zero), and a Gaussian
+        # (zero-skew) restart is q=2 with BOTH Delta columns forced to zero
+        # throughout EM (_em_update_cfusn's/_em_update_multivariate's
+        # force_gaussian handling in update_steps.py) -- see
+        # _pad_component_params_to_q's docstring for the q=1 case's
+        # algebraic proof; the Gaussian case is the same argument applied
+        # twice. Mixing in these cheaper, always-stable restarts alongside
+        # full q=2 ones gives best-of-pool selection a safety net against
+        # q=2's real EM-runaway risk on weakly-identified/over-
+        # parameterized data (see _mv_fit_is_degenerate) and, per
+        # tests/cfusn_simulations/sim_gaussian_restart_strategy.py, a large
+        # (>2x held-out log-likelihood) win specifically when a gene set
+        # has more parameters than data points -- at negligible cost when
+        # the data supports full skew (val_ll-based selection just never
+        # picks the simpler candidates there; confirmed on real TP53 K=3/
+        # K=6 data AND on synthetic data with genuine 2-direction skew).
+        # _restart_mode_sequence allocates restarts ~1:2:4
+        # (gaussian:q1:q2, see _RESTART_MODE_WEIGHTS) at any budget size,
+        # not just a fixed num_fits -- matching each mode's actual
+        # sign-pattern search space. execute_fit_job pads a winning q=1
+        # restart back up to nominal_latent_q shape before it's ever
+        # returned (a Gaussian restart is already natively
+        # nominal_latent_q-shaped, all-zero Delta -- no padding needed),
+        # so every downstream consumer keeps seeing uniform q=2-shaped
+        # output regardless of which restart type actually won.
+        #
+        # greedy_restarts replaces the single fixed pattern each mode gets
+        # above with an adaptive search: emit one SEED job per mode here
+        # (lambdaIndex=0, the all-(+1) "trust the data-driven sign" pattern),
+        # tagged with enough metadata (greedy_meta) for the array-task runner
+        # to generate each mode's remaining candidates one at a time --
+        # flipping one (component, skewness-direction) sign relative to the
+        # best pattern found so far and keeping the flip only if it improves
+        # held-out log-likelihood (mirrors the validated reference
+        # implementation, run_greedy in
+        # tests/cfusn_simulations/sim_init_enumeration_vs_datadriven.py).
+        # That sequential dependency (candidate N+1 needs candidate N's
+        # result) is incompatible with this function's job-shape contract
+        # (every job independent, pre-computable) -- so unlike every other
+        # job below, generate_fit_jobs only emits the seed; the array-task
+        # runner (hpc/run_array_task.py) drives the rest via
+        # next_greedy_lambda. Gated behind an explicit flag rather than
+        # replacing the fixed-pattern behavior outright: this changes total
+        # restart count per unit from 3 to 3*(K+1) (1 + (1+K) + (1+2K)), a
+        # deliberate, separately-decided compute-cost tradeoff, not a
+        # drop-in replacement.
+        greedy_restarts = (
+            bool(kwargs.get("greedy_restarts", False))
+            and mv and _nominal_latent_q >= 2
+        )
+        if greedy_restarts:
+            jobs = []
+            init_method_0 = init_methods[0]
+            init_adj_0 = init_constraint_adjustments[0]
+            _SEED_FIT_IDX = {"gaussian": 0, "q1": 1, "q2": 2}
+            for num_components in component_range:
+                for mode, job_q, force_gaussian in (
+                    ("gaussian", _nominal_latent_q, True),
+                    ("q1", 1, False),
+                    ("q2", _nominal_latent_q, False),
+                ):
+                    n_patterns = min((2 ** job_q) ** num_components, 100)
+                    # No sign to search for the Gaussian restart (Delta is
+                    # pinned at zero throughout EM), so it has no slots.
+                    n_slots = (0 if mode == "gaussian"
+                              else min(job_q * num_components, n_patterns - 1))
+                    fit_idx = _SEED_FIT_IDX[mode]
+                    job_kwargs = kwargs.copy()
+                    job_kwargs["latent_q"] = job_q
+                    job_kwargs["force_gaussian"] = force_gaussian
+                    job_kwargs["lambdaIndex"] = 0
+                    job_kwargs["fit_seed"] = derive_fit_seed(
+                        master_seed, bootstrap_seed, num_components, fit_idx
+                    )
+                    job = {
+                        "job_id": f"b{bootstrap_seed}_{mode}seed_c{num_components}",
+                        "bootstrap_seed": bootstrap_seed,
+                        "fit_idx": fit_idx,
+                        "num_components": num_components,
+                        "train_observations": observations[train_indices],
+                        "train_sample_assignments": sample_assignments[train_indices],
+                        "val_observations": observations[val_indices] if len(val_indices) else None,
+                        "val_sample_assignments": sample_assignments[val_indices] if len(val_indices) else None,
+                        "val_variant_indices": original_indices[val_indices] if len(val_indices) else None,
+                        "constrained": constrained,
+                        "init_method": init_method_0,
+                        "init_constraint_adjustment": init_adj_0,
+                        "multivariate": mv,
+                        "calibrated_dims": calibrated_dims,
+                        "nominal_latent_q": _nominal_latent_q,
+                        "kwargs": job_kwargs,
+                        "greedy_meta": {
+                            "mode": mode,
+                            "n_patterns": n_patterns,
+                            "n_slots": n_slots,
+                        },
+                    }
+                    jobs.append(job)
+            return jobs
+
+        _restart_modes = _restart_mode_sequence(NUM_FITS) if (mv and _nominal_latent_q >= 2) else None
+
+        # Sign patterns are enumerated per restart MODE, not off the global
+        # fit_idx. With the global index, the sole q=2 restart of a num_fits=3
+        # budget is fit_idx=2 and so gets lambdaIndex=2 -- two flips away from
+        # the data-driven sign -- while lambdaIndex 0 and 1 are spent on the
+        # Gaussian restart (which pins Delta at zero and ignores the sign
+        # entirely) and the q=1 restart (a different, smaller pattern space).
+        # Counting within each mode gives every mode its own enumeration
+        # starting at 0, which is now the all-(+1) no-flip pattern.
+        _mode_counts = {}
 
         jobs = []
         for i in range(NUM_FITS):
             for num_components in component_range:
                 if mv:
-                    # Mixed q=1/q=2 restarts: alternate by fit_idx parity
-                    # whenever the caller asked for latent_q>=2. A q=1
-                    # restart is mathematically an exact special case of
-                    # q=2 (its second Delta column is zero -- see
-                    # _pad_component_params_to_q's docstring for the
-                    # algebraic proof), so mixing in cheaper, always-stable
-                    # q=1 restarts alongside q=2 ones gives best-of-pool
-                    # selection a safety net against q=2's real EM-runaway
-                    # risk on weakly-identified/over-parameterized data
-                    # (see _mv_fit_is_degenerate), at zero cost to fits
-                    # that genuinely need 2 directions (validated in
-                    # tests/cfusn_simulations/sim_mixed_q1q2_strategy.py:
-                    # never worse than all-q=2, measurably better when the
-                    # truth only needs 1 direction). execute_fit_job pads
-                    # a winning q=1 restart back up to nominal_latent_q
-                    # shape before it's ever returned, so every downstream
-                    # consumer keeps seeing uniform q=2-shaped output.
-                    job_q = (1 if (_nominal_latent_q >= 2 and i % 2 == 0)
-                              else _nominal_latent_q)
+                    force_gaussian = False
+                    if _restart_modes is not None:
+                        restart_mode = _restart_modes[i]
+                        if restart_mode == "q1":
+                            job_q = 1
+                        elif restart_mode == "gaussian":
+                            job_q = _nominal_latent_q
+                            force_gaussian = True
+                        else:
+                            job_q = _nominal_latent_q
+                    else:
+                        job_q = _nominal_latent_q
                     n_patterns = min((2 ** job_q) ** num_components, 100)
                     kwargs["latent_q"] = job_q
+                    kwargs["force_gaussian"] = force_gaussian
+                    _mode_key = (restart_mode if _restart_modes is not None
+                                 else "mv", num_components)
+                    _within = _mode_counts.get(_mode_key, 0)
+                    _mode_counts[_mode_key] = _within + 1
+                    pattern_idx = _within
                 else:
                     n_patterns = 2 ** num_components
-                kwargs["lambdaIndex"] = i % n_patterns
+                    pattern_idx = i
+                kwargs["lambdaIndex"] = pattern_idx % n_patterns
                 kwargs["fit_seed"] = derive_fit_seed(master_seed, bootstrap_seed, num_components, i)
                 job = {
                     "job_id": f"b{bootstrap_seed}_f{i}_c{num_components}",
@@ -956,7 +1194,34 @@ class Fit:
             # a similar runaway) can let this get selected as "the" fit.
             # Treat it the same as init_failed: -inf val_ll excludes it from
             # selection without otherwise disrupting the job's control flow.
-            if mv and _mv_fit_is_degenerate(params):
+            # Guard: repeated indefinite-Gamma rejections mean the affected
+            # components never moved from their initialisation. The fit still
+            # returns finite, plausible-looking parameters and a finite val_ll,
+            # so without this it competes normally in best-of-num_fits despite
+            # not having fitted those components at all. Measured on
+            # kras_labelseq_mv: two components holding ~92% of the 346 rows were
+            # rejected on every one of 1166 iterations. Only a rejection that
+            # touched a materially-sized component counts -- rejections on
+            # near-empty components are routine and harmless.
+            gstats = result.get("guard_stats") or {}
+            rejected_mass = float(gstats.get("gamma_rejected_max_mass", 0.0))
+            n_train = len(job["train_observations"]) if job.get(
+                "train_observations") is not None else 0
+            frozen_dominant = (
+                gstats.get("gamma_rejected", 0) > 0
+                and n_train > 0
+                and rejected_mass >= 0.05 * n_train
+            )
+            if frozen_dominant:
+                import warnings
+                warnings.warn(
+                    f"fit excluded: Gamma rejected as indefinite on a component "
+                    f"with up to {rejected_mass:.1f} of {n_train} effective "
+                    f"observations ({gstats.get('gamma_rejected')} events); "
+                    f"those components never left their initialisation."
+                )
+
+            if frozen_dominant or (mv and _mv_fit_is_degenerate(params)):
                 return {
                     "dataset_name": job.get("dataset_name"),
                     "bootstrap_seed": job["bootstrap_seed"],

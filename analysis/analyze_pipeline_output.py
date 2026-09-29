@@ -2060,8 +2060,11 @@ figure4_driver.build_figure4(
     danzs_oob=conf_no_f9_tp53,
     auths_oob=auth_no_f9_tp53,
     dataset_names=datasets_no_f9_tp53,
-    vus_pct_danz=_aggregate_coverage_pct(vus_no_f9_tp53),
-    vus_pct_auth=_aggregate_coverage_pct(auth_vus_no_f9_tp53),
+    # `partner=`: the matrices passed alongside these percentages are pooled
+    # by plot_aggregate_confusion_matrices, which drops any dataset where
+    # either side is None -- keep the VUS percentages on that same subset.
+    vus_pct_danz=_aggregate_coverage_pct(vus_no_f9_tp53, partner=auth_vus_no_f9_tp53),
+    vus_pct_auth=_aggregate_coverage_pct(auth_vus_no_f9_tp53, partner=vus_no_f9_tp53),
 )
 
 # %% [markdown]
@@ -2199,6 +2202,24 @@ vus_evidence_df
 # dropped -- biobank/All-of-Us association numbers are out of scope entirely
 # (nothing in this pipeline supports them).
 #
+# **In-bag vs OOB.** Every number in this section uses in-bag evidence
+# (`standard_points`) ONLY -- gene counts, variant-effect-measurement and
+# unique-variant totals, and the OddsPath-gap datasets. The two exceptions,
+# tagged `[OOB]` in the printed output, are the ClinVar-agreement accuracy
+# and the VUS indeterminate-range coverage, which are deliberately OOB
+# (that's the whole point of holding variants out). Letting OOB points leak
+# into the rest inflates the headline gene count (36 rather than 34: two
+# genes clear zero evidence only via OOB) and can add OOB-only datasets to
+# the OddsPath gap.
+#
+# Both OOB statistics are pooled over the datasets/genes where ExCALIBR and
+# the author functional annotation BOTH have data, never over each side's
+# own subset -- `compute_aggregate_metrics` and
+# `plot_aggregate_confusion_matrices` already drop a dataset when either
+# matrix is None, `restrict_to_genes_with_author_data` does the same at the
+# gene level for the deduplicated branch, and `_aggregate_coverage_pct`'s
+# `partner=` argument does it for the VUS coverage percentages.
+#
 # `_compute_manuscript_summary`'s `excluded_genes` argument only ever derives
 # new, function-local variables -- it never filters or mutates
 # `deduped_variants`, `df_primary_dedup`, or any object shared with the
@@ -2239,17 +2260,20 @@ print(f"All-variant-groups population: {len(df_all_groups):,} rows across "
       f"kept+VUS-only population load_all_variants exports)")
 
 # %%
-from analysis.plot_common import effective_points as _effective_points_summary
 from src.assay_calibration.plot_utils.utils import compute_aggregate_metrics
 
 EXCLUDED_GENES = {"F9", "TP53", "SFPQ"}
 
 
 def _compute_manuscript_summary(excluded_genes: set, label: str, use_gene_dedup: bool = True) -> dict:
-    # -- 1. Gene scope --------------------------------------------------------
+    # -- 1. Gene scope (OOB-free population; see step 2) ----------------------
+    # `deduped_scope` is the OOB-scored kept+VUS population -- steps 3/4 below
+    # need it (ClinVar agreement / VUS coverage are deliberately OOB), but the
+    # gene counts must not come from it: every headline number in this section
+    # other than those two statistics is in-bag only, and two genes clear zero
+    # evidence solely via OOB points. The counts themselves are therefore
+    # computed in step 2 from `df_all_scope`/`deduped_all_scope`.
     deduped_scope = deduped_variants[~deduped_variants["gene"].isin(excluded_genes)]
-    n_genes_summary = deduped_scope["gene"].nunique()
-    n_genes_with_evidence = deduped_scope.loc[deduped_scope["points"] != 0, "gene"].nunique()
 
     # -- 2. Overall variant effect measurement / unique variant totals --------
     # Uses df_all_groups (every variant the assay measured), not df_primary_dedup
@@ -2263,6 +2287,11 @@ def _compute_manuscript_summary(excluded_genes: set, label: str, use_gene_dedup:
     deduped_all_scope = build_gene_deduped_variants(df_all_scope, use_oob=False)
     n_unique_variants = len(deduped_all_scope)
     n_unique_variants_with_evidence = int((deduped_all_scope["points"] != 0).sum())
+    # Gene counts from this same in-bag, all-variants-the-assay-measured frame
+    # (not just VUS or the four fitting sample groups), so "N unique variants
+    # across M genes" quotes one population rather than two.
+    n_genes_summary = df_all_scope["gene"].nunique()
+    n_genes_with_evidence = int(deduped_all_scope.loc[deduped_all_scope["points"] != 0, "gene"].nunique())
 
     # Kept sample-group + VUS-only population (df_primary_dedup, with real
     # OOB points) -- used below (step 5) to decide whether ExCALIBR's actual
@@ -2329,19 +2358,28 @@ def _compute_manuscript_summary(excluded_genes: set, label: str, use_gene_dedup:
             excalibr_agreement_pct = None
             author_agreement_pct = None
 
-        _excalibr_det_pct = _aggregate_coverage_pct(_vus_scope)
-        _author_det_pct = _aggregate_coverage_pct(_auth_vus_scope)
+        # `partner=`: build_author_vus_coverage returns None strictly more
+        # often than build_vus_coverage (missing auth_label, no ClinVar
+        # controls, all-indeterminate author calls), so aggregating each list
+        # independently would give ExCALIBR a denominator containing datasets
+        # the author side never saw. Pair them, matching what
+        # compute_aggregate_metrics above already does to the matrices.
+        _excalibr_det_pct = _aggregate_coverage_pct(_vus_scope, partner=_auth_vus_scope)
+        _author_det_pct = _aggregate_coverage_pct(_auth_vus_scope, partner=_vus_scope)
         pct_indeterminate_excalibr = 100 - _excalibr_det_pct if _excalibr_det_pct is not None else None
         pct_indeterminate_author = 100 - _author_det_pct if _author_det_pct is not None else None
 
     # -- 5. OddsPath-gap datasets ----------------------------------------------
-    datasets_scope = sorted(df_scope["dataset"].unique())
-    calibrated_datasets = [
-        ds for ds in datasets_scope
-        if (_effective_points_summary(
-            df_scope[df_scope["dataset"] == ds], use_oob=True, label=ds, context="all",
-        ) != 0).any()
-    ]
+    # Every dataset in scope IS calibrated: df_primary_dedup only carries
+    # datasets ExCALIBR produced a calibration for (discover_outputs ->
+    # load_all_variants, which skips a dataset with no calibration JSON).
+    # This deliberately does NOT test whether any variant reached a nonzero
+    # evidence point -- a calibration that assigns only indeterminate
+    # (0-point) evidence is still a calibration, and the OddsPath comparison
+    # asks which datasets the established approach could calibrate AT ALL,
+    # not which ones cleared an evidence threshold. Because no points are
+    # consulted, the in-bag/OOB distinction doesn't arise here at all.
+    calibrated_datasets = sorted(df_scope["dataset"].unique())
 
     n_additional = 0
     n_vem_additional = 0
@@ -2372,23 +2410,25 @@ def _compute_manuscript_summary(excluded_genes: set, label: str, use_gene_dedup:
 
     # -- Summary ----------------------------------------------------------------
     print(f"\n{'=' * 80}\nMANUSCRIPT SUMMARY NUMBERS ({label})\n{'=' * 80}")
+    print("(in-bag evidence throughout, except the two [OOB]-tagged statistics)")
     print(f"Genes in scope: {n_genes_summary}")
     print(f"Genes with >=1 point of pathogenic or benign evidence: {n_genes_with_evidence}/{n_genes_summary}")
     print(f"Variant effect measurements: {n_vem_total:,} total "
           f"({n_vem_benign:,} benign evidence, {n_vem_pathogenic:,} pathogenic evidence)")
     print(f"Unique variants (gene-deduplicated, aa/nt-separated): {n_unique_variants:,} "
-          f"across {n_genes_summary} genes ({n_unique_variants_with_evidence:,} with "
-          f"pathogenic or benign evidence)")
+          f"across {n_genes_summary} genes")
+    print(f"  ...of which {n_unique_variants_with_evidence:,} have pathogenic or benign evidence, "
+          f"across {n_genes_with_evidence} genes")
     if excalibr_agreement_pct is not None:
-        print(f"Agreement with ClinVar PLP/BLB controls: "
+        print(f"Agreement with ClinVar PLP/BLB controls [OOB]: "
               f"ExCALIBR {excalibr_agreement_pct:.1f}% vs functional annotation {author_agreement_pct:.1f}%")
     else:
         print("  SKIP agreement comparison: no author/ExCALIBR confusion matrix available in scope")
     if pct_indeterminate_excalibr is not None:
-        print(f"VUS assigned to indeterminate range: "
+        print(f"VUS assigned to indeterminate range [OOB]: "
               f"functional annotation {pct_indeterminate_author:.1f}% vs ExCALIBR {pct_indeterminate_excalibr:.1f}%"
               if pct_indeterminate_author is not None else
-              f"VUS assigned to indeterminate range (ExCALIBR): {pct_indeterminate_excalibr:.1f}%")
+              f"VUS assigned to indeterminate range (ExCALIBR) [OOB]: {pct_indeterminate_excalibr:.1f}%")
     else:
         print("  SKIP VUS coverage comparison: no VUS in scope")
     print(f"Datasets calibrated by ExCALIBR but not covered by the OddsPath approach: {n_additional} "

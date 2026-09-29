@@ -221,14 +221,34 @@ def build_author_vus_coverage(df_sub: pd.DataFrame) -> Optional[tuple]:
     return n_determinate, len(df_vus)
 
 
-def _aggregate_coverage_pct(coverages: Optional[List]) -> Optional[float]:
+def _aggregate_coverage_pct(
+    coverages: Optional[List], partner: Optional[List] = None,
+) -> Optional[float]:
     """coverages: list of (n_determinate, n_total)-or-None (one per dataset,
     same shape as the matrices lists build_confusion_matrix produces).
     Returns the pooled determinate percentage, or None if every entry was
-    None/empty -- lets callers show "no VUS in scope" rather than a fake 0%."""
+    None/empty -- lets callers show "no VUS in scope" rather than a fake 0%.
+
+    `partner` is the other side's parallel coverage list when this
+    percentage is half of a two-sided comparison (ExCALIBR vs author);
+    datasets where *either* side is None are then dropped from this side
+    too. Without it the two sides pool over different dataset subsets,
+    because build_author_vus_coverage returns None strictly more often
+    than build_vus_coverage (missing auth_label, no ClinVar controls,
+    all-indeterminate author calls) -- a dataset with VUS but no recorded
+    author labels would add its VUS to ExCALIBR's denominator and nothing
+    to the author's. Passing `partner` mirrors the pairing
+    compute_aggregate_metrics / plot_aggregate_confusion_matrices already
+    apply to the confusion matrices themselves (both `continue` when
+    either matrix is None), so a comparison's percentages describe the
+    same datasets as its matrices. Leave it None for genuinely
+    single-sided callers."""
     if not coverages:
         return None
-    pairs = [c for c in coverages if c is not None]
+    if partner is None:
+        pairs = [c for c in coverages if c is not None]
+    else:
+        pairs = [a for a, b in zip(coverages, partner) if a is not None and b is not None]
     if not pairs:
         return None
     n_det = sum(p[0] for p in pairs)
@@ -315,8 +335,12 @@ def make_confusion_figure(
                            fontsize=18, fontweight="bold", pad=10)
         axes[1].set_title(title2 if title2 is not None else _pretty(label2),
                            fontsize=18, fontweight="bold", pad=10)
-        vus_pct_1 = _aggregate_coverage_pct(vus_coverages_m1)
-        vus_pct_2 = _aggregate_coverage_pct(vus_coverages_m2)
+        # Paired (`partner=`): plot_aggregate_confusion_matrices above already
+        # dropped any dataset where either matrix was None, so pooling each
+        # side over its own non-None subset would caption the two panels with
+        # different dataset sets than the matrices they sit under.
+        vus_pct_1 = _aggregate_coverage_pct(vus_coverages_m1, partner=vus_coverages_m2)
+        vus_pct_2 = _aggregate_coverage_pct(vus_coverages_m2, partner=vus_coverages_m1)
         axes[0].text(
             0.5, -0.24, _dor_coverage_text(danz_metrics["dor_standard"], 100 * danz_metrics["coverage"], vus_pct_1),
             transform=axes[0].transAxes, fontsize=11, ha="center", va="top", color="#555555",
@@ -456,6 +480,9 @@ def make_single_confusion_figure(
     ax.set_ylabel("ClinVar Classification", fontsize=12)
     ax.set_title(f"{_pretty(label)} {title_suffix if title_suffix is not None else f'({n_datasets} datasets)'}",
                   fontsize=14, fontweight="bold", pad=10)
+    # Single-sided by construction (one ExCALIBR-vs-ClinVar panel, no author
+    # partner list), so the unpaired _aggregate_coverage_pct is correct here --
+    # unlike make_confusion_figure's two-panel caption above.
     vus_pct = _aggregate_coverage_pct(vus_coverages)
     ax.text(
         0.5, -0.24,
@@ -472,6 +499,8 @@ def make_confusion_grid_figure(
     figure_dir: Path,
     filename: str,
     suptitle: Optional[str] = None,
+    vus_coverages: Optional[List[List]] = None,
+    titles: Optional[List[str]] = None,
 ):
     """N-panel confusion-matrix grid, one panel per (panel_label, matrices)
     pair -- same diverging Blue/Gray/Red row-normalized style as
@@ -485,9 +514,19 @@ def make_confusion_grid_figure(
     already produce) -- aggregated internally exactly like
     make_single_confusion_figure. A pair with no valid matrix in scope is
     dropped rather than failing the whole grid.
+
+    *vus_coverages*, if given, is one per-dataset coverage list per panel
+    (build_vus_coverage output, parallel to `panels`); each caption then gains
+    a VUS percentage, pooled over only the datasets where EVERY panel has a
+    coverage tuple -- the N-panel form of _aggregate_coverage_pct's
+    `partner=` pairing, so the panels' VUS figures describe the same datasets.
+
+    *titles*, if given, replaces each panel's auto title
+    ("{pretty label} (N datasets)") verbatim -- e.g. for a single-dataset
+    comparison, or labels pretty_method would title-case.
     """
     valid = []
-    for panel_label, matrices in panels:
+    for panel_idx, (panel_label, matrices) in enumerate(panels):
         aggregate = None
         n_datasets = 0
         for mat in matrices:
@@ -496,7 +535,7 @@ def make_confusion_grid_figure(
             aggregate = mat.copy() if aggregate is None else aggregate + mat
             n_datasets += 1
         if aggregate is not None:
-            valid.append((panel_label, aggregate, n_datasets))
+            valid.append((panel_idx, panel_label, aggregate, n_datasets))
 
     if not valid:
         print(f"  SKIP confusion grid {filename}: no panel had a valid matrix")
@@ -505,11 +544,18 @@ def make_confusion_grid_figure(
     label_map = {"PLP": "P/LP", "BLB": "B/LB", "IR": "Indeterminate",
                  "Normal": "Benign", "Abnormal": "Pathogenic"}
 
+    vus_pct_by_panel = {}
+    if vus_coverages is not None:
+        n_ds = len(vus_coverages[0]) if vus_coverages else 0
+        shared = [i for i in range(n_ds) if all(cov[i] is not None for cov in vus_coverages)]
+        for panel_idx, cov in enumerate(vus_coverages):
+            vus_pct_by_panel[panel_idx] = _aggregate_coverage_pct([cov[i] for i in shared])
+
     fig, axes = plt.subplots(1, len(valid), figsize=(5 * len(valid), 4.6))
     if len(valid) == 1:
         axes = [axes]
 
-    for ax, (panel_label, aggregate, n_datasets) in zip(axes, valid):
+    for ax, (panel_idx, panel_label, aggregate, n_datasets) in zip(axes, valid):
         metrics = compute_classification_metrics(aggregate)
         xlabels = [label_map.get(str(c), str(c)) for c in aggregate.columns]
         ylabels = [label_map.get(str(r), str(r)) for r in aggregate.index]
@@ -524,9 +570,11 @@ def make_confusion_grid_figure(
             spine.set_visible(False)
         ax.set_xlabel("Evidence Direction", fontsize=11)
         ax.set_ylabel("ClinVar Classification", fontsize=11)
-        ax.set_title(f"{_pretty(panel_label)} ({n_datasets} datasets)", fontsize=13, fontweight="bold", pad=10)
+        title = titles[panel_idx] if titles is not None else f"{_pretty(panel_label)} ({n_datasets} datasets)"
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
         ax.text(
-            0.5, -0.26, _dor_coverage_text(metrics["dor_standard"], 100 * metrics["coverage"], None),
+            0.5, -0.26, _dor_coverage_text(
+                metrics["dor_standard"], 100 * metrics["coverage"], vus_pct_by_panel.get(panel_idx)),
             transform=ax.transAxes, fontsize=9, ha="center", va="top", color="#555555",
         )
 

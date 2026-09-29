@@ -5,7 +5,7 @@ evidence), show how they distribute across our canonical v3 model's discrete
 -8..+8 point scale -- i.e. VUS (single source node) -> our_points bin (17
 target nodes), reusing the same `plot_categorical_sankey` primitive and the
 `STRENGTH_COLOR` point-bin palette already defined for exactly this kind of
-figure in `mv_analysis/sankey_plot.py::
+figure in `mv_analysis/sankey_plot_flat.py::
 plot_evidence_sankey_pair_points` (there: ClinVar class -> point bin; here:
 residual-VUS -> point bin, single source).
 
@@ -24,7 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from mv_analysis.sankey_plot import STRENGTH_COLOR, plot_categorical_sankey
+from mv_analysis.sankey_plot_flat import STRENGTH_COLOR, plot_categorical_sankey
 
 OUTPUT_DIR = "/data/ross/assay_calibration/multivariate/experimental_staged_fit"
 

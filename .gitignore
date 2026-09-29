@@ -22,3 +22,5 @@ __pycache__/
 # CFUSN simulation-study run artifacts (re-run often, not committed fixtures)
 tests/cfusn_simulations/results/*.csv
 mv_analysis/figures/
+
+ExCALIBR_latex_092026

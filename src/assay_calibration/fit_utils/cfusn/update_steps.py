@@ -32,7 +32,7 @@ from typing import List, Tuple, Any
 import numpy as np
 import scipy.stats as sps
 from scipy.stats import truncnorm
-from scipy.special import logsumexp, owens_t
+from scipy.special import logsumexp, owens_t, log_ndtr, erfcx, roots_legendre
 from scipy.linalg import cho_factor, cho_solve
 from scipy.stats import norm
 
@@ -72,11 +72,252 @@ def _bvn_cdf_owens(h, k, rho):
     return 0.5 * (norm.cdf(h) + norm.cdf(k)) - T1 - T2 - delta
 
 
+# ── Cancellation-free tail companions to _bvn_cdf_owens ────────────────────
+#
+# The Owen's-T identity above is a DIFFERENCE of terms each O(Phi(h)), so its
+# error is ABSOLUTE (~1e-16 x term size) while the result it computes can be far
+# smaller. Measured against a validated quadrature reference over 4000 random
+# (h, k, rho):
+#
+#     true L        median rel err     max rel err    returned <= 0
+#     > 1e-2           1.7e-15          1.3e-14           0
+#     ~ 1e-6           2.2e-13          2.7e-11           0
+#     ~ 1e-10          1.2e-11          1.7e-07           0
+#     ~ 1e-14          2.2e-09          2.2e-03           0
+#     < 1e-16          2.3e+05          2.3e+269      64% of cases
+#
+# Production traces show 5-18% of rows below 1e-13 on every EM iteration and
+# L_min = -5.55e-17, so the broken regime is routine, not a corner case. Since
+# eta = mu1 + (s1^2 c00_1 + s12 c00_2)/L, an L wrong by 1e5 gives an eta wrong by
+# 1e5 -- which is what drove eta/Psi into the 1e4 clip, made the Gamma M-step
+# candidate indefinite, and collapsed the likelihood (see _psd_floor_or_reject).
+#
+# Everything the moment recursion needs is a RATIO to L, and those ratios stay
+# finite as L -> 0. So compute logs, not values, and form each ratio as
+# exp(log_num - log_L). These helpers supply the log pieces.
+
+_LOG_SQRT_2PI = 0.5 * np.log(2.0 * np.pi)
+
+# Above this L the Owen's-T form is accurate to ~1e-11 relative, so keep the
+# fast path there and pay for quadrature only on the tail rows.
+_OWENS_MIN_RELIABLE = 1e-10
+
+# Gauss-Legendre resolution. Do NOT reduce these without testing across the
+# full rho range: the integrand sharpens as |rho| -> 1, and S = I - D' Om^-1 D
+# drives rho toward +-1 exactly as Delta grows. Measured max |dlog| vs a 256x16
+# reference: at rho=0.999, 64x4 gives 1.5e-13 but 32x2 gives 4.5e-05; at
+# rho=0.9999, 64x4 gives 4.9e-08 and 32x2 gives 1.3e-03. A 32x2 setting looked
+# fine at rho=0.45 and destroyed real fits (kras 4c: 10001 monotone iterations
+# became 12 iterations with a -1.8e-01 decrease).
+_BVN_QUAD_NODES = 64
+_BVN_QUAD_PANELS = 4
+_BVN_QUAD_LOG_RANGE = 140.0
+
+# Below t = -_F1_1_ASYMPTOTIC_T the erfcx form of t*Phi(t) + phi(t) has lost
+# ~2*log10|t| digits to cancellation and the asymptotic series is more accurate.
+_F1_1_ASYMPTOTIC_T = 25.0
+
+
+def _log_bvn_orthant_quad(h, k, rho, n_nodes=_BVN_QUAD_NODES,
+                          n_panels=_BVN_QUAD_PANELS,
+                          log_range=_BVN_QUAD_LOG_RANGE):
+    """log P(Z1 <= h, Z2 <= k), standard bivariate normal, correlation rho.
+
+    Cancellation-free by construction -- every term in the accumulation is
+    positive, so relative accuracy is retained arbitrarily deep into the tail:
+
+        P = int_0^inf phi(z) * Phi((k' - rho z)/sqrt(1-rho^2)) dz,  z = h' - u
+
+    with (h', k') ordered so the more negative variable is the outer one: it
+    sets the exponential decay scale, which keeps the integration range short
+    and well resolved. Vectorized over h, k; rho is scalar (shared covariance).
+    """
+    h = np.asarray(h, dtype=float)
+    k = np.asarray(k, dtype=float)
+    h, k = np.broadcast_arrays(h, k)
+    rho = float(rho)
+    s = np.sqrt(max(1.0 - rho * rho, 1e-300))
+
+    lo_v = np.minimum(h, k)
+    hi_v = np.maximum(h, k)
+
+    H = np.maximum(-lo_v, 0.0)
+    U = np.sqrt(H ** 2 + 2.0 * log_range) - H
+    U = np.maximum(U, 1e-3)
+    U = np.where(lo_v > 0, np.maximum(U, 12.0), U)
+
+    x, w = roots_legendre(n_nodes)
+    edges = np.linspace(0.0, 1.0, n_panels + 1)
+
+    parts = []
+    for e0, e1 in zip(edges[:-1], edges[1:]):
+        half = 0.5 * U * (e1 - e0)
+        mid = 0.5 * U * (e1 + e0)
+        u = mid[..., None] + half[..., None] * x
+        z = lo_v[..., None] - u
+        log_phi = -0.5 * z * z - _LOG_SQRT_2PI
+        log_Phi = log_ndtr((hi_v[..., None] - rho * z) / s)
+        log_w = np.log(np.maximum(w * half[..., None], 1e-300))
+        parts.append(logsumexp(log_w + log_phi + log_Phi, axis=-1))
+    return logsumexp(np.stack(parts, axis=-1), axis=-1)
+
+
+def _log_bvn_cdf(h, k, rho):
+    """log Phi_2(h, k; rho): Owen's T where it is reliable, quadrature below.
+
+    The two methods fail in complementary regimes, so the hybrid is about
+    accuracy and not merely speed:
+      - Owen's T is a difference of O(Phi(h)) terms, so it dies in the deep
+        tail (below L = 1e-16: median relative error 2.3e+05, non-positive 64%
+        of the time) but stays accurate at high |rho| (~1.5e-09 at rho=0.9999).
+      - The quadrature keeps relative accuracy arbitrarily deep, but its
+        integrand sharpens as |rho| -> 1 and it degrades there (4.9e-08 at
+        rho=0.9999 even at 64x4).
+    Since L is large whenever |rho| is extreme, routing on L picks the method
+    that is accurate in each regime.
+
+    An unconditional-quadrature variant was tried, to make the CPU and GPU paths
+    literally the same formula. It regressed real fits badly (see the node-count
+    comment above) because it removed Owen's T from precisely the high-rho rows
+    the quadrature handles worst. Parity has to come from porting BOTH branches,
+    not from deleting one.
+    """
+    fast = np.asarray(_bvn_cdf_owens(h, k, rho), dtype=float)
+    good = fast > _OWENS_MIN_RELIABLE
+    out = np.empty(fast.shape, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out[good] = np.log(fast[good])
+    bad = ~good
+    if np.any(bad):
+        _diag_bump("bvn_tail_quadrature", int(np.count_nonzero(bad)))
+        hh = np.broadcast_to(np.asarray(h, dtype=float), fast.shape)[bad]
+        kk = np.broadcast_to(np.asarray(k, dtype=float), fast.shape)[bad]
+        out[bad] = _log_bvn_orthant_quad(hh, kk, rho)
+    return out
+
+
+def _log_phi_at0(mu, s):
+    """log of the N(mu, s^2) density evaluated at 0."""
+    return -0.5 * (mu / s) ** 2 - np.log(s) - _LOG_SQRT_2PI
+
+
+def _log_f1_0(mu, s):
+    """log F1_0 = log P(X > 0) for X ~ N(mu, s^2), i.e. log Phi(mu/s).
+
+    The direct translation of the Kan & Robotti recursion writes this as
+    1 - Phi(-mu/s), which is the SAME number but annihilates once -mu/s > 8
+    (Phi rounds to 1). log_ndtr is exact across the whole range.
+    """
+    return log_ndtr(mu / s)
+
+
+def _log_f1_1(mu, s):
+    """log F1_1 = log E[X 1{X>0}] for X ~ N(mu, s^2) = log(s * g(mu/s)),
+    g(t) = t*Phi(t) + phi(t).
+
+    Three regimes, because no single expression covers the range:
+
+      t >= -1   direct: g = t*Phi(t) + phi(t). No cancellation (both terms
+                positive for t >= 0) and no overflow -- g -> t for t >> 0.
+      -T < t < -1  the terms cancel to O(phi(t)/t^2), so factor out phi(t) and
+                evaluate the bracket 1 + t*u with u = Phi(t)/phi(t) ~ 1/|t|.
+                Note u = exp(log_ndtr(t) + t^2/2 + log sqrt(2pi)) grows like
+                exp(t^2/2), so this form OVERFLOWS for t greater than about +38
+                and must not be applied to positive t -- that bug (applying it
+                for all t > -T) returned inf for t >= 45 and destroyed real
+                fits: kras 4c went from 10001 monotone iterations to 12 with a
+                -1.8e-01 decrease.
+      t <= -T   the bracket itself is cancellation-limited, so use its
+                asymptotic series 1/t^2 - 3/t^4 + 15/t^6 - 105/t^8 + 945/t^10.
+
+    Uses only log_ndtr/exp/log -- no erfcx -- so the JAX mirror in
+    jax_batch/batch_em_cfusn.py can run the IDENTICAL formula.
+    """
+    t = np.asarray(mu, dtype=float) / s
+    scalar = t.ndim == 0
+    t = np.atleast_1d(t)
+    out = np.empty(t.shape, dtype=float)
+
+    direct = t >= -1.0
+    if direct.any():
+        td = t[direct]
+        out[direct] = np.log(np.maximum(
+            td * np.exp(log_ndtr(td)) + np.exp(-0.5 * td ** 2 - _LOG_SQRT_2PI),
+            1e-300))
+
+    mid = (~direct) & (t > -_F1_1_ASYMPTOTIC_T)
+    if mid.any():
+        tm = t[mid]
+        u = np.exp(log_ndtr(tm) + 0.5 * tm ** 2 + _LOG_SQRT_2PI)   # Phi/phi
+        out[mid] = (-0.5 * tm ** 2 - _LOG_SQRT_2PI
+                    + np.log(np.maximum(1.0 + tm * u, 1e-300)))
+
+    far = (~direct) & (~mid)
+    if far.any():
+        tf = t[far]
+        it2 = 1.0 / (tf * tf)
+        series = it2 * (1.0 + it2 * (-3.0 + it2 * (15.0 + it2
+                        * (-105.0 + it2 * 945.0))))
+        out[far] = (-0.5 * tf ** 2 - _LOG_SQRT_2PI
+                    + np.log(np.maximum(series, 1e-300)))
+
+    out = out + np.log(s)
+    return float(out[0]) if scalar else out
+
+
 # ══════════════════════════════════════════════
 # Truncated-normal moments — scalar (q=1, unchanged)
 # ══════════════════════════════════════════════
 
-def _psd_floor_or_reject(Gamma_cand, floor=1e-8):
+# ---------------------------------------------------------------------------
+# Optional guard diagnostics
+# ---------------------------------------------------------------------------
+# Every M-step guard below (PSD floor, Delta magnitude cap, Delta-solve ridge,
+# E-step moment clip, ...) is a departure from the exact conditional maximiser,
+# so any of them firing can cost EM its ascent property. When a fit trips the
+# likelihood-decrease guard in cfusn/fit.py we need to know WHICH one fired on
+# that iteration -- otherwise the diagnosis is guesswork.
+#
+# _DIAG is None in normal operation and every bump is a single `is not None`
+# test, so this costs nothing in production. A diagnostic harness sets it to a
+# dict (see enable_guard_diagnostics) and reads the counts back per iteration.
+_DIAG = None
+
+
+def _diag_bump(key, n=1):
+    if _DIAG is not None:
+        _DIAG[key] = _DIAG.get(key, 0) + n
+
+
+def enable_guard_diagnostics(on=True):
+    """Turn guard-firing counters on/off and return the live counter dict."""
+    global _DIAG
+    _DIAG = {} if on else None
+    return _DIAG
+
+
+def guard_diagnostics_snapshot():
+    return dict(_DIAG) if _DIAG is not None else {}
+
+
+def _note_guard_event(kwargs, key, n_eff=0.0):
+    """Record an M-step guard event for the caller (single_fit) to inspect.
+
+    `_guard_stats` is a dict single_fit puts in kwargs; absent for any other
+    caller, in which case this is a no-op. Tracks both the event count and the
+    largest responsibility mass affected, because a rejection on a 0.3-mass
+    component is routine while one on a 222-mass component means the fit is not
+    actually fitting that component at all.
+    """
+    stats = kwargs.get("_guard_stats")
+    if stats is None:
+        return
+    stats[key] = stats.get(key, 0) + 1
+    mass_key = key + "_max_mass"
+    stats[mass_key] = max(stats.get(mass_key, 0.0), float(n_eff))
+
+
+def _psd_floor_or_reject(Gamma_cand, floor=1e-8, reject_rel=1e-8):
     """Enforce positive-definiteness of a candidate Gamma, or signal that
     the candidate is unusable.
 
@@ -94,15 +335,41 @@ def _psd_floor_or_reject(Gamma_cand, floor=1e-8):
     isfinite checks before AND after the eigendecomposition.
     """
     if not np.all(np.isfinite(Gamma_cand)):
+        _diag_bump("gamma_rejected")
         return Gamma_cand, False
     try:
         eigvals = np.linalg.eigvalsh(Gamma_cand)
     except np.linalg.LinAlgError:
+        _diag_bump("gamma_rejected")
         return Gamma_cand, False
     if not np.all(np.isfinite(eigvals)):
+        _diag_bump("gamma_rejected")
         return Gamma_cand, False
-    if eigvals.min() < floor:
-        Gamma_cand = Gamma_cand + (floor - eigvals.min()) * np.eye(Gamma_cand.shape[0])
+    lam_min = float(eigvals.min())
+    if lam_min < floor:
+        # Distinguish round-off dust from a genuinely indefinite candidate.
+        # Flooring adds (floor - lam_min) * I, which is harmless when lam_min is
+        # -1e-16 and catastrophic when it is -1e+06: measured on a real
+        # production fit (kras_labelseq_mv, 4 components), the Gamma M-step
+        # returned lam_min = -1.46e+06 for a component with n_eff = 96, and
+        # flooring it added ~1.26e+06 * I -- a valid-but-meaningless covariance
+        # that dropped the log-likelihood by 2.04e+06 on the next iteration and
+        # failed the whole fit. A covariance M-step candidate is PSD by
+        # construction whenever the E-step moments feeding it are consistent, so
+        # a large negative eigenvalue means those moments are not, and the right
+        # response is to reject the candidate (keep the component's previous
+        # parameters -- an ECM no-op, so ascent is preserved) rather than to
+        # paper over it.
+        #
+        # The test is relative to the candidate's own spectral norm so it is
+        # scale-free: genuine round-off gives lam_min/lam_max ~ -1e-16, while
+        # the failures above give ~ -1.
+        lam_max = float(np.abs(eigvals).max())
+        if lam_min < -reject_rel * max(lam_max, 1e-300):
+            _diag_bump("gamma_indefinite_rejected")
+            return Gamma_cand, False
+        _diag_bump("gamma_psd_floor")
+        Gamma_cand = Gamma_cand + (floor - lam_min) * np.eye(Gamma_cand.shape[0])
     return Gamma_cand, True
 
 
@@ -320,13 +587,23 @@ def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
         cov  = 0.5 * (cov + cov.T)
         eig  = np.linalg.eigvalsh(cov)
         if eig.min() < 1e-12:
+            # Counted: this perturbs the truncated normal's covariance, so the
+            # E-step moments are no longer those of the model's own conditional
+            # and Q stops being the true Q. cov = I - Delta' Omega^-1 Delta goes
+            # singular exactly as Delta is pushed against its magnitude cap.
+            _diag_bump("estep_cov_floor")
             cov = cov + (1e-12 - eig.min() + 1e-12) * np.eye(2)
 
         mu1, mu2   = means[:, 0], means[:, 1]
         s1sq, s2sq = cov[0, 0], cov[1, 1]
         s12        = cov[0, 1]
         s1, s2     = np.sqrt(s1sq), np.sqrt(s2sq)
-        rho        = np.clip(s12 / (s1 * s2), -0.999999, 0.999999)
+        _rho_raw   = s12 / (s1 * s2)
+        if abs(_rho_raw) > 0.999999:
+            # Same concern as the covariance floor above: clamping the
+            # correlation changes the distribution whose moments we return.
+            _diag_bump("estep_rho_clip")
+        rho        = np.clip(_rho_raw, -0.999999, 0.999999)
 
         alpha1, alpha2 = -mu1 / s1, -mu2 / s2
         # L = P(X1>0, X2>0) computed as a single direct bivariate-CDF call
@@ -348,13 +625,13 @@ def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
         # flipped the EM step's net likelihood delta negative, tripping
         # the hard likelihood-decrease guard (fit.py) and discarding the
         # whole fit.
-        L = _bvn_cdf_owens(-alpha1, -alpha2, rho)
-        # Floor only against genuine floating-point noise (this form's own
-        # residual negative dust, ~1e-20 scale -- see above), not as a
-        # large-magnitude safety net; downstream overflow protection is
-        # the CLIP/nan_to_num on eta/Psi below, so this floor no longer
-        # needs to double as that safety net.
-        L = np.maximum(L, 1e-300)
+        # Everything below is a RATIO to L, and those ratios stay finite as
+        # L -> 0, so work in logs and never form L itself. See the helpers next
+        # to _bvn_cdf_owens for the measured accuracy of the old value-space
+        # form: once L < 1e-16 it had median relative error 2.3e+05 and returned
+        # a non-positive value 64% of the time, and 5-18% of rows are below
+        # 1e-13 on every production iteration.
+        log_L = _log_bvn_cdf(-alpha1, -alpha2, rho)
 
         # Conditional params for removing dim 2 -> tilde params of dim 1,
         # and vice versa (Kan & Robotti's c_kappa terms need these).
@@ -363,37 +640,29 @@ def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
         mu_t2  = mu1 - s12 * mu2 / s2sq
         s_t2   = np.sqrt(max(s1sq - s12 ** 2 / s2sq, 1e-300))
 
-        def phi1_at0(mu, s):
-            return norm.pdf(0.0, loc=mu, scale=s)
+        # c_kappa terms as logs; r_* is that term divided by L.
+        log_p1 = _log_phi_at0(mu1, s1)
+        log_p2 = _log_phi_at0(mu2, s2)
+        r00_1  = np.exp(log_p1 + _log_f1_0(mu_t1, s_t1) - log_L)
+        r00_2  = np.exp(log_p2 + _log_f1_0(mu_t2, s_t2) - log_L)
 
-        def F1_0(mu, s):
-            return 1 - norm.cdf(-mu / s)
+        # E[T1], E[T2] -- the old F10/L and F01/L, with L divided through.
+        e1 = mu1 + s1sq * r00_1 + s12 * r00_2
+        e2 = mu2 + s12 * r00_1 + s2sq * r00_2
 
-        def F1_1(mu, s):
-            a = -mu / s
-            return mu * F1_0(mu, s) + s * norm.pdf(a)
+        r10_2 = np.exp(log_p2 + _log_f1_1(mu_t2, s_t2) - log_L)
+        r01_1 = np.exp(log_p1 + _log_f1_1(mu_t1, s_t1) - log_L)
 
-        c00_1 = phi1_at0(mu1, s1) * F1_0(mu_t1, s_t1)
-        c00_2 = phi1_at0(mu2, s2) * F1_0(mu_t2, s_t2)
-        F10   = mu1 * L + s1sq * c00_1 + s12 * c00_2   # E[T1] numerator
-        F01   = mu2 * L + s12 * c00_1 + s2sq * c00_2   # E[T2] numerator
-
-        c10_2      = phi1_at0(mu2, s2) * F1_1(mu_t2, s_t2)
-        F20        = mu1 * F10 + s1sq * L + s12 * c10_2         # E[T1^2] numerator
-        F11_route1 = mu2 * F10 + s12 * L + s2sq * c10_2         # E[T1 T2] via kappa=(1,0)
-
-        c01_1      = phi1_at0(mu1, s1) * F1_1(mu_t1, s_t1)
-        F02        = mu2 * F01 + s12 * c01_1 + s2sq * L         # E[T2^2] numerator
-        F11_route2 = mu1 * F01 + s1sq * c01_1 + s12 * L         # E[T1 T2] via kappa=(0,1)
-
-        eta          = np.stack([F10 / L, F01 / L], axis=1)
+        eta          = np.stack([e1, e2], axis=1)
+        diag0        = mu1 * e1 + s1sq + s12 * r10_2          # E[T1^2]
+        diag1        = mu2 * e2 + s12 * r01_1 + s2sq          # E[T2^2]
         # Both routes derive the same true cross moment via independent
         # recursion paths; averaging cancels floating-point drift between
         # them (they agree to ~1e-17 in validation, so this is not masking
         # a real discrepancy).
-        cross        = 0.5 * (F11_route1 + F11_route2) / L
-        diag0        = F20 / L
-        diag1        = F02 / L
+        x_route1     = mu2 * e1 + s12 + s2sq * r10_2          # kappa=(1,0)
+        x_route2     = mu1 * e2 + s1sq * r01_1 + s12          # kappa=(0,1)
+        cross        = 0.5 * (x_route1 + x_route2)
 
         # Defense-in-depth: when a component's shape drifts so far that the
         # true positive-orthant probability L rounds to (numerically
@@ -416,6 +685,11 @@ def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
         # bounded, mirroring the same PSD-guarantee approach used for the
         # old approximate formula's cross term.
         CLIP = 1e4
+        if _DIAG is not None:
+            _diag_bump("estep_clip_rows", int(
+                (~np.isfinite(eta)).any(axis=1).sum()
+                + (np.isfinite(eta) & (np.abs(eta) > CLIP)).any(axis=1).sum()
+            ))
         eta   = np.nan_to_num(eta, nan=0.0, posinf=CLIP, neginf=-CLIP)
         eta   = np.clip(eta, -CLIP, CLIP)
         diag0 = np.nan_to_num(diag0, nan=0.0, posinf=CLIP ** 2, neginf=0.0)
@@ -506,9 +780,14 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
         Omega_inv_Delta = np.linalg.solve(Omega, Delta)  # (p, q)
         S = np.eye(q) - Delta.T @ Omega_inv_Delta  # (q, q)
         S = 0.5 * (S + S.T)
-        # Regularize
+        # Regularize. Counted: S = I - Delta' Omega^-1 Delta collapses toward
+        # singular exactly as Delta grows, so this fires in the same regime the
+        # Delta magnitude cap binds. Flooring it changes the truncated normal
+        # whose moments we return, so Q stops being the true Q and EM loses its
+        # ascent guarantee -- with no guard in the M-step to show for it.
         eig = np.linalg.eigvalsh(S)
         if eig.min() < 1e-10:
+            _diag_bump("estep_S_floor")
             S += (1e-10 - eig.min() + 1e-10) * np.eye(q)
 
         residuals = observations - mu  # (N, p)
@@ -552,6 +831,7 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
         Omega_s = 0.5 * (Omega_s + Omega_s.T)
         eig_O = np.linalg.eigvalsh(Omega_s)
         if eig_O.min() < 1e-10:
+            _diag_bump("estep_Omega_s_floor")
             Omega_s += (1e-10 - eig_O.min() + 1e-10) * np.eye(len(obs_dims))
 
         Omega_s_inv_Delta_s = np.linalg.solve(Omega_s, Delta_s)  # (|S|, q)
@@ -559,6 +839,7 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
         S_s = 0.5 * (S_s + S_s.T)
         eig_S = np.linalg.eigvalsh(S_s)
         if eig_S.min() < 1e-10:
+            _diag_bump("estep_S_floor")
             S_s += (1e-10 - eig_S.min() + 1e-10) * np.eye(q)
 
         residuals_s = x_s - mu_s
@@ -636,6 +917,9 @@ def _regularized_spd(A, floor=1e-10):
     A = 0.5 * (np.asarray(A, dtype=float) + np.asarray(A, dtype=float).T)
     eig = np.linalg.eigvalsh(A)
     if eig.min() < floor:
+        # Counted because this perturbs the E-step's conditional distribution,
+        # so a firing here makes Q inexact the same way the eta/Psi clip does.
+        _diag_bump("gamma_oo_floor")
         A = A + (floor - eig.min() + floor) * np.eye(A.shape[0])
     return A
 
@@ -799,6 +1083,15 @@ MIN_GAMMA_EIGVAL_FRAC = 1e-6
 # ~Psi/(n_c + nu + p + 1), i.e. it adapts to component mass rather than being a
 # fixed constant like MIN_GAMMA_EIGVAL_FRAC.
 GAMMA_RIDGE_FRAC = 1e-3
+
+# Floor on the smallest eigenvalue of Psi_sum = sum_n z_n E[t_n t_n'] before the
+# Delta M-step solves against it. Unlike the Gamma ridge this is NOT part of the
+# penalised objective, so a firing here is a genuine departure from the exact
+# conditional maximiser and can cost EM its ascent property -- that is why
+# _diag_bump("delta_solve_ridge") counts it. It only bites when a component's
+# posterior over the latent t collapses (eta -> 0, Psi -> 0), i.e. when the
+# component has little effective mass or no skew left to support.
+DELTA_SOLVE_RIDGE_FLOOR = 1e-3
 
 # Which regularisation the multivariate M-step applies to Gamma.
 # False -> hard eigenvalue floor (_floor_gamma_eigenvalues); True -> IW ridge.
@@ -1002,7 +1295,9 @@ def _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev=None, global_var_d=No
     if not over.any():
         return Delta_new, False
     if Delta_prev is not None:
+        _diag_bump("delta_cap_reject")
         return np.asarray(Delta_prev, dtype=float), True
+    _diag_bump("delta_cap_rescale")
     scale = np.where(over, max_norm_d / np.maximum(row_norms, 1e-12), 1.0)
     return Delta_new * scale[:, None], True
 
@@ -1016,7 +1311,7 @@ def _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q, Delta_prev
     to a single q x q solve -- the same system the complete-data M-step solves.
     """
     Ex, Ext, Exx = completed
-    RIDGE_FLOOR = 1e-3   # same floor/rationale as the available-case path below
+    RIDGE_FLOOR = DELTA_SOLVE_RIDGE_FLOOR
 
     # numer[d, r] = sum_n z_n (E[x_n t_n']_{d,r} - mu_d eta_{n,r})
     numer = (np.einsum('n,ndr->dr', z_eff, Ext)
@@ -1025,6 +1320,7 @@ def _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q, Delta_prev
 
     eig = np.linalg.eigvalsh(0.5 * (Psi_sum + Psi_sum.T))
     if eig.min() < RIDGE_FLOOR:
+        _diag_bump("delta_solve_ridge")
         Psi_sum = Psi_sum + (RIDGE_FLOOR - eig.min() + RIDGE_FLOOR) * np.eye(q)
     try:
         Delta_new = np.linalg.solve(Psi_sum, numer.T).T   # (p, q)
@@ -1095,12 +1391,13 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
     # (e.g. a dimension with ~zero effective observations for this
     # component), which is exactly the case that needs damping rather than
     # amplification.
-    RIDGE_FLOOR = 1e-3
+    RIDGE_FLOOR = DELTA_SOLVE_RIDGE_FLOOR
     Delta_new = np.zeros((p, q))
     for d in range(p):                                 # p=2 → 2 iterations
         Ps = Psi_sum[d]
         eig = np.linalg.eigvalsh(Ps)
         if eig.min() < RIDGE_FLOOR:
+            _diag_bump("delta_solve_ridge")
             Ps = Ps + (RIDGE_FLOOR - eig.min() + RIDGE_FLOOR) * np.eye(q)
         try:
             Delta_new[d] = np.linalg.solve(Ps, numer[d])
@@ -1279,14 +1576,39 @@ def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma,
             return np.asarray(mu, dtype=float)
         return (r[:, None] * (Ex - v[:, None] * Delta_vec[None, :])).sum(0) / denom
 
-    # Complete data: available-case masking is exact -- original path, unchanged.
+    # Complete data: available-case masking is exact.
     v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     x_fill = np.where(obs, observations, 0.0)
     m = x_fill - v[:, None] * Delta_vec[None, :]
     z = r[:, None]
     numer = (m * z * obs).sum(axis=0)
     denom = (z * obs).sum(axis=0)
-    return numer / np.maximum(denom, 1e-12)
+    # Freeze an unbacked dimension rather than letting 0/1e-12 drive it to 0.
+    # Aligned with get_location_update_cfusn: leaving an uninformed block at its
+    # previous value is an ECM no-op and preserves ascent, whereas zeroing it is
+    # an arbitrary jump that can decrease Q -- and 0 is only a meaningful target
+    # at all because production happens to standardise per dimension
+    # (fit.py:813-817), which single_fit does not require of its callers.
+    return np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12),
+                    np.asarray(mu, dtype=float))
+
+
+def _mv_capped(Delta_new, weighted_var_d, Delta_prev, observations):
+    """Apply the CFUSN Delta magnitude cap to a q=1 (p,) Delta.
+
+    The cap previously existed ONLY on the CFUSN path, so q=1 restarts -- one in
+    three of every multivariate fit's restarts (fit.py:882) -- ran with no Delta
+    bound at all while q>=2 restarts were capped, and the two then competed on
+    val_ll. Reshaping to (p,1) reuses one implementation, including the
+    (1 - 2/pi) positive-definiteness correction, so a restart's latent_q no
+    longer changes which safety machinery applies.
+    """
+    D2 = np.asarray(Delta_new, dtype=float).reshape(-1, 1)
+    prev2 = (np.asarray(Delta_prev, dtype=float).reshape(-1, 1)
+             if Delta_prev is not None else None)
+    capped, _ = _apply_delta_cap(D2, weighted_var_d, prev2,
+                                 global_var_d=_global_var_d(observations))
+    return np.asarray(capped, dtype=float).ravel()
 
 
 def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, Gamma,
@@ -1303,15 +1625,32 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
         # denominator is a single scalar rather than one per dimension.
         numer = (z[:, None] * Ext[:, :, 0]).sum(0) - updated_mu * float((z * v).sum())
         denom = float((z * w).sum())
-        return numer / max(denom, 1e-12)
+        Delta_new = (numer / denom if denom > 1e-12
+                     else np.asarray(Delta, dtype=float).ravel())
+        z_tot = float(z.sum())
+        if z_tot > 1e-8:
+            var_rows = (np.einsum('ndd->nd', Exx)
+                        - 2.0 * Ex * updated_mu[None, :]
+                        + (updated_mu ** 2)[None, :])
+            weighted_var_d = (z[:, None] * var_rows).sum(0) / z_tot
+        else:
+            weighted_var_d = np.zeros(observations.shape[1])
+        return _mv_capped(Delta_new, weighted_var_d, Delta, observations)
 
-    # Complete data: available-case masking is exact -- original path, unchanged.
+    # Complete data: available-case masking is exact.
     v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
     x_fill = np.where(obs, observations, 0.0)
     residuals = x_fill - updated_mu[None, :]
     numer = (z[:, None] * v[:, None] * residuals * obs).sum(axis=0)
     denom = (z[:, None] * w[:, None] * obs).sum(axis=0)
-    return numer / np.maximum(denom, 1e-12)
+    Delta_new = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12),
+                         np.asarray(Delta, dtype=float).ravel())
+    obs_z = obs * z[:, None]
+    denom_d = obs_z.sum(axis=0)
+    weighted_var_d = np.where(
+        denom_d > 1e-8,
+        (obs_z * residuals ** 2).sum(axis=0) / np.maximum(denom_d, 1e-8), 0.0)
+    return _mv_capped(Delta_new, weighted_var_d, Delta, observations)
 
 
 def get_Gamma_update_mv(updated_mu, updated_Delta, observations, responsibilities, mu, Delta, Gamma,
@@ -1996,8 +2335,11 @@ def _em_update_multivariate(
 
         mu_cand = get_location_update_mv(observations, z, mu_old, Delta_old, Gamma_old,
                                          sample_weights=sample_weights)
-        Delta_cand = get_Delta_update_mv(mu_cand, observations, z, mu_old, Delta_old, Gamma_old,
-                                         sample_weights=sample_weights)
+        if kwargs.get("force_gaussian"):
+            Delta_cand = np.zeros_like(Delta_old)
+        else:
+            Delta_cand = get_Delta_update_mv(mu_cand, observations, z, mu_old, Delta_old, Gamma_old,
+                                             sample_weights=sample_weights)
         Gamma_cand = get_Gamma_update_mv(
             mu_cand, Delta_cand, observations, z, mu_old, Delta_old, Gamma_old,
             sample_weights=sample_weights,
@@ -2021,6 +2363,7 @@ def _em_update_multivariate(
         # non-convergent candidate used to kill the entire tryToFit attempt.
         Gamma_cand, gamma_ok = _psd_floor_or_reject(Gamma_cand)
         if not gamma_ok:
+            _note_guard_event(kwargs, "gamma_rejected", _n_eff)
             updated[c] = (mu_old, Delta_old, Gamma_old)
             continue
 
@@ -2116,11 +2459,23 @@ def _em_update_cfusn(
             sample_weights=sample_weights, return_completed=True,
         )
 
-        # Step 2: Delta (p, q)
-        Delta_cand = get_Delta_update_cfusn(mu_cand, observations, z, eta, Psi,
-                                            sample_weights=sample_weights,
-                                            completed=completed,
-                                            Delta_prev=Delta_old)
+        # Step 2: Delta (p, q). force_gaussian: pin Delta at zero every
+        # iteration -- a q=2-shaped CFUSN component with Delta==0 IS a
+        # plain multivariate Gaussian component (Omega=Gamma, no skew
+        # contribution; see fit.py's generate_fit_jobs docstring for why
+        # this restart mode exists). The E-step naturally stays well-behaved
+        # here too: with Delta=0, S=I_q and the truncated-normal's
+        # conditional mean m=Delta'*Omega_inv*(x-mu)=0 for every
+        # observation, so eta/Psi are just the fixed, data-independent
+        # moments of a standard truncated normal -- no special numerical
+        # handling required beyond skipping the Delta solve.
+        if kwargs.get("force_gaussian"):
+            Delta_cand = np.zeros_like(Delta_old)
+        else:
+            Delta_cand = get_Delta_update_cfusn(mu_cand, observations, z, eta, Psi,
+                                                sample_weights=sample_weights,
+                                                completed=completed,
+                                                Delta_prev=Delta_old)
 
         # Step 3: Gamma (p, p)
         Gamma_cand = get_Gamma_update_cfusn(mu_cand, Delta_cand, observations, z, eta, Psi,
@@ -2152,6 +2507,7 @@ def _em_update_cfusn(
         # attempt.
         Gamma_cand, gamma_ok = _psd_floor_or_reject(Gamma_cand)
         if not gamma_ok:
+            _note_guard_event(kwargs, "gamma_rejected", _n_eff)
             updated[c] = (mu_old, Delta_old, Gamma_old)
             continue
 
