@@ -27,6 +27,23 @@ line, # comments allowed) are silently skipped.
 """
 import sys
 import os
+
+# Must happen BEFORE numpy (or anything importing it) is loaded -- these are
+# read once at BLAS-library init time, not per-call. Without this, each of
+# the n_cpus ProcessPoolExecutor workers below can independently spawn its
+# own multi-threaded BLAS trying to use every visible core, oversubscribing
+# by up to n_cpus^2 threads on an n_cpus-core node (e.g. 16 workers x up to
+# 16 BLAS threads each = up to 256 threads contending for 16 cores) --
+# confirmed this guard was already present in run_local_array.sh (with the
+# same rationale in its own comment) but absent from submit_array.sh's
+# SLURM path and from this file itself, so any SLURM-submitted run had no
+# protection against it regardless of how --cpus-per-task/SLURM_CPUS was
+# tuned.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import pickle
 import argparse
 import concurrent.futures

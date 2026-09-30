@@ -54,6 +54,15 @@ JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 #SBATCH --cpus-per-task=${CPUS}
 #SBATCH --partition=${PARTITION}
 
+# See run_local_array.sh's identical exports / run_array_task.py's own
+# os.environ.setdefault safety net: without this, each ProcessPoolExecutor
+# worker below can spawn its own multi-threaded BLAS trying to use every
+# visible core, oversubscribing --cpus-per-task by up to its square.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
 ${PYTHON} ${SCRIPT_DIR}/run_array_task.py ${OUTPUT_DIR} \${SLURM_ARRAY_TASK_ID}
 SBATCH_SCRIPT
 )
