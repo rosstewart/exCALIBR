@@ -48,7 +48,12 @@ def _signed_label(v: int) -> str:
     return f"+{v}" if v > 0 else str(v)
 
 
-def make_figure(df, title, out_stem):
+def make_figure(df, title, out_stem, slides=False):
+    """No title in either mode (removed -- was redundant with the panel's
+    own filename/caption context). ``slides=True``: a simplified, all-text-
+    larger rendering for a slideshow (not the paper) -- same data, same
+    layout, just bigger source/target labels and a bigger figure so it reads
+    from the back of a room."""
     pivotal = df.copy()
     pivotal["point_bin"] = pivotal["our_points"].round().clip(-8, 8).astype(int)
     pivotal["source"] = "VUS"
@@ -57,25 +62,28 @@ def make_figure(df, title, out_stem):
             .reset_index(name="count")
             .rename(columns={"point_bin": "target"}))
 
-    fig, ax = plt.subplots(figsize=(7, 9))
+    figsize = (9, 11) if slides else (7, 9)
+    fig, ax = plt.subplots(figsize=figsize)
     plot_categorical_sankey(
         flow, _SOURCE_ORDER, _POINT_ORDER, _SOURCE_COLOR, _POINT_COLOR, ax=ax,
-        target_fontsize=9, show_target_counts=True, gap_frac=0.006,
+        source_fontsize=20 if slides else 9, target_fontsize=18 if slides else 9,
+        show_target_counts=True, gap_frac=0.02 if slides else 0.006,
+        # Bigger min_frac in slides mode: small bins (e.g. "+7 (10)") still
+        # need enough layout height that their much-larger label doesn't
+        # vertically collide with its neighbors' labels.
+        min_frac=0.035 if slides else 0.012,
         target_label_fmt=_signed_label, gradient=True,
     )
-    n_genes = pivotal["gene"].nunique()
-    ax.set_title(f"{title}\nTrue ClinVar VUS -> our canonical points "
-                 f"(n={len(pivotal):,} variants, {n_genes} genes)",
-                 fontsize=12, fontweight="bold")
     fig.tight_layout()
+    stem = f"{out_stem}_slides" if slides else out_stem
     for ext in ("pdf", "png"):
-        out_path = OUTPUT_DIR / f"{out_stem}.{ext}"
+        out_path = OUTPUT_DIR / f"{stem}.{ext}"
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         print(f"Saved {out_path}")
     plt.close(fig)
 
 
-def main():
+def main(slides=False):
     for panel, csv_name, title in _PANELS:
         csv_path = OUTPUT_DIR / csv_name
         if not csv_path.exists():
@@ -85,8 +93,16 @@ def main():
         if df.empty:
             print(f"[{panel}] no rows, skipping")
             continue
-        make_figure(df, title, f"{panel}_vus_points_sankey")
+        make_figure(df, title, f"{panel}_vus_points_sankey", slides=slides)
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--slides", action="store_true",
+                     help="Also render the simplified, large-text slideshow version "
+                          "(saved alongside the paper version with a _slides suffix).")
+    args = ap.parse_args()
     main()
+    if args.slides:
+        main(slides=True)

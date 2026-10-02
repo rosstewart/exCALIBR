@@ -1303,19 +1303,37 @@ def _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev=None, global_var_d=No
 
 
 def _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q, Delta_prev=None,
-                            global_var_d=None):
+                            global_var_d=None, dim_weights=None, obs=None):
     """Delta M-step from completed-data moments (missing-data case).
 
     With E[x] completed, every row contributes to every dimension, so the
     per-dimension (p separate q x q) solves of the available-case path collapse
     to a single q x q solve -- the same system the complete-data M-step solves.
+
+    ``dim_weights`` (EXPERIMENTAL, opt-in -- see cfusn/fit.py's
+    compute_dim_weights): when given (shape (p,), paired with the (N, p)
+    boolean ``obs`` mask of genuinely-observed entries), rows where
+    dimension d is truly observed get dim_weights[d]x more pull on THAT
+    dimension's numerator row, relative to rows where d was EM-imputed
+    (completed) rather than really measured. Psi_sum below is intentionally
+    left unweighted -- it is the single SHARED (q, q) normalisation every
+    dimension's solve uses (not itself per-dimension; see this function's
+    docstring above), so reweighting it per-dimension would not be
+    meaningful. With dim_weights all 1 (or None), this reproduces the
+    original computation exactly.
     """
     Ex, Ext, Exx = completed
     RIDGE_FLOOR = DELTA_SOLVE_RIDGE_FLOOR
 
-    # numer[d, r] = sum_n z_n (E[x_n t_n']_{d,r} - mu_d eta_{n,r})
-    numer = (np.einsum('n,ndr->dr', z_eff, Ext)
-             - np.outer(mu_new, (z_eff[:, None] * eta).sum(0)))
+    if dim_weights is None:
+        # numer[d, r] = sum_n z_n (E[x_n t_n']_{d,r} - mu_d eta_{n,r})
+        numer = (np.einsum('n,ndr->dr', z_eff, Ext)
+                 - np.outer(mu_new, (z_eff[:, None] * eta).sum(0)))
+    else:
+        w_nd = z_eff[:, None] * np.where(obs, dim_weights[None, :], 1.0)  # (N, p)
+        cross = np.einsum('nd,ndr->dr', w_nd, Ext)
+        eta_sum = np.einsum('nd,nr->dr', w_nd, eta)
+        numer = cross - mu_new[:, None] * eta_sum
     Psi_sum = np.einsum('n,nij->ij', z_eff, Psi)          # (q, q)
 
     eig = np.linalg.eigvalsh(0.5 * (Psi_sum + Psi_sum.T))
@@ -1345,7 +1363,8 @@ def _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q, Delta_prev
 
 
 def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
-                           sample_weights=None, completed=None, Delta_prev=None):
+                           sample_weights=None, completed=None, Delta_prev=None,
+                           dim_weights=None):
     """CFUSN Delta M-step.  Returns (p, q).
 
     KEY FIX: replace per-d einsum loop with two batched einsums, then
@@ -1354,6 +1373,20 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
     ``completed`` is the (Ex, Ext, Exx) tuple from _completed_data_moments,
     supplied only when the data has missing entries; when it is None the
     original available-case path runs unchanged (exact for complete data).
+
+    ``dim_weights`` (EXPERIMENTAL, opt-in, shape (p,) or None -- see
+    cfusn/fit.py's compute_dim_weights): per-dimension Delta upweighting.
+    See _delta_update_completed's docstring for the missing-data case
+    (the one real TP53/MV fits actually hit, since any dimension with
+    partial coverage makes the WHOLE observation matrix fail the
+    ``completed is None`` fully-observed check below). In the fully-
+    observed branch, Psi_sum[d] is already per-dimension (built from
+    ``obs_z``), so weighting it the same way as numer[d] would cancel
+    exactly in the ratio -- here dim_weights instead scales ONLY numer,
+    which rescales that dimension's resulting Delta magnitude directly
+    (a cruder "trust this dimension's own skew estimate more" dial, bounded
+    by the same magnitude cap below). This branch is not exercised by any
+    current MV gene fit (all have some missingness) but is kept consistent.
     """
     obs    = ~np.isnan(observations)
     x_fill = np.where(obs, observations, 0.0)
@@ -1365,13 +1398,16 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
     if completed is not None:
         return _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q,
                                        Delta_prev=Delta_prev,
-                                       global_var_d=_global_var_d(observations))
+                                       global_var_d=_global_var_d(observations),
+                                       dim_weights=dim_weights, obs=obs)
 
     obs_z    = obs * z_eff[:, None]                   # (N, p)
     residuals = x_fill - mu_new                       # (N, p)
 
     # numer[d, r] = sum_n obs_z[n,d] * residuals[n,d] * eta[n,r]
     numer    = (obs_z * residuals).T @ eta             # (p, q) — one matmul
+    if dim_weights is not None:
+        numer = numer * dim_weights[:, None]
 
     # Psi_sum[d, i, j] = sum_n obs_z[n,d] * Psi[n, i, j]
     Psi_sum  = np.einsum('nd,nij->dij', obs_z, Psi)   # (p, q, q)
@@ -1612,8 +1648,22 @@ def _mv_capped(Delta_new, weighted_var_d, Delta_prev, observations):
 
 
 def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, Gamma,
-                       sample_weights=None):
-    """Delta update for q=1 restricted MSN. Returns (p,) vector."""
+                       sample_weights=None, dim_weights=None):
+    """Delta update for q=1 restricted MSN. Returns (p,) vector.
+
+    ``dim_weights`` (EXPERIMENTAL, opt-in -- see cfusn/fit.py's
+    compute_dim_weights): the q=1 analog of get_Delta_update_cfusn's
+    dim_weights treatment. In the missing-data branch, rows where dimension
+    d is genuinely observed get dim_weights[d]x more pull on THAT
+    dimension's numerator entry; ``denom`` is left unweighted since it is a
+    single SHARED scalar every dimension's Delta entry divides by (not
+    itself per-dimension), the q=1 analog of CFUSN's shared Psi_sum. In the
+    fully-observed branch, dim_weights scales only numer (denom is also
+    per-dimension there, but degenerate to the same scalar for every d
+    since obs is all-True everywhere) -- same cruder "rescale this
+    dimension's own Delta magnitude" caveat as get_Delta_update_cfusn's
+    available-case branch; not exercised by any current MV gene fit.
+    """
     obs = ~np.isnan(observations)
     z = responsibilities if sample_weights is None else responsibilities * sample_weights
 
@@ -1623,7 +1673,11 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
         # Delta_d = sum_n z (E[x_d t] - mu_d E[t]) / sum_n z E[t^2]; with the
         # completed moments every row informs every dimension, so the
         # denominator is a single scalar rather than one per dimension.
-        numer = (z[:, None] * Ext[:, :, 0]).sum(0) - updated_mu * float((z * v).sum())
+        if dim_weights is None:
+            numer = (z[:, None] * Ext[:, :, 0]).sum(0) - updated_mu * float((z * v).sum())
+        else:
+            w_nd = z[:, None] * np.where(obs, dim_weights[None, :], 1.0)  # (N, p)
+            numer = (w_nd * Ext[:, :, 0]).sum(0) - updated_mu * (w_nd * v[:, None]).sum(0)
         denom = float((z * w).sum())
         Delta_new = (numer / denom if denom > 1e-12
                      else np.asarray(Delta, dtype=float).ravel())
@@ -1642,6 +1696,8 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
     x_fill = np.where(obs, observations, 0.0)
     residuals = x_fill - updated_mu[None, :]
     numer = (z[:, None] * v[:, None] * residuals * obs).sum(axis=0)
+    if dim_weights is not None:
+        numer = numer * dim_weights
     denom = (z[:, None] * w[:, None] * obs).sum(axis=0)
     Delta_new = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12),
                          np.asarray(Delta, dtype=float).ravel())
@@ -2265,8 +2321,18 @@ def _em_update_univariate(
 ):
     """One M-step for all components, univariate case."""
     sample_weights = kwargs.get("sample_weights", None)
+    # Explicit, caller-specified freeze (distinct from low_mass_freeze's
+    # automatic mass-based freeze below, which doesn't exist on this
+    # univariate path anyway) -- e.g. for growing a fit by adding one new
+    # component while holding every pre-existing component fixed. See
+    # frozen_components usage in _em_update_multivariate/_em_update_cfusn
+    # for the full rationale.
+    frozen_components = kwargs.get("frozen_components", None) or set()
     updated = [None] * K
     for c in range(K):
+        if c in frozen_components:
+            updated[c] = current_component_params[c]
+            continue
         z = responsibilities[c]
         cp = current_component_params[c]
 
@@ -2315,16 +2381,31 @@ def _em_update_multivariate(
     component_params in alternate form: (mu, Delta_vec, Gamma_mat).
     """
     sample_weights = kwargs.get("sample_weights", None)
+    # EXPERIMENTAL, opt-in -- see cfusn/fit.py's compute_dim_weights. None
+    # (the default) reproduces standard EM exactly.
+    dim_weights = kwargs.get("dim_weights", None)
     stabilize = kwargs.get("_stabilize_separation", False)
     # Low-mass freeze: independently togglable from the separation/tempering
     # stabilizers above (`stabilize`) -- experimental, default off to match
     # existing committed behavior. See low_mass_freeze usage below.
     low_mass_freeze = stabilize or kwargs.get("low_mass_freeze", False)
     min_mass = separation.min_component_mass(**kwargs) if low_mass_freeze else 0.0
+    # Explicit, caller-specified freeze -- e.g. for growing a fit by adding
+    # one new component while holding every pre-existing component fixed
+    # (see fit.py's add_component_to_fit / single_fit's new_component_idx
+    # kwarg). Distinct from low_mass_freeze above, which is automatic and
+    # mass-threshold-based; this is an unconditional, caller-chosen set of
+    # component indices that NEVER update regardless of their responsibility
+    # mass.
+    frozen_components = kwargs.get("frozen_components", None) or set()
     updated = [None] * K
     for c in range(K):
         z = responsibilities[c]
         mu_old, Delta_old, Gamma_old = current_component_params[c]
+
+        if c in frozen_components:
+            updated[c] = (mu_old, Delta_old, Gamma_old)
+            continue
 
         # Low-mass freeze (see _em_update_cfusn).
         if low_mass_freeze:
@@ -2339,7 +2420,8 @@ def _em_update_multivariate(
             Delta_cand = np.zeros_like(Delta_old)
         else:
             Delta_cand = get_Delta_update_mv(mu_cand, observations, z, mu_old, Delta_old, Gamma_old,
-                                             sample_weights=sample_weights)
+                                             sample_weights=sample_weights,
+                                             dim_weights=dim_weights)
         Gamma_cand = get_Gamma_update_mv(
             mu_cand, Delta_cand, observations, z, mu_old, Delta_old, Gamma_old,
             sample_weights=sample_weights,
@@ -2425,18 +2507,30 @@ def _em_update_cfusn(
     """
     n_mc = kwargs.get("n_mc_truncated", 500)
     sample_weights = kwargs.get("sample_weights", None)
+    # EXPERIMENTAL, opt-in -- see cfusn/fit.py's compute_dim_weights. None
+    # (the default) reproduces standard EM exactly.
+    dim_weights = kwargs.get("dim_weights", None)
     stabilize = kwargs.get("_stabilize_separation", False)
     # Low-mass freeze: independently togglable from the separation/tempering
     # stabilizers above (`stabilize`) -- experimental, default off to match
     # existing committed behavior. See low_mass_freeze usage below.
     low_mass_freeze = stabilize or kwargs.get("low_mass_freeze", False)
     min_mass = separation.min_component_mass(**kwargs) if low_mass_freeze else 0.0
+    # Explicit, caller-specified freeze -- unconditional, chosen up front
+    # (e.g. "every component except the newly-added one"), unlike
+    # low_mass_freeze's automatic per-iteration mass threshold below. See
+    # fit.py's add_component_to_fit.
+    frozen_components = kwargs.get("frozen_components", None) or set()
     updated = [None] * K
 
     for c in range(K):
         z = responsibilities[c]  # (N,)
         mu_old, Delta_old, Gamma_old = current_component_params[c]
         Delta_old = density_utils._ensure_matrix_delta(Delta_old)
+
+        if c in frozen_components:
+            updated[c] = (mu_old, Delta_old, Gamma_old)
+            continue
 
         # Low-mass freeze: a component that has lost (almost) all of its
         # responsibility mass has an ill-defined mean — keep it put rather than
@@ -2475,7 +2569,8 @@ def _em_update_cfusn(
             Delta_cand = get_Delta_update_cfusn(mu_cand, observations, z, eta, Psi,
                                                 sample_weights=sample_weights,
                                                 completed=completed,
-                                                Delta_prev=Delta_old)
+                                                Delta_prev=Delta_old,
+                                                dim_weights=dim_weights)
 
         # Step 3: Gamma (p, p)
         Gamma_cand = get_Gamma_update_cfusn(mu_cand, Delta_cand, observations, z, eta, Psi,

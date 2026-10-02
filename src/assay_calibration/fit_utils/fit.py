@@ -346,14 +346,23 @@ def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, 
     When sample_balance_beta=0 and sample_proportions=None (defaults), returns the
     standard per-observation average LL (existing behaviour, n-based).
 
-    When sample_balance_beta > 0 or sample_proportions is given, computes the
-    per-sample mean LL and combines them with the same weights used in the M-step,
-    so that the val score reflects the same objective the EM optimised.
+    When sample_balance_beta > 0, sample_weight_transform is set, or sample_proportions
+    is given, computes the per-sample mean LL and combines them with the same weights
+    used in the M-step, so that the val score reflects the same objective the EM
+    optimised -- otherwise the M-step would optimize a reweighted objective while
+    restart-selection (this function) still scores the plain count-weighted one.
+
+    NOTE: "log2" and "ln" give an identical score here too -- the per-class
+    weight vector `w` is normalised by its own sum below, and log2(N)/ln(N)
+    differ only by the same global constant factor across every class, which
+    cancels under that normalisation. See compute_sample_weights's docstring
+    (cfusn/fit.py) for the full argument; only one of the two needs running.
 
     Parameters
     ----------
     fit_kwargs : dict
-        Expects sample_balance_beta (float) and/or sample_proportions (array-like).
+        Expects sample_balance_beta (float) and/or sample_proportions (array-like)
+        and/or sample_weight_transform ({None, "log2", "ln"}).
     """
     if not fit_kwargs.get("weighted_val_ll", False):
         return get_likelihood(
@@ -362,8 +371,9 @@ def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, 
 
     beta = float(fit_kwargs.get("sample_balance_beta", 0.0))
     proportions = fit_kwargs.get("sample_proportions", None)
+    transform = fit_kwargs.get("sample_weight_transform", None)
 
-    if proportions is None and beta == 0.0:
+    if proportions is None and beta == 0.0 and transform not in ("log2", "ln"):
         return get_likelihood(
             val_observations, val_sample_assignments, params, weights, multivariate=mv
         ) / len(val_sample_assignments)
@@ -383,6 +393,9 @@ def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, 
             raise ValueError(
                 f"sample_proportions length {len(w)} != N_samples {N_samples}"
             )
+    elif transform in ("log2", "ln"):
+        log_fn = np.log2 if transform == "log2" else np.log
+        w = np.where(n_per_sample > 0, log_fn(np.maximum(n_per_sample, 1.0)), 0.0)
     else:
         n_ref = n_per_sample[n_per_sample > 0].min() if (n_per_sample > 0).any() else 1.0
         w = np.where(n_per_sample > 0, (n_ref / np.maximum(n_per_sample, 1.0)) ** beta, 0.0)

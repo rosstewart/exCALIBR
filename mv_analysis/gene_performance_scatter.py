@@ -36,6 +36,20 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# Slideshow-mode per-panel colors (A/B/C) -- the dataviz skill's first three
+# categorical slots (references/palette.md), the only subset of its 8-hue
+# theme validated all-pairs-safe for a 3-series scatter (worst-pair CVD
+# Delta-E 9.2, normal-vision Delta-E 24.0): aqua/teal reads as "experimental/
+# assay data", orange as "computational predictor/ML", blue as "combined,
+# unified evidence".
+_SLIDES_PANEL_COLOR = {"A": "#1baf7a", "B": "#eb6834", "C": "#2a78d6"}
+
+# Slideshow-mode gene-label display-name overrides -- "FGFR_COMBINED" (the
+# pooled FGFR1/2/3/4 dataset_name) reads as a single unfamiliar gene on a
+# slide; the paper version leaves this alone since its audience already
+# knows the FGFR panel's construction.
+_SLIDES_GENE_LABEL = {"FGFR_COMBINED": "FGFR1/2/3/4"}
+
 from src.assay_calibration.data_utils.dataset import MultiScoreset
 from src.assay_calibration.multivariate_analysis import mv_calibration as _mv_calibration_mod
 from src.assay_calibration.multivariate_analysis.gene_set_analysis import build_gene_set_analysis
@@ -521,8 +535,18 @@ _PALETTE_CMAP = LinearSegmentedColormap.from_list(
 _METRIC_AXIS_LABEL = {"mcc": "MCC", "accuracy": "Accuracy", "auc": "AUC (ROC)"}
 
 
-def plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=None):
+def plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=None,
+                               slides=False, color=None):
     """Generic version of plot_mcc_scatter_panel supporting mcc/accuracy/auc.
+
+    ``slides=True``: a simplified, large-font rendering for a slideshow
+    (not the paper) -- uniform dot size (no N-control-variants size
+    encoding, no legend at all), a single flat panel color (``color``,
+    defaulting to _SLIDES_PANEL_COLOR[letter.strip("()")] when not given)
+    instead of the paper version's size-only color, larger gene-name labels,
+    and axis labels renamed to "Independent calibration" (x, i.e. UV/
+    univariate) vs. "Multidimensional calibration" (y, i.e. MV) instead of
+    the paper version's method-name/metric-name labels.
 
     mcc/auc are mathematically undefined when the evaluated set has zero
     P/LP or zero B/LB variants (compute_classification_metrics/roc_auc_score
@@ -552,56 +576,114 @@ def plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=None):
 
     lo = max(0.0, min(df[mv_col].min(), df[uv_col].min()) - 0.05)
     hi = 1.02
-    diag_line = ax.plot([lo, hi], [lo, hi], "k--", alpha=0.35, linewidth=1.5,
+    diag_line = ax.plot([lo, hi], [lo, hi], "k--", alpha=0.35,
+                         linewidth=2.0 if slides else 1.5,
                          zorder=1, label="Equal performance")[0]
 
-    # Size is the only encoding (was redundantly duplicated by color before);
-    # a single solid color avoids implying a second variable is shown.
-    n_vals = df["n_eval"].values
-    size_min, size_max = n_vals.min(), n_vals.max()
+    panel_color = color or _SLIDES_PANEL_COLOR.get(letter.strip("()"), "#4C72B0")
 
-    def _size_for(v):
-        return 60 + 500 * (np.sqrt(v) - np.sqrt(size_min)) / max(1e-9, (np.sqrt(size_max) - np.sqrt(size_min)))
+    if slides:
+        # No size encoding at all -- every dot the same size, one flat color,
+        # no legend (see docstring).
+        ax.scatter(df[uv_col], df[mv_col], s=480, c=panel_color,
+                   edgecolors="white", alpha=0.9, linewidth=2.0, zorder=3)
+    else:
+        # Size is the only encoding (was redundantly duplicated by color
+        # before); a single solid color avoids implying a second variable is
+        # shown.
+        n_vals = df["n_eval"].values
+        size_min, size_max = n_vals.min(), n_vals.max()
 
-    size = _size_for(n_vals)
+        def _size_for(v):
+            return 60 + 500 * (np.sqrt(v) - np.sqrt(size_min)) / max(1e-9, (np.sqrt(size_max) - np.sqrt(size_min)))
 
-    ax.scatter(df[uv_col], df[mv_col], s=size, c="#4C72B0",
-               edgecolors="white", alpha=0.85, linewidth=1.5, zorder=3)
+        size = _size_for(n_vals)
+        ax.scatter(df[uv_col], df[mv_col], s=size, c=panel_color,
+                   edgecolors="white", alpha=0.85, linewidth=1.5, zorder=3)
 
+    # Dense panels (e.g. functional, ~34 genes) need a smaller label size than
+    # sparse ones (predictor/combined, ~8 genes) to avoid the labels
+    # overlapping each other or getting shoved far outside the axes by
+    # adjustText's repulsion -- confirmed this happens at a flat fontsize=15
+    # for panel A specifically.
+    if slides:
+        label_fontsize = 19 if len(df) <= 15 else 12
+    else:
+        label_fontsize = 8
+    label_stroke = 3.5 if slides else 2.25
     texts = []
     for _, row in df.iterrows():
-        t = ax.text(row[uv_col], row[mv_col], str(row["gene"]).upper(), fontsize=8,
-                    ha="center", va="center", fontweight="bold", zorder=10)
-        t.set_path_effects([pe.Stroke(linewidth=2.25, foreground="white"), pe.Normal()])
+        # clip_on=True: Text, unlike the scatter dots above, does NOT clip to
+        # the axes by default -- a gene whose point falls below panel A's
+        # explicit ymin=0.6 floor (e.g. mv_mcc=0.0) had its dot correctly
+        # hidden but its label still rendered, floating with no visible
+        # anchor below the plot (confirmed for ASPA/CBS/PAX6).
+        gene_label = str(row["gene"]).upper()
+        if slides:
+            gene_label = _SLIDES_GENE_LABEL.get(gene_label, gene_label)
+        t = ax.text(row[uv_col], row[mv_col], gene_label, fontsize=label_fontsize,
+                    ha="center", va="center", fontweight="bold", zorder=10, clip_on=True)
+        t.set_path_effects([pe.Stroke(linewidth=label_stroke, foreground="white"), pe.Normal()])
         texts.append(t)
     if adjust_text is not None and texts:
         try:
-            adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle="-", color="gray", lw=0.8, alpha=0.5))
+            # only_move + a expand/force cap keeps adjustText from shoving
+            # labels arbitrarily far from their point when a panel is dense
+            # (confirmed this happened at the default settings for the
+            # ~34-gene functional panel in slides mode -- several labels
+            # landed entirely outside the axes).
+            adjust_text(texts, ax=ax, expand=(1.15, 1.3), force_text=(0.3, 0.5),
+                        force_static=(0.2, 0.3),
+                        arrowprops=dict(arrowstyle="-", color="gray", lw=0.8, alpha=0.5))
         except Exception:
             pass
 
-    axis_label = _METRIC_AXIS_LABEL[metric]
-    ax.set_xlabel(f"ExCALIBR (UV, non-conflicting) {axis_label}", fontsize=11, fontweight="bold")
-    ax.set_ylabel(f"ExCALIBR-MV {axis_label}", fontsize=11, fontweight="bold")
-    ax.set_xlim(lo, hi)
-    ax.set_ylim(ymin if ymin is not None else lo, hi)
+    if slides:
+        ax.set_xlabel("Independent calibration", fontsize=26, fontweight="bold", labelpad=12)
+        ax.set_ylabel("Multidimensional calibration", fontsize=26, fontweight="bold", labelpad=12)
+    else:
+        axis_label = _METRIC_AXIS_LABEL[metric]
+        ax.set_xlabel(f"ExCALIBR (UV, non-conflicting) {axis_label}", fontsize=11, fontweight="bold")
+        ax.set_ylabel(f"ExCALIBR-MV {axis_label}", fontsize=11, fontweight="bold")
+    # Slides mode pads the visible range past `lo`/`hi` (beyond the diagonal
+    # line's own extent) so a big-font label on a gene at/near the 0.0 or 1.0
+    # boundary has room and doesn't get mid-word clipped by clip_on=True
+    # above (confirmed both edges needed it: "MRAS"/"EGFR" at x=0 clipped on
+    # the left, "SCN5A" near mv=1.0 clipped on the right/top).
+    lo_axis = lo - 0.05 if slides else lo
+    hi_axis = hi + 0.045 if slides else hi
+    ax.set_xlim(lo_axis, hi_axis)
+    ax.set_ylim(lo_axis if ymin is None else ymin, hi_axis)
     ax.grid(True, alpha=0.2)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.text(-0.12, 1.08, letter, transform=ax.transAxes, fontsize=16,
-            fontweight="bold", va="top", ha="left")
+    if slides:
+        # Thin dotted reference lines at 0 and 1 -- the theoretical
+        # floor/ceiling of MCC/accuracy/AUC -- distinct from the dashed
+        # diagonal "equal performance" line above.
+        for v in (0.0, 1.0):
+            if lo_axis < v < hi_axis:
+                ax.axvline(v, color="#999999", linestyle=":", linewidth=1.3, alpha=0.6, zorder=0)
+                ax.axhline(v, color="#999999", linestyle=":", linewidth=1.3, alpha=0.6, zorder=0)
+    if slides:
+        ax.tick_params(axis="both", labelsize=20)
+        ax.set_title(title, fontsize=28, fontweight="bold", pad=18)
+    else:
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.text(-0.12, 1.08, letter, transform=ax.transAxes, fontsize=16,
+                fontweight="bold", va="top", ha="left")
 
-    # One legend: the diagonal reference line plus size-encoding min/max markers.
-    size_handles = [
-        diag_line,
-        Line2D([0], [0], marker="o", linestyle="", markersize=np.sqrt(_size_for(size_min)) / 2,
-               markerfacecolor="#4C72B0", markeredgecolor="white", label=f"N={int(size_min):,}"),
-        Line2D([0], [0], marker="o", linestyle="", markersize=np.sqrt(_size_for(size_max)) / 2,
-               markerfacecolor="#4C72B0", markeredgecolor="white", label=f"N={int(size_max):,}"),
-    ]
-    ax.legend(handles=size_handles, title="N control variants (size)", loc="lower right",
-              frameon=True, edgecolor="#999", framealpha=0.95, fontsize=7, title_fontsize=7)
+    if not slides:
+        # One legend: the diagonal reference line plus size-encoding min/max markers.
+        size_handles = [
+            diag_line,
+            Line2D([0], [0], marker="o", linestyle="", markersize=np.sqrt(_size_for(size_min)) / 2,
+                   markerfacecolor=panel_color, markeredgecolor="white", label=f"N={int(size_min):,}"),
+            Line2D([0], [0], marker="o", linestyle="", markersize=np.sqrt(_size_for(size_max)) / 2,
+                   markerfacecolor=panel_color, markeredgecolor="white", label=f"N={int(size_max):,}"),
+        ]
+        ax.legend(handles=size_handles, title="N control variants (size)", loc="lower right",
+                  frameon=True, edgecolor="#999", framealpha=0.95, fontsize=7, title_fontsize=7)
 
 
 def plot_mcc_scatter_panel(ax, df, letter, title, ymin=None):
@@ -618,7 +700,7 @@ def plot_mcc_scatter_panel(ax, df, letter, title, ymin=None):
     plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=ymin)
 
 
-def build_gene_performance_figure(results_json, save_path=None, cache_dir=None):
+def build_gene_performance_figure(results_json, save_path=None, cache_dir=None, slides=False):
     """cache_dir, if given, persists each gene's full metrics record (mcc/
     accuracy/auc for MV+UV, n_pathogenic/n_benign/n_eval) to disk as it's
     computed -- a crash, a bug fix, or an interrupted run only requires
@@ -632,7 +714,12 @@ def build_gene_performance_figure(results_json, save_path=None, cache_dir=None):
     mathematically undefined there); the accuracy panel does not, since
     accuracy has no such degeneracy -- see plot_metric_scatter_panel's
     docstring for why these need different filtering, not just different
-    y-axes on the same data."""
+    y-axes on the same data.
+
+    ``slides=True``: simplified, large-font slideshow rendering (see
+    plot_metric_scatter_panel's docstring) -- one flat color per panel
+    (_SLIDES_PANEL_COLOR), uniform dot size, no legend, renamed axis labels.
+    Not for the paper; a separate rendering pass, same underlying data."""
     print("=== Panel A: functional ===")
     df_a = build_panel_a(results_json, cache_dir=cache_dir)
     print("=== Panel B: computational predictors ===")
@@ -645,15 +732,22 @@ def build_gene_performance_figure(results_json, save_path=None, cache_dir=None):
 
     figures = {}
     for metric in ("mcc", "accuracy", "auc"):
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig, axes = plt.subplots(1, 3, figsize=(28, 8.5) if slides else (18, 6))
         for ax, (letter, title, df, ymin) in zip(axes, panels):
-            plot_metric_scatter_panel(ax, df, letter, title, metric=metric, ymin=ymin)
-        plt.tight_layout()
+            plot_metric_scatter_panel(ax, df, letter, title, metric=metric, ymin=ymin, slides=slides)
+        if slides:
+            # Explicit spacing instead of tight_layout -- at the larger
+            # slides fontsize, tight_layout let an axis label from one panel
+            # bleed into its neighbor's plot area.
+            fig.subplots_adjust(wspace=0.18, left=0.05, right=0.98, bottom=0.14, top=0.94)
+        else:
+            plt.tight_layout()
         figures[metric] = fig
 
         if save_path:
             p = Path(save_path)
-            metric_path = p if metric == "mcc" else p.with_name(f"{p.stem}_{metric}{p.suffix}")
+            stem = f"{p.stem}_slides" if slides else p.stem
+            metric_path = p.with_name(f"{stem}{p.suffix}") if metric == "mcc" else p.with_name(f"{stem}_{metric}{p.suffix}")
             metric_path.parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(metric_path, dpi=300, bbox_inches="tight")
             print(f"Saved {metric} figure to {metric_path}")

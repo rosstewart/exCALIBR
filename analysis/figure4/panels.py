@@ -157,7 +157,7 @@ def plot_panel_a(gs_spec, scoreset_2018, indv_summary, fits, score_range, flippe
         hist_data = scoreset_2018.scores[sample_mask]
         n_count = sample_mask.sum()
         
-        sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax,
+        sns.histplot(hist_data, binwidth=bin_width, binrange=(x_min, x_max), stat='density', ax=ax,
                    alpha=0.5, color=color)
         
         density_sample = sample_density(score_range, fits, sample_idx)
@@ -235,14 +235,14 @@ def plot_panel_b(gs_spec, scoreset, all_scores, point_ranges, score_range, flipp
             display_name = 'All SNVs'
             n_count = len(all_scores)
             # Plot All SNVs on twin axis (right)
-            sns.histplot(hist_data, binwidth=bin_width, stat='count', ax=ax_twin,
+            sns.histplot(hist_data, binwidth=bin_width, binrange=(x_min, x_max), stat='count', ax=ax_twin,
                        alpha=alpha, color=color)
         else:
             hist_data = scoreset.scores[sample_mask]
             display_name = SAMPLE_NAMES[sample_num]
             n_count = sample_mask.sum()
             # Plot PLP/BLB on main axis (left)
-            sns.histplot(hist_data, binwidth=bin_width, stat='count', ax=ax_hist,
+            sns.histplot(hist_data, binwidth=bin_width, binrange=(x_min, x_max), stat='count', ax=ax_hist,
                        alpha=alpha, color=color)
         
         face_rgba = to_rgba(color, alpha)
@@ -570,11 +570,12 @@ def plot_panel_e(gs_spec, gene, dist, labdat, snvdf, sorted_thresholds, oldsorte
     ax_twin = ax_hist.twinx()
     
     bin_width = (labdat[0].max() - labdat[0].min()) / 50
-    sns.histplot(labdat[labdat[1] == 0][0], binwidth=bin_width, color=SAMPLE_COLORS[1],
+    bin_range = (0, 1)
+    sns.histplot(labdat[labdat[1] == 0][0], binwidth=bin_width, binrange=bin_range, color=SAMPLE_COLORS[1],
                 alpha=SAMPLE_ALPHAS[1], ax=ax_hist, label=f'ClinVar BLB\n(n={len(labdat[labdat[1] == 0])})')
-    sns.histplot(labdat[labdat[1] == 1][0], binwidth=bin_width, color=SAMPLE_COLORS[0],
+    sns.histplot(labdat[labdat[1] == 1][0], binwidth=bin_width, binrange=bin_range, color=SAMPLE_COLORS[0],
                 alpha=SAMPLE_ALPHAS[0], ax=ax_hist, label=f'ClinVar PLP\n(n={len(labdat[labdat[1] == 1])})')
-    sns.histplot(snvdf[dist], binwidth=bin_width, color=SAMPLE_COLORS[2], alpha=SAMPLE_ALPHAS[2],
+    sns.histplot(snvdf[dist], binwidth=bin_width, binrange=bin_range, color=SAMPLE_COLORS[2], alpha=SAMPLE_ALPHAS[2],
                 ax=ax_twin, label=f'All SNVs\n(n={len(snvdf):,})')
     
     ax_hist.set_xlim(0, 1)

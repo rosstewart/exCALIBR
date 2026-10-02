@@ -34,9 +34,9 @@
 #
 # ## Status (be honest about what's wired up vs. scaffolded)
 # - **Working**: load-existing-fit path (canonical + staged_init_all_assayed),
-#   registry-driven; `results-table`; `uv-comparison`; `gene-performance-scatter`
-#   (labelseq/integrated); `evidence-3d` (generic, no gene-specific aux
-#   disease groups); `vus-sankey` (shells out to the already-built
+#   registry-driven; `results-table`; `uv-comparison`; `evidence-3d` (generic,
+#   no gene-specific aux disease groups); `vus-sankey` (shells out to the
+#   already-built
 #   `analysis/run_vus_reclassification.py` + `analysis/
 #   plot_vus_reclassification_sankey.py`, labelseq RASopathy genes only,
 #   matching that module's current scope).
@@ -81,7 +81,7 @@ import pandas as pd
 
 from mv_analysis import config
 from mv_analysis.report import build_comparison_table
-from mv_analysis.gene_performance_scatter import plot_mcc_scatter_panel, fast_results_json
+from mv_analysis.gene_performance_scatter import fast_results_json, EVIDENCE_DIRECTION
 from src.assay_calibration.multivariate_analysis.gene_set_analysis import build_gene_set_analysis
 from src.assay_calibration.fit_utils.fit import Fit
 
@@ -117,7 +117,18 @@ def resolve_fit(gene_set: str, fit_type: str, gene: str, n_components: int = 6):
 
 
 def pick_best_canonical_config(gene: str, gene_set: str, ms, results_json: str, dataset_name: str,
-                                run_kwargs: dict) -> str:
+                                run_kwargs: dict, threshold: str = EVIDENCE_DIRECTION) -> str:
+    """Pick the config (e.g. "3c_unc" vs "4c_unc") with the highest MCC at
+    `threshold` (default EVIDENCE_DIRECTION -- the SAME criterion the actual
+    manuscript accuracy-scatter figure uses, see gene_performance_scatter.py's
+    `_extract_mv_uv`). Previously defaulted to "clinical" (P/LP>=6/B/LB<=-1);
+    confirmed this produced a DIFFERENT config choice than the manuscript
+    figure's own selection for some genes (e.g. BRCA1: clinical picks 3c_unc,
+    evidence_direction picks 4c_unc) -- two disagreeing "MCC-based" criteria
+    across the pipeline was a real bug, not an intentional design choice.
+    `threshold` stays a parameter (not hardcoded) so a caller that genuinely
+    wants the stricter clinical-threshold config choice can still ask for it
+    explicitly."""
     import gzip, json
     with fast_results_json(results_json):
         with gzip.open(results_json, "rt", encoding="utf-8") as f:
@@ -127,10 +138,10 @@ def pick_best_canonical_config(gene: str, gene_set: str, ms, results_json: str, 
             gene.lower(), gene_set, ms, results_json, dataset_name=dataset_name,
             modes=["trust_global"], compare_uv=False, **run_kwargs,
         )
-        clinical = table[table["threshold"].str.startswith("clinical")]
+        sub = table[table["threshold"] == threshold]
         best_config, best_mcc = None, -1
         for cfg in configs:
-            row = clinical[clinical["config"] == cfg]
+            row = sub[sub["config"] == cfg]
             if row.empty:
                 continue
             mcc = row["mcc"].max()
@@ -281,33 +292,6 @@ def run_results_table(gene_set: str, fit_type: str, genes, n_components=6, run_k
         except Exception as e:
             print(f"  [{gene}] results-table failed (variant lookup): {e}")
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
-
-# %% [markdown]
-# ## Analysis: gene-performance scatter (MV vs UV MCC)
-
-# %%
-def run_gene_performance_scatter(gene_set: str, fit_type: str, genes, n_components=6, run_kwargs=None,
-                                  ax=None, title=None, ymin=None):
-    run_kwargs = run_kwargs or DEFAULT_RUN_KWARGS
-    table = run_results_table(gene_set, fit_type, genes, n_components, run_kwargs, compare_uv=True)
-    if table.empty:
-        print("No data for gene-performance-scatter")
-        return None
-    clinical = table[table["threshold"].str.startswith("clinical")]
-    mv_rows = clinical[clinical["method"] == "MV"] if "method" in clinical.columns else clinical
-    rows = []
-    for gene, grp in mv_rows.groupby("gene"):
-        mv_mcc = grp["mcc"].max()
-        uv_row = clinical[(clinical["gene"] == gene) & (clinical.get("method", "UV") != "MV")]
-        uv_mcc = uv_row["mcc"].max() if not uv_row.empty else np.nan
-        n_eval = grp["total"].max() if "total" in grp.columns else np.nan
-        rows.append({"gene": gene, "mv_mcc": mv_mcc, "uv_mcc": uv_mcc, "n_eval": n_eval})
-    df = pd.DataFrame(rows)
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 6))
-    plot_mcc_scatter_panel(ax, df, "", title or f"{gene_set} ({fit_type})", ymin=ymin)
-    return df
 
 
 # %% [markdown]
@@ -655,7 +639,7 @@ def main():
     ap.add_argument("--n-components", type=int, default=6)
     ap.add_argument("--output-dir", default=".")
     ap.add_argument("--analyses", nargs="+", default=["results-table"],
-                     choices=["results-table", "uv-comparison", "gene-performance-scatter",
+                     choices=["results-table", "uv-comparison",
                               "evidence-3d", "vus-sankey", "confusion-matrices", "brnich-comparison"])
     ap.add_argument("--no-strip-functional-evidence", action="store_true",
                      help="For --analyses confusion-matrices: keep PS3/BS3 in the ClinGen "
@@ -692,12 +676,6 @@ def main():
         table.to_csv(out, index=False)
         print(f"Saved {out}")
 
-    if "gene-performance-scatter" in args.analyses:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        run_gene_performance_scatter(args.gene_set, args.fit_type, genes, args.n_components, run_kwargs, ax=ax)
-        out = Path(args.output_dir) / f"{args.gene_set}_{args.fit_type}_gene_performance.png"
-        fig.savefig(out, dpi=200, bbox_inches="tight")
-        print(f"Saved {out}")
 
     if "evidence-3d" in args.analyses:
         for gene in genes:

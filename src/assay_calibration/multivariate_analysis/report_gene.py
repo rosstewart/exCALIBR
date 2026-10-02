@@ -69,6 +69,7 @@ def generate_gene_report(
     n_grid=120,
     cache_dir=None,
     force_recompute=False,
+    include_dim_densities=False,
 ):
     """Write, per config: confusion_matrix.txt (+ metrics), the marginal/
     skew-normal-fit plot (PNG), and -- for each entry in ``rpv_samples`` --
@@ -87,6 +88,15 @@ def generate_gene_report(
     is cheap. Defaults to ``{output_dir}/.precompute_cache`` when
     unspecified but non-None desired: pass ``cache_dir=False`` to disable
     caching entirely. ``force_recompute`` bypasses an existing cache entry.
+
+    ``include_dim_densities`` (default False): also write one
+    ``{gene}_{config}_dim{d}_{name}_densities.png`` per dimension via
+    plot_component_densities. Off everywhere (including TP53's dedicated RPV
+    report, tp53_rpv_report.py) -- it draws from the exact same
+    precomputed['marginal_data'] that render_mv_plot_data's D>2 layout
+    already embeds as marginal rows in the main {gene}_{config}_
+    mv_calibration.png, so it's redundant there; confirmed not wanted
+    anywhere, not just outside TP53's report.
 
     Returns {config: {"metrics": dict, "rpv_scores": {name: DataFrame}}}.
     """
@@ -140,15 +150,16 @@ def generate_gene_report(
         plt.close(fig)
         print(f"  Saved {fig_path}")
 
-        density_figs = plot_component_densities(precomputed)
-        dataset_names = getattr(analysis.ms, "dataset_names", [f"dim{d}" for d in range(D)])
-        for dim, (fig_d, _axes_d) in density_figs.items():
-            dim_name = dataset_names[dim] if dim < len(dataset_names) else f"dim{dim}"
-            safe_name = "".join(c if c.isalnum() else "_" for c in dim_name)
-            p = os.path.join(output_dir, f"{gene}_{config}_dim{dim}_{safe_name}_densities.png")
-            fig_d.savefig(p, dpi=100, bbox_inches="tight")
-            plt.close(fig_d)
-            print(f"  Saved {p}")
+        if include_dim_densities:
+            density_figs = plot_component_densities(precomputed)
+            dataset_names = getattr(analysis.ms, "dataset_names", [f"dim{d}" for d in range(D)])
+            for dim, (fig_d, _axes_d) in density_figs.items():
+                dim_name = dataset_names[dim] if dim < len(dataset_names) else f"dim{dim}"
+                safe_name = "".join(c if c.isalnum() else "_" for c in dim_name)
+                p = os.path.join(output_dir, f"{gene}_{config}_dim{dim}_{safe_name}_densities.png")
+                fig_d.savefig(p, dpi=100, bbox_inches="tight")
+                plt.close(fig_d)
+                print(f"  Saved {p}")
 
         # P/LP variants the primary model itself called indeterminate (points==0)
         # -- shown as a 4th row alongside B/LB, P/LP, and the auxiliary sample.

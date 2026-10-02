@@ -371,7 +371,16 @@ def kmeans_init_mv(X, **kwargs):
                         for d2 in range(d1, K_dim):
                             both = ~np.isnan(Xc[:, d1]) & ~np.isnan(Xc[:, d2])
                             if both.sum() < 2:
-                                cov[d1, d2] = 1e-2
+                                # Too few co-observed points in this cluster for a
+                                # reliable per-cluster cross-dimension estimate --
+                                # fall back to the GLOBAL cross-dimension covariance
+                                # (already computed above, same scale as the data
+                                # actually being fit) rather than a bare absolute
+                                # constant, which was tuned for raw ~[0,1]-bounded
+                                # predictor scores and badly understates real
+                                # correlation structure for standardized (unit-
+                                # variance) inputs.
+                                cov[d1, d2] = global_cov[d1, d2]
                             else:
                                 cov[d1, d2] = np.cov(Xc[both, d1], Xc[both, d2])[0, 1]
                             cov[d2, d1] = cov[d1, d2]
@@ -656,6 +665,19 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
     S = sample_indicators.shape[1]
     anchor_groups = kwargs.get("anchor_groups") or default_anchor_groups(n_clusters, S)
 
+    # Fallback covariance for sparse-pair cross-dimension terms below --
+    # computed once from the full X, same rationale as kmeans_init_mv's
+    # global_cov (a data-scaled fallback, not a bare absolute constant,
+    # which badly understates correlation structure for standardized/
+    # z-scored inputs).
+    global_cov = np.zeros((K_dim, K_dim))
+    for d1 in range(K_dim):
+        for d2 in range(d1, K_dim):
+            both = ~np.isnan(X[:, d1]) & ~np.isnan(X[:, d2])
+            if both.sum() >= 2:
+                global_cov[d1, d2] = np.cov(X[both, d1], X[both, d2])[0, 1]
+            global_cov[d2, d1] = global_cov[d1, d2]
+
     component_parameters = []
     for c in range(min(n_clusters, len(anchor_groups))):
         group = anchor_groups[c]
@@ -687,7 +709,7 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
             for d2 in range(d1, K_dim):
                 both = ~np.isnan(Xc[:, d1]) & ~np.isnan(Xc[:, d2])
                 if both.sum() < 2:
-                    cov[d1, d2] = 1e-2
+                    cov[d1, d2] = global_cov[d1, d2]
                 else:
                     cov[d1, d2] = np.cov(Xc[both, d1], Xc[both, d2])[0, 1]
                 cov[d2, d1] = cov[d1, d2]

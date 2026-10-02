@@ -87,7 +87,7 @@ from mv_analysis import mv_cockpit as cockpit
 from mv_analysis import report
 from mv_analysis import phenotype_evidence as pheno
 from mv_analysis import tp53_rpv_report
-from mv_analysis.gene_performance_scatter import build_gene_performance_figure, PLAIN_INTEGRATED_GENES
+from mv_analysis.gene_performance_scatter import build_gene_performance_figure, PLAIN_INTEGRATED_GENES, EVIDENCE_DIRECTION
 
 # ---------------------------------------------------------------------------
 # Gene lists per gene-set (single source of truth for THIS notebook's runs;
@@ -153,18 +153,24 @@ def ensure_aggregated():
 # ## Section 2: whole-aggregate gene-performance scatter (Figure fig:mv_scatter)
 
 # %%
-def run_gene_performance_scatter_all(save_path=None, cache_dir=None):
+def run_gene_performance_scatter_all(save_path=None, cache_dir=None, slides=False):
     """cache_dir defaults to {PAPER_CACHE_DIR}/scatter_cache -- build_gene_performance_figure's
     own per-(panel, gene) disk cache (_load_cached/_save_cached in gene_performance_scatter.py)
     was previously never reached from here since this wrapper never forwarded a cache_dir,
     silently forcing a full ~34+8+8-gene, zero-cache recompute on every call regardless of
-    whether a prior run's cache existed. Pass cache_dir=False to force a full recompute."""
+    whether a prior run's cache existed. Pass cache_dir=False to force a full recompute.
+
+    ``slides=True``: simplified, large-font slideshow rendering (see
+    build_gene_performance_figure/plot_metric_scatter_panel) saved alongside
+    the paper version with a "_slides" suffix -- reuses the SAME cache (the
+    underlying per-gene MV/UV numbers don't change, only the rendering)."""
     save_path = save_path or f"{config.PAPER_ACCURACY_DIR}/gene_performance_scatter.png"
     if cache_dir is None:
         cache_dir = f"{config.PAPER_CACHE_DIR}/scatter_cache"
     elif cache_dir is False:
         cache_dir = None
-    return build_gene_performance_figure(config.PAPER_RESULTS_JSON, save_path=save_path, cache_dir=cache_dir)
+    return build_gene_performance_figure(config.PAPER_RESULTS_JSON, save_path=save_path,
+                                          cache_dir=cache_dir, slides=slides)
 
 
 # %% [markdown]
@@ -389,13 +395,19 @@ def run_per_gene_diagnostics(cache_dir=None):
     tp53_rpv_report.py, itself calling the same generate_gene_report this
     reuses) -- every other gene got none of this.
 
-    Deliberately renders only the best-MCC config per gene (`configs=
-    [best_config]`), NOT generate_gene_report's own default (every config
-    with valid results) -- at ~50 genes, rendering every config would
-    multiply an already-substantial per-gene compute cost (a parallel
-    bootstrap sweep per config) for no benefit here; TP53's own existing
-    call via tp53_rpv_report.py is untouched and keeps rendering all of its
-    configs, since that's established, separate, TP53-specific behavior.
+    Renders EVERY config with valid bootstrap results per gene (`configs=
+    None`, generate_gene_report's own default) -- in this pipeline's
+    component_range that's always exactly {3c_unc, 4c_unc}, so both get a
+    `{gene}_{config}_mv_calibration.png` (previously only the best-MCC
+    config rendered, silently missing whichever of 3c/4c wasn't picked as
+    best -- there is no cross-config cache reuse in precompute_mv_plot_data,
+    so this genuinely ~doubles this rollout's cost; worth it for complete
+    coverage). Does NOT pass include_dim_densities (stays at
+    generate_gene_report's new default, False) -- the separate per-dimension
+    density PNGs are redundant with the main calibration plot's own
+    marginal rows for D>2 and are dropped everywhere, including TP53's own
+    tp53_rpv_report.py call (explicitly confirmed not wanted anywhere, not
+    just outside the TP53-specific report).
 
     Does NOT replace or touch run_tp53_special_figures/
     run_ret_phenotype_evidence/run_card11_phenotype_evidence -- those add
@@ -436,7 +448,7 @@ def run_per_gene_diagnostics(cache_dir=None):
                     continue
                 output_dir = f"{config.PAPER_PER_GENE_DIR}/{gene_set}/{gene}"
                 generate_gene_report(
-                    analysis, gene, output_dir, configs=[best_config],
+                    analysis, gene, output_dir, configs=None,
                     cache_dir=f"{cache_dir}/{gene_set}/{gene}",
                 )
             except Exception as e:
@@ -485,7 +497,15 @@ def print_manuscript_summary(functional_table, predictor_table, combined_table,
     def _mcc(pooled_table):
         if pooled_table is None or pooled_table.empty:
             return float("nan")
-        row = pooled_table[pooled_table["threshold"].str.startswith("clinical")]
+        # evidence_direction, not "clinical" -- matches the config-selection
+        # criterion (cockpit.pick_best_canonical_config's new default) and
+        # the actual manuscript accuracy-scatter figure's own selection
+        # (gene_performance_scatter.py's _extract_mv_uv); previously this
+        # reported a clinical-threshold MCC for a config chosen under a
+        # DIFFERENT (clinical) criterion too, which was at least internally
+        # consistent then -- now that selection is evidence_direction-based,
+        # reporting stays matched to it rather than mixing two thresholds.
+        row = pooled_table[pooled_table["threshold"] == EVIDENCE_DIRECTION]
         return row["mcc"].max() if not row.empty else float("nan")
 
     print(f"NumFunctionalGenes = {functional_table['gene'].nunique() if not functional_table.empty else 0}")

@@ -20,6 +20,20 @@ Two dataset-specific quirks made explicit here, per the consolidation plan:
     represent well without dedicating whole components to each spike.
     sigma=0.1 still keeps categories comfortably separated (~5 sigma gap)
     while giving components room to fit smooth, non-degenerate density.
+  - log_TempSens: the notebook's plain ``np.log(TempSens)`` silently turned
+    every TempSens <= 0 into NaN (indistinguishable from a true missing
+    measurement) -- TempSens is signed (observed range here is roughly
+    [-437, 80]), and ~42% of its non-null values are <= 0, so a straight
+    log discarded nearly half of the dimension's already-sparse real data.
+    A signed-log transform (``sign(x) * log1p(|x|)``) was tried as a fix
+    (keeps all rows, avoids the NaN-ing), but a rank-based separation check
+    (Mann-Whitney AUC, P/LP vs B/LB) showed it's identical to raw TempSens's
+    separation -- expected, since AUC only depends on rank order and any
+    monotonic transform preserves that exactly. With no separation upside
+    and a transform that only obscures the variable's natural units, the
+    column (name kept as "log_TempSens" for backward compatibility with
+    existing job configs/figure naming, though it is no longer logged) now
+    carries raw, untransformed TempSens.
 """
 
 from typing import Optional, Tuple
@@ -82,7 +96,9 @@ def build_tp53_dataframe(
     df_rpvs_high = df_rpvs[df_rpvs["confidence"] != "low"]
 
     df_tp53 = pd.read_csv(variants_path)
-    df_tp53["log_TempSens"] = np.log(df_tp53["TempSens"])
+    # No transform: raw TempSens, kept under the "log_TempSens" column name
+    # for backward compatibility -- see module docstring's quirk note.
+    df_tp53["log_TempSens"] = df_tp53["TempSens"]
 
     rng = np.random.RandomState(kawoligo_seed)
     df_tp53["KawOligo"] = (

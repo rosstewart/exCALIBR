@@ -258,7 +258,7 @@ def standardize_auth_label(
 
 
 class BasicScoreset:
-    def __init__(self, scores, sample_assignments, ids=None, **kwargs):
+    def __init__(self, scores, sample_assignments, ids=None, standardize: bool = False, **kwargs):
         self.scores = np.asarray(scores, dtype=float)
         self._sample_assignments = np.asarray(sample_assignments)
         if ids is not None:
@@ -288,9 +288,31 @@ class BasicScoreset:
         # regardless of sample membership (this class never filters rows by
         # sample-assignment membership, only NaN scores above). Used by the
         # shared score-axis grid (score_range) in pipeline/visualize.py
-        # instead of the sample-filtered range.
+        # instead of the sample-filtered range. Always computed from the RAW
+        # (pre-standardization) scores, even when standardize=True, so plot
+        # axes/display stay in the original, interpretable units regardless
+        # of what scale the EM fit itself is run on.
+        self.scores_raw = self.scores.copy()
         self.global_score_min = float(np.nanmin(self.scores))
         self.global_score_max = float(np.nanmax(self.scores))
+
+        # standardize=True: fit on z-scored data (0 mean, unit std) instead
+        # of the raw scale -- e.g. for predictor scores like REVEL/MutPred2/
+        # AlphaMissense, which are bounded ~[0,1] and fit poorly by the
+        # unbounded-support skew-normal/CFUSN mixture family at that raw
+        # scale. self.scores_raw/global_score_min/max above stay on the
+        # original scale for display; only self.scores (what the EM fit
+        # actually consumes) is standardized. Default False: byte-for-byte
+        # unchanged behavior for every existing caller.
+        self.standardize = standardize
+        if standardize:
+            self._score_mean = float(np.mean(self.scores))
+            self._score_std = float(np.std(self.scores))
+            if self._score_std > 0:
+                self.scores = (self.scores - self._score_mean) / self._score_std
+        else:
+            self._score_mean = 0.0
+            self._score_std = 1.0
 
         self.validate_inputs()
         self.validate_sample_assignments()

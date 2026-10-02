@@ -64,12 +64,17 @@ def load_predictor_data(data_dir: str,
     return dict(by_gene)
 
 
-def df_to_basic_scoreset(df: pd.DataFrame, predictor: str) -> BasicScoreset:
+def df_to_basic_scoreset(df: pd.DataFrame, predictor: str, standardize: bool = False) -> BasicScoreset:
     """Convert one per-predictor DataFrame into a BasicScoreset with ids.
 
     `protein_variant` is used as the alignment ID. Rows that don't fall
     in any of the SAMPLE_COLUMNS (i.e. unlabeled) are dropped so the
     EM only sees rows with a class assignment.
+
+    ``standardize`` (default False): fit this predictor's EM on z-scored
+    (0 mean, unit std) scores instead of the raw ~[0,1]-bounded scale --
+    see BasicScoreset's own docstring/comment for why. Each predictor gets
+    its own independent mean/std (computed from its own score column).
     """
     df = df.copy()
     df = df.dropna(subset=["score", "protein_variant", "sample_assignments"])
@@ -92,18 +97,22 @@ def df_to_basic_scoreset(df: pd.DataFrame, predictor: str) -> BasicScoreset:
         sample_assignments=onehot,
         ids=df["protein_variant"].astype(str).to_numpy(),
         scoreset_name=PREDICTOR_DATASET_NAMES.get(predictor, predictor),
+        standardize=standardize,
     )
 
 
 def build_basic_multi_scoreset(
     gene: str,
     predictor_dfs: Dict[str, pd.DataFrame],
+    standardize: bool = False,
 ) -> Tuple[Optional[BasicMultiScoreset], object]:
     """Build a BasicMultiScoreset for one gene.
 
     Returns ``(ms, dataset_names)`` on success or ``(None, reason_str)``
     if the gene is missing any of the three predictors or any of the
     per-predictor BasicScoresets fails to build.
+
+    ``standardize`` (default False): see df_to_basic_scoreset.
     """
     have = [p for p in PREDICTORS if p in predictor_dfs]
     missing = [p for p in PREDICTORS if p not in predictor_dfs]
@@ -114,7 +123,7 @@ def build_basic_multi_scoreset(
     dataset_names = []
     for p in PREDICTORS:
         try:
-            bs = df_to_basic_scoreset(predictor_dfs[p], p)
+            bs = df_to_basic_scoreset(predictor_dfs[p], p, standardize=standardize)
         except (ValueError, KeyError) as e:
             return None, f"BasicScoreset({p}) failed: {e}"
         if len(bs.scores) == 0:
@@ -130,17 +139,19 @@ def build_basic_multi_scoreset(
     return ms, dataset_names
 
 
-def load_predictor_ms(gene: str, data_dir: str) -> BasicMultiScoreset:
+def load_predictor_ms(gene: str, data_dir: str, standardize: bool = False) -> BasicMultiScoreset:
     """Convenience loader: build the BasicMultiScoreset for one gene.
 
     Raises ``ValueError`` if the gene cannot be assembled (missing
     predictors, empty CSVs, etc.) — easier to use from notebooks than
     the (ms, reason) tuple from build_basic_multi_scoreset.
+
+    ``standardize`` (default False): see df_to_basic_scoreset.
     """
     by_gene = load_predictor_data(data_dir, genes=[gene])
     if gene not in by_gene:
         raise ValueError(f"No predictor CSVs found under {data_dir}/{gene}/")
-    ms, info = build_basic_multi_scoreset(gene, by_gene[gene])
+    ms, info = build_basic_multi_scoreset(gene, by_gene[gene], standardize=standardize)
     if ms is None:
         raise ValueError(f"Could not build BasicMultiScoreset for {gene}: {info}")
     return ms

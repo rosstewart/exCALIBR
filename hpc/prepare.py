@@ -806,6 +806,7 @@ def _cluster_suffixed_label(dataset_label: str, cluster_idx: int) -> str:
 def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
                                   component_range, constraint_modes, latent_q, init_strategy,
                                   min_overlap_rows=30, sample_balance_beta=None,
+                                  sample_weight_transform=None,
                                   extra_cjob_fields=None, master_seed=DEFAULT_MASTER_SEED,
                                   greedy_restarts=False):
     """Shared bootstrap x component x constraint job-generation loop, backed
@@ -857,6 +858,7 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                 cluster_ms, cluster_label, gene, cluster_save_dir, N_BOOTSTRAPS, NUM_FITS,
                 component_range, constraint_modes, latent_q, init_strategy,
                 min_overlap_rows=min_overlap_rows, sample_balance_beta=sample_balance_beta,
+                sample_weight_transform=sample_weight_transform,
                 extra_cjob_fields=cluster_extra_fields, master_seed=master_seed,
                 greedy_restarts=greedy_restarts,
             ))
@@ -885,6 +887,8 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                 }
                 if sample_balance_beta is not None:
                     fit_kwargs["sample_balance_beta"] = sample_balance_beta
+                if sample_weight_transform is not None and sample_weight_transform != "none":
+                    fit_kwargs["sample_weight_transform"] = sample_weight_transform
                 if greedy_restarts:
                     fit_kwargs["greedy_restarts"] = True
                 elif NUM_FITS is not None:
@@ -1412,10 +1416,12 @@ def _generate_predictor_mv_jobs(by_gene, args):
     constraint_modes = _resolve_constraints(args.constraints)
     latent_q = 2
 
+    standardize_predictors = getattr(args, "standardize_predictors", False)
+
     def process_one(gene, predictor_dfs):
         label = predictor_dataset_label(gene)
         save_dir = os.path.join(output_dir, label)
-        ms, info = build_basic_multi_scoreset(gene, predictor_dfs)
+        ms, info = build_basic_multi_scoreset(gene, predictor_dfs, standardize=standardize_predictors)
         if ms is None:
             print(f"  {gene}: skipping — {info}")
             return None
@@ -1426,6 +1432,7 @@ def _generate_predictor_mv_jobs(by_gene, args):
             component_range, constraint_modes, latent_q, args.init_strategy,
             min_overlap_rows=1,  # pattern_stratified_bootstrap already guards sparse dims
             sample_balance_beta=args.sample_balance_beta,
+            sample_weight_transform=getattr(args, "sample_weight_transform", None),
             master_seed=args.seed,
             greedy_restarts=getattr(args, "greedy_restarts", False),
         )
@@ -1829,6 +1836,23 @@ def main():
                              "identical behavior here.")
     p_pred.add_argument("--sample-balance-beta", type=float, default=0,
                         help="Sample-balanced M-step β ∈ [0,1] (default: 0)")
+    p_pred.add_argument("--sample-weight-transform", choices=["none", "log2", "ln"], default="none",
+                        help="Make each sample class's total M-step contribution proportional "
+                             "to log2(N)/ln(N) instead of raw N (default: none, i.e. standard "
+                             "count-proportional EM). A gentler correction than --sample-balance-"
+                             "beta=1 (full balancing); different functional form (log vs power "
+                             "law), not reachable via any --sample-balance-beta value. Takes "
+                             "precedence over --sample-balance-beta when both are set. NOTE: "
+                             "'log2' and 'ln' give mathematically IDENTICAL fits (log2(N) = "
+                             "ln(N)/ln(2), a global constant factor that cancels in every "
+                             "M-step's normalized weighted average) -- running both is redundant, "
+                             "pick either one.")
+    p_pred.add_argument("--standardize-predictors", action="store_true",
+                        help="Fit each predictor dimension (REVEL/MutPred2/AlphaMissense) on "
+                             "z-scored (0 mean, unit std) scores instead of raw ~[0,1]-bounded "
+                             "scores. Default off (byte-for-byte unchanged behavior). Plot axes/"
+                             "display stay on the original raw scale regardless (BasicScoreset "
+                             "keeps scores_raw) -- only what the EM fit itself consumes changes.")
     p_pred.set_defaults(func=run_predictor_mv)
 
     # ── mv_all ───────────────────────────────────────────────────────────────
@@ -1874,6 +1898,12 @@ def main():
                                "pipeline in --pipelines.")
     p_mv_all.add_argument("--sample-balance-beta", type=float, default=0,
                        help="[predictor-mv] Sample-balanced M-step β ∈ [0,1] (default: 0)")
+    p_mv_all.add_argument("--sample-weight-transform", choices=["none", "log2", "ln"], default="none",
+                       help="[predictor-mv] See `predictor-mv --help` for the same flag; "
+                            "identical behavior here.")
+    p_mv_all.add_argument("--standardize-predictors", action="store_true",
+                       help="[predictor-mv] See `predictor-mv --help` for the same flag; "
+                            "identical behavior here.")
     p_mv_all.add_argument("--max-dimensions", type=int, default=None,
                        help="['integrated' pipeline only] skip genes with more datasets than this")
     p_mv_all.add_argument("--population-type", default=None,

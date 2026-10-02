@@ -58,18 +58,19 @@ def build_gene_set_analysis(
 
     ``gene_set``, if given as "combined", forces ``benign_method="benign"``
     (unless the caller already overrode ``benign_method`` to something
-    other than the "avg" default) -- for the combined gene-set, Synonymous-
-    labeled rows structurally never have predictor-dimension scores (no
-    predictor carries a synonymous concept at all), so under
-    partial_pattern_mode="trust_global" (the mode every production caller
-    actually uses -- "gate" only exists as MVCalibrationAnalysis's own
-    unused internal default), "avg" unconditionally blends Synonymous into
-    the benign reference for every pattern, including ones touching a
-    predictor dimension -- "gate" is the only mode that gates this per-
-    pattern, and nothing in production uses "gate". Predictor-only gene-sets
-    need no equivalent override: their ms structurally never has a non-
-    empty Synonymous column at all (PredictorScoreset only has 3 sample-
-    role columns), so "avg" is already a no-op there.
+    other than the "avg" default) -- belt-and-suspenders for the combined
+    gene-set, where Synonymous-labeled rows structurally never have
+    predictor-dimension scores (no predictor carries a synonymous concept
+    at all). ``partial_pattern_mode="trust_global"`` (the sole production
+    default -- see mv_calibration.py's _PARTIAL_PATTERN_MODES comment)
+    already computes real per-pattern support for the benign side and
+    falls back to Benign-only whenever Synonymous lacks joint coverage of
+    the pattern, so this override is no longer load-bearing for
+    correctness; it's kept as an explicit, cheap guarantee for this one
+    gene-set rather than relying on per-pattern gating alone. Predictor-
+    only gene-sets need no equivalent override: their ms structurally
+    never has a non-empty Synonymous column at all (PredictorScoreset only
+    has 3 sample-role columns), so "avg" is already a no-op there.
     """
     if gene_set == "combined" and benign_method == "avg":
         benign_method = "benign"
