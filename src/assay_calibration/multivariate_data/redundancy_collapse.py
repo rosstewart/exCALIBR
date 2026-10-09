@@ -333,6 +333,9 @@ def collapse_block(ms, block_names: Sequence[str], k: int,
     missing_names = [n for n in block_names if n not in name_to_idx]
     if missing_names:
         raise ValueError(f"collapse_block: dimension(s) not found in ms.dataset_names: {missing_names}")
+    categorical = [n for n in block_names if n in (getattr(ms, "categorical_dims", None) or {})]
+    if categorical:
+        raise ValueError(f"collapse_block: categorical dimension(s) {categorical} can't be PCA-collapsed")
     block_dims = [name_to_idx[n] for n in block_names]
     remaining_dims = [i for i in range(len(names)) if i not in block_dims]
 
@@ -374,6 +377,9 @@ def select_dims(ms, dim_indices: Sequence[int]) -> None:
     new_scores = ms.scores[:, list(dim_indices)]
     ms._scores = new_scores
     ms.dataset_names = [names[i] for i in dim_indices]
+    if getattr(ms, "categorical_dims", None):
+        ms.categorical_dims = {n: v for n, v in ms.categorical_dims.items()
+                               if n in ms.dataset_names}
     ms.d = new_scores.shape[1]
     ms._missing = np.isnan(new_scores)
     ms._xlims = tuple(

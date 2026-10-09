@@ -103,6 +103,16 @@ def _init_univariate(full_job):
 
 def _init_cfusn(full_job):
     kwargs = dict(full_job.get("kwargs", {}))
+    if kwargs.get("cat_spec") is not None:
+        raise NotImplementedError(
+            "categorical dims (cfusn/categorical.py) are CPU-only; the JAX batch "
+            "EM has no categorical term -- run with --device cpu"
+        )
+    if kwargs.get("weight_divergence"):
+        raise NotImplementedError(
+            "weight_divergence (cfusn/weight_divergence.py) is CPU-only; the JAX "
+            "batch EM has no penalised W step -- run with --device cpu"
+        )
     kwargs["rng"] = np.random.RandomState(kwargs.get("fit_seed"))
     K = full_job["num_components"]
     constrained = full_job["constrained"]

@@ -169,13 +169,19 @@ def load_gene(gene_set: str, fit_type: str, gene: str, n_components: int = 6,
     run_kwargs = run_kwargs or DEFAULT_RUN_KWARGS
     if regularization_type is None and fit_type == "staged_init_all_assayed":
         regularization_type = "all_assayed"
-    ms_map = config.build_multiscoresets_for_gene_set(
-        gene_set, genes=[gene], regularization_type=regularization_type,
-        redundancy_collapse_preset=redundancy_collapse_preset)
-    gene_key = gene.lower() if gene_set == "labelseq" else gene.upper()
-    ms = ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
-
     results_json, dataset_name, config_name = resolve_fit(gene_set, fit_type, gene, n_components)
+    if regularization_type is None and redundancy_collapse_preset is None:
+        # Same builder as the results tables / scatter: restricts to the
+        # dimensions the stored fit was trained on (e.g. BRCA2's 4-dim
+        # Sahu 2023 group), instead of the gene's full current dimension set.
+        ms = config.build_ms_for_gene_cluster(gene_set, gene, cluster_idx=0, results_json=results_json)
+    else:
+        ms_map = config.build_multiscoresets_for_gene_set(
+            gene_set, genes=[gene], regularization_type=regularization_type,
+            redundancy_collapse_preset=redundancy_collapse_preset)
+        gene_key = gene.lower() if gene_set == "labelseq" else gene.upper()
+        ms = ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
+
     if config_name is None:
         config_name = pick_best_canonical_config(gene, gene_set, ms, results_json, dataset_name, run_kwargs)
 

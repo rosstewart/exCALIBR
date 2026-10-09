@@ -20,6 +20,8 @@ def _fmt_pct(x) -> str:
 
 
 def _fmt3(x) -> str:
+    if x is None or (isinstance(x, float) and x != x):  # undefined (e.g. PPV with no pathogenic calls)
+        return "--"
     return f"{x:.3f}"
 
 
@@ -83,6 +85,8 @@ def latex_performance_table_clinvar(groups: List[Tuple[str, Dict, Dict]]) -> str
             ("Sensitivity", _fmt3(danz["sensitivity"]), _fmt3(auth["sensitivity"])),
             ("Specificity", _fmt3(danz["specificity"]), _fmt3(auth["specificity"])),
             ("MCC", _fmt3(danz["mcc"]), _fmt3(auth["mcc"])),
+            ("PPV", _fmt3(danz["ppv"]), _fmt3(auth["ppv"])),
+            ("FDR", _fmt3(danz["fdr"]), _fmt3(auth["fdr"])),
             ("\\midrule", "", ""),
             ("LR$^+$ (P vs. B)", _fmt1(danz["lr_plus_standard"]), _fmt1(auth["lr_plus_standard"])),
             ("LR$^+$ (P vs. R)", _fmt1(danz["lr_plus_pathogenic"]), _fmt1(auth["lr_plus_pathogenic"])),
@@ -203,7 +207,9 @@ def latex_performance_table_multi(
         return f"{x:.1f}"
 
     rows = [
-        ("Datasets calibratable",
+        # "with evidence" rather than "calibratable": acmgscaler estimates
+        # likelihood ratios but no prior, so it does not calibrate.
+        ("Datasets with LR$^+$ estimates",
          *[f'{own_calibrated_counts[m]:,}/{n_total_datasets:,}' for m in methods]),
         ("Total variants",
          *[_fmt_int(agg_metrics_by_method[m]["total"]) for m in methods]),
@@ -218,6 +224,8 @@ def latex_performance_table_multi(
         ("Sensitivity", *[_fmt3(agg_metrics_by_method[m]["sensitivity"]) for m in methods]),
         ("Specificity", *[_fmt3(agg_metrics_by_method[m]["specificity"]) for m in methods]),
         ("MCC", *[_fmt3(agg_metrics_by_method[m]["mcc"]) for m in methods]),
+        ("PPV", *[_fmt3(agg_metrics_by_method[m]["ppv"]) for m in methods]),
+        ("FDR", *[_fmt3(agg_metrics_by_method[m]["fdr"]) for m in methods]),
         ("\\midrule",),
         ("LR$^+$ (P vs. B)", *[_fmt1(agg_metrics_by_method[m]["lr_plus_standard"]) for m in methods]),
         ("LR$^+$ (P vs. R)", *[_fmt1(agg_metrics_by_method[m]["lr_plus_pathogenic"]) for m in methods]),
@@ -289,6 +297,8 @@ def latex_performance_table_clingen(groups: List[Tuple[str, Dict]]) -> str:
             ("Sensitivity", _fmt3(ex['sensitivity']), _fmt3(au['sensitivity'])),
             ("Specificity", _fmt3(ex['specificity']), _fmt3(au['specificity'])),
             ("MCC", _fmt3(ex['mcc']), _fmt3(au['mcc'])),
+            ("PPV", _fmt3(ex['ppv']), _fmt3(au['ppv'])),
+            ("FDR", _fmt3(ex['fdr']), _fmt3(au['fdr'])),
             ("\\midrule", "", ""),
             ("LR$^+$ (P vs. B)", _fmt1(ex['lr_plus_standard']), _fmt1(au['lr_plus_standard'])),
             ("LR$^+$ (P vs. R)", _fmt1(ex['lr_plus_pathogenic']), _fmt1(au['lr_plus_pathogenic'])),
@@ -461,17 +471,21 @@ def latex_robustness_metrics_table(table_df: pd.DataFrame, perturbation_type: st
             return f"{p50:+.0f}"
         return f"{p50:+.0f} [{p25:+.0f}, {p75:+.0f}]"
 
+    # Brnich OddsPath columns (label-discordance table only, when computed).
+    with_op = "op_ps3_p50" in table_df.columns and table_df["op_ps3_p50"].notna().any()
     title = "Downsampling" if perturbation_type == "downsample" else "Label discordance"
+    n_seeds_max = int(table_df["n_seeds"].max()) if not table_df.empty else 0
     lines = [
         r"\begin{table}[!tb]",
         r"\centering",
         rf"\caption{{Robustness ({title.lower()}) confusion-matrix accuracy, determinate "
-        r"coverage, and max pathogenic/benign evidence strength, median [IQR] across 10 seeds per level. "
-        r"Metrics are computed with respect to the original control samples.}}",
+        rf"coverage, and max pathogenic/benign evidence strength, median [IQR] across {n_seeds_max} seeds per level. "
+        r"Metrics are computed with respect to the original control samples.}",
         rf"\label{{tab:robustness_{perturbation_type}_metrics}}",
-        r"\begin{tabular}{llcccc}",
+        r"\begin{tabular}{llcccc" + ("cc" if with_op else "") + "}",
         r"\toprule",
-        r"Dataset & Level & Accuracy & Determinate \% & Max Pathogenic & Max Benign \\",
+        r"Dataset & Level & Accuracy & Determinate \% & Max Pathogenic & Max Benign"
+        + (r" & OddsPath PS3 & OddsPath BS3" if with_op else "") + r" \\",
         r"\midrule",
     ]
     prev_dataset = None
@@ -483,9 +497,19 @@ def latex_robustness_metrics_table(table_df: pd.DataFrame, perturbation_type: st
         cov_cell = _fmt_pct_cell(row["coverage_p25"], row["coverage_p50"], row["coverage_p75"], row["n_seeds"])
         maxp_cell = _fmt_signed_cell(row["maxp_p25"], row["maxp_p50"], row["maxp_p75"], row["n_seeds"])
         maxb_cell = _fmt_signed_cell(row["maxb_p25"], row["maxb_p50"], row["maxb_p75"], row["n_seeds"])
+        from analysis.gene_table import extract_gene_from_dataset
+        gene_label = f"\\textit{{{extract_gene_from_dataset(row['base_dataset'])}}}"
+        level_label = str(row["level_label"]).replace("%", r"\%")
+        op_cells = ""
+        if with_op:
+            op_vals = [row.get(f"op_{k}_p50") for k in ("ps3", "bs3")]
+            op_cells = "".join(
+                " & " + ("--" if v is None or (isinstance(v, float) and v != v)
+                         else _fmt_signed_cell(row[f"op_{k}_p25"], v, row[f"op_{k}_p75"], row["n_seeds"]))
+                for k, v in zip(("ps3", "bs3"), op_vals))
         lines.append(
-            f"{_format_dataset_label(row['base_dataset'])} & {row['level_label']} & {acc_cell} & {cov_cell} & "
-            f"{maxp_cell} & {maxb_cell} \\\\"
+            f"{gene_label} & {level_label} & {acc_cell} & {cov_cell} & "
+            f"{maxp_cell} & {maxb_cell}{op_cells} \\\\"
         )
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
 
@@ -512,19 +536,22 @@ def latex_moi_comparison_table(moi_comparison_df: pd.DataFrame, label: str) -> s
         r"\midrule",
     ]
 
-    def _fmt_metric_or_dash(x, is_dor):
+    def _fmt_metric_or_dash(x, is_dor, is_pct):
         if x is None:
             return "--"
+        if is_pct:  # a fraction in [0, 1], shown as a percentage like the other tables
+            return f"{100 * x:.1f}\\%"
         return _fmt_int(round(x)) if is_dor else _fmt3(x)
 
     for _, row in moi_comparison_df.iterrows():
         is_dor = row["metric"] == "DOR"
+        is_pct = "%" in row["metric"]
         cells = [
-            row["metric"],
-            _fmt_metric_or_dash(row["mean_AD"], is_dor),
-            _fmt_metric_or_dash(row["mean_AR"], is_dor),
-            _fmt_metric_or_dash(row["median_AD"], is_dor),
-            _fmt_metric_or_dash(row["median_AR"], is_dor),
+            row["metric"].replace("%", r"\%"),
+            _fmt_metric_or_dash(row["mean_AD"], is_dor, is_pct),
+            _fmt_metric_or_dash(row["mean_AR"], is_dor, is_pct),
+            _fmt_metric_or_dash(row["median_AD"], is_dor, is_pct),
+            _fmt_metric_or_dash(row["median_AR"], is_dor, is_pct),
             _fmt_int(row["n_AD"]),
             _fmt_int(row["n_AR"]),
             _fmt3(row["p_value"]) if row["p_value"] is not None else "--",
@@ -604,12 +631,18 @@ def latex_splice_ablation_fixed_population_table(
         r"Metrics are computed with respect to the original control samples.}",
         r"\label{tab:splice_ablation_fixed_population}",
         r"\begin{tabular}{lccc}", r"\toprule",
-        r"Condition & Accuracy ($\Delta\%$) & Coverage ($\Delta\%$) & DOR ($\Delta\%$) \\",
+        r"SpliceAI threshold & Accuracy ($\Delta\%$) & Coverage ($\Delta\%$) & DOR ($\Delta\%$) \\",
         r"\midrule",
     ]
+
+    def _condition_display(label: str) -> str:
+        if label.startswith("thresh_"):
+            return label[len("thresh_"):]
+        return {"keep_all": "Keep all"}.get(label, label.replace("_", r"\_"))
+
     for _, row in summary_df.iterrows():
         lines.append(
-            f"{row['condition_label']} & {_fmt_metric(row, 'accuracy')} & "
+            f"{_condition_display(row['condition_label'])} & {_fmt_metric(row, 'accuracy')} & "
             f"{_fmt_metric(row, 'coverage')} & {_fmt_metric(row, 'dor_standard')} \\\\"
         )
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]

@@ -125,10 +125,10 @@ def _build_ms(gene, gene_set, require_both_modalities=False):
             build_functional_scoresets, build_combined_multiscoreset,
             get_functionally_assayed_protein_variants, DEFAULT_INTEGRATED_DATAFRAME,
         )
-        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release, functional_datasets_for_gene
         import pandas as pd
         df = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
-        datasets = sorted(df[df["Gene"] == gene]["Dataset"].unique())
+        datasets = functional_datasets_for_gene(df, gene)
         if not datasets:
             raise ValueError(f"no functional datasets for {gene}")
         functional_scoresets = build_functional_scoresets(
@@ -198,6 +198,15 @@ def _grow_one_restart(args):
 def run_gene(gene, gene_set, source_dir, source_config, target_sample_idx,
              n_bootstraps, num_fits, latent_q, output_dir, max_workers,
              require_both_modalities=False):
+    """Flattens every (bootstrap, restart) pair into ONE ProcessPoolExecutor
+    pool sized to `max_workers`, instead of a small per-bootstrap pool
+    nested inside a sequential bootstrap loop -- at 100 bootstraps x 3
+    restarts, the old nested design capped parallelism at `num_fits` (3)
+    workers per gene-process regardless of how many cores were free,
+    wasting most of a 128-core machine once more than a few gene-processes
+    were running concurrently. Flattening lets one gene's full workload
+    (n_bootstraps * num_fits tasks) co-fill whatever `max_workers` budget
+    the caller assigns, independent of other genes' progress."""
     dataset_name = _dataset_name(gene, gene_set)
     print(f"\n=== {gene_set}/{gene} ({dataset_name}) ===", flush=True)
     ms = _build_ms(gene, gene_set, require_both_modalities=require_both_modalities)
@@ -205,33 +214,53 @@ def run_gene(gene, gene_set, source_dir, source_config, target_sample_idx,
     out_gene_dir = Path(output_dir) / dataset_name
     out_gene_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build the full flat (bootstrap, restart) task list upfront -- source
+    # loading and bootstrap-split reconstruction are cheap (no EM), so doing
+    # all of it before submitting any EM work is fine and keeps the pool
+    # saturated with real work from the start.
+    flat_args = []       # one entry per (bootstrap, restart) task
+    task_bootstrap = []  # parallel list: which bootstrap index each flat_args entry belongs to
+    bootstrap_meta = {}  # bootstrap_idx -> source_entry (for calibrated_dims etc.)
     for i in range(n_bootstraps):
         source_entry = _load_source_entry(source_dir, dataset_name, i, source_config)
         if source_entry is None:
             print(f"  bootstrap {i}: SKIP, no source fit found under {source_dir}")
             continue
         source_fit = source_entry["fit"]
+        bootstrap_meta[i] = source_entry
 
         observations, sample_assignments, train_idx, val_idx = _reconstruct_bootstrap_split(ms, i)
         train_obs, train_sa = observations[train_idx], sample_assignments[train_idx]
         val_obs, val_sa = observations[val_idx], sample_assignments[val_idx]
 
         grown_num_components = len(source_fit["component_params"]) + 1
-        restart_args = []
         for r in range(num_fits):
             fit_seed = derive_fit_seed(DEFAULT_MASTER_SEED, i, grown_num_components, r)
-            restart_args.append((train_obs, train_sa, val_obs, val_sa, source_fit,
-                                  target_sample_idx, latent_q, fit_seed))
+            flat_args.append((train_obs, train_sa, val_obs, val_sa, source_fit,
+                               target_sample_idx, latent_q, fit_seed))
+            task_bootstrap.append(i)
 
-        results = []
-        if max_workers > 1:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as ex:
-                results = list(ex.map(_grow_one_restart, restart_args))
-        else:
-            results = [_grow_one_restart(a) for a in restart_args]
+    if not flat_args:
+        print(f"  {dataset_name}: no bootstraps to run")
+        return
 
+    if max_workers > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as ex:
+            flat_results = list(ex.map(_grow_one_restart, flat_args))
+    else:
+        flat_results = [_grow_one_restart(a) for a in flat_args]
+
+    # Group flat results back by bootstrap index, pick best-of-num_fits per
+    # bootstrap (by held-out val_ll), write exactly as the old per-bootstrap
+    # loop did.
+    by_bootstrap = {}
+    for bidx, (grown, val_ll, err) in zip(task_bootstrap, flat_results):
+        by_bootstrap.setdefault(bidx, []).append((grown, val_ll, err))
+
+    for i in sorted(by_bootstrap):
+        source_entry = bootstrap_meta[i]
         best_grown, best_val_ll, best_r = None, -np.inf, None
-        for r, (grown, val_ll, err) in enumerate(results):
+        for r, (grown, val_ll, err) in enumerate(by_bootstrap[i]):
             if err is not None:
                 print(f"  bootstrap {i} restart {r}: FAILED ({err})")
                 continue

@@ -37,6 +37,38 @@ from ..data_utils.dataset import Scoreset, MultiScoreset, BasicMultiScoreset
 GENES_2018 = {"BRCA1", "MSH2", "PTEN", "TP53"}
 
 
+# Integrated-dataframe "datasets" that are derived from other datasets of the
+# same gene (meta-analyses, models fit on other readouts, composite scores
+# averaging a study's own readouts) rather than independent measurements.
+# Never used as joint-calibration dimensions or in the independent baseline:
+# keeping a composite alongside its constituents double-counts them, and a
+# held-out P/LP vs B/LB classifier (BRCA2, HMBS, TP53 Giacomelli; 2026-10-07)
+# showed the constituent readouts separate at least as well as the composite
+# (TP53 Giacomelli: AUC 0.964 vs 0.949), so the constituents are kept.
+DERIVED_DATASETS = {
+    "F9_Popp_2025_model",
+    "TP53_Fayer_2021_meta",
+    "BRCA2_Sahu_2023_exon13_global_score",
+    "HMBS_van_Loggerenberg_2023_combined",
+    "TP53_Giacomelli_2018_combined_score",
+}
+
+
+def is_derived_dataset(name: str) -> bool:
+    """True if ``name`` is a DERIVED_DATASETS entry, also matching suffixed
+    variants of it (e.g. UV calibration directories ending in a ClinVar-
+    release suffix)."""
+    return any(name == d or name.startswith(d + "_") for d in DERIVED_DATASETS)
+
+
+def functional_datasets_for_gene(df: pd.DataFrame, gene: str) -> List[str]:
+    """Sorted ``Dataset`` values for ``gene`` in the integrated dataframe,
+    excluding DERIVED_DATASETS -- the one place every joint-calibration
+    pipeline (integrated, combined) picks a gene's functional dimensions."""
+    return sorted(d for d in df.loc[df["Gene"] == gene, "Dataset"].unique()
+                  if not is_derived_dataset(d))
+
+
 def resolve_clinvar_release(gene: str) -> str:
     return "2018" if gene in GENES_2018 else "2026"
 

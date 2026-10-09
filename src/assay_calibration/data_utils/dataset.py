@@ -2481,6 +2481,10 @@ class BasicMultiScoreset:
         if len(dataset_names) != self.d:
             raise ValueError("dataset_names must match number of scoresets")
         self.dataset_names = dataset_names
+        # EXPERIMENTAL categorical dims ({dim_name: [level names]}), name-keyed
+        # so column reorders (redundancy_collapse) can't misalign it. Empty =
+        # every dim continuous (the default). See fit_utils/cfusn/categorical.py.
+        self.categorical_dims = dict(kwargs.get("categorical_dims", {}) or {})
 
         s_total = max(s._sample_assignments.shape[1] for s in scoresets)
         self._n_samples_total = s_total

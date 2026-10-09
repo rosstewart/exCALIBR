@@ -30,9 +30,13 @@ changed:
   ``analysis.config.EVIDENCE_COUNTS_DIR`` — if missing, panels B/C are simply
   skipped rather than crashing.
 
-- The two hardcoded OR-estimate CSVs -> ``analysis.config.OR_ESTIMATES_CSV``
-  / ``analysis.config.YURIY_OR_CSV``, both ``warn_if_missing``-guarded (skip
-  the OR-dependent panels/table if unavailable).
+- The OR-estimate data -> ``analysis.config.AOU_OR_ESTIMATES_TSV``, a single
+  long-format file (``warn_if_missing``-guarded; skip the OR-dependent
+  panels/table if unavailable) filtered to ``Grouping/Calibration ==
+  "ExCALIBR"`` and a chosen ``Consequence`` (default ``"All"``). Per-gene
+  dataset selection is a manual ``GENE_TO_DATASET`` mapping maintained in
+  this module (the old ``YURIY_OR_CSV``-derived lookup no longer applies,
+  since the new file has multiple datasets per gene rather than one).
 
 - The master integrated variant dataframe -> ``analysis.config.DATASET_TSV``.
 
@@ -85,10 +89,38 @@ STRENGTH_COLOR = {
 GENE_DISEASE_MAP = {
     "BAP1": "Cancer", "BARD1": "Cancer", "BRCA1": "Cancer", "BRCA2": "Cancer",
     "CALM3": "Cardiovascular", "CHEK2": "Cancer", "G6PD": "Metabolic", "GCK": "Metabolic",
-    "KCNE1": "Cardiovascular", "KCNH2": "Cardiovascular", "KCNQ4": "Hearing loss",
+    "KCNE1": "Cardiovascular", "KCNH2": "Cardiovascular", "KCNQ4": "Hearing loss", "LDLR": "Metabolic",
     "MSH2": "Cancer", "OTC": "Metabolic", "PALB2": "Cancer", "PTEN": "Cancer",
     "RAD51C": "Cancer", "RAD51D": "Cancer", "SCN5A": "Cardiovascular",
     "TARDBP": "Rare disease", "TP53": "Cancer", "TSC2": "Cancer"
+}
+
+# Manual gene -> dataset pick for genes with more than one Dataset/Predictor
+# row under Grouping/Calibration == "ExCALIBR" in AOU_OR_ESTIMATES_TSV (the
+# old Yuriy-file-derived build_gene_to_dataset no longer applies, since that
+# file had ~one row per gene and the new one doesn't). Picks with a prior
+# Yuriy-file precedent keep that choice; the rest were confirmed directly.
+# TP53 rows come from the separate AOU_TP53_OR_ESTIMATES_TSV (all 15 TP53
+# assays); TP53_Fortuno_2021 is the gene-level pick.
+GENE_TO_DATASET = {
+    "BAP1": "BAP1_Waters_2024",
+    "BARD1": "BARD1_IGVF",
+    "BRCA1": "BRCA1_Findlay_2018",
+    "BRCA2": "BRCA2_Huang_2025_SGE",
+    "CHEK2": "CHEK2_Gebbia_2024",
+    "GCK": "GCK_Gersing_2023_complementation",
+    "KCNE1": "KCNE1_Muhammad_2024_potassium_flux",
+    "KCNH2": "KCNH2_Jiang_2022",
+    "KCNQ4": "KCNQ4_Zheng_2022_current_homozygous",
+    "LDLR": "LDLR_Tabet_2025_abundance",
+    "MSH2": "MSH2_Jia_2021",
+    "PALB2": "PALB2_IGVF",
+    "PTEN": "PTEN_Mighell_2018",
+    "RAD51C": "RAD51C_Olvera-León_2024",
+    "RAD51D": "RAD51D_IGVF",
+    "SCN5A": "SCN5A_Ma_2024",
+    "TP53": "TP53_Fortuno_2021",
+    "TSC2": "TSC2_IGVF",
 }
 
 
@@ -240,49 +272,144 @@ def load_evidence_counts(evidence_counts_dir: Optional[str] = None) -> Optional[
 # OR-estimate CSVs (guarded)
 # ---------------------------------------------------------------------------
 
-def load_or_estimates(
-    or_estimates_csv: Optional[str] = None,
-    yuriy_or_csv: Optional[str] = None,
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Load (df_ors, df_ors_old), or (None, None) for whichever is missing."""
-    or_estimates_csv = or_estimates_csv or cfg.OR_ESTIMATES_CSV
-    yuriy_or_csv = yuriy_or_csv or cfg.YURIY_OR_CSV
+def load_aou_or_estimates(
+    aou_or_estimates_tsv: Optional[str] = None,
+    consequence: str = "All",
+    tp53_or_estimates_tsv: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """Load AOU_OR_ESTIMATES_TSV, or None if it's missing.
 
-    df_ors = None
-    if not cfg.warn_if_missing(or_estimates_csv, "OR estimates CSV"):
-        df_ors = pd.read_csv(or_estimates_csv)
+    Rows from ``AOU_TP53_OR_ESTIMATES_TSV`` (TP53 assays, delivered
+    separately) are appended, replacing any main-file rows with the same
+    ``Dataset/Predictor``; skipped with a warning if that file is missing.
 
-    df_ors_old = None
-    if not cfg.warn_if_missing(yuriy_or_csv, "Yuriy OR CSV"):
-        df_ors_old = pd.read_csv(yuriy_or_csv)
+    Filters to ``Grouping/Calibration == "ExCALIBR"`` and the requested
+    ``Consequence``, derives linear-scale ``Odds Ratio``/``OR_LI``/``OR_UI``
+    from the file's ``LogOR``/``LogOR_LI``/``LogOR_UI`` columns, and renames
+    columns to match what the (unchanged) plotting/table code below expects:
+    ``Dataset/Predictor`` -> ``Dataset``, ``Group/Range`` -> ``Classification``,
+    ``Wald p-value`` -> ``p-value``, ``Carrier cases``/``Carrier controls`` ->
+    ``Cases with variants``/``Controls with variants``.
+    """
+    aou_or_estimates_tsv = aou_or_estimates_tsv or cfg.AOU_OR_ESTIMATES_TSV
 
-    return df_ors, df_ors_old
+    if cfg.warn_if_missing(aou_or_estimates_tsv, "AoU OR estimates TSV"):
+        return None
 
+    df = pd.read_csv(aou_or_estimates_tsv, sep="\t")
+    tp53_tsv = tp53_or_estimates_tsv or cfg.AOU_TP53_OR_ESTIMATES_TSV
+    if tp53_tsv and not cfg.warn_if_missing(tp53_tsv, "AoU TP53 OR estimates TSV"):
+        df_tp53 = pd.read_csv(tp53_tsv, sep="\t")
+        df = pd.concat([df[~df["Dataset/Predictor"].isin(set(df_tp53["Dataset/Predictor"]))], df_tp53],
+                       ignore_index=True)
+    df = df[
+        (df["Grouping/Calibration"] == "ExCALIBR") & (df["Consequence"] == consequence)
+    ].copy()
 
-def build_gene_to_dataset(df_ors_old: pd.DataFrame) -> Dict[str, str]:
-    """Map gene -> single chosen dataset name (unchanged logic)."""
-    gene_to_dataset = {}
+    # A few rows have near-infinite CIs from degenerate (zero-cell) logistic
+    # fits -- exp() correctly sends those to 0/inf rather than erroring, so
+    # just silence the expected overflow warning.
+    with np.errstate(over="ignore"):
+        df["Odds Ratio"] = np.exp(df["LogOR"])
+        df["OR_LI"] = np.exp(df["LogOR_LI"])
+        df["OR_UI"] = np.exp(df["LogOR_UI"])
 
-    for gene in df_ors_old.Gene.unique():
-        if gene == "TP53":
-            dataset = "TP53_Fortuno_2021"
-        else:
-            dataset = df_ors_old[df_ors_old.Gene == gene].Dataset.unique()[0].replace(
-                "rapgap_unpublished", "IGVF"
-            ).replace("unpublished", "IGVF").replace(
-                "RAD51C_Olvera-León_2024_z_score_D4_D14", "RAD51C_Olvera-León_2024"
-            )
+    df = df.rename(columns={
+        "Dataset/Predictor": "Dataset",
+        "Group/Range": "Classification",
+        "Wald p-value": "p-value",
+        "Carrier cases": "Cases with variants",
+        "Carrier controls": "Controls with variants",
+    })
 
-        gene_to_dataset[gene] = dataset
-
-    gene_to_dataset["SCN5A"] = "SCN5A_Ma_2024"
-
-    return gene_to_dataset
+    return df
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers (unchanged)
 # ---------------------------------------------------------------------------
+
+def dataset_short_label(dataset_name, gene=None) -> str:
+    """Dataset name for figure labels/captions: internal suffix and leading
+    gene token dropped, underscores as spaces ("BRCA2_Huang_2025_SGE" ->
+    "Huang 2025 SGE")."""
+    from analysis.plot_common import display_name
+    name = display_name(dataset_name)
+    prefix = f"{gene}_" if gene else name.split("_", 1)[0] + "_"
+    if name.startswith(prefix):
+        name = name[len(prefix):]
+    return name.replace("_", " ")
+
+
+def order_genes_by_disease(genes):
+    """Genes grouped by GENE_DISEASE_MAP category: largest group first (ties
+    alphabetical by group name), genes alphabetical within each group."""
+    genes = list(dict.fromkeys(genes))
+    groups = {}
+    for g in genes:
+        groups.setdefault(GENE_DISEASE_MAP.get(g, "Unknown"), []).append(g)
+    order = sorted(groups, key=lambda d: (-len(groups[d]), d))
+    return [g for d in order for g in sorted(groups[d])]
+
+
+CARRIER_TEXT_COLOR = "#9a9a9a"
+
+
+def _annotate_carriers(ax, odds_ratio, y, cases):
+    """Carrier-case count in small grey text (thin white outline) just above an OR point."""
+    from matplotlib import patheffects as pe
+    t = ax.annotate(f"{cases}", (odds_ratio, y), xytext=(0, 4.5), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=6, color=CARRIER_TEXT_COLOR, zorder=3)
+    t.set_path_effects([pe.Stroke(linewidth=1.5, foreground="white"), pe.Normal()])
+
+
+# Groups with few carriers on either side have imprecise ORs. All of Us
+# reports such counts only as "<= 20"; the collaborators' filtered OR file
+# (AoU-OR-estimates_2026-10-07_filter_lowcarriercontrolcase) blanks exactly
+# the groups with carrier cases <= 20 or carrier controls <= 20 (verified on
+# all 640 shared ExCALIBR rows), so the same rule flags them here instead of
+# dropping them. Strength stays in the color and significance in the fill;
+# flagged groups get a thinner dashed CI and a smaller marker.
+LOW_CARRIER_MAX = 20
+LOW_CARRIER_STYLE = "dashed"  # "dashed" | "alpha" | "grey" | "off"; supplementary OR figures only (Fig. 5C: "off")
+
+
+def _carrier_count_low(val) -> bool:
+    """True for a carrier count <= LOW_CARRIER_MAX, or AoU's suppressed "<= 20" label."""
+    if pd.isna(val):
+        return False
+    try:
+        return float(val) <= LOW_CARRIER_MAX
+    except (TypeError, ValueError):
+        return True
+
+
+def is_low_carrier(row) -> bool:
+    return _carrier_count_low(row.get("Cases with variants")) or _carrier_count_low(row.get("Controls with variants"))
+
+
+def _draw_or_point(ax, row, y, bar_color, style=None):
+    """One OR estimate with its 95% CI: filled marker if significant, open if not;
+    low-carrier groups (is_low_carrier) drawn in the LOW_CARRIER_STYLE."""
+    style = style or LOW_CARRIER_STYLE
+    low = style != "off" and is_low_carrier(row)
+    color, alpha, lw, ls, size, cap = bar_color, 1.0, 2, "-", 50, 3
+    if low:
+        if style == "dashed":
+            lw, ls, size, cap = 1.2, (0, (2.5, 1.5)), 26, 0
+        elif style == "alpha":
+            alpha = 0.35
+        elif style == "grey":
+            color = "#9e9e9e"
+    eb = ax.errorbar(row['Odds Ratio'], y,
+                     xerr=[[row['Odds Ratio'] - row['OR_LI']], [row['OR_UI'] - row['Odds Ratio']]],
+                     fmt='none', ecolor=color, elinewidth=lw, capsize=cap, capthick=lw, alpha=alpha, zorder=1)
+    for lc in eb[2]:
+        lc.set_linestyle(ls)
+    facecolor = color if row['significant'] else 'none'
+    ax.scatter(row['Odds Ratio'], y, marker='o', s=size, facecolors=facecolor, edgecolors=color,
+               linewidth=1.2 if low and style == "dashed" else 1.5, alpha=alpha, zorder=2)
+
 
 def compute_log_xmin(xmax, x_ref=1.0, fraction=0.05):
     """
@@ -309,6 +436,23 @@ def shrink_data_min_log(data_min, xmax, fraction=0.05):
     data_min_shrink = 10 ** log_data_min_shrink
 
     return data_min_shrink
+
+
+def _has_carriers(val):
+    """True if a 'Cases with variants' value indicates >=1 carrier.
+
+    AoU privacy rules replace small counts with a label like "<= 20" rather
+    than the real number, so the whole column loads as strings -- including
+    the plain-numeric ones (e.g. "0", "1398"). Try to parse it as a number
+    first; only a non-numeric label (the suppressed case) is treated as
+    "nonzero but hidden".
+    """
+    if pd.isna(val):
+        return False
+    try:
+        return float(val) > 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _get_strength(label):
@@ -338,7 +482,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
                           bottom_genes=['BRCA1', 'BRCA2', 'PALB2', 'RAD51C', 'RAD51D'],
                           size_by='vus',
                           annotate_gene_scatter=True, seed=42,
-                          save_path=None, figsize=(18, 10)):
+                          save_path=None, figsize=(18, 10), show_carrier_counts=False):
 
     # Create figure
     fig = plt.figure(figsize=figsize)
@@ -451,18 +595,31 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
 
             texts.append(text)
 
+    # Final limits first: adjust_text must place labels within the axes as
+    # drawn, otherwise a label (and its leader line) can land outside panel A
+    # once the limits are narrowed (e.g. into panel C).
+    ax_gene.set_xlim(plot_min * 0.95, plot_max+0.02)
+    # Lower y-limit follows the data so no gene is cut off (JAG1 was below the
+    # previous fixed 0.8075 floor, leaving only its leader line visible).
+    y_floor = min(0.85 * 0.95, min(r['danz_accuracy'] for r in finite) - 0.02) if finite else 0.85 * 0.95
+    ax_gene.set_ylim(y_floor, plot_max)
     if annotate_gene_scatter:
         np.random.seed(seed)
         try:
             adjust_text(texts, ax=ax_gene, arrowprops=dict(arrowstyle='-', color='gray', lw=1, alpha=0.5),
-                       expand_points=(0.7, 0.7), force_text=0.3)
+                       expand_points=(0.7, 0.7), force_text=0.3, ensure_inside_axes=True)
         except Exception:
             pass
+        from matplotlib.patches import FancyArrowPatch
+        from matplotlib.text import Annotation
+        for _artist in ax_gene.get_children():  # leader lines never leave panel A
+            _arrow = _artist.arrow_patch if isinstance(_artist, Annotation) else _artist
+            if isinstance(_arrow, FancyArrowPatch):
+                _arrow.set_clip_on(True)
+                _arrow.set_clip_path(ax_gene.patch)
 
     ax_gene.set_xlabel('Author Accuracy', fontsize=FONTSIZE_AXIS_LABEL, fontweight='bold')
     ax_gene.set_ylabel('ExCALIBR Accuracy', fontsize=FONTSIZE_AXIS_LABEL, fontweight='bold')
-    ax_gene.set_xlim(plot_min * 0.95, plot_max+0.02)
-    ax_gene.set_ylim(0.85 * 0.95, plot_max)
     ax_gene.grid(True, alpha=0.2)
     ax_gene.spines['top'].set_visible(False)
     ax_gene.spines['right'].set_visible(False)
@@ -575,12 +732,23 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
 
             # select gene and one dataset
             gene_data = df_filtered[(df_filtered['Gene'] == gene_name) & (df_filtered['Dataset'] == gene_to_dataset[gene_name])].copy()
+            # Only rows that actually get drawn (see _has_carriers) should set
+            # the axis range, and among those, only ones with a sane
+            # (finite, positive-lower-bound) CI -- a quasi-separated fit from
+            # very few carriers on one/both sides can have a carrier count
+            # that passes _has_carriers yet a near-infinite CI that would
+            # otherwise blow up xlim for the whole panel.
+            gene_data_plotted = gene_data[gene_data['Cases with variants'].apply(_has_carriers)]
+            gene_data_for_axis = gene_data_plotted[
+                (gene_data_plotted['OR_LI'] > 0) & np.isfinite(gene_data_plotted['OR_UI'])
+            ]
 
             all_classes_df = pd.DataFrame({'Classification': full_classification_order})
 
             if len(gene_data) > 0:
                 all_classes_df = all_classes_df.merge(
-                    gene_data[['Classification', 'Odds Ratio', 'OR_LI', 'OR_UI', 'significant', 'Cases with variants']],
+                    gene_data[['Classification', 'Odds Ratio', 'OR_LI', 'OR_UI', 'significant', 'Cases with variants',
+                           'Controls with variants']],
                     on='Classification', how='left')
             else:
                 all_classes_df['Odds Ratio'] = np.nan
@@ -594,18 +762,14 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
                 ax.axhline(y=y, color='gray', linestyle='-', linewidth=0.5, alpha=0.2, zorder=0)
 
             for idx, row in all_classes_df.iterrows():
-                if pd.notna(row['Odds Ratio']) and row['Cases with variants'] > 0:
+                if pd.notna(row['Odds Ratio']) and _has_carriers(row['Cases with variants']):
                     y = idx
                     strength = get_strength(row['Classification'])
                     bar_color = STRENGTH_COLOR.get(strength, '#999999')
 
-                    ax.errorbar(row['Odds Ratio'], y,
-                        xerr=[[row['Odds Ratio'] - row['OR_LI']], [row['OR_UI'] - row['Odds Ratio']]],
-                        fmt='none', ecolor=bar_color, elinewidth=2, capsize=3, capthick=2, alpha=1, zorder=1)
-
-                    facecolor = bar_color if row['significant'] else 'none'
-                    ax.scatter(row['Odds Ratio'], y, marker='o', s=50,
-                              facecolors=facecolor, edgecolors=bar_color, linewidth=1.5, zorder=2)
+                    _draw_or_point(ax, row, y, bar_color, style="off")  # Fig. 5C: low-carrier groups drawn normally
+                    if show_carrier_counts:
+                        _annotate_carriers(ax, row['Odds Ratio'], y, row['Cases with variants'])
 
             ax.axvline(x=1, linestyle='--', color='black', linewidth=1, alpha=0.5, zorder=1)
             ax.set_yticks(y_pos)
@@ -617,10 +781,10 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
                 ax.set_ylabel('Evidence Strength', fontsize=FONTSIZE_AXIS_LABEL, fontweight='bold')
             ax.tick_params(axis='both', labelsize=FONTSIZE_AXIS_TICK, left=show_y_ticks, labelleft=show_y_ticks)
 
-            # For each gene, set limits individually
+            # For each gene, set limits individually (from the plotted rows only)
             ax.set_xscale('log')
-            if len(gene_data) > 0:
-                data_max = gene_data['OR_UI'].max()
+            if len(gene_data_for_axis) > 0:
+                data_max = gene_data_for_axis['OR_UI'].max()
                 if pd.notna(data_max):
                     # Round up to nearest clean limit
                     clean_limits = [3, 5, 10, 30, 50, 100, 1000, 10000]
@@ -631,7 +795,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
                 xlim_max = 10
 
             xlim_min = compute_log_xmin(xlim_max, x_ref=1.0, fraction=0.05) # based on plot proportion
-            data_min = shrink_data_min_log(gene_data['OR_LI'].min(), xlim_max, fraction=0.05)
+            data_min = shrink_data_min_log(gene_data_for_axis['OR_LI'].min(), xlim_max, fraction=0.05)
             if data_min < xlim_min:
                 xlim_min = data_min # based on data
 
@@ -730,7 +894,30 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
 # Supplementary all-genes OR figure (unchanged body)
 # ---------------------------------------------------------------------------
 
-def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, figsize=(18, 12)):
+def resolve_gene_dataset_entries(df_ors, gene_to_dataset, gene_order=None, dataset_mode="primary"):
+    """Return [(gene, dataset), ...] to plot, given `dataset_mode`.
+
+    "primary": one (gene, gene_to_dataset[gene]) pair per gene (today's
+    behavior). "all": one pair per Dataset/Predictor row present for that
+    gene in df_ors, since the new AOU_OR_ESTIMATES_TSV can have several
+    datasets per gene even within Grouping/Calibration == "ExCALIBR".
+    """
+    genes = gene_order if gene_order is not None else sorted(gene_to_dataset.keys())
+    entries = []
+    for gene in genes:
+        if dataset_mode == "all":
+            datasets = sorted(df_ors.loc[df_ors['Gene'] == gene, 'Dataset'].unique())
+            entries.extend((gene, dataset) for dataset in datasets)
+        else:
+            dataset = gene_to_dataset.get(gene)
+            if dataset is not None:
+                entries.append((gene, dataset))
+    return entries
+
+
+def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, dataset_mode="primary",
+                       save_path=None, figsize=(18, 12), show_carrier_counts=False,
+                       ncols=None, row_height=None):
     """
     Create supplementary figure with OR plots for all genes.
 
@@ -741,48 +928,48 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
                                 'OR_LI', 'OR_UI', 'LogOR', 'LogOR_LI', 'LogOR_UI',
                                 'Wald p-value']
     gene_to_dataset : dict
-        Maps gene name -> dataset name (selects one dataset per gene).
+        Maps gene name -> dataset name (selects one dataset per gene), used
+        when dataset_mode == "primary".
     gene_order : list, optional
         Order of genes to display. If None, sorts alphabetically.
+    dataset_mode : {"primary", "all"}
+        "primary" shows one dataset per gene (via gene_to_dataset); "all"
+        shows a separate panel for every Dataset/Predictor available for
+        that gene.
     save_path : str, optional
         Path to save figure
     figsize : tuple
-        Figure size (width, height)
+        Figure size (width, height); the height is per 3 rows.
+    ncols, row_height : optional
+        Grid columns and inches per row. Default: 5 columns at figsize[1] / 3
+        per row; dataset_mode == "all" defaults to a condensed 8-column grid
+        (about 3.1 in per row) so the figure fits one portrait page.
     """
 
-    # Get all unique genes from data
-    if gene_order is None:
-        all_genes = sorted(df_ors['Gene'].unique())
-    else:
-        all_genes = gene_order
+    entries = resolve_gene_dataset_entries(df_ors, gene_to_dataset, gene_order, dataset_mode)
+    all_genes = [gene for gene, _dataset in entries]
 
-    # Arrange in 3 rows: 5, 5, 3
-    n_genes = len(all_genes)
+    n_genes = len(entries)
+    condensed = dataset_mode == "all"
+    ncols = ncols or (8 if condensed else 5)
+    nrows = -(-n_genes // ncols)  # ceil div
+    row_height = row_height or (3.1 if condensed else figsize[1] / 3)
 
-    # Create figure with 3 rows
-    fig = plt.figure(figsize=figsize)
+    # Fixed space (inches) above each row for the disease bracket, gene and
+    # dataset titles, so the layout no longer depends on the number of rows.
+    fig_h = row_height * nrows + 0.9
+    fig = plt.figure(figsize=(figsize[0], fig_h))
+    gs = gridspec.GridSpec(nrows, ncols, figure=fig,
+                          left=0.05, right=0.98, top=1 - 0.9 / fig_h, bottom=0.45 / fig_h,
+                          hspace=0.75 if condensed else 0.6, wspace=0.12 if condensed else 0.15)
 
-    # Create grid: 3 rows with different column counts
-    gs = gridspec.GridSpec(3, 5, figure=fig,
-                          left=0.05, right=0.95, top=0.95, bottom=0.05,
-                          hspace=0.4, wspace=0.15)
-
-    # Create axes for each gene
-    ax_genes = []
-    for row in range(3):
-        if row < 2:  # First two rows: 5 columns each
-            for col in range(5):
-                idx = row * 5 + col
-                if idx < n_genes:
-                    ax_genes.append(fig.add_subplot(gs[row, col]))
-        else:  # Third row: 3 columns, centered
-            for col in range(0, 4):  # Columns 1, 2, 3 (centered)
-                idx = row * 5 + col - 1
-                if idx < n_genes:
-                    ax_genes.append(fig.add_subplot(gs[row, col]))
+    # Create axes, one per entry, filled row-major.
+    ax_genes = [fig.add_subplot(gs[i // ncols, i % ncols]) for i in range(n_genes)]
 
     FONTSIZE_AXIS_LABEL = 14
-    FONTSIZE_AXIS_TICK = 12
+    FONTSIZE_AXIS_TICK = 11 if condensed else 12
+    FONTSIZE_Y_TICK = 8 if condensed else FONTSIZE_AXIS_TICK
+    TITLE_Y = 1.20 if condensed else 1.12
 
     # Classification order
     full_classification_order = FULL_CLASSIFICATION_ORDER
@@ -793,17 +980,28 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
     df_filtered = df_ors[df_ors['Classification'] != "0"].copy()
     df_filtered['significant'] = ((df_filtered['LogOR_LI'] > 0) | (df_filtered['LogOR_UI'] < 0))
 
-    for i, (ax, gene_name) in enumerate(zip(ax_genes, all_genes)):
+    for i, (ax, (gene_name, dataset_name)) in enumerate(zip(ax_genes, entries)):
 
-        # select gene and one dataset
-        gene_data = df_filtered[(df_filtered['Gene'] == gene_name) & (df_filtered['Dataset'] == gene_to_dataset[gene_name])].copy()
+        # select gene and dataset
+        gene_data = df_filtered[(df_filtered['Gene'] == gene_name) & (df_filtered['Dataset'] == dataset_name)].copy()
+        # Only rows that actually get drawn (see _has_carriers) should set
+        # the axis range, and among those, only ones with a sane
+        # (finite, positive-lower-bound) CI -- a quasi-separated fit from
+        # very few carriers on one/both sides can have a carrier count
+        # that passes _has_carriers yet a near-infinite CI that would
+        # otherwise blow up xlim for the whole panel.
+        gene_data_plotted = gene_data[gene_data['Cases with variants'].apply(_has_carriers)]
+        gene_data_for_axis = gene_data_plotted[
+            (gene_data_plotted['OR_LI'] > 0) & np.isfinite(gene_data_plotted['OR_UI'])
+        ]
 
         # Create complete dataframe with all classification levels
         all_classes_df = pd.DataFrame({'Classification': full_classification_order})
 
         if len(gene_data) > 0:
             all_classes_df = all_classes_df.merge(
-                gene_data[['Classification', 'Odds Ratio', 'OR_LI', 'OR_UI', 'significant', 'Cases with variants']],
+                gene_data[['Classification', 'Odds Ratio', 'OR_LI', 'OR_UI', 'significant', 'Cases with variants',
+                           'Controls with variants']],
                 on='Classification', how='left')
         else:
             all_classes_df['Odds Ratio'] = np.nan
@@ -819,18 +1017,14 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
 
         # Plot data points
         for idx, row in all_classes_df.iterrows():
-            if pd.notna(row['Odds Ratio']) and row['Cases with variants'] > 0:
+            if pd.notna(row['Odds Ratio']) and _has_carriers(row['Cases with variants']):
                 y = idx
                 strength = get_strength(row['Classification'])
                 bar_color = STRENGTH_COLOR.get(strength, '#999999')
 
-                ax.errorbar(row['Odds Ratio'], y,
-                    xerr=[[row['Odds Ratio'] - row['OR_LI']], [row['OR_UI'] - row['Odds Ratio']]],
-                    fmt='none', ecolor=bar_color, elinewidth=2, capsize=3, capthick=2, alpha=1, zorder=1)
-
-                facecolor = bar_color if row['significant'] else 'none'
-                ax.scatter(row['Odds Ratio'], y, marker='o', s=50,
-                          facecolors=facecolor, edgecolors=bar_color, linewidth=1.5, zorder=2)
+                _draw_or_point(ax, row, y, bar_color)
+                if show_carrier_counts:
+                    _annotate_carriers(ax, row['Odds Ratio'], y, row['Cases with variants'])
 
         # Vertical line at OR = 1
         ax.axvline(x=1, linestyle='--', color='black', linewidth=1, alpha=0.5, zorder=1)
@@ -838,21 +1032,22 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
         # Styling
         ax.set_xscale('log')
         ax.set_yticks(y_pos)
-        ax.set_yticklabels(all_classes_df['Classification'], fontsize=FONTSIZE_AXIS_TICK)
+        ax.set_yticklabels(all_classes_df['Classification'], fontsize=FONTSIZE_Y_TICK)
 
-        # Only show x-label on bottom row
-        if i >= len(all_genes) - 4 or i == 9:  # Bottom row plus the overhangs
+        # Only show x-label where there's no panel below in the same column
+        if i + ncols >= n_genes:
             ax.set_xlabel('Odds Ratio', fontsize=FONTSIZE_AXIS_LABEL, fontweight='bold')
 
         # Only show y-label on leftmost column
-        show_y_ticks = (i % 5 == 0)
+        show_y_ticks = (i % ncols == 0)
         if show_y_ticks:
             ax.set_ylabel('Evidence Strength', fontsize=FONTSIZE_AXIS_LABEL, fontweight='bold')
-        ax.tick_params(axis='both', labelsize=FONTSIZE_AXIS_TICK, left=show_y_ticks, labelleft=show_y_ticks)
+        ax.tick_params(axis='x', labelsize=FONTSIZE_AXIS_TICK)
+        ax.tick_params(axis='y', labelsize=FONTSIZE_Y_TICK, left=show_y_ticks, labelleft=show_y_ticks)
 
-        # Set x-axis limits
-        if len(gene_data) > 0:
-            data_max = gene_data['OR_UI'].max()
+        # Set x-axis limits (from the plotted rows only)
+        if len(gene_data_for_axis) > 0:
+            data_max = gene_data_for_axis['OR_UI'].max()
             if pd.notna(data_max):
                 clean_limits = [3, 5, 10, 30, 50, 100, 1000, 10000]
                 xlim_max = next((lim for lim in clean_limits if lim >= data_max), 10000)
@@ -862,7 +1057,7 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
             xlim_max = 10
 
         xlim_min = compute_log_xmin(xlim_max, x_ref=1.0, fraction=0.05) # based on plot proportion
-        data_min = shrink_data_min_log(gene_data['OR_LI'].min(), xlim_max, fraction=0.05)
+        data_min = shrink_data_min_log(gene_data_for_axis['OR_LI'].min(), xlim_max, fraction=0.05)
         if data_min < xlim_min:
             xlim_min = data_min # based on data
 
@@ -915,62 +1110,54 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
 
-        # Title with gene name only (disease will be shown in brackets above)
+        # Title: gene name (disease will be shown in brackets above
+        # regardless). In dataset_mode == "all", the dataset name goes on
+        # its own smaller, word-wrapped line below -- these can be long
+        # (e.g. "BRCA2_Sahu_2023_exon13_Cisplatin_Resistance") and would
+        # otherwise overrun neighboring panels in the narrow "all" grid.
+        # Gene title, with the dataset (without its gene prefix) on a smaller
+        # line below, in both modes.
         _bold_italic_gene_title(ax, gene_name, "", fontsize=FONTSIZE_AXIS_LABEL,
-                                 x=0.5, y=1.0, ha='center', va='bottom')
+                                 x=0.5, y=TITLE_Y, ha='center', va='bottom')
+        t = ax.text(0.5, 1.0, dataset_short_label(dataset_name, gene_name), transform=ax.transAxes,
+                    fontsize=7 if condensed else 8, ha='center', va='bottom', wrap=True)
+        t._get_wrap_line_width = lambda: ax.get_window_extent().width * 0.95
 
     # ========== ADD DISEASE GROUP BRACKETS ==========
 
-    # Group genes by disease for bracket annotations
-    gene_diseases = [(gene, GENE_DISEASE_MAP.get(gene, "Unknown")) for gene in all_genes]
+    # Group panels by disease for bracket annotations, working off entry
+    # *indices* (not gene-name lookups) so repeated gene names under
+    # dataset_mode == "all" still group/position correctly.
+    entry_diseases = [GENE_DISEASE_MAP.get(gene, "Unknown") for gene in all_genes]
 
-    # We need to track which row each gene is in
-    gene_to_position = {}
-    for idx, gene in enumerate(all_genes):
-        row = idx // 5
-        col_in_row = idx % 5
-        if row == 2:  # Bottom row is offset
-            col_in_row += 1
-        gene_to_position[gene] = (row, idx)
-
-    # Group consecutive genes with same disease within each row
-    current_row = -1
-    disease_groups = []
+    disease_groups = []  # (disease, start_idx, end_idx, row)
     current_disease = None
-    current_genes = []
-
-    for gene, disease in gene_diseases:
-        row = gene_to_position[gene][0]
-
-        # New row or different disease
+    current_row = -1
+    group_start = None
+    for idx, disease in enumerate(entry_diseases):
+        row = idx // ncols
         if row != current_row or disease != current_disease:
-            if current_genes:
-                disease_groups.append((current_disease, current_genes, current_row))
+            if group_start is not None:
+                disease_groups.append((current_disease, group_start, idx - 1, current_row))
+            group_start = idx
             current_disease = disease
-            current_genes = [gene]
             current_row = row
-        else:
-            current_genes.append(gene)
-
-    # Don't forget the last group
-    if current_genes:
-        disease_groups.append((current_disease, current_genes, current_row))
+    if group_start is not None:
+        disease_groups.append((current_disease, group_start, len(entry_diseases) - 1, current_row))
 
     # Draw brackets for each disease group
-    for disease, genes, row in disease_groups:
-        # Find the axes indices for first and last gene in this group
-        start_gene_idx = all_genes.index(genes[0])
-        end_gene_idx = all_genes.index(genes[-1])
-
+    for disease, start_idx, end_idx, row in disease_groups:
         # Get the axis positions in figure coordinates
-        bbox_start = ax_genes[start_gene_idx].get_position()
-        bbox_end = ax_genes[end_gene_idx].get_position()
+        bbox_start = ax_genes[start_idx].get_position()
+        bbox_end = ax_genes[end_idx].get_position()
 
         # Calculate bracket positions
         x_left = bbox_start.x0
         x_right = bbox_end.x1
-        y_bracket = bbox_start.y1 + 0.02  # Slightly above the axes
-        bracket_height = 0.006
+        # Above the gene title (at 1.12 axes heights) plus its text, in
+        # inches, so the bracket stays clear of the row above at any size.
+        y_bracket = bbox_start.y1 + (TITLE_Y - 1) * bbox_start.height + 0.30 / fig_h
+        bracket_height = 0.06 / fig_h
 
         # Draw the bracket (horizontal line with vertical ends)
         fig.add_artist(plt.Line2D([x_left, x_left], [y_bracket, y_bracket + bracket_height],
@@ -982,7 +1169,7 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
 
         # Add disease label centered above bracket
         x_center = (x_left + x_right) / 2
-        y_text = y_bracket + bracket_height + 0.007
+        y_text = y_bracket + bracket_height + 0.05 / fig_h
 
         fig.text(x_center, y_text, disease,
                 ha='center', va='bottom',
@@ -1000,7 +1187,7 @@ def plot_all_genes_or(df_ors, gene_to_dataset, gene_order=None, save_path=None, 
 # OR display table (unchanged)
 # ---------------------------------------------------------------------------
 
-def prepare_or_display_table(df_ors, gene_to_dataset, gene_order=None):
+def prepare_or_display_table(df_ors, gene_to_dataset, gene_order=None, dataset_mode="primary"):
     """
     Filter df_ors to only the columns and rows needed for plot_all_genes_or.
 
@@ -1009,26 +1196,24 @@ def prepare_or_display_table(df_ors, gene_to_dataset, gene_order=None):
     df_ors : pd.DataFrame
         Full OR results table.
     gene_to_dataset : dict
-        Maps gene name -> dataset name (selects one dataset per gene).
+        Maps gene name -> dataset name (selects one dataset per gene), used
+        when dataset_mode == "primary".
     gene_order : list, optional
         Genes to include. If None, uses all keys in gene_to_dataset.
+    dataset_mode : {"primary", "all"}
+        See resolve_gene_dataset_entries.
 
     Returns
     -------
     pd.DataFrame
         Minimal table with only the rows/columns used for plotting.
     """
-    if gene_order is None:
-        gene_order = sorted(gene_to_dataset.keys())
+    entries = resolve_gene_dataset_entries(df_ors, gene_to_dataset, gene_order, dataset_mode)
 
-    # Keep only the selected dataset per gene
-    rows = []
-    for gene in gene_order:
-        ds = gene_to_dataset.get(gene)
-        if ds is None:
-            continue
-        mask = (df_ors['Gene'] == gene) & (df_ors['Dataset'] == ds)
-        rows.append(df_ors.loc[mask])
+    rows = [
+        df_ors.loc[(df_ors['Gene'] == gene) & (df_ors['Dataset'] == dataset)]
+        for gene, dataset in entries
+    ]
 
     df = pd.concat(rows, ignore_index=True)
 
@@ -1072,12 +1257,26 @@ def build_gene_performance_scatter(
     dataset_configs_path: Optional[str] = None,
     evidence_counts_dir: Optional[str] = None,
     evidence_counts: Optional[Dict[str, Dict]] = None,
-    or_estimates_csv: Optional[str] = None,
-    yuriy_or_csv: Optional[str] = None,
+    aou_or_estimates_tsv: Optional[str] = None,
+    consequence: str = "All",
+    dataset_mode: str = "primary",
     annotate_gene_scatter: bool = True,
     output_or_display_csv: Optional[str] = None,
+    confusion_data: Optional[Tuple[List[str], List, List]] = None,
+    show_carrier_counts: bool = False,
+    also_all_datasets_figure: bool = False,
 ) -> Dict:
     """Rebuild the gene-performance-scatter / evidence-strength / OR figures.
+
+    `show_carrier_counts`: print each OR point's carrier-case count in small
+    grey text in the supplementary OR figures (never in Fig. 5C).
+    `also_all_datasets_figure`: with dataset_mode="primary", additionally save
+    supp_OR_all_datasets.png (one OR panel per dataset, every ExCALIBR dataset
+    of each gene) without changing the primary-mode figures or display table.
+
+    `confusion_data`: optional precomputed (dataset_names, danzs_oob,
+    auths_oob), e.g. the notebook's own datasets / conf_by_method[primary] /
+    auths, to skip `build_confusion_data`'s second discovery + load pass.
 
     Replaces the notebook's top-level script logic. Any input that can't be
     found on disk is skipped (with a warning) rather than crashing:
@@ -1091,8 +1290,15 @@ def build_gene_performance_scatter(
         output and the author/OddsPath side from OP_EVIDENCE_CODES_CSV --
         instead of requiring the legacy datasets_reached_evidence/*.pkl
         files on disk. Takes precedence over `evidence_counts_dir` when given.
-      - OR estimate CSVs missing -> OR panels/supplementary figure/display
+      - AOU_OR_ESTIMATES_TSV missing -> OR panels/supplementary figure/display
         table are skipped.
+
+    `consequence` selects the Consequence facet of AOU_OR_ESTIMATES_TSV to
+    use (default "All"); pass e.g. "Missense" or "Stop Gained" and a
+    different `output_or_display_csv`/`figure_dir` to generate per-
+    consequence figures alongside the default ones. `dataset_mode` controls
+    per-gene dataset selection for the supplementary figure/table -- see
+    resolve_gene_dataset_entries.
 
     Returns a dict of whatever was successfully produced, e.g.
     {'gene_results': [...], 'fig_combined': <Figure>, 'fig_supp': <Figure>,
@@ -1111,10 +1317,13 @@ def build_gene_performance_scatter(
     print(f"Loaded dataframe with {len(df_std)} variants")
 
     print("Building confusion matrices from pipeline output...")
-    dataset_names, danzs_oob, auths_oob = build_confusion_data(
-        output_dir=output_dir, dataset_tsv=dataset_tsv,
-        dataset_configs_path=dataset_configs_path,
-    )
+    if confusion_data is not None:
+        dataset_names, danzs_oob, auths_oob = (list(x) for x in confusion_data)
+    else:
+        dataset_names, danzs_oob, auths_oob = build_confusion_data(
+            output_dir=output_dir, dataset_tsv=dataset_tsv,
+            dataset_configs_path=dataset_configs_path,
+        )
     result["dataset_names"] = dataset_names
 
     if not dataset_names:
@@ -1128,12 +1337,9 @@ def build_gene_performance_scatter(
     result["gene_to_vus_count"] = gene_to_vus_count
 
     evidence_counts = evidence_counts if evidence_counts is not None else load_evidence_counts(evidence_counts_dir)
-    df_ors, df_ors_old = load_or_estimates(or_estimates_csv, yuriy_or_csv)
-
-    gene_to_dataset = None
-    if df_ors_old is not None:
-        gene_to_dataset = build_gene_to_dataset(df_ors_old)
-        result["gene_to_dataset"] = gene_to_dataset
+    df_ors = load_aou_or_estimates(aou_or_estimates_tsv, consequence=consequence)
+    gene_to_dataset = GENE_TO_DATASET
+    result["gene_to_dataset"] = gene_to_dataset
 
     if evidence_counts is not None:
         print("Generating combined plot...")
@@ -1144,9 +1350,10 @@ def build_gene_performance_scatter(
             dataset_names, gene_to_vus_count,
             compute_classification_metrics=compute_classification_metrics,
             annotate_gene_scatter=annotate_gene_scatter,
-            df_ors=df_ors if gene_to_dataset is not None else None,
+            df_ors=df_ors,
             gene_to_dataset=gene_to_dataset,
-            bottom_genes=sorted(['BAP1', 'BRCA1', 'MSH2', 'TSC2', 'RAD51D']) + sorted(['KCNQ4']),
+            bottom_genes=['BRCA1', 'MSH2', 'RAD51D', 'TP53', 'TSC2', 'KCNQ4'],
+            show_carrier_counts=False,  # Fig. 5C: no carrier counts (supplementary OR figures only)
             save_path=str(figure_dir / f'gene_brnich_OR{"_noannot" if not annotate_gene_scatter else ""}.png'),
             seed=42,
         )
@@ -1155,16 +1362,24 @@ def build_gene_performance_scatter(
     else:
         print("  SKIP combined plot: evidence counts unavailable")
 
-    if df_ors is not None and gene_to_dataset is not None:
-        gene_order = ['BAP1', 'BARD1', 'BRCA1', 'BRCA2', 'MSH2', 'PALB2', 'RAD51C', 'RAD51D',
-                      'TP53', 'TSC2', 'KCNH2', 'SCN5A', 'KCNQ4', 'GCK']
+    if df_ors is not None:
+        # Disease groups largest first (ties alphabetical), genes alphabetical within.
+        gene_order = order_genes_by_disease(
+            [g for g in df_ors["Gene"].unique() if g in gene_to_dataset or dataset_mode == "all"])
         fig_supp = plot_all_genes_or(
-            df_ors, gene_to_dataset, gene_order=gene_order,
-            save_path=str(figure_dir / 'supp_OR.png'),
+            df_ors, gene_to_dataset, gene_order=gene_order, dataset_mode=dataset_mode,
+            save_path=str(figure_dir / f'supp_OR{"_all_datasets" if dataset_mode == "all" else ""}.png'),
+            show_carrier_counts=show_carrier_counts,
         )
         result["fig_supp"] = fig_supp
+        if also_all_datasets_figure and dataset_mode != "all":
+            result["fig_supp_all_datasets"] = plot_all_genes_or(
+                df_ors, gene_to_dataset, gene_order=order_genes_by_disease(df_ors["Gene"].unique()),
+                dataset_mode="all", save_path=str(figure_dir / "supp_OR_all_datasets.png"),
+                show_carrier_counts=show_carrier_counts,
+            )
 
-        df_display = prepare_or_display_table(df_ors, gene_to_dataset, gene_order=gene_order)
+        df_display = prepare_or_display_table(df_ors, gene_to_dataset, gene_order=gene_order, dataset_mode=dataset_mode)
         print(f"{len(df_display)} rows, {df_display['Gene'].nunique()} genes")
         result["df_display"] = df_display
 
@@ -1172,7 +1387,7 @@ def build_gene_performance_scatter(
             df_display.to_csv(output_or_display_csv, index=False)
             print(f"  Saved OR display table to {output_or_display_csv}")
     else:
-        print("  SKIP OR-based panels/table: OR estimate CSV(s) unavailable")
+        print("  SKIP OR-based panels/table: AoU OR estimates TSV unavailable")
 
     return result
 

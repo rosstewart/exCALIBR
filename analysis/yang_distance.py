@@ -11,6 +11,7 @@ identical without needing the pickle.
 """
 from joblib import Parallel, delayed
 import numpy as np
+from pathlib import Path
 from scipy import stats as sps
 from scipy.interpolate import interp1d
 
@@ -19,8 +20,13 @@ def build_splits_for_dataset(scoreset, n_c: int, bootstrap_indices) -> dict:
     """Regenerate {boot_idx: {"train_observations", "train_sample_assignments"}}
     for the given bootstrap indices, deterministically, from `scoreset`.
 
-    Equivalent to looking up `dataset_to_splits[dataset]` in the legacy
-    `dataset_splits_recovered.pkl`, but computed fresh — no pickle required.
+    Uses the pipeline's default master seed (0), under which a bootstrap's
+    composition is keyed by its index, so the splits are identical to the
+    ones the production fits were trained on (config.SPLITS_FILE; checked on
+    MSH2_Jia_2021, BRCA2_Huang_2025_SGE and KCNQ4_Zheng_2022). Without
+    master_seed, generate_fit_jobs falls back to OS entropy -- a fresh random
+    resample on every call -- which is what this function did before
+    2026-10-09.
 
     Deliberately serial: each generate_fit_jobs call is cheap on its own
     (~0.04s measured on BAP1_Waters_2024, so ~1000 calls is on the order of
@@ -31,13 +37,13 @@ def build_splits_for_dataset(scoreset, n_c: int, bootstrap_indices) -> dict:
     without re-measuring on a case where the scoreset is large enough that
     the compute-per-task genuinely exceeds pickling overhead.
     """
-    from src.assay_calibration.fit_utils.fit import Fit
+    from src.assay_calibration.fit_utils.fit import Fit, DEFAULT_MASTER_SEED
 
     fitter = Fit(scoreset)
     splits = {}
     for idx in bootstrap_indices:
         jobs = fitter.generate_fit_jobs(
-            component_range=[n_c], bootstrap_seed=int(idx),
+            component_range=[n_c], bootstrap_seed=int(idx), master_seed=DEFAULT_MASTER_SEED,
             check_monotonic=True, num_fits=1,
         )
         if jobs:
@@ -140,8 +146,13 @@ def _resolve_sample_indices(scoreset) -> dict:
 
 def _process_single_bootstrap(
     boot_idx, dataset, n_c, fits_dict, dataset_splits, sample_indices, n_points=1000, n_grid=10000,
+    split="train",
 ):
     """Worker function to process a single bootstrap iteration.
+
+    `split`: "train" scores the fit on the variants it was trained on; "val"
+    on that bootstrap's held-out variants. Either way distances are
+    normalized by the training scores' range.
 
     `sample_indices` : {canonical_key: column_index_or_None} from
     _resolve_sample_indices -- column_index indexes both train_assign's
@@ -154,10 +165,11 @@ def _process_single_bootstrap(
         return {k: np.nan for k in all_keys}
 
     boot_dict = dataset_splits[int(boot_idx)]
-    train_obs = boot_dict["train_observations"]
-    train_assign = boot_dict["train_sample_assignments"]
+    train_obs = boot_dict[f"{split}_observations"]
+    train_assign = boot_dict[f"{split}_sample_assignments"]
 
-    score_range = train_obs.max() - train_obs.min()
+    _range_obs = boot_dict["train_observations"]
+    score_range = _range_obs.max() - _range_obs.min()
     if score_range == 0:
         score_range = 1.0
 
@@ -202,9 +214,29 @@ def _process_single_bootstrap(
     return boot_distances
 
 
+_PRODUCTION_SPLITS = None
+
+
+def production_splits():
+    """{dataset: {seed: {"train_observations", "train_sample_assignments", ...}}}
+    from config.SPLITS_FILE (the splits the production bootstrap fits, and the
+    skew-locked refits, were trained on), loaded once per process; None if
+    the file is missing."""
+    global _PRODUCTION_SPLITS
+    if _PRODUCTION_SPLITS is None:
+        import pickle
+        from analysis import config as cfg
+        path = Path(cfg.SPLITS_FILE)
+        if not path.exists():
+            return None
+        with open(path, "rb") as f:
+            _PRODUCTION_SPLITS = pickle.load(f)
+    return _PRODUCTION_SPLITS
+
+
 def compute_bootstrap_yang_distances_parallel(
     dataset, n_c, fits, scoreset, dataset_to_splits=None, n_jobs=-1, normalize=True,
-    n_points=1000, n_grid=10000,
+    n_points=1000, n_grid=10000, split="train",
 ):
     """
     Compute Yang distances for all bootstrap iterations across all samples (parallelized).
@@ -222,8 +254,10 @@ def compute_bootstrap_yang_distances_parallel(
         not provided (see build_splits_for_dataset).
     dataset_to_splits : dict, optional
         Precomputed {dataset: {boot_idx: {...}}} splits (legacy pickle format).
-        If None, splits are regenerated on demand from `scoreset` — deterministic,
-        so results are identical either way.
+        If None, the production splits file (config.SPLITS_FILE, see
+        production_splits) is used when it has the dataset (faster); otherwise
+        splits are regenerated from `scoreset` with the pipeline's default
+        master seed, which gives the same splits.
     n_jobs : int
         Number of parallel jobs (-1 for all cores) for the per-bootstrap
         distance computation. Split regeneration (build_splits_for_dataset)
@@ -254,27 +288,48 @@ def compute_bootstrap_yang_distances_parallel(
     missing = [k for k, v in sample_indices.items() if v is None]
     if missing:
         print(f"  {dataset}: no {', '.join(missing)} sample -- those Yang distances will be all-NaN")
-    fits_dict = {i: fits[i] for i in range(len(fits))} if isinstance(fits, list) else fits
+    if isinstance(fits, list):
+        # Key each fit by its bootstrap seed so it is scored against that
+        # seed's training split (legacy_fits.SeededFits carries the seeds);
+        # list position is not the seed when the fits file's keys are strings.
+        seeds = getattr(fits, "seeds", None)
+        if seeds is None or len(seeds) != len(fits):
+            raise ValueError(f"{dataset}: fits list without bootstrap seeds; pass {{seed: fit}} instead")
+        fits_dict = {int(sd): f for sd, f in zip(seeds, fits)}
+    else:
+        fits_dict = {int(k): v for k, v in fits.items()}
     boot_indices = sorted(fits_dict.keys())
 
     n_c_int = int(str(n_c).rstrip("c"))
+    if dataset_to_splits is None:
+        dataset_to_splits = production_splits()
+    if split != "train" and not (dataset_to_splits is not None and dataset in dataset_to_splits):
+        raise ValueError(f"{dataset}: held-out ({split}) Yang distances need the production splits file")
     if dataset_to_splits is not None and dataset in dataset_to_splits:
+        # The splits the bootstrap fits were trained on (each fit's stored
+        # val_ll is reproduced exactly on them); identical to regenerating
+        # with master seed 0, just faster.
         splits = dataset_to_splits[dataset]
     else:
+        print(f"  {dataset}: not in the production splits file; regenerating splits (master seed 0)")
         splits = build_splits_for_dataset(scoreset, n_c_int, boot_indices)
 
     norm_str = "normalized " if normalize else ""
     print(f"{dataset}: computing {norm_str}Yang distances for {len(boot_indices)} bootstrap iterations on {n_jobs if n_jobs > 0 else 'all'} cores...")
 
     if n_jobs != 1:
+        # Each task gets only its own fit and split: passing the whole
+        # fits/splits dicts re-pickles every bootstrap's data for every task.
         results = Parallel(n_jobs=n_jobs, verbose=5)(
             delayed(_process_single_bootstrap)(
-                boot_idx, dataset, n_c, fits_dict, splits, sample_indices, n_points, n_grid,
+                boot_idx, dataset, n_c, {boot_idx: fits_dict[boot_idx]},
+                {int(boot_idx): splits[int(boot_idx)]} if int(boot_idx) in splits else {},
+                sample_indices, n_points, n_grid, split,
             ) for boot_idx in boot_indices
         )
     else:
         results = [_process_single_bootstrap(
-                boot_idx, dataset, n_c, fits_dict, splits, sample_indices, n_points, n_grid,
+                boot_idx, dataset, n_c, fits_dict, splits, sample_indices, n_points, n_grid, split,
             ) for boot_idx in boot_indices]
 
     yang_distances = {k: [] for k in sample_indices.keys()}
@@ -285,3 +340,78 @@ def compute_bootstrap_yang_distances_parallel(
     yang_distances = {k: np.array(v) for k, v in yang_distances.items()}
 
     return yang_distances
+
+
+def cached_bootstrap_yang_distances(
+    dataset, n_c, fits, scoreset, cache_dir=None, output_dir=None, n_jobs=-1, n_grid=10000, **kwargs,
+):
+    """`compute_bootstrap_yang_distances_parallel` with a per-dataset disk cache.
+
+    One `{cache_dir}/{dataset}_{n_c}_grid{n_grid}.npz` per dataset holds every
+    bootstrap's distance per sample, so the batch table
+    (run_build_excalibr_datasets_table --with-yang), the fit-quality numbers
+    and Extended Data Fig. 1 compute each dataset once. An entry is reused
+    only while the dataset's newest *_calibration.json in `output_dir` is
+    unchanged (a refit invalidates it).
+    """
+    import json
+    from pathlib import Path
+
+    if cache_dir is None:
+        return compute_bootstrap_yang_distances_parallel(
+            dataset, n_c, fits, scoreset, n_jobs=n_jobs, n_grid=n_grid, **kwargs)
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    split = kwargs.get("split", "train")
+    path = cache_dir / f"{dataset}_{n_c}_grid{n_grid}{'' if split == 'train' else '_' + split}.npz"
+    cal_mtime = None
+    if output_dir is not None:
+        cals = list((Path(output_dir) / dataset).glob("*_calibration.json"))
+        cal_mtime = max(p.stat().st_mtime for p in cals) if cals else None
+
+    if path.exists():
+        with np.load(path, allow_pickle=False) as z:
+            meta = json.loads(str(z["__meta__"]))
+            if meta.get("calibration_mtime") == cal_mtime and meta.get("splits") == "production":
+                print(f"{dataset}: Yang distances from cache ({path.name})")
+                return {k: z[k] for k in z.files if k != "__meta__"}
+        print(f"{dataset}: cached Yang distances are stale (calibration refit); recomputing")
+
+    distances = compute_bootstrap_yang_distances_parallel(
+        dataset, n_c, fits, scoreset, n_jobs=n_jobs, n_grid=n_grid, **kwargs)
+    meta = json.dumps({"dataset": dataset, "n_c": n_c, "n_grid": n_grid, "calibration_mtime": cal_mtime,
+                       "splits": "production"})
+    np.savez(path, __meta__=np.array(meta), **{k: np.asarray(v, dtype=float) for k, v in distances.items()})
+    return distances
+
+
+HELDOUT_SAMPLES = {"plp": "pathogenic", "blb": "benign", "gnomad": "gnomad", "synonymous": "synonymous"}
+
+
+def heldout_yang_table(csv_path=None, cache_dir=None, n_grid=None):
+    """Regular-fit held-out Yang distances, one row per dataset: for each
+    sample (plp/blb/gnomad/synonymous) the median and Q1/Q3 across bootstraps
+    (`yang_val_<s>`, `_p25`, `_p75`, from the per-dataset `*_val.npz` caches)
+    and the median held-out sample size (`n_val_<s>`, from
+    config.YANG_HELDOUT_CSV, written by `analysis.skew_locked_yang --split val`)."""
+    import pandas as pd
+    from analysis import config as cfg
+
+    df = pd.read_csv(csv_path or cfg.YANG_HELDOUT_CSV)
+    cache_dir = Path(cache_dir or cfg.YANG_CACHE_DIR)
+    n_grid = n_grid or cfg.YANG_N_GRID
+    rows = []
+    for _, r in df.iterrows():
+        row = {"dataset": r["dataset"], "n_c": r["n_c"]}
+        path = cache_dir / f"{r['dataset']}_{r['n_c']}_grid{n_grid}_val.npz"
+        z = dict(np.load(path)) if path.exists() else {}
+        for short, key in HELDOUT_SAMPLES.items():
+            v = np.asarray(z.get(key, []), dtype=float)
+            ok = np.isfinite(v).any()
+            row[f"yang_val_{short}"] = float(np.nanmedian(v)) if ok else np.nan
+            row[f"yang_val_{short}_p25"] = float(np.nanpercentile(v, 25)) if ok else np.nan
+            row[f"yang_val_{short}_p75"] = float(np.nanpercentile(v, 75)) if ok else np.nan
+            row[f"n_val_{short}"] = r.get(f"n_val_{key}", np.nan)
+        rows.append(row)
+    return pd.DataFrame(rows)

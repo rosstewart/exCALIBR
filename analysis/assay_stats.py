@@ -24,6 +24,8 @@ from matplotlib.colors import LinearSegmentedColormap, LogNorm
 from matplotlib.patches import Rectangle
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
+from analysis.plot_common import display_name
+
 
 # Model-system label normalization (mirrors analysis/gene_table.py).
 # "not applicable" is a distinct, genuine category (e.g. a meta-analysis
@@ -49,6 +51,20 @@ def _looks_like_meta_analysis(dataset: str) -> bool:
     also happened to be blank, instead of "Other"."""
     lowered = dataset.lower()
     return 'meta' in lowered or 'combined' in lowered
+
+
+def _assay_group(vamp_val, model_val, meta_flag, dataset) -> str:
+    """Fig. 6 assay group: VAMP-seq / SGE as curated; otherwise Meta-analysis
+    when the curation flags the dataset as one (meta_analysis column) --
+    falling back, when that flag is missing, to an explicitly "not
+    applicable" model system or a meta/combined dataset name -- else Other."""
+    if vamp_val in ('VAMP-seq', 'SGE'):
+        return vamp_val
+    if meta_flag is not None and not (isinstance(meta_flag, float) and pd.isna(meta_flag)):
+        is_meta = str(meta_flag).strip().lower() in ('true', '1', 'yes')
+    else:
+        is_meta = model_val == 'not applicable' or _looks_like_meta_analysis(dataset)
+    return 'Meta-analysis' if is_meta else 'Other'
 
 
 def normalize_assay_method_map(assay_method_map, dataset_descriptions=None):
@@ -189,8 +205,8 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
         None: 'O', np.nan: 'O',
     }
     MODEL_SYSTEM_CODES = {
-        'immortalized human cells': 'H', 'murine primary cells': 'M', 'yeast': 'Y',
-        'other': 'O', 'not applicable': 'N', None: 'O', np.nan: 'O',
+        'immortalized human cells': 'H', 'murine primary cells': 'M', 'mouse embryonic stem cells': 'M',
+        'yeast': 'Y', 'other': 'O', 'not applicable': 'N', None: 'O', np.nan: 'O',
     }
     DISEASE_CODES = {
         'cancer': 'C', 'cardiovascular': 'V', 'cardio': 'V', 'rare disease': 'R',
@@ -218,11 +234,7 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
             # not the same thing as model_val simply being NaN/missing
             # (e.g. a newly added dataset with no metadata-file entry yet),
             # which should fall back to "other" instead.
-            is_blank_vamp = pd.isna(vamp_val) or vamp_val in ('', 'not applicable')
-            if is_blank_vamp and (model_val == 'not applicable' or _looks_like_meta_analysis(dataset)):
-                vamp_val = 'Meta-analysis'
-            elif is_blank_vamp:
-                vamp_val = 'Other'
+            vamp_val = _assay_group(vamp_val, model_val, row.get('meta_analysis'), dataset)
 
             vamp_sge_map[dataset] = vamp_val
             model_system_map[dataset] = 'other' if pd.isna(model_val) else model_val
@@ -294,7 +306,7 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
     # ── Sorting ──────────────────────────────────────────────────────
     vamp_sge_order = {'VAMP-seq': 0, 'SGE': 1, 'Meta-analysis': 2, 'other': 3, 'Other': 3}
     model_system_order = {
-        'immortalized human cells': 0, 'murine primary cells': 1,
+        'immortalized human cells': 0, 'murine primary cells': 1, 'mouse embryonic stem cells': 1,
         'yeast': 2, 'other': 3, 'not applicable': 4,
     }
     disease_order = {'cancer': 0, 'cardiovascular': 1, 'cardio': 1, 'rare disease': 2, 'metabolic': 3}
@@ -423,9 +435,9 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
                                    xycoords=('axes fraction', 'data'),
                                    frameon=False, box_alignment=(1, 0.5))
                 ax.add_artist(ab)
-            clean_names.append(new_names_dict.get(dataset, dataset) + '      ')
+            clean_names.append(display_name(new_names_dict.get(dataset, dataset)) + '      ')
         else:
-            clean_names.append(new_names_dict.get(dataset, dataset))
+            clean_names.append(display_name(new_names_dict.get(dataset, dataset)))
 
     ax.set_yticks(np.arange(len(proportion_df)))
     ax.set_yticklabels(clean_names, rotation=0, fontsize=8)
@@ -528,7 +540,7 @@ def plot_dataset_point_heatmap(dataset_info_df, all_danz_assignments,
 
     model_legend_text = [
         ('H', 'Immortalized\nhuman cells', MODEL_SYSTEM_COLORS['H']),
-        ('M', 'Murine\nprimary cells', MODEL_SYSTEM_COLORS['M']),
+        ('M', 'Murine cells', MODEL_SYSTEM_COLORS['M']),
         ('Y', 'Yeast', MODEL_SYSTEM_COLORS['Y']),
         ('N', 'Not applicable', MODEL_SYSTEM_COLORS['N']),
         ('O', 'Other', MODEL_SYSTEM_COLORS['O']),
@@ -594,11 +606,7 @@ def compute_assay_evidence_stats(dataset_info_df, all_danz_assignments, assay_me
         # (explicitly recorded, e.g. a meta-analysis with no single model
         # system) is a distinct value from model_val simply being NaN/missing
         # (e.g. a newly added dataset with no metadata-file entry yet).
-        is_blank_vamp = pd.isna(vamp_val) or vamp_val in ('', 'not applicable')
-        if is_blank_vamp and (model_val == 'not applicable' or _looks_like_meta_analysis(ds)):
-            vamp_val = 'Meta-analysis'
-        elif is_blank_vamp:
-            vamp_val = 'Other'
+        vamp_val = _assay_group(vamp_val, model_val, row.get('meta_analysis'), ds)
 
         meta[ds] = {
             'assay_type': vamp_val,

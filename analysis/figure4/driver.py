@@ -54,7 +54,7 @@ for whichever flags are left unset:
     --dataset-configs   EXCALIBR_DATASET_CONFIGS  dataset -> (n_c, benign_method) JSON
     --precomputed-fits  EXCALIBR_PRECOMPUTED_FITS gzipped bootstrap fits (MSH2 mixture overlay, panel a)
     --revel-dir         EXCALIBR_YILE_DIR         external REVEL gene-specific calibration files (panels e/f only)
-    --figure-dir        EXCALIBR_FIGURE_DIR       where fig4_PP.png / Figure4.pdf get written (default: OUTPUT_DIR/figures)
+    --figure-dir        EXCALIBR_PILLAR_FIGURE_DIR where fig4_PP.png / Figure4.pdf get written (default: OUTPUT_DIR/pillar_project_figures)
 
 Missing `--revel-dir`/`EXCALIBR_YILE_DIR` or MSH2 calibration data prints a
 warning and skips (see build_figure4's docstring) rather than raising, so a
@@ -447,7 +447,7 @@ def build_figure4(
     rather than raising.
     """
     output_dir = output_dir or cfg.OUTPUT_DIR
-    figure_dir = Path(figure_dir or cfg.FIGURE_DIR)
+    figure_dir = Path(figure_dir or cfg.PILLAR_FIGURE_DIR)
     figure_dir.mkdir(parents=True, exist_ok=True)
 
     dataset_tsv = dataset_tsv or cfg.DATASET_TSV
@@ -556,7 +556,7 @@ def _main():
                               "Falls back to EXCALIBR_YILE_DIR / analysis.config.YILE_DIR.")
     parser.add_argument("--figure-dir", default=None,
                          help="Where fig4_PP.png / Figure4.pdf get written. "
-                              "Falls back to EXCALIBR_FIGURE_DIR / analysis.config.FIGURE_DIR.")
+                              "Falls back to EXCALIBR_PILLAR_FIGURE_DIR / analysis.config.PILLAR_FIGURE_DIR.")
     parser.add_argument("--panel-c-data", default=None,
                          help="Precomputed panel c (ExCALIBR vs. author confusion) aggregate JSON, "
                               "written by analysis.figure4.export_msh2_bundle / "

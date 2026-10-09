@@ -87,7 +87,7 @@ COMBINED_GENES = list(DEFAULT_GENES)  # BRCA1, BRCA2, F9, JAG1, MSH2, SCN5A, TP5
 # combined.py's own functional-scoreset builder doesn't exclude these, which
 # is fine for the "combined" gene-set (different pipeline) but was wrong for
 # Panel A's plain-integrated genes -- caused a dimension mismatch for F9).
-META_ANALYSIS_DATASETS = {"F9_Popp_2025_model", "TP53_Fayer_2021_meta"}
+from src.assay_calibration.multivariate_data.common import DERIVED_DATASETS as META_ANALYSIS_DATASETS  # noqa: E402
 
 RUN_KWARGS = dict(
     path_percentile=5, min_valid_boots=1,
@@ -409,48 +409,13 @@ def build_panel_a(results_json, cache_dir=None):
             if cached is not None and cached.get("status") == "ok" and _valid_cache_entry(cached):
                 rows.append(_row_from_cache_record(cached))
                 continue
-            datasets = sorted(
-                d for d in df_integrated[df_integrated["Gene"] == gene]["Dataset"].unique()
-                if d not in META_ANALYSIS_DATASETS
-            )
-            if not datasets:
-                print(f"  [{gene}] no functional datasets in integrated dataframe, skipping")
-                continue
-            scoreset_kwargs = dict(
-                clinvar_release=resolve_clinvar_release(gene),
-                min_clinvar_star=1, population_type="gnomAD",
-            )
-            # Reduce to the historically-fitted dimension subset (see
-            # _select_connected_datasets) -- the raw `datasets` list above is
-            # every dataset currently in the dataframe for this gene, which
-            # can include more dimensions than the stored bootstrap fit was
-            # actually trained on (confirmed for BRCA2: 8 datasets now vs. a
-            # 4-dim stored fit -> IndexError; KCNH2: Kozek_Glazer_2020 has
-            # negligible overlap with the other 2 datasets and was correctly
-            # excluded from the real 2D fit).
-            selected = _select_connected_datasets(
-                df_integrated, gene, datasets, scoreset_kwargs, min_overlap_rows=30)
-            if not selected:
-                print(f"  [{gene}] no dataset pair clears the overlap threshold, skipping")
-                continue
-            if set(selected) != set(datasets):
-                print(f"  [{gene}] dimension-selection reduced {len(datasets)} -> "
-                      f"{len(selected)} datasets: {selected}")
-            datasets = selected
-            # Canonical builder for the plain-"integrated" gene-set (matches
-            # hpc/prepare.py::_process_multivariate_gene exactly, which is
-            # what these genes' MV fits were actually trained on) -- NOT
-            # combined.py::build_functional_scoresets (that one lacks the
-            # min_samples=2 per-dataset filter and doesn't exclude the two
-            # known meta-analysis datasets, which produced a dimension
-            # mismatch against the real fit for at least F9 -- confirmed
-            # "0/1000 valid bootstraps" for BRCA2/F9/KCNH2 with the old
-            # builder).
-            ms = build_multiscoreset_from_long_dataframe(
-                df_integrated, gene, datasets, scoreset_kwargs=scoreset_kwargs,
-            )
-            if ms is None:
-                print(f"  [{gene}] fewer than 2 usable dimensions, skipping")
+            # The canonical cluster builder, which selects the dimensions the
+            # stored fit was trained on (shared with the results tables).
+            try:
+                ms = config.build_ms_for_gene_cluster("integrated", gene, cluster_idx=0,
+                                                      results_json=results_json)
+            except Exception as e:
+                print(f"  [{gene}] could not build ms: {e}")
                 continue
             try:
                 dataset_name = _find_dataset_key(results_json, gene)
@@ -495,23 +460,15 @@ def build_panel_c(results_json, cache_dir=None):
         print("All combined-evidence genes cached -- skipping dataframe reload.")
         return pd.DataFrame(_cached_rows(cache_dir, "C", COMBINED_GENES))
 
-    print("Loading integrated dataframe for combined genes...")
-    df_integrated = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
     for gene in COMBINED_GENES:
         cached = _load_cached(cache_dir, "C", gene)
         if cached is not None and cached.get("status") == "ok" and _valid_cache_entry(cached):
             rows.append(_row_from_cache_record(cached))
             continue
-        datasets = sorted(df_integrated[df_integrated["Gene"] == gene]["Dataset"].unique())
-        if not datasets:
-            print(f"  [{gene}] no functional datasets, skipping")
-            continue
-        functional_scoresets = build_functional_scoresets(
-            df_integrated, gene, datasets, clinvar_release=resolve_clinvar_release(gene))
-        functionally_assayed = get_functionally_assayed_protein_variants(df_integrated, gene, datasets)
-        ms = build_combined_multiscoreset(
-            gene, functional_scoresets, datasets, config.PREDICTOR_RAW_DATA_DIR,
-            functionally_assayed_variants=functionally_assayed)
+        # The canonical combined builder (union population, TP53's default
+        # Kato-panel collapse) -- the same ms the results tables and the fit
+        # use, so the fit-vs-dataset shape guard applies here too.
+        ms = config.build_multiscoresets_for_gene_set("combined", genes=[gene]).get(gene)
         if ms is None:
             print(f"  [{gene}] could not build combined ms, skipping")
             continue
@@ -619,8 +576,7 @@ def plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=None,
         # hidden but its label still rendered, floating with no visible
         # anchor below the plot (confirmed for ASPA/CBS/PAX6).
         gene_label = str(row["gene"]).upper()
-        if slides:
-            gene_label = _SLIDES_GENE_LABEL.get(gene_label, gene_label)
+        gene_label = _SLIDES_GENE_LABEL.get(gene_label, gene_label)
         t = ax.text(row[uv_col], row[mv_col], gene_label, fontsize=label_fontsize,
                     ha="center", va="center", fontweight="bold", zorder=10, clip_on=True)
         t.set_path_effects([pe.Stroke(linewidth=label_stroke, foreground="white"), pe.Normal()])
@@ -643,15 +599,18 @@ def plot_metric_scatter_panel(ax, df, letter, title, metric="mcc", ymin=None,
         ax.set_ylabel("Multidimensional calibration", fontsize=26, fontweight="bold", labelpad=12)
     else:
         axis_label = _METRIC_AXIS_LABEL[metric]
-        ax.set_xlabel(f"ExCALIBR (UV, non-conflicting) {axis_label}", fontsize=11, fontweight="bold")
-        ax.set_ylabel(f"ExCALIBR-MV {axis_label}", fontsize=11, fontweight="bold")
+        ax.set_xlabel(f"Independent calibration (ExCALIBR) {axis_label}", fontsize=11, fontweight="bold")
+        ax.set_ylabel(f"Joint calibration (ExCALIBR-MV) {axis_label}", fontsize=11, fontweight="bold")
     # Slides mode pads the visible range past `lo`/`hi` (beyond the diagonal
     # line's own extent) so a big-font label on a gene at/near the 0.0 or 1.0
     # boundary has room and doesn't get mid-word clipped by clip_on=True
     # above (confirmed both edges needed it: "MRAS"/"EGFR" at x=0 clipped on
     # the left, "SCN5A" near mv=1.0 clipped on the right/top).
-    lo_axis = lo - 0.05 if slides else lo
-    hi_axis = hi + 0.045 if slides else hi
+    # The paper version pads too (less): its labels are smaller but were
+    # still clipped at x=0 and at the 1.0 ceiling (MRAS, SOS1, CRAF).
+    pad = 0.05 * (hi - lo)
+    lo_axis = lo - (0.05 if slides else pad)
+    hi_axis = hi + (0.045 if slides else pad)
     ax.set_xlim(lo_axis, hi_axis)
     ax.set_ylim(lo_axis if ymin is None else ymin, hi_axis)
     ax.grid(True, alpha=0.2)

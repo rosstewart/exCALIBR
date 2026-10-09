@@ -90,11 +90,12 @@ import numpy as np
 import pandas as pd
 
 from mv_analysis import config
+from mv_analysis import report
 from mv_analysis.mv_cockpit import pick_best_canonical_config, DEFAULT_RUN_KWARGS
 from mv_analysis.gene_performance_scatter import fast_results_json, PLAIN_INTEGRATED_GENES
 from mv_analysis.analyze_mv_pipeline_output import PREDICTOR_COMBINED_GENES
 from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
-from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+from src.assay_calibration.multivariate_data.common import resolve_clinvar_release, functional_datasets_for_gene
 from src.assay_calibration.multivariate_data.combined import (
     build_functional_scoresets, build_combined_multiscoreset,
     get_functionally_assayed_protein_variants, DEFAULT_INTEGRATED_DATAFRAME,
@@ -201,16 +202,25 @@ def score_gene(gene, gene_set, ms, dataset_name, vus_keys, variant_index=None):
     if variant_index is None:
         variant_index = {kv: i for i, kv in enumerate(ms.kept_variants)}
 
+    # "combined" gene-set: ALWAYS restrict VUS scoring to the intersection
+    # subset (both predictor AND functional dims observed), regardless of
+    # whether the underlying fit was trained on union or intersection --
+    # see mv_analysis.report._both_modality_mask's docstring for why.
+    both_mod = report._both_modality_mask(ms) if gene_set == "combined" else None
+
     rows, n_matched = [], 0
     for v in vus_keys:
         idx = variant_index.get(v)
         if idx is None:
             continue
+        if both_mod is not None and not both_mod[idx]:
+            continue
         n_matched += 1
         rows.append({"gene": gene, "gene_set": gene_set, "variant_key": str(v),
                       "our_points": points[idx], "canonical_config": best_config})
     print(f"  {gene}: {len(vus_keys)} true ClinVar VUS, {n_matched} matched "
-          f"(config={best_config})", flush=True)
+          f"(config={best_config})"
+          f"{' [both-modality restricted]' if both_mod is not None else ''}", flush=True)
     return rows
 
 
@@ -332,17 +342,19 @@ def run_combined_panel(out_path):
     and calls the underlying builders directly instead. Writes out_path
     incrementally (after each gene).
 
-    require_both_modalities is left at its default (True, see combined.py)
-    deliberately: regardless of what the stored "combined" fit was itself
-    trained on, EVERY evaluation of it -- VUS reclassification here, the
-    gene-performance scatter, results tables, confusion matrices -- must be
-    restricted to variants observed in at least one predictor dim AND at
-    least one functional dim. Scoring a "combined" model on a single-
-    modality variant (which is really just a predictor-only or
-    functional-only observation wearing a "combined" label) isn't a
-    meaningful evaluation of cross-modality calibration; VUS not surviving
-    this restriction are naturally dropped by score_gene's variant_index
-    lookup (absent key -> None), no extra masking needed here."""
+    ``require_both_modalities=False`` (union) is now passed explicitly here,
+    matching what the stored "combined" fit is actually trained on
+    (hpc/prepare.py's combined branch locks this to union too). Regardless
+    of training population, EVERY evaluation -- VUS reclassification here,
+    the gene-performance scatter, results tables, confusion matrices --
+    must still be restricted to variants observed in at least one predictor
+    dim AND at least one functional dim (scoring a "combined" model on a
+    single-modality variant isn't a meaningful evaluation of cross-modality
+    calibration) -- but that restriction is now applied by `score_gene`
+    itself (via `mv_analysis.report._both_modality_mask`) at scoring time,
+    not by pre-filtering the ms here. Pre-filtering the ms would mismatch
+    a union-trained fit's variant/weight-row shape (the role-count-mismatch
+    issue seen for TP53/BRCA2 this session)."""
     rows = []
 
     def _flush():
@@ -358,7 +370,7 @@ def run_combined_panel(out_path):
             continue
 
         try:
-            datasets = sorted(df_gene["Dataset"].unique())
+            datasets = functional_datasets_for_gene(df_integrated, gene)
             if not datasets:
                 print(f"  {gene}: no functional datasets, skipping", flush=True)
                 continue
@@ -369,7 +381,8 @@ def run_combined_panel(out_path):
             functionally_assayed = get_functionally_assayed_protein_variants(df_integrated, gene, datasets)
             ms = build_combined_multiscoreset(
                 gene, functional_scoresets, datasets, config.PREDICTOR_RAW_DATA_DIR,
-                functionally_assayed_variants=functionally_assayed)
+                functionally_assayed_variants=functionally_assayed,
+                require_both_modalities=False)
             if ms is None:
                 print(f"  SKIP {gene}: could not build combined ms", flush=True)
                 continue

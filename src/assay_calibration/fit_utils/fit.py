@@ -340,7 +340,8 @@ def pattern_stratified_bootstrap(observations, sample_assignments, bootstrap_see
     return train_out, eval_out
 
 
-def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, mv, fit_kwargs):
+def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, mv, fit_kwargs,
+                     cat_fit=None):
     """Validation log-likelihood with optional per-sample weighting.
 
     When sample_balance_beta=0 and sample_proportions=None (defaults), returns the
@@ -363,10 +364,22 @@ def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, 
     fit_kwargs : dict
         Expects sample_balance_beta (float) and/or sample_proportions (array-like)
         and/or sample_weight_transform ({None, "log2", "ln"}).
+    cat_fit : dict, optional
+        A single_fit result carrying ``cat_spec``/``cat_probs`` (EXPERIMENTAL
+        categorical dims, cfusn/categorical.py): the categorical columns are
+        split off and scored with the fitted per-component log-pmf.
     """
+    extra = None
+    if cat_fit is not None and cat_fit.get("cat_spec") is not None:
+        from .cfusn import categorical as _cat
+        spec = _cat.CatSpec.from_dict(cat_fit["cat_spec"])
+        val_observations, labels, _ = _cat.split_observations(val_observations, spec)
+        extra = _cat.cat_log_pdfs(labels, cat_fit["cat_probs"])
+
     if not fit_kwargs.get("weighted_val_ll", False):
         return get_likelihood(
-            val_observations, val_sample_assignments, params, weights, multivariate=mv
+            val_observations, val_sample_assignments, params, weights, multivariate=mv,
+            extra_log_pdfs=extra,
         ) / len(val_sample_assignments)
 
     beta = float(fit_kwargs.get("sample_balance_beta", 0.0))
@@ -375,14 +388,16 @@ def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, 
 
     if proportions is None and beta == 0.0 and transform not in ("log2", "ln"):
         return get_likelihood(
-            val_observations, val_sample_assignments, params, weights, multivariate=mv
+            val_observations, val_sample_assignments, params, weights, multivariate=mv,
+            extra_log_pdfs=extra,
         ) / len(val_sample_assignments)
 
     N_samples = val_sample_assignments.shape[1]
     n_per_sample = val_sample_assignments.sum(axis=0).astype(float)
 
     sample_lls = get_sample_likelihood(
-        val_observations, val_sample_assignments, params, weights, multivariate=mv
+        val_observations, val_sample_assignments, params, weights, multivariate=mv,
+        extra_log_pdfs=extra,
     )
     with np.errstate(invalid="ignore", divide="ignore"):
         per_sample_mean_ll = np.where(n_per_sample > 0, sample_lls / n_per_sample, 0.0)
@@ -535,7 +550,7 @@ class Fit:
             ):
                 return -np.inf
             try:
-                return _weighted_val_ll(obs, sa, params, weights, mv, kwargs)
+                return _weighted_val_ll(obs, sa, params, weights, mv, kwargs, cat_fit=m)
             except Exception:
                 return -np.inf
 
@@ -929,6 +944,45 @@ class Fit:
                 original_indices = original_indices[valid]
             kwargs["calibrated_dims"] = calibrated_dims
 
+            # ── Categorical dims (EXPERIMENTAL, opt-in) ──────────────────
+            # Name-keyed spec ({dim_name: [level names]}) from kwargs or the
+            # scoreset's own categorical_dims metadata, resolved AFTER the
+            # overlap gating above so positions refer to the calibrated
+            # columns (a gated-out categorical dim just drops out of the
+            # spec). Integer keys refer to original scoreset columns.
+            cat_spec = None
+            cat_dims_in = kwargs.get("categorical_dims")
+            if cat_dims_in is None:
+                cat_dims_in = getattr(self.scoreset, "categorical_dims", None)
+            if cat_dims_in:
+                from .cfusn import categorical as _cat
+                all_names = list(getattr(self.scoreset, "dataset_names", None)
+                                 or [str(i) for i in range(self.scoreset.scores.shape[1])])
+                by_name = {
+                    (all_names[k] if isinstance(k, (int, np.integer)) else k): v
+                    for k, v in cat_dims_in.items()
+                }
+                cal_names = [all_names[i] for i in calibrated_dims]
+                cat_spec = _cat.resolve_cat_spec(by_name, observations.shape[1], cal_names)
+                if cat_spec is not None:
+                    kwargs["cat_spec"] = cat_spec.to_dict()
+                else:
+                    kwargs.pop("cat_spec", None)
+
+            # ── Weight-divergence penalty (EXPERIMENTAL, opt-in) ─────────
+            # Name-keyed {"lambda", "groups": [[sample name, ...], ...]} ->
+            # {"lambda", "pairs"} over this job's sample columns; absent or
+            # lambda <= 0 leaves kwargs untouched (plain path).
+            if kwargs.get("weight_divergence"):
+                from .cfusn import weight_divergence as _wdiv
+                _wd = _wdiv.resolve_weight_divergence(
+                    kwargs["weight_divergence"], getattr(self.scoreset, "sample_names", None),
+                    sample_assignments.shape[1])
+                if _wd is not None:
+                    kwargs["weight_divergence"] = _wd
+                else:
+                    kwargs.pop("weight_divergence", None)
+
             # ── Per-dimension standardization ────────────────────────────
             # k-means init (kmeans_init_mv) clusters on raw Euclidean
             # distance, and the constrained-mode separation features
@@ -951,6 +1005,10 @@ class Fit:
             scale_mean = np.nanmean(observations, axis=0)
             scale_std = np.nanstd(observations, axis=0)
             scale_std = np.where(scale_std < 1e-8, 1.0, scale_std)
+            if cat_spec is not None:
+                # Categorical columns hold integer level codes: never standardize.
+                scale_mean[cat_spec.positions] = 0.0
+                scale_std[cat_spec.positions] = 1.0
             observations = (observations - scale_mean) / scale_std
             kwargs["_scale_mean"] = scale_mean
             kwargs["_scale_std"] = scale_std
@@ -1268,6 +1326,7 @@ class Fit:
                     result["weights"],
                     mv,
                     job.get("kwargs", {}),
+                    cat_fit=result,
                 )
 
             # Undo generate_fit_jobs's per-dimension standardization (if any)
@@ -1279,6 +1338,11 @@ class Fit:
             scale_mean = job.get("kwargs", {}).get("_scale_mean")
             scale_std = job.get("kwargs", {}).get("_scale_std")
             if scale_mean is not None and scale_std is not None:
+                if result.get("cat_spec") is not None:
+                    # Continuous block covers only the continuous columns.
+                    cont = result["cat_spec"]["cont_positions"]
+                    scale_mean = np.asarray(scale_mean)[cont]
+                    scale_std = np.asarray(scale_std)[cont]
                 result["component_params"] = _unstandardize_component_params(
                     result["component_params"], scale_mean, scale_std,
                 )

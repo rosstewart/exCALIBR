@@ -123,6 +123,11 @@ def resolve_component_for(
     return n_c, benign_method
 
 
+class SeededFits(list):
+    """List of per-bootstrap fits; `.seeds[i]` is the bootstrap seed of fits[i]."""
+    seeds: list = []
+
+
 def load_scoreset_and_fits(
     dataset: str,
     output_dir: Optional[str] = None,
@@ -219,10 +224,15 @@ def load_scoreset_and_fits(
     from src.assay_calibration.pipeline.visualize import load_precomputed_fits
 
     bootstrap_results = load_precomputed_fits(precomputed_fits, pipeline_dataset)
-    fits = [
-        seed_results[n_c] for seed_results in bootstrap_results.values()
+    # In bootstrap-seed order, with the seeds attached: the JSON keys are
+    # strings ("0", "100", "101", ...), and the Yang distance pairs each fit
+    # with its own seed's training split (analysis.yang_distance).
+    _seeded = sorted(
+        (int(seed), seed_results[n_c]) for seed, seed_results in bootstrap_results.items()
         if isinstance(seed_results, dict) and seed_results.get(n_c) is not None
-    ]
+    )
+    fits = SeededFits(fit for _, fit in _seeded)
+    fits.seeds = [seed for seed, _ in _seeded]
     if not fits:
         raise KeyError(f"No '{n_c}' fits found for '{pipeline_dataset}' in {precomputed_fits}")
 

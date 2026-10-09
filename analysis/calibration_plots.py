@@ -11,6 +11,7 @@ in src/assay_calibration/plot_utils/utils.py.)
 """
 from __future__ import annotations
 
+from analysis.plot_common import display_name
 import gzip
 import json
 from pathlib import Path
@@ -263,7 +264,7 @@ def make_calibration_figure(
         squeeze=False,
         gridspec_kw={"hspace": 0.38, "wspace": 0.30},
     )
-    fig.suptitle(dataset.replace("_", " "), fontsize=13, fontweight="bold", y=1.01)
+    fig.suptitle(display_name(dataset).replace("_", " "), fontsize=13, fontweight="bold", y=1.01)
 
     for col, sname in enumerate(samples_present):
         a = ax[0, col]
@@ -383,6 +384,9 @@ def plot_yang_distance_diagnostic(
     filename: str = "yang_distance_diagnostic.png",
     good_fit_threshold: float = 0.2,
     n_jobs: int = 8,
+    cache_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    n_grid: int = 10000,
 ):
     """4-panel (2x2) diagnostic: distribution of per-bootstrap Yang distances
     (normalized, p=2) between each sample's empirical training data and its
@@ -401,7 +405,7 @@ def plot_yang_distance_diagnostic(
     A dashed horizontal line at `good_fit_threshold` marks the "good fit"
     cutoff used in the main text (distances below 0.2).
     """
-    from analysis.yang_distance import compute_bootstrap_yang_distances_parallel
+    from analysis.yang_distance import cached_bootstrap_yang_distances
 
     if len(dataset_names) != 4:
         raise ValueError("Must provide exactly 4 dataset names")
@@ -413,19 +417,22 @@ def plot_yang_distance_diagnostic(
         try:
             scoreset, indv_summary, fits, score_range, config, n_c, flipped, n_samples = loader_fn(dataset)
         except Exception as e:
-            ax.set_title(f"({letter}) {dataset}\n[failed to load: {e}]", fontsize=10)
+            ax.set_title(f"({letter}) {display_name(dataset)}\n[failed to load: {e}]", fontsize=10)
             ax.axis("off")
             print(f"  SKIP Yang distance panel for {dataset}: {e}")
             continue
 
-        distances = compute_bootstrap_yang_distances_parallel(dataset, n_c, fits, scoreset, n_jobs=n_jobs)
+        distances = cached_bootstrap_yang_distances(
+            dataset, n_c, fits, scoreset, cache_dir=cache_dir, output_dir=output_dir, n_jobs=n_jobs,
+            n_grid=n_grid,
+        )
 
         present = [
             k for k in _YANG_SAMPLE_ORDER
             if k in distances and not np.all(np.isnan(distances[k]))
         ]
         if not present:
-            ax.set_title(f"({letter}) {dataset}\n[no sample had valid distances]", fontsize=10)
+            ax.set_title(f"({letter}) {display_name(dataset)}\n[no sample had valid distances]", fontsize=10)
             ax.axis("off")
             continue
 

@@ -466,14 +466,23 @@ def _single_component_logpdf(x, params, multivariate=False):
             if Delta_arr.ndim == 2 and Delta_arr.shape[1] > 1:
                 # CFUSN path
                 if has_nan:
-                    return cfusn_logpdf_alternate_missing(x_arr, mu, Delta, Gamma)
-                return cfusn_logpdf_alternate(x_arr, mu, Delta, Gamma)
+                    out = cfusn_logpdf_alternate_missing(x_arr, mu, Delta, Gamma)
+                else:
+                    out = cfusn_logpdf_alternate(x_arr, mu, Delta, Gamma)
             else:
                 # q=1 restricted MSN path
                 Delta_vec = Delta_arr.ravel()
                 if has_nan:
-                    return msn_logpdf_alternate_missing(x_arr, mu, Delta_vec, Gamma)
-                return msn_logpdf_alternate(x_arr, mu, Delta_vec, Gamma)
+                    out = msn_logpdf_alternate_missing(x_arr, mu, Delta_vec, Gamma)
+                else:
+                    out = msn_logpdf_alternate(x_arr, mu, Delta_vec, Gamma)
+            # Always (N,): the fully-observed paths squeeze a single row to a
+            # 0-d scalar, which made log_joint_densities' log_w[:, None] +
+            # log_pdfs broadcast to (K, K) and get_likelihood score a one-row
+            # sample as ~the sum of every component's log-pdf (corrupting
+            # val_ll whenever a class's held-out split had exactly one fully
+            # observed row).
+            return np.asarray(out, dtype=float).reshape(x_arr.shape[0])
         else:
             # canonical form fallback
             return multivariate_skewnorm.logpdf(x, *params)
@@ -543,18 +552,39 @@ def get_log_fPB(X, params, weights, multivariate=False):
     )
 
 
+def _component_logpdfs(x, params, multivariate):
+    """(K, N) per-component log-pdfs; adds the categorical term when
+    ``params`` is a categorical.MixtureParams (analysis-side fitted mixtures
+    with categorical dims). The EM fitter only ever passes plain lists, for
+    which this is the original per-component loop."""
+    if getattr(params, "cat_spec", None) is not None:
+        from .categorical import component_logpdf_full
+
+        def _base(xc, mu, Delta, Gamma):
+            return _single_component_logpdf(xc, (mu, Delta, Gamma), multivariate)
+        return np.array([component_logpdf_full(x, params, c, _base) for c in range(len(params))])
+    return np.array([_single_component_logpdf(x, p, multivariate) for p in params])
+
+
 def joint_densities(x, params, weights, multivariate=False):
+    if getattr(params, "cat_spec", None) is not None:
+        lp = _component_logpdfs(x, params, multivariate)
+        return np.array([w * np.exp(l) for l, w in zip(lp, weights)])
     return np.array([
         w * np.exp(_single_component_logpdf(x, p, multivariate))
         for p, w in zip(params, weights)
     ])
 
 
-def log_joint_densities(x, params, weights, multivariate=False):
+def log_joint_densities(x, params, weights, multivariate=False, extra_log_pdfs=None):
+    """``extra_log_pdfs``: optional (K, N) additive per-component log-density
+    term aligned to the rows of ``x`` -- the categorical part of the
+    location model (see cfusn/categorical.py). None leaves the result
+    bit-identical."""
     weights = np.asarray(weights)
-    log_pdfs = np.array([
-        _single_component_logpdf(x, p, multivariate) for p in params
-    ])
+    log_pdfs = _component_logpdfs(x, params, multivariate)
+    if extra_log_pdfs is not None:
+        log_pdfs = log_pdfs + extra_log_pdfs
     with np.errstate(divide="ignore"):
         log_w = np.log(weights)
     log_w[weights == 0] = -np.inf
@@ -566,7 +596,8 @@ def log_joint_densities(x, params, weights, multivariate=False):
 # ──────────────────────────────────────────────
 
 def component_posteriors(X, canonical_params, individual_sample_weights,
-                          multivariate=False, cached_log_pdfs=None):
+                          multivariate=False, cached_log_pdfs=None,
+                          extra_log_pdfs=None):
     """Compute responsibilities P(component | x).
 
     Parameters
@@ -574,7 +605,11 @@ def component_posteriors(X, canonical_params, individual_sample_weights,
     cached_log_pdfs : (K, N_s) array or None
         If provided, skips the density evaluation (which is the dominant
         cost) and reuses the supplied log-pdfs. Caller is responsible for
-        ensuring the cache matches ``X`` and ``canonical_params``.
+        ensuring the cache matches ``X`` and ``canonical_params``. The cache
+        always holds the continuous part only; ``extra_log_pdfs`` is added
+        after it, so a cache stays valid when categorical probs change.
+    extra_log_pdfs : (K, N_s) array or None
+        Additive categorical log-pmf term (cfusn/categorical.py).
     """
     individual_sample_weights = np.array(individual_sample_weights)[:, None]
     assert len(canonical_params) == individual_sample_weights.shape[0]
@@ -598,6 +633,9 @@ def component_posteriors(X, canonical_params, individual_sample_weights,
             log_pdfs_list.append(lp)
         log_pdfs = np.stack(log_pdfs_list, axis=0)
 
+    if extra_log_pdfs is not None:
+        log_pdfs = log_pdfs + extra_log_pdfs
+
     with np.errstate(divide="ignore", invalid="ignore"):
         # invalid='ignore' suppresses the (-inf) - (-inf) = NaN warning that
         # fires when an observation has zero density under all components;
@@ -614,7 +652,7 @@ def component_posteriors(X, canonical_params, individual_sample_weights,
 # ──────────────────────────────────────────────
 
 def get_likelihood(observations, sample_indicators, component_params, weights,
-                   multivariate=False, sample_weights=None):
+                   multivariate=False, sample_weights=None, extra_log_pdfs=None):
     """Total log-likelihood under the mixture.
 
     When ``sample_weights`` (per-obs, length N) is given, returns the
@@ -625,13 +663,18 @@ def get_likelihood(observations, sample_indicators, component_params, weights,
     Used by EM under ``sample_balance_beta>0``: the M-step then
     maximises the same weighted Q-function we evaluate here, restoring
     the standard EM monotonicity guarantee on this objective.
+
+    ``extra_log_pdfs``: optional (K, N) categorical term aligned to the rows
+    of ``observations`` (cfusn/categorical.py); sliced per sample.
     """
     if component_params is None or weights is None:
         return -np.inf
     L = 0.0
     for s, mask in enumerate(sample_indicators.T):
         X = observations[mask]
-        lw = log_joint_densities(X, component_params, weights[s], multivariate=multivariate)
+        extra = None if extra_log_pdfs is None else extra_log_pdfs[:, mask]
+        lw = log_joint_densities(X, component_params, weights[s], multivariate=multivariate,
+                                 extra_log_pdfs=extra)
         log_mix = logsumexp(lw, axis=0)
         if sample_weights is not None:
             L += float(np.sum(np.asarray(sample_weights)[mask] * log_mix))
@@ -640,12 +683,15 @@ def get_likelihood(observations, sample_indicators, component_params, weights,
     return L
 
 
-def get_sample_likelihood(observations, sample_indicators, component_params, weights, multivariate=False):
+def get_sample_likelihood(observations, sample_indicators, component_params, weights,
+                          multivariate=False, extra_log_pdfs=None):
     if component_params is None or weights is None:
         return [-np.inf] * sample_indicators.shape[1]
     Ls = [0.0] * sample_indicators.shape[1]
     for s, mask in enumerate(sample_indicators.T):
         X = observations[mask]
-        lw = log_joint_densities(X, component_params, weights[s], multivariate=multivariate)
+        extra = None if extra_log_pdfs is None else extra_log_pdfs[:, mask]
+        lw = log_joint_densities(X, component_params, weights[s], multivariate=multivariate,
+                                 extra_log_pdfs=extra)
         Ls[s] += logsumexp(lw, axis=0).sum()
     return np.array(Ls)

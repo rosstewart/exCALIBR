@@ -93,13 +93,17 @@ def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
     lo = coarse_vals[max(best_i - 1, 0)]
     hi = coarse_vals[min(best_i + 1, len(coarse_vals) - 1)]
 
-    fine_vals = np.arange(max(1, lo), hi + 1)
-    if len(fine_vals) > 250_000:
+    # Check the window width before allocating it: far out in the log grid
+    # the window can span ~1e11 integers (seen for an extreme bootstrap
+    # prior), which np.arange cannot allocate.
+    if hi - max(1, lo) + 1 > 250_000:
         # Window too wide for a dense integer scan (only possible far out
         # in the log grid, where neighboring points are themselves far
         # apart) -- fall back to a denser log-spaced sub-scan of the same
         # window instead of scanning every integer in it.
         fine_vals = np.unique(np.round(np.geomspace(max(1, lo), hi, 250_000)).astype(np.int64))
+    else:
+        fine_vals = np.arange(max(1, lo), hi + 1)
     fine_fails = _tavtigian_fails(fine_vals, prior, original, strict, verbose)
     return int(fine_vals[np.argmin(fine_fails)])
 

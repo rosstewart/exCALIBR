@@ -41,10 +41,10 @@ def _build_ms(gene, gene_set, require_both_modalities):
             build_functional_scoresets, build_combined_multiscoreset,
             get_functionally_assayed_protein_variants, DEFAULT_INTEGRATED_DATAFRAME,
         )
-        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release, functional_datasets_for_gene
         import pandas as pd
         df = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
-        datasets = sorted(df[df["Gene"] == gene]["Dataset"].unique())
+        datasets = functional_datasets_for_gene(df, gene)
         functional_scoresets = build_functional_scoresets(
             df, gene, datasets, clinvar_release=resolve_clinvar_release(gene))
         functionally_assayed = get_functionally_assayed_protein_variants(df, gene, datasets)

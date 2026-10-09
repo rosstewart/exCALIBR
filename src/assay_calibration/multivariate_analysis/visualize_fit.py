@@ -27,6 +27,7 @@ from scipy.stats import multivariate_normal as mvn, norm
 from scipy.ndimage import uniform_filter1d
 from joblib import Parallel, delayed
 from ..fit_utils.cfusn.density_utils import get_q
+from ..fit_utils.cfusn import categorical as _cat
 
 
 # ──────────────────────────────────────
@@ -84,6 +85,20 @@ def _sn_logpdf(x, mu, Delta, Gamma):
         return _cfusn_logpdf(x, mu, Delta, Gamma)
     else:
         return _msn_logpdf_q1(x, mu, np.atleast_1d(Delta).ravel(), Gamma)
+
+
+def _comp_logpdf(x, params, c):
+    """Component ``c``'s log-density on full-width rows, including the
+    categorical term when ``params`` carries one (fit_utils/cfusn/
+    categorical.py); otherwise exactly ``_sn_logpdf(x, *params[c])``."""
+    return _cat.component_logpdf_full(x, params, c, _sn_logpdf)
+
+
+def _categorical_dim_levels(ms):
+    """{column index: n_levels} for ms.categorical_dims (empty if none)."""
+    cat_dims = getattr(ms, "categorical_dims", None) or {}
+    names = list(getattr(ms, "dataset_names", []))
+    return {names.index(n): len(levels) for n, levels in cat_dims.items() if n in names}
 
 
 def _msn_logpdf_q1(x, mu, Delta, Gamma):
@@ -217,6 +232,7 @@ def _reconstitute_fit_dict(fit_raw):
         if Delta.ndim == 2 and Delta.shape[1] == 1:
             Delta = Delta.ravel()
         params.append((mu, Delta, Gamma))
+    params = _cat.wrap_params(params, inner)
     weights = np.array(inner['weights'], dtype=float)
     val_ll = fit_raw.get('val_ll')
     return {'component_params': params, 'weights': weights,
@@ -237,6 +253,61 @@ def _collect_valid_fits(analysis, config):
         for fit_raw in candidates
     )
     return [r for r in results if r is not None]
+
+
+def _measured_marginals_for_fit(fit, scores, sample_assignments, x_grids):
+    """Per-dimension, per-sample mixture density for ONLY the variants on which
+    that dimension was measured (OPT-IN; see precompute_mv_plot_data's
+    ``measured_marginals``).
+
+    The ordinary per-sample marginal mixes components with the sample's
+    whole-sample weights W[s], i.e. it describes a random variant of the
+    sample as if every variant had that dimension measured. For a dimension
+    measured on a non-random subset (e.g. a DNA-binding-domain-only assay in
+    gnomAD) that is a different population from the plotted histogram. Here
+    the weights are instead the average, over the measured rows, of each
+    row's component posterior given ALL its observed dimensions:
+    sum_k rbar_k f_k(x_d) -- the fitted mixture reweighted to exactly the
+    plotted variants (the per-subset analogue of W[s], which EM sets to the
+    mean posterior over all of s's rows). It checks whether the fitted
+    component shapes describe those variants.
+
+    (A leave-this-dimension-out posterior was tried first and rejected for
+    joint-component fits: components specialised to variants WITHOUT the
+    dimension have broad, poorly determined marginals on it, and masking
+    the dimension lets measured rows leak onto them, smearing the curve.)
+
+    Returns a list over dims of {s: log-density on x_grids[d], or None}.
+    """
+    params = fit['component_params']
+    W = np.asarray(fit['weights'], dtype=float)
+    K = len(params)
+    N, D = scores.shape
+    S = min(sample_assignments.shape[1], W.shape[0])
+    out = []
+    for d in range(D):
+        x_2d = np.full((len(x_grids[d]), D), np.nan)
+        x_2d[:, d] = x_grids[d]
+        comp_grid = np.array([_comp_logpdf(x_2d, params, c) for c in range(K)])
+        res = {}
+        for s in range(S):
+            rows = np.where(sample_assignments[:, s] & ~np.isnan(scores[:, d]))[0]
+            if len(rows) == 0:
+                res[s] = None
+                continue
+            X = scores[rows]
+            has = ~np.all(np.isnan(X), axis=1)
+            R = np.tile(W[s][:, None], (1, len(rows)))
+            if has.any():
+                with np.errstate(divide='ignore'):
+                    lp = (np.array([_comp_logpdf(X[has], params, c) for c in range(K)])
+                          + np.log(W[s])[:, None])
+                R[:, has] = np.exp(lp - logsumexp(lp, axis=0))
+            rbar = R.mean(axis=1)
+            with np.errstate(divide='ignore'):
+                res[s] = logsumexp(comp_grid + np.log(rbar)[:, None], axis=0)
+        out.append(res)
+    return out
 
 
 def _eval_all_marginals(fit, x_2d_list, p_idx, b_idx, s_idx, benign_method, S,
@@ -264,7 +335,7 @@ def _eval_fit_on_grid(fit, grid_pts, p_idx, b_idx, s_idx, benign_method,
     nu_mode = p_idx is None and (b_idx is not None or s_idx is not None) and g_idx is not None
     pu_mode = p_idx is not None and b_idx is None and s_idx is None and g_idx is not None
 
-    comp_log = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+    comp_log = [_comp_logpdf(grid_pts, params, c) for c in range(K)]
 
     s_valid = s_idx is not None and s_idx < n_w
     b_valid = b_idx is not None and b_idx < n_w
@@ -324,7 +395,7 @@ def _eval_fit_on_grid_batch_p(fit, grid_pts, p_indices, b_idx, s_idx, benign_met
     K = len(params)
     n_w = len(weights)
 
-    comp_log = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+    comp_log = [_comp_logpdf(grid_pts, params, c) for c in range(K)]
 
     s_valid = s_idx is not None and s_idx < n_w
     b_valid = b_idx is not None and b_idx < n_w
@@ -403,7 +474,7 @@ def _eval_all_marginals_batch_p(fit, x_2d_list, p_indices, b_idx, s_idx, benign_
     results_per_p = [[] for _ in p_indices]
 
     for x_2d in x_2d_list:
-        comp_log = [_sn_logpdf(x_2d, *params[c]) for c in range(K)]
+        comp_log = [_comp_logpdf(x_2d, params, c) for c in range(K)]
 
         sample_logs, comp_logs_per_sample = [], []
         for s in range(S):
@@ -451,7 +522,7 @@ def _eval_fit_sample_densities(fit, grid_pts, n_samples):
     params = fit['component_params']
     weights = fit['weights']
     K = len(params)
-    comp_logs = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+    comp_logs = [_comp_logpdf(grid_pts, params, c) for c in range(K)]
     result = []
     for s in range(n_samples):
         w_s = weights[s]
@@ -479,7 +550,7 @@ def _eval_marginal_fit(fit, x_2d, p_idx, b_idx, s_idx, benign_method, S,
     K = len(params)
     n_w = len(weights)
 
-    comp_log = [_sn_logpdf(x_2d, *params[c]) for c in range(K)]
+    comp_log = [_comp_logpdf(x_2d, params, c) for c in range(K)]
 
     sample_logs = []
     comp_logs_per_sample = []
@@ -622,7 +693,7 @@ def _compute_all_sample_density_grids(all_fits, S, x1g, x2g,
     if not all_fits:
         return [None] * S
     if total_dims is None:
-        total_dims = all_fits[0]['component_params'][0][0].shape[0]
+        total_dims = _cat.total_dims(all_fits[0]['component_params'])
 
     X1, X2 = np.meshgrid(x1g, x2g, indexing='ij')
     grid_pts = np.full((X1.size, total_dims), np.nan)
@@ -644,7 +715,7 @@ def _compute_all_sample_density_grids(all_fits, S, x1g, x2g,
         K = len(params)
         n_w = len(weights)
         # Component log-densities computed once, shared across all samples
-        comp_log = [_sn_logpdf(grid_pts, *params[c]) for c in range(K)]
+        comp_log = [_comp_logpdf(grid_pts, params, c) for c in range(K)]
         for s in range(min(S, n_w)):
             w_s = weights[s]
             log_d = logsumexp([np.log(w_s[c] + 1e-300) + comp_log[c]
@@ -670,7 +741,7 @@ def _compute_all_sample_density_grids(all_fits, S, x1g, x2g,
 def _compute_sample_density_grid(all_fits, s_idx, x1g, x2g, dim_i=0, dim_j=1, total_dims=None):
     """Compute mean density for sample s_idx on a 2D grid."""
     if total_dims is None and all_fits:
-        total_dims = all_fits[0]['component_params'][0][0].shape[0]
+        total_dims = _cat.total_dims(all_fits[0]['component_params'])
     if total_dims is None:
         total_dims = 2
     X1, X2 = np.meshgrid(x1g, x2g, indexing='ij')
@@ -688,7 +759,7 @@ def _compute_sample_density_grid(all_fits, s_idx, x1g, x2g, dim_i=0, dim_j=1, to
         K = len(params)
         w_s = weights[s_idx]
         log_d = logsumexp([
-            np.log(w_s[c] + 1e-300) + _sn_logpdf(grid_pts, *params[c])
+            np.log(w_s[c] + 1e-300) + _comp_logpdf(grid_pts, params, c)
             for c in range(K)
         ], axis=0)
         densities.append(log_d)
@@ -984,7 +1055,7 @@ def _compute_all_marginals_batch_p(all_fits, x_grids, p_indices,
     D = len(x_grids)
     total_dims = len(x_grids)   # will be overridden below from first fit
     if all_fits:
-        total_dims = all_fits[0]['component_params'][0][0].shape[0]
+        total_dims = _cat.total_dims(all_fits[0]['component_params'])
 
     x_2d_list = []
     for dim, x_grid in enumerate(x_grids):
@@ -1083,8 +1154,18 @@ def build_heatmap_data(analysis, config):
     }
 
 def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
-                            projection=None, pivot_dim='activity_No_treatment'):
+                            projection=None, pivot_dim='activity_No_treatment',
+                            measured_marginals=False):
     """Precompute all expensive data needed for plot_mv_calibration.
+
+    measured_marginals : bool (default False)
+        OPT-IN. Additionally store, per dimension and sample, the fitted
+        mixture density for only the variants on which that dimension was
+        measured (``marginal_data[d]['sample_measured'][s]``; see
+        _measured_marginals_for_fit). The marginal renderers then draw it as
+        the main curve, with the whole-sample marginal faint/dashed -- the
+        like-for-like comparison with the histogram for dimensions measured
+        on a non-random subset of a sample. Off: output unchanged.
 
     Returns a dict that can be passed directly to render_mv_plot_data.
     Separating precomputation from rendering means you can tweak plot
@@ -1117,12 +1198,19 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
     path_pctile = r_cfg.get('path_percentile', 5)
     ben_pctile  = 100 - path_pctile
 
+    # Categorical dims (fit_utils/cfusn/categorical.py) are evaluated only at
+    # their level codes: the "marginal density" there is the fitted pmf, and
+    # np.interp lookups at an observed (integer) code return that grid point
+    # exactly.
+    cat_levels = _categorical_dim_levels(ms)
     x_grids = [
+        np.arange(cat_levels[d], dtype=float) if d in cat_levels else
         np.linspace(np.nanmin(scores[:, d]) - pad, np.nanmax(scores[:, d]) + pad, 500)
         for d in range(D)
     ]
     # Separate coarser grids for 2D pairwise display (n_grid × n_grid, not 500 × 500)
     x_grids_plot = [
+        np.arange(cat_levels[d], dtype=float) if d in cat_levels else
         np.linspace(np.nanmin(scores[:, d]) - pad, np.nanmax(scores[:, d]) + pad, n_grid)
         for d in range(D)
     ]
@@ -1151,6 +1239,31 @@ def precompute_mv_plot_data(analysis, config, n_grid=120, pad=0.5, n_jobs=-1,
         n_jobs=n_jobs,
     )
     marginal_data = {d: primary_marginals[0][d] for d in range(D)}
+
+    if measured_marginals:
+        print(f"  Computing measured-variant marginals ({D} dims, {n_boots_used} boots)...")
+        sa_bool = np.asarray(ms.sample_assignments, dtype=bool)
+        meas = Parallel(n_jobs=n_jobs)(
+            delayed(_measured_marginals_for_fit)(fit, scores, sa_bool, x_grids)
+            for fit in all_fits
+        )
+        for d in range(D):
+            if marginal_data.get(d) is None:
+                continue
+            per_s = {}
+            for s in range(S):
+                arr = [m[d][s] for m in meas if s in m[d] and m[d][s] is not None]
+                if not arr:
+                    per_s[s] = None
+                    continue
+                arr = np.array(arr)
+                per_s[s] = {
+                    'mean': np.exp(logsumexp(arr, axis=0) - np.log(arr.shape[0])),
+                    'std': np.std(np.exp(arr), axis=0),
+                    'n_measured': int((sa_bool[:, s] & ~np.isnan(scores[:, d])).sum()),
+                    'n_total': int(sa_bool[:, s].sum()),
+                }
+            marginal_data[d]['sample_measured'] = per_s
 
     aux_marginal_data = {}
     if aux_p_entries:
@@ -1474,7 +1587,17 @@ def precompute_mv_plot_data_cached(analysis, config, cache_dir, n_grid=120, pad=
     re-injected as the live ``analysis`` object on every call, cached or not.
     """
     os.makedirs(cache_dir, exist_ok=True)
-    gene = getattr(analysis.ms, 'scoreset_name', 'gene')
+    # Real gene name, NOT ms.scoreset_name -- for a multi-dataset ms (e.g.
+    # "combined", predictor+functional), scoreset_name is " + ".join(every
+    # dataset name), which for BRCA2 (11 datasets) and TP53 (19 datasets,
+    # incl. Kato_2003's 8-assay panel) blows past the filesystem's 255-byte
+    # filename limit (OSError: File name too long). analysis.gene is the
+    # short, actual gene identifier MVCalibrationAnalysis was constructed
+    # with; fall back to scoreset_name (truncated+hashed if needed) only
+    # for the rare direct-construction case where gene wasn't set.
+    gene = getattr(analysis, 'gene', None) or getattr(analysis.ms, 'scoreset_name', 'gene')
+    if len(gene) > 64:
+        gene = f"{gene[:40]}_{hashlib.sha1(gene.encode()).hexdigest()[:8]}"
     r = analysis.results.get(config, {}) or {}
     key_material = repr({
         'gene': gene,
@@ -1685,6 +1808,7 @@ def plot_component_densities(precomputed, sample_names=None, sample_style=None,
         sample_names = [_sn_raw[i] if i < len(_sn_raw) else f'Sample {i}' for i in range(S)]
     _sc = sample_style['colors'] if sample_style else [SAMPLE_COLORS[i % len(SAMPLE_COLORS)] for i in range(S)]
 
+    cat_levels = _categorical_dim_levels(ms)
     figs = {}
     for dim in range(D):
         md = marginal_data.get(dim)
@@ -1701,6 +1825,49 @@ def plot_component_densities(precomputed, sample_names=None, sample_style=None,
 
             obs = scores[sa[:, s_idx], dim]
             obs = obs[~np.isnan(obs)]
+
+            if dim in cat_levels:
+                # Categorical dim: observed level frequencies (bars) vs the
+                # fitted pmf (x_marg holds the level codes, so md's "density"
+                # there is sum_k w_k pi_k(level)).
+                L = cat_levels[dim]
+                codes = np.arange(L)
+                level_names = ms.categorical_dims[dataset_names[dim]]
+                if len(obs) > 0:
+                    freq = np.bincount(obs.astype(int), minlength=L) / len(obs)
+                    ax.bar(codes, freq, width=0.6, alpha=0.25, color=color,
+                           edgecolor='white', label=f'Observed (n={len(obs)})')
+                s_data = md['sample'][s_idx] if md['sample'] is not None else None
+                meas = (md.get('sample_measured') or {}).get(s_idx)
+                if meas is not None:
+                    ax.errorbar(codes, meas['mean'], yerr=meas['std'], fmt='s-', color='k',
+                                lw=1.4, ms=4, capsize=3, zorder=4,
+                                label=f"Mixture (measured {meas['n_measured']}/{meas['n_total']})")
+                if s_data is not None:
+                    ax.errorbar(codes, s_data['mean'], yerr=s_data['std'], fmt='o-', color=color,
+                                lw=1.8 if meas is None else 1.0, capsize=3, zorder=3,
+                                alpha=1.0 if meas is None else 0.5,
+                                label='Mixture' if meas is None else 'Mixture (whole sample)')
+                    c_data = md['components'][s_idx] if md['components'] is not None else None
+                    if c_data is not None:
+                        comp_colors = plt.cm.Set2(np.linspace(0, 1, max(len(c_data), 3)))
+                        for c in range(len(c_data)):
+                            c_mean = c_data[c]['mean']
+                            if c_mean.max() < np.max(s_data['mean']) * 0.005:
+                                continue
+                            ax.plot(codes, c_mean, color=comp_colors[c], lw=1.0, ls='--',
+                                    marker='x', alpha=0.8, label=f'Component {c + 1}')
+                ax.set_xticks(codes)
+                ax.set_xticklabels(level_names, fontsize=7)
+                ax.set_ylim(0, 1.05)
+                n_s = int(sa[:, s_idx].sum())
+                ax.set_title(f'{sample_names[s_idx]} (n={n_s})', fontsize=9,
+                             fontweight='bold', color=color)
+                ax.set_xlabel(f'{dataset_names[dim]} (categorical)', fontsize=8)
+                ax.set_ylabel('Probability', fontsize=8)
+                ax.legend(fontsize=6, framealpha=0.6)
+                ax.grid(lw=0.2, alpha=0.2)
+                continue
             # Scale the y-axis off the observed histogram, not the fitted
             # curve -- a component fit to a handful of points can have an
             # arbitrarily tall, narrow peak that would otherwise swamp the
@@ -1723,9 +1890,21 @@ def plot_component_densities(precomputed, sample_names=None, sample_style=None,
                 total_mean = s_data['mean']
                 total_std = s_data['std']
                 curve_ymax = float(np.nanmax(total_mean)) if len(total_mean) else None
-                ax.plot(x_marg, total_mean, color=color, lw=1.8, zorder=3, label='Mixture')
-                ax.fill_between(x_marg, np.maximum(total_mean - total_std, 0),
-                                total_mean + total_std, color=color, alpha=0.1)
+                meas = (md.get('sample_measured') or {}).get(s_idx)
+                if meas is not None:
+                    # Opt-in measured-variant curve is the like-for-like one
+                    # for the histogram; whole-sample marginal kept faint.
+                    ax.plot(x_marg, total_mean, color=color, lw=1.0, ls='--', alpha=0.5,
+                            zorder=3, label='Mixture (whole sample)')
+                    ax.plot(x_marg, meas['mean'], color=color, lw=1.8, zorder=4,
+                            label=f"Mixture (measured {meas['n_measured']}/{meas['n_total']})")
+                    ax.fill_between(x_marg, np.maximum(meas['mean'] - meas['std'], 0),
+                                    meas['mean'] + meas['std'], color=color, alpha=0.1)
+                    curve_ymax = max(curve_ymax or 0, float(np.nanmax(meas['mean'])))
+                else:
+                    ax.plot(x_marg, total_mean, color=color, lw=1.8, zorder=3, label='Mixture')
+                    ax.fill_between(x_marg, np.maximum(total_mean - total_std, 0),
+                                    total_mean + total_std, color=color, alpha=0.1)
                 c_data = md['components'][s_idx] if md['components'] is not None else None
                 if c_data is not None:
                     n_comp = len(c_data)
@@ -2713,8 +2892,12 @@ _AUX_COLORS = ['#e6a817', '#8B4513', '#006400', '#800080', '#FF6600', '#4B0082']
 def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
                        dataset_names, sample_names, tau_p_log, tau_b_log,
                        ylim_bound, path_pctile, ben_pctile, analysis,
-                       sample_style=None, extra_lr_cols=None):
+                       sample_style=None, extra_lr_cols=None, cat_level_names=None):
     """Draw one row: S sample density panels + primary LR+ + optional extra LR+ columns.
+
+    cat_level_names : level names (code order) when ``dim`` is categorical;
+        the density panels then show observed level frequencies (bars) vs
+        the fitted pmf (markers), and LR panels get level-name x ticks.
 
     extra_lr_cols : list of dicts, each with keys:
         md        : marginal_data dict for this dim (or None)
@@ -2739,6 +2922,30 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
 
         obs = scores[sa[:, s_idx], dim]
         obs = obs[~np.isnan(obs)]
+        if cat_level_names is not None:
+            L = len(cat_level_names)
+            codes = np.arange(L)
+            if len(obs) > 0:
+                ax.bar(codes, np.bincount(obs.astype(int), minlength=L) / len(obs),
+                       width=0.6, alpha=0.25, color=color, edgecolor='white')
+            s_data = md['sample'][s_idx] if md['sample'] is not None else None
+            meas = (md.get('sample_measured') or {}).get(s_idx)
+            if meas is not None:
+                ax.errorbar(codes, meas['mean'], yerr=meas['std'], fmt='s-', color='k',
+                            lw=1.3, ms=3, capsize=2, zorder=4)
+            if s_data is not None:
+                ax.errorbar(codes, s_data['mean'], yerr=s_data['std'], fmt='o-', color=color,
+                            lw=1.5 if meas is None else 0.9, ms=3, capsize=2, zorder=3,
+                            alpha=1.0 if meas is None else 0.5)
+            ax.set_xticks(codes)
+            ax.set_xticklabels(cat_level_names, fontsize=6)
+            ax.set_ylim(0, 1.05)
+            ax.set_xlabel(f'{dataset_names[dim]} (categorical)', fontsize=7)
+            ax.set_ylabel('Probability', fontsize=7)
+            ax.set_title(f'{sample_names[s_idx]} — {dataset_names[dim]} (n={len(obs)})',
+                         fontsize=7, fontweight='bold', color=color)
+            ax.grid(lw=0.2, alpha=0.2)
+            continue
         # Scale the y-axis off the observed histogram, not the fitted curve
         # -- a component fit to a handful of points can have an arbitrarily
         # tall, narrow peak that would otherwise swamp the axis and flatten
@@ -2760,10 +2967,18 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
             total_mean = s_data['mean']
             total_std  = s_data['std']
             curve_ymax = float(np.nanmax(total_mean)) if len(total_mean) else None
-            ax.plot(x_marg, total_mean, color=color, lw=1.5, zorder=3)
-            ax.fill_between(x_marg,
-                            np.maximum(total_mean - total_std, 0),
-                            total_mean + total_std, color=color, alpha=0.08)
+            meas = (md.get('sample_measured') or {}).get(s_idx)
+            if meas is not None:
+                ax.plot(x_marg, total_mean, color=color, lw=0.9, ls='--', alpha=0.5, zorder=3)
+                ax.plot(x_marg, meas['mean'], color=color, lw=1.5, zorder=4)
+                ax.fill_between(x_marg, np.maximum(meas['mean'] - meas['std'], 0),
+                                meas['mean'] + meas['std'], color=color, alpha=0.08)
+                curve_ymax = max(curve_ymax or 0, float(np.nanmax(meas['mean'])))
+            else:
+                ax.plot(x_marg, total_mean, color=color, lw=1.5, zorder=3)
+                ax.fill_between(x_marg,
+                                np.maximum(total_mean - total_std, 0),
+                                total_mean + total_std, color=color, alpha=0.08)
             c_data = md['components'][s_idx] if md['components'] is not None else None
             if c_data is not None:
                 n_comp = len(c_data)
@@ -2820,6 +3035,11 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
     ax.set_xlabel(dataset_names[dim], fontsize=7)
     ax.set_ylabel('log LR+', fontsize=7)
     ax.set_title(f'Marginal LR+ — {dataset_names[dim]}', fontsize=8, fontweight='bold')
+    if cat_level_names is not None:
+        for ln in ax.get_lines():
+            ln.set_marker('o'); ln.set_markersize(3)
+        ax.set_xticks(np.arange(len(cat_level_names)))
+        ax.set_xticklabels(cat_level_names, fontsize=6)
     ax.legend(fontsize=5, framealpha=0.6)
     ax.grid(lw=0.2, alpha=0.2)
 
@@ -2864,6 +3084,9 @@ def _draw_marginal_row(fig, gs, row, dim, md, scores, sa, S, n_cols,
         ax.set_xlabel(dataset_names[dim], fontsize=7)
         ax.set_ylabel('log LR', fontsize=7)
         ax.set_title(ec['title'], fontsize=7, fontweight='bold', color=ec_col)
+        if cat_level_names is not None:
+            ax.set_xticks(np.arange(len(cat_level_names)))
+            ax.set_xticklabels(cat_level_names, fontsize=6)
         ax.legend(fontsize=5, framealpha=0.6)
         ax.grid(lw=0.2, alpha=0.2)
 
@@ -3315,7 +3538,8 @@ def _plot_mv_2d(analysis, config, all_fits, marginal_data, x_grids,
             _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
                                dataset_names, sample_names, tau_p_log, tau_b_log,
                                ylim_bound, path_pctile, ben_pctile, analysis,
-                               sample_style=sample_style, extra_lr_cols=extra_cols)
+                               sample_style=sample_style, extra_lr_cols=extra_cols,
+                               cat_level_names=(getattr(analysis.ms, 'categorical_dims', None) or {}).get(dataset_names[dim]))
 
     fig.suptitle(suptitle, fontsize=11, fontweight='bold', y=1.02)
     info = {
@@ -3800,7 +4024,8 @@ def _plot_mv_hd(analysis, config, all_fits, marginal_data, x_grids,
         _draw_marginal_row(fig, gs, base_row, dim, md, scores, sa, S, n_cols,
                            dataset_names, sample_names, tau_p_log, tau_b_log,
                            ylim_bound, path_pctile, ben_pctile, analysis,
-                           sample_style=sample_style, extra_lr_cols=extra_cols)
+                           sample_style=sample_style, extra_lr_cols=extra_cols,
+                           cat_level_names=(getattr(analysis.ms, 'categorical_dims', None) or {}).get(dataset_names[dim]))
 
     fig.suptitle(suptitle, fontsize=11, fontweight='bold', y=1.01)
     info = {

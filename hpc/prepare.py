@@ -768,10 +768,10 @@ def _discover_gene_groups(df, max_dimensions=None, manual_groups=None):
                 print(f"  Warning: {name} — fewer than 2 valid datasets, skipping")
         return validated
 
-    meta_analyses = {"F9_Popp_2025_model", "TP53_Fayer_2021_meta"}
+    from src.assay_calibration.multivariate_data.common import is_derived_dataset
     gene_to_datasets = defaultdict(list)
     for _, row in df.groupby("Dataset")["Gene"].first().reset_index().iterrows():
-        if row["Dataset"] in meta_analyses:
+        if is_derived_dataset(row["Dataset"]):
             continue
         gene_to_datasets[row["Gene"]].append(row["Dataset"])
 
@@ -985,6 +985,7 @@ def _build_gene_set_ms_map(gene_set, args):
         return {"TP53": build_tp53_multiscoreset(
             RPVS_ALL=args.rpvs_all, kawoligo_seed=args.kawoligo_seed,
             kawoligo_jitter_sigma=args.kawoligo_jitter_sigma,
+            kawoligo_mode=getattr(args, "kawoligo_mode", "jitter"),
         )}
 
     if gene_set == "labelseq":
@@ -1002,7 +1003,9 @@ def _build_gene_set_ms_map(gene_set, args):
             get_functionally_assayed_protein_variants, DEFAULT_INTEGRATED_DATAFRAME,
         )
         from src.assay_calibration.multivariate_data.predictors import DEFAULT_GENES
-        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+        from src.assay_calibration.multivariate_data.common import (
+            resolve_clinvar_release, functional_datasets_for_gene,
+        )
 
         df_path = args.dataframe or DEFAULT_INTEGRATED_DATAFRAME
         sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
@@ -1011,7 +1014,7 @@ def _build_gene_set_ms_map(gene_set, args):
 
         result = {}
         for gene in genes:
-            datasets = sorted(df[df["Gene"] == gene]["Dataset"].unique())
+            datasets = functional_datasets_for_gene(df, gene)
             if not datasets:
                 print(f"  {gene}: no functional datasets in {df_path}, skipping")
                 continue
@@ -1033,6 +1036,14 @@ def _build_gene_set_ms_map(gene_set, args):
             ms = build_combined_multiscoreset(
                 gene, functional_scoresets, datasets, args.predictor_data_dir,
                 functionally_assayed_variants=functionally_assayed,
+                # Explicit, not inherited: fitting uses the UNION population
+                # (model sees full variant diversity) -- evaluation/scoring
+                # always restricts to the intersection subset regardless
+                # (see mv_analysis/report.py's _eval_labels), independent of
+                # this default. Locking this explicitly means job generation
+                # doesn't silently change behavior if build_combined_
+                # multiscoreset's own default ever flips again.
+                require_both_modalities=False,
             )
             if ms is None:
                 print(f"  {gene}: no predictor CSVs under {args.predictor_data_dir}, skipping")
@@ -1071,20 +1082,31 @@ def _apply_redundancy_collapse(gene_ms_map, args, gene_set=None):
     # with the full 16 dims, versus 3 of 6 after the collapse.
     #
     # Applied only when the caller specified no collapse of their own, so an
-    # explicit --redundancy-collapse-preset/-block still wins, and only for
-    # --gene-set tp53 (the 'integrated' TP53 path names the same dims
-    # differently; apply_preset resolves suffixes per-gene, but leaving that
-    # path alone keeps this change scoped to the dedicated TP53 ingestion).
+    # explicit --redundancy-collapse-preset/-block still wins, and for
+    # --gene-set tp53 AND --gene-set combined (the 'integrated' TP53 path
+    # names the same dims differently; apply_preset resolves suffixes
+    # per-gene, but leaving that path alone keeps this change scoped to the
+    # dedicated TP53 ingestion and the combined predictor+functional
+    # ingestion -- the two gene-sets confirmed to use the raw, un-suffixed
+    # Kato_2003 dataset names). "combined" was originally left out of this
+    # default (an oversight, not a deliberate choice -- confirmed: its own
+    # TP53 functional dims come from the exact same ingestion as "tp53"'s,
+    # so there is no reason for them to be collapsed one way and not the
+    # other), meaning TP53_combined_mv's 16 raw Kato-included functional dims
+    # suffer the same component-degeneracy problem documented above for
+    # "tp53", uncorrected. apply_preset safely no-ops for every other gene
+    # in a "combined" gene_set run (its suffix-matching only fires for genes
+    # that actually carry the Kato_2003 block).
     # gene_set is passed explicitly by the caller because it is NOT always on
     # args: the `multivariate` subcommand has args.gene_set, but `mv-all`
     # iterates args.pipelines and passes the current one down. Reading it off
     # args would silently skip this default for every mv-all run, so TP53 would
     # collapse one way and not the other.
     _gs = gene_set if gene_set is not None else getattr(args, "gene_set", None)
-    if (preset is None and not block_names and _gs == "tp53"
+    if (preset is None and not block_names and _gs in ("tp53", "combined")
             and not getattr(args, "no_default_redundancy_collapse", False)):
         preset = TP53_DEFAULT_COLLAPSE_PRESET
-        print(f"  [redundancy-collapse] --gene-set tp53: applying default preset "
+        print(f"  [redundancy-collapse] --gene-set {_gs}: applying default preset "
               f"{preset!r} (pass --no-default-redundancy-collapse to fit all "
               f"16 dimensions instead)")
     if preset is not None and block_names:
@@ -1736,6 +1758,10 @@ def main():
     p_multi.add_argument("--rpvs-all", action="store_true",
                          help="[--gene-set tp53] Use the full RPV list instead of the "
                               "high-confidence subset (default: high-confidence only)")
+    p_multi.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default="jitter",
+                         help="[tp53] EXPERIMENTAL: 'categorical' fits KawOligo as a nominal "
+                              "categorical dim (location model) instead of jittered {0,0.5,1} "
+                              "(default: jitter)")
     p_multi.add_argument("--kawoligo-seed", type=int, default=0,
                          help="[--gene-set tp53] Seed for KawOligo's jitter (default: 0)")
     p_multi.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,
@@ -1910,6 +1936,10 @@ def main():
                        help="['integrated' pipeline only]")
     p_mv_all.add_argument("--rpvs-all", action="store_true",
                        help="[tp53] use the full RPV list instead of the high-confidence subset")
+    p_mv_all.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default="jitter",
+                       help="[tp53] EXPERIMENTAL: 'categorical' fits KawOligo as a nominal "
+                            "categorical dim (location model) instead of jittered {0,0.5,1} "
+                            "(default: jitter)")
     p_mv_all.add_argument("--kawoligo-seed", type=int, default=0,
                        help="[tp53] seed for KawOligo's jitter (default: 0)")
     p_mv_all.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,

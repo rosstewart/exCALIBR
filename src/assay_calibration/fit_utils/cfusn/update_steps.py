@@ -1251,7 +1251,8 @@ def _global_var_d(observations):
     return np.where(np.isfinite(v), v, 0.0)
 
 
-def _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev=None, global_var_d=None):
+def _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev=None, global_var_d=None,
+                      force_global_scale=False):
     """Defense-in-depth magnitude cap; see get_Delta_update_cfusn for the full
     rationale on why the bound is SAFETY_FACTOR * sqrt(local variance).
 
@@ -1269,11 +1270,26 @@ def _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev=None, global_var_d=No
       fit failing with a 1.51e-04 decrease at iteration 1476 converged
       monotonically once the rescale was removed).
 
+    ``force_global_scale`` (EXPERIMENTAL, opt-in -- used only by the
+    dim_weights M-step path, cfusn/fit.py's compute_dim_weights): forces
+    ``global_var_d`` as the cap's ceiling for THIS call only, regardless of
+    the module-level DELTA_CAP_SCALE setting. Needed because ``weighted_var_d``
+    (the default "local" ceiling) is derived from the completed-data moments,
+    which for a mostly-missing dimension are themselves imputed conditional on
+    the CURRENT Delta/Gamma -- so under dim_weights' amplified Delta pull,
+    weighted_var_d can climb in lockstep with an already-too-large Delta
+    candidate, and the cap never trips (confirmed directly: a TP53 fit ran
+    away to Delta row norms ~90 before this fix, with weighted_var_d tracking
+    it step for step). global_var_d (the raw, NaN-aware, observed-only data
+    variance -- _global_var_d) is independent of Delta/Gamma/imputation and
+    can't be gamed this way. False (the default, used by every caller that
+    doesn't pass dim_weights) reproduces today's "local" behaviour exactly.
+
     Returns (Delta, capped) where ``capped`` reports whether the cap bound.
     """
     SAFETY_FACTOR = 0.95
     var_d = weighted_var_d
-    if DELTA_CAP_SCALE == "global" and global_var_d is not None:
+    if (DELTA_CAP_SCALE == "global" or force_global_scale) and global_var_d is not None:
         var_d = global_var_d
     # Positive-definiteness limit. For X = mu + Delta T + e with
     # T ~ TN_q(0, I, R_+^q), Var(T_i) = 1 - 2/pi, so
@@ -1358,7 +1374,8 @@ def _delta_update_completed(mu_new, z_eff, eta, Psi, completed, p, q, Delta_prev
     else:
         weighted_var_d = np.zeros(p)
     Delta_new, _capped = _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev,
-                                          global_var_d=global_var_d)
+                                          global_var_d=global_var_d,
+                                          force_global_scale=(dim_weights is not None))
     return Delta_new
 
 
@@ -1490,7 +1507,8 @@ def get_Delta_update_cfusn(mu_new, observations, responsibilities, eta, Psi,
         0.0,
     )
     Delta_new, _capped = _apply_delta_cap(Delta_new, weighted_var_d, Delta_prev,
-                                          global_var_d=_global_var_d(observations))
+                                          global_var_d=_global_var_d(observations),
+                                          force_global_scale=(dim_weights is not None))
 
     return Delta_new
 
@@ -1629,7 +1647,7 @@ def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma,
                     np.asarray(mu, dtype=float))
 
 
-def _mv_capped(Delta_new, weighted_var_d, Delta_prev, observations):
+def _mv_capped(Delta_new, weighted_var_d, Delta_prev, observations, dim_weights=None):
     """Apply the CFUSN Delta magnitude cap to a q=1 (p,) Delta.
 
     The cap previously existed ONLY on the CFUSN path, so q=1 restarts -- one in
@@ -1638,12 +1656,17 @@ def _mv_capped(Delta_new, weighted_var_d, Delta_prev, observations):
     val_ll. Reshaping to (p,1) reuses one implementation, including the
     (1 - 2/pi) positive-definiteness correction, so a restart's latent_q no
     longer changes which safety machinery applies.
+
+    ``dim_weights``: see _apply_delta_cap's force_global_scale docstring --
+    forces the cap's ceiling to the Delta-independent global_var_d whenever
+    dim_weights is active, same rationale as the q>1 path.
     """
     D2 = np.asarray(Delta_new, dtype=float).reshape(-1, 1)
     prev2 = (np.asarray(Delta_prev, dtype=float).reshape(-1, 1)
              if Delta_prev is not None else None)
     capped, _ = _apply_delta_cap(D2, weighted_var_d, prev2,
-                                 global_var_d=_global_var_d(observations))
+                                 global_var_d=_global_var_d(observations),
+                                 force_global_scale=(dim_weights is not None))
     return np.asarray(capped, dtype=float).ravel()
 
 
@@ -1689,7 +1712,7 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
             weighted_var_d = (z[:, None] * var_rows).sum(0) / z_tot
         else:
             weighted_var_d = np.zeros(observations.shape[1])
-        return _mv_capped(Delta_new, weighted_var_d, Delta, observations)
+        return _mv_capped(Delta_new, weighted_var_d, Delta, observations, dim_weights=dim_weights)
 
     # Complete data: available-case masking is exact.
     v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
@@ -1706,7 +1729,7 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
     weighted_var_d = np.where(
         denom_d > 1e-8,
         (obs_z * residuals ** 2).sum(axis=0) / np.maximum(denom_d, 1e-8), 0.0)
-    return _mv_capped(Delta_new, weighted_var_d, Delta, observations)
+    return _mv_capped(Delta_new, weighted_var_d, Delta, observations, dim_weights=dim_weights)
 
 
 def get_Gamma_update_mv(updated_mu, updated_Delta, observations, responsibilities, mu, Delta, Gamma,
@@ -1759,7 +1782,7 @@ def validate_indicators(Indicators):
 
 def sample_specific_responsibilities(
     observations, sample_indicators, component_params, weights, multivariate=False,
-    cached_log_pdfs=None,
+    cached_log_pdfs=None, extra_log_pdfs=None,
 ):
     """E-step responsibilities.
 
@@ -1770,7 +1793,10 @@ def sample_specific_responsibilities(
         ``sample_indicators.T``. When supplied, density re-evaluation is
         skipped — used to reuse the log-pdfs computed by the previous
         iteration's ``get_sample_weights_and_ll`` (which are computed on
-        the same iterate that this E-step needs).
+        the same iterate that this E-step needs). Continuous part only.
+    extra_log_pdfs : (K, N) array or None
+        Categorical log-pmf term aligned to ``observations`` rows
+        (cfusn/categorical.py), added on top of the (cached) continuous part.
     """
     N_samples = sample_indicators.shape[1]
     N_components = len(component_params)
@@ -1781,23 +1807,26 @@ def sample_specific_responsibilities(
         X = observations[mask]
         cached_i = (cached_log_pdfs[i]
                     if cached_log_pdfs is not None else None)
+        extra_i = None if extra_log_pdfs is None else extra_log_pdfs[:, mask]
         responsibilities[:, mask] = density_utils.component_posteriors(
             X, component_params, weights[i], multivariate=multivariate,
-            cached_log_pdfs=cached_i,
+            cached_log_pdfs=cached_i, extra_log_pdfs=extra_i,
         )
     return responsibilities
 
 
 def get_sample_weights(
     observations, sample_indicators, updated_component_params, current_weights,
-    multivariate=False
+    multivariate=False, extra_log_pdfs=None,
 ):
     updated_weights = np.zeros_like(current_weights)
     for i in range(current_weights.shape[0]):
-        X = observations[sample_indicators[:, i]]
+        mask = sample_indicators[:, i]
+        X = observations[mask]
+        extra_i = None if extra_log_pdfs is None else extra_log_pdfs[:, mask]
         posts = density_utils.component_posteriors(
             X, updated_component_params, current_weights[i],
-            multivariate=multivariate
+            multivariate=multivariate, extra_log_pdfs=extra_i,
         )
         uw = posts.mean(1)
         if np.isnan(uw).any():
@@ -1813,8 +1842,15 @@ def get_sample_weights(
 
 def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
                                current_weights, multivariate=False,
-                               return_log_pdfs=False, sample_weights=None):
+                               return_log_pdfs=False, sample_weights=None,
+                               extra_log_pdfs=None, weight_divergence=None):
     """Compute updated weights AND normalised log-likelihood in a single density pass.
+
+    ``weight_divergence``: optional resolved {"lambda", "pairs"} spec
+    (cfusn/weight_divergence.py, EXPERIMENTAL). When given, the closed-form
+    W update is replaced by a GEM step on the penalised minoriser that never
+    decreases it, so EM stays monotone on the penalised objective; None
+    (default) leaves this function bit-identical.
 
     The original code calls get_sample_weights (density eval) then fit.py calls
     get_likelihood (identical density eval).  This function caches the log_pdfs
@@ -1835,11 +1871,16 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
     updated_weights : (S, K)
     normalised_ll   : float   (LL / N, ready to append to likelihoods array)
     log_pdfs_per_sample : list[ndarray]   (only if return_log_pdfs=True)
+        Continuous part only -- ``extra_log_pdfs`` (the categorical term) is
+        added for the weight update and LL but never stored in the cache.
     """
     S, Kc  = current_weights.shape
     N      = observations.shape[0]
     upd_w  = np.zeros_like(current_weights)
+    nbar   = np.zeros_like(current_weights) if weight_divergence is not None else None
+    sw_all = None if sample_weights is None else np.asarray(sample_weights)
     cache  = [None] * S                              # cache (Kc, N_s) log_pdfs
+    full   = [None] * S                              # cache + extra (what W/LL use)
 
     for i in range(S):
         mask = sample_indicators[:, i]
@@ -1862,6 +1903,11 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
                 lp_list.append(lp)
             log_pdfs = np.stack(lp_list, axis=0)      # (Kc, N_s)
 
+        cache[i] = log_pdfs
+        if extra_log_pdfs is not None:
+            log_pdfs = log_pdfs + extra_log_pdfs[:, mask]
+        full[i] = log_pdfs
+
         with np.errstate(divide='ignore', invalid='ignore'):
             # invalid='ignore' suppresses (-inf) - (-inf) = NaN when an
             # observation has zero density under all components; the
@@ -1880,7 +1926,14 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
                 f"NaN weight: {uw}\n{X[bad]}\n{updated_params}\n{current_weights[i]}"
             )
         upd_w[i] = uw
-        cache[i] = log_pdfs
+        if nbar is not None:
+            nbar[i] = (P.sum(1) if sw_all is None
+                       else P @ sw_all[mask])        # sw-weighted expected counts
+
+    if nbar is not None:
+        from .weight_divergence import penalized_weight_update
+        upd_w = penalized_weight_update(nbar, current_weights, weight_divergence["pairs"],
+                                        float(weight_divergence["lambda"]) * N)
 
     # ── LL with updated weights — zero extra density evals ──────────────
     # When sample_weights is given, evaluate the per-obs *weighted* LL
@@ -1895,7 +1948,7 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
     for i in range(S):
         with np.errstate(divide='ignore'):
             log_w = np.where(upd_w[i] > 0, np.log(upd_w[i]), -np.inf)
-        log_mix = logsumexp(cache[i] + log_w[:, None], axis=0)
+        log_mix = logsumexp(full[i] + log_w[:, None], axis=0)
         if sw is not None:
             ll += float(np.sum(sw[sample_indicators[:, i]] * log_mix))
         else:
@@ -2230,7 +2283,15 @@ def em_iteration(observations, sample_indicators, current_component_params,
         When True, also returns the freshly computed per-sample log-pdf
         matrices on ``updated_params`` so the caller can thread them
         forward as ``cached_log_pdfs`` for the next iteration.
+    cat_state : dict, optional (kwarg; EXPERIMENTAL, see cfusn/categorical.py)
+        {"labels", "probs", "alpha", "has_cont"} for categorical dims.
+        ``observations`` is then the continuous-only matrix. When given, the
+        categorical M-step runs after the continuous one (same
+        responsibilities) and BEFORE the weight/LL pass, and the updated
+        probs are appended to the return tuple.
     """
+    cat_state = kwargs.pop("cat_state", None)
+    weight_divergence = kwargs.pop("weight_divergence", None)
     mv = multivariate
     constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
 
@@ -2255,9 +2316,14 @@ def em_iteration(observations, sample_indicators, current_component_params,
     assert current_weights.shape == (S, K)
     sample_indicators = validate_indicators(sample_indicators)
 
+    extra = None
+    if cat_state is not None:
+        from . import categorical as _cat
+        extra = _cat.cat_log_pdfs(cat_state["labels"], cat_state["probs"])
+
     responsibilities = sample_specific_responsibilities(
         observations, sample_indicators, current_component_params, current_weights,
-        multivariate=mv, cached_log_pdfs=cached_log_pdfs,
+        multivariate=mv, cached_log_pdfs=cached_log_pdfs, extra_log_pdfs=extra,
     )
 
     # (1) Responsibility tempering — sharpen before the M-step.
@@ -2274,22 +2340,37 @@ def em_iteration(observations, sample_indicators, current_component_params,
     # degeneracy that responsibility sharpening exacerbates.
     kwargs["_stabilize_separation"] = sep_cfg is not None
 
+    # Continuous M-step inputs. With categorical dims, rows observed ONLY on
+    # categorical dims carry no continuous information: dropping them from
+    # the continuous M-step is valid EM (their completed-data contribution
+    # to the continuous Q is constant) and keeps their mass out of _n_eff,
+    # the low-mass check and the Delta cap. They still enter the E-step,
+    # the categorical M-step and the weight update.
+    obs_m, resp_m, kw_m = observations, responsibilities, kwargs
+    if cat_state is not None and not np.all(cat_state["has_cont"]):
+        hc = cat_state["has_cont"]
+        obs_m = observations[hc]
+        resp_m = responsibilities[:, hc]
+        if kwargs.get("sample_weights") is not None:
+            kw_m = dict(kwargs)
+            kw_m["sample_weights"] = np.asarray(kwargs["sample_weights"])[hc]
+
     if not mv:
         updated_params = _em_update_univariate(
-            observations, responsibilities, current_component_params,
-            mstep_constrained, xlims, K, **kwargs
+            obs_m, resp_m, current_component_params,
+            mstep_constrained, xlims, K, **kw_m
         )
     else:
         q = density_utils.get_q(current_component_params)
         if q > 1:
             updated_params = _em_update_cfusn(
-                observations, responsibilities, current_component_params,
-                mstep_constrained, xlims, K, q=q, **kwargs
+                obs_m, resp_m, current_component_params,
+                mstep_constrained, xlims, K, q=q, **kw_m
             )
         else:
             updated_params = _em_update_multivariate(
-                observations, responsibilities, current_component_params,
-                mstep_constrained, xlims, K, **kwargs
+                obs_m, resp_m, current_component_params,
+                mstep_constrained, xlims, K, **kw_m
             )
 
     # (2) Bhattacharyya repulsion — push overlapping components apart in joint
@@ -2300,17 +2381,36 @@ def em_iteration(observations, sample_indicators, current_component_params,
         )
 
     sw = kwargs.get("sample_weights", None)
+
+    # Categorical M-step: same (tempered) responsibilities, closed form, run
+    # before the weight/LL pass so W and LL are evaluated on the new probs.
+    new_extra, new_probs = None, None
+    if cat_state is not None:
+        new_probs = _cat.cat_mstep(
+            cat_state["labels"], responsibilities, cat_state["alpha"],
+            old_probs=cat_state["probs"],
+            frozen=kwargs.get("frozen_components", None) or (),
+            sample_weights=sw,
+        )
+        new_extra = _cat.cat_log_pdfs(cat_state["labels"], new_probs)
+
     if return_log_pdfs:
         updated_weights, ll, new_log_pdfs = get_sample_weights_and_ll(
             observations, sample_indicators, updated_params, current_weights,
             multivariate=mv, return_log_pdfs=True, sample_weights=sw,
+            extra_log_pdfs=new_extra, weight_divergence=weight_divergence,
         )
+        if cat_state is not None:
+            return updated_params, updated_weights, ll, new_log_pdfs, new_probs
         return updated_params, updated_weights, ll, new_log_pdfs
 
     updated_weights, ll = get_sample_weights_and_ll(
         observations, sample_indicators, updated_params, current_weights,
-        multivariate=mv, sample_weights=sw,
+        multivariate=mv, sample_weights=sw, extra_log_pdfs=new_extra,
+        weight_divergence=weight_divergence,
     )
+    if cat_state is not None:
+        return updated_params, updated_weights, ll, new_probs
     return updated_params, updated_weights, ll
 
 
@@ -2416,7 +2516,7 @@ def _em_update_multivariate(
 
         mu_cand = get_location_update_mv(observations, z, mu_old, Delta_old, Gamma_old,
                                          sample_weights=sample_weights)
-        if kwargs.get("force_gaussian"):
+        if kwargs.get("force_gaussian") or c in (kwargs.get("gaussian_components") or ()):
             Delta_cand = np.zeros_like(Delta_old)
         else:
             Delta_cand = get_Delta_update_mv(mu_cand, observations, z, mu_old, Delta_old, Gamma_old,
@@ -2563,7 +2663,7 @@ def _em_update_cfusn(
         # observation, so eta/Psi are just the fixed, data-independent
         # moments of a standard truncated normal -- no special numerical
         # handling required beyond skipping the Delta solve.
-        if kwargs.get("force_gaussian"):
+        if kwargs.get("force_gaussian") or c in (kwargs.get("gaussian_components") or ()):
             Delta_cand = np.zeros_like(Delta_old)
         else:
             Delta_cand = get_Delta_update_cfusn(mu_cand, observations, z, eta, Psi,

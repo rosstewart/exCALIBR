@@ -16,7 +16,7 @@
 #
 # The paper-specific counterpart to `mv_analysis/mv_cockpit.py` (which stays
 # the flexible "load and analyze one dataset of choosing" tool) -- this
-# notebook runs *every* analysis `ExCALIBR_latex_092026/ExCALIBR_MV.tex`
+# notebook runs *every* analysis `ExCALIBR-MV_latex_092026/ExCALIBR_MV.tex`
 # needs, from one fits directory (`mv_analysis.config.PAPER_FITS_DIR`), the
 # same role `analysis/analyze_pipeline_output.py` plays for the univariate
 # paper. Lives in `mv_analysis/`, not `analysis/`, so MV output never mixes
@@ -239,7 +239,7 @@ def run_gene_set_results(gene_set, genes, run_kwargs=None, redundancy_collapse_p
                 analysis = cockpit.build_gene_set_analysis(ms, gene.lower(), results_json, dataset_name=dataset_name, gene_set=gene_set)
                 analysis.run(partial_pattern_mode="trust_global", **run_kwargs)
                 points = np.asarray(analysis.results[config_name]["points"], dtype=float)
-                eval_mask, labels = report._eval_labels(ms, analysis.p_idx, analysis.b_idx)
+                eval_mask, labels = report._eval_labels(ms, analysis.p_idx, analysis.b_idx, gene_set=gene_set)
                 lp = (labels, points[eval_mask])
                 per_gene_lp[label] = lp
                 if cache_path is not None:
@@ -340,6 +340,24 @@ def run_ret_phenotype_evidence(x_dim="abundance_No_treatment", y_dim="abundance_
         replace_role="P/LP", config=config_name, z_log10=False, ms_map=ms_map, save_path=save_path,
         run_kwargs=run_kwargs,
     )
+
+
+def run_ret_phenotype_specific_evidence(run_kwargs=None):
+    """Manuscript Figure fig:mv_ret: MEN2A/B-specific vs Hirschsprung-specific
+    vs benign evidence for RET (pheno.ret_phenotype_evidence -- post-hoc
+    phenotype weights on the canonical fit, see its TODO(next rerun)), the
+    same variants with no calibration at all (make_ret_class_3d.py), and the
+    per-dimension phenotype histograms (Extended Data). Returns the evidence
+    dict plus the per-class variant counts the manuscript reports."""
+    import subprocess
+    ev = pheno.ret_phenotype_evidence(config.PAPER_RESULTS_JSON, run_kwargs=run_kwargs or RUN_KWARGS)
+    _, counts = pheno.plot_ret_phenotype_evidence_3d(
+        ev, html_path=f"{config.PAPER_RET_EVIDENCE_DIR}/ret_phenotype_evidence_3d.html",
+        png_path=f"{config.PAPER_RET_EVIDENCE_DIR}/ret_phenotype_evidence_3d.png")
+    scripts = _ROOT / "mv_analysis" / "figures" / "scripts"
+    for script in ("make_ret_class_3d.py", "make_ret_dimension_plots_with_phenotypes.py"):
+        subprocess.run([sys.executable, str(scripts / script)], check=True)
+    return ev, counts
 
 
 def run_card11_phenotype_evidence(config_name="4c_unc", save_path=None, run_kwargs=None):
@@ -473,6 +491,407 @@ def run_clinvar_vus_points_by_panel():
     )
 
 
+def run_cartoons():
+    """Conceptual figures (Figure 1, the Gaussian/MSN/CFUSN illustration, the
+    1D-vs-2D separability illustration) and the GCK worked example (real
+    canonical fit), written under PAPER_CARTOONS_DIR."""
+    import subprocess
+    scripts = _ROOT / "mv_analysis" / "figures" / "scripts"
+    out = Path(config.PAPER_CARTOONS_DIR)
+    out.mkdir(parents=True, exist_ok=True)
+    for script, target in (("make_fig1_motivation.py", "fig1_cartoon_mv.png"),
+                           ("make_gaussian_msn_cfusn_cartoon.py", "gaussian_msn_cfusn_cartoon.png"),
+                           ("make_slide_separability_cartoon.py", "slide_separability_cartoon.png")):
+        subprocess.run([sys.executable, str(scripts / script), "--out", str(out / target)], check=True)
+    subprocess.run([sys.executable, str(scripts / "make_gck_slideshow_calibration.py")], check=True)
+
+
+def run_correlation_and_conflict():
+    """Within-class correlation between evidence sources (correlation_analysis.py)
+    and per-gene whole-panel correlation / independently-calibrated evidence
+    conflict rates (panel_wide_analysis.py), under PAPER_CORRELATION_DIR."""
+    import subprocess
+    scripts = _ROOT / "mv_analysis" / "figures" / "scripts"
+    for script in ("correlation_analysis.py", "panel_wide_analysis.py"):
+        subprocess.run([sys.executable, str(scripts / script), "--out-dir", config.PAPER_CORRELATION_DIR],
+                       check=True)
+
+
+def run_manuscript_figures():
+    """The composed manuscript figures (Figures 1, 2, 3-5 A-B, 7), drawn from
+    outputs the other sections write: conflict tables (correlation), the GCK
+    precompute, the per-gene results tables, and the TP53 RPV scores."""
+    import subprocess
+    scripts = _ROOT / "mv_analysis" / "figures" / "scripts"
+    for script in ("make_fig1_conflict.py", "make_fig2_method.py",
+                   "make_panel_performance.py", "make_fig7_tp53_rpv.py"):
+        subprocess.run([sys.executable, str(scripts / script)], check=True)
+
+
+# %% [markdown]
+# ## Section 11: manuscript macros + figure export
+#
+# Every number the manuscript reports is a `\Name{}` macro written here to
+# `{MANUSCRIPT_DIR}/Figures/generated/macros.tex` (analysis/manuscript_numbers.py's
+# registry, the same one the univariate paper uses). Values render red for
+# review; any macro the .tex uses that this run cannot compute is written as
+# a red XX. Figures the .tex includes are copied into Figures/generated/.
+
+# %%
+# {file name in Figures/generated/: source under PAPER_FIGURES_DIR}
+MANUSCRIPT_FIGURES = {
+    "fig1_conflict.pdf": "cartoons/fig1_conflict.pdf",
+    "fig2_method.pdf": "cartoons/fig2_method.pdf",
+    "fig_performance_functional.pdf": "accuracy/fig_performance_functional.pdf",
+    "fig_performance_predictor.pdf": "accuracy/fig_performance_predictor.pdf",
+    "fig_performance_combined.pdf": "accuracy/fig_performance_combined.pdf",
+    "functional_vus_points_sankey.pdf": "vus_reclassification/functional_vus_points_sankey.pdf",
+    "predictor_vus_points_sankey.pdf": "vus_reclassification/predictor_vus_points_sankey.pdf",
+    "combined_vus_points_sankey.pdf": "vus_reclassification/combined_vus_points_sankey.pdf",
+    "ret_phenotype_evidence_3d.png": "ret_evidence/ret_phenotype_evidence_3d.png",
+    "fig7_tp53_rpv_classification.pdf": "tp53_rpv/fig7_tp53_rpv_classification.pdf",
+    "mv_confusion_matrices.png": "confusions/mv_confusion_matrices.png",
+    "mv_brnich_comparison.png": "brnich_comparison/mv_brnich_comparison.png",
+}
+
+
+def _mcc_from_counts(tp, tn, fp, fn):
+    den = np.sqrt(float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    return float((tp * tn - fp * fn) / den) if den > 0 else 0.0
+
+
+def _pooled_from_table(table, method_prefix, keys=None):
+    """Pool one method's per-gene rows (evidence-direction threshold) by
+    summing confusion counts across genes -- the manuscript's convention. For
+    MV, each gene contributes its canonical config (the highest-MCC config,
+    as cockpit.pick_best_canonical_config selects); UV rows are unique."""
+    t = table[(table["threshold"] == EVIDENCE_DIRECTION) & table["method"].str.startswith(method_prefix)]
+    if t.empty:
+        return None
+    if method_prefix == "MV":
+        t = t.sort_values(["mcc", "determinate"], ascending=False).groupby(["gene", "cluster"], as_index=False).head(1)
+    if keys is not None:
+        t = t[t.set_index(["gene", "cluster"]).index.isin(keys)]
+    s = t[["TP", "TN", "FP", "FN", "total", "determinate"]].sum()
+    return dict(mcc=_mcc_from_counts(s.TP, s.TN, s.FP, s.FN), coverage=s.determinate / s.total,
+                n_genes=t["gene"].nunique(), mv_better=None, rows=t)
+
+
+def _gene_label(g):
+    g = str(g)
+    return ["FGFR1", "FGFR2", "FGFR3", "FGFR4"] if g.upper().startswith("FGFR") else [g.upper()]
+
+
+def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
+    """Register every manuscript number from the canonical outputs on disk,
+    write Figures/generated/macros.tex, and export the included figures."""
+    import shutil
+    import re as _re
+    from analysis.manuscript_numbers import ManuscriptRegistry
+
+    REG = ManuscriptRegistry(
+        tex_paths=[config.MANUSCRIPT_MAIN_TEX, config.MANUSCRIPT_SUPP_TEX],
+        out_dir=config.MANUSCRIPT_GENERATED_DIR, repo_root=_ROOT, strict=strict)
+    figs = Path(config.PAPER_FIGURES_DIR)
+
+    # -- run configuration ------------------------------------------------
+    import gzip
+    with gzip.open(config.PAPER_RESULTS_JSON, "rt") as f:
+        raw = json.load(f)
+    n_boot = {k: len(v) for k, v in raw.items()}
+    REG.num("MethNumBootstraps", int(np.median(list(n_boot.values()))), kind="method",
+            source="median bootstrap count per dataset in PAPER_RESULTS_JSON", inputs=[config.PAPER_RESULTS_JSON])
+    ks = set()
+    for k, boots in raw.items():
+        if k.startswith("TP53_tp53"):
+            continue
+        b0 = next(iter(boots.values()))
+        ks |= {int(c.split("c_")[0]) for c in b0 if b0[c] is not None and _re.match(r"\d+c_", c)}
+    REG.num("MethComponentsLow", min(ks), kind="method", source="configs in PAPER_RESULTS_JSON")
+    REG.num("MethComponentsHigh", max(ks), kind="method", source="configs in PAPER_RESULTS_JSON")
+    tp53_ks = set()
+    for k, boots in raw.items():
+        if k.startswith("TP53_tp53"):
+            b0 = next(iter(boots.values()))
+            tp53_ks |= {int(c.split("c_")[0]) for c in b0 if b0[c] is not None}
+    if tp53_ks:
+        REG.num("MethTPFiftyThreeComponentsLow", min(tp53_ks), kind="method", source="TP53_tp53_mv configs")
+        REG.num("MethTPFiftyThreeComponentsHigh", max(tp53_ks), kind="method", source="TP53_tp53_mv configs")
+    # restarts per (bootstrap, K): from the array logs' "N bootstraps, M fits" header
+    log_dir = Path(config.PAPER_FITS_DIR) / "logs"
+    per = []
+    for log in sorted(log_dir.glob("array_*.log"))[:200]:
+        m = _re.search(r"(\d+) bootstraps, (\d+) fits", log.read_text(errors="ignore")[:500])
+        if m and int(m.group(1)):
+            per.append(int(m.group(2)) / int(m.group(1)))
+    if per:
+        REG.num("MethNumRestarts", int(round(np.median(per) / len(ks))), kind="method",
+                source=f"array logs: median fits per bootstrap / {len(ks)} component counts")
+    REG.num("MethPathPercentile", RUN_KWARGS["path_percentile"], kind="method", source="RUN_KWARGS")
+    REG.num("MethBenPercentile", 100 - RUN_KWARGS["path_percentile"], kind="method", source="RUN_KWARGS")
+
+    # -- dimensions ----------------------------------------------------------
+    def _ndim(key):
+        boots = raw.get(key)
+        if not boots:
+            return None
+        for b in boots.values():
+            for c in b.values():
+                if c and c.get("fit") and c["fit"].get("component_params"):
+                    n_cat = len((c["fit"].get("cat_spec") or {}).get("positions", []))
+                    return len(c["fit"]["component_params"][0][0]) + n_cat
+        return None
+    REG.num("MethTPFiftyThreeDims", _ndim("TP53_tp53_mv"), kind="method", source="TP53_tp53_mv fit dimension")
+    tp53c = _ndim("TP53_combined_mv")
+    if tp53c is not None:
+        REG.num("MethTPFiftyThreeCombinedFunctionalDims", tp53c - 3, kind="method",
+                source="TP53_combined_mv fit dimension minus 3 predictors")
+    try:
+        from src.assay_calibration.multivariate_data import tp53 as _tp53
+        REG.num("MethTPFiftyThreeDimsRaw", len(_tp53.SCORE_COLS), kind="method", source="tp53.SCORE_COLS")
+    except Exception as e:
+        print(f"  TP53 raw dimension count unavailable: {e}")
+
+    # -- gene counts + pooled performance ----------------------------------
+    tables = {
+        "Functional": Path(config.PAPER_FUNCTIONAL_DIR) / "functional_all_results_table.csv",
+        "Predictor": Path(config.PAPER_PREDICTOR_DIR) / "predictor_results_table.csv",
+        "Combined": Path(config.PAPER_COMBINED_DIR) / "combined_results_table.csv",
+    }
+    all_genes = set()
+    for panel, path in tables.items():
+        if not REG.require(path, f"{panel} per-gene results table"):
+            continue
+        t = pd.read_csv(path)
+        genes = set()
+        for g in t["gene"].unique():
+            genes.update(_gene_label(g))
+        all_genes |= genes
+        REG.num(f"Num{panel}Genes", len(genes), source=str(path), inputs=[path], words=True)
+        # Pool MV and UV over the SAME genes (those with both), so the two
+        # pooled numbers compare like with like.
+        mv_all, uv_all = _pooled_from_table(t, "MV"), _pooled_from_table(t, "UV non-conflicting")
+        mv = uv = None
+        if mv_all and uv_all:
+            keys = (set(map(tuple, mv_all["rows"][["gene", "cluster"]].values))
+                    & set(map(tuple, uv_all["rows"][["gene", "cluster"]].values)))
+            mv, uv = _pooled_from_table(t, "MV", keys), _pooled_from_table(t, "UV non-conflicting", keys)
+            missing_uv = sorted({g for g, _ in set(map(tuple, mv_all["rows"][["gene", "cluster"]].values)) - keys})
+            if missing_uv:
+                REG._fail_soft("no-uv-baseline", f"{panel}: no UV rows for {missing_uv} (excluded from pooled MCC)")
+        if mv and uv:
+            REG.num(f"ResMCC{panel}MV", mv["mcc"], fmt=".2f", source=f"pooled MV, {path.name}", inputs=[path])
+            REG.num(f"ResMCC{panel}UV", uv["mcc"], fmt=".2f", source=f"pooled UV, {path.name}", inputs=[path])
+            REG.pct(f"ResDetRate{panel}MV", mv["coverage"], 1, digits=1, source=f"pooled MV determinate rate, {path.name}")
+            REG.pct(f"ResDetRate{panel}UV", uv["coverage"], 1, digits=1, source=f"pooled UV determinate rate, {path.name}")
+            # Per-gene comparison (abstract + scatter): paired over genes with
+            # both MV and UV rows, excluding genes whose evaluated set lacks a
+            # class (MCC undefined -- the scatter's own filter). A method making
+            # no determinate calls in a gene scores MCC 0 there.
+            m = mv["rows"].set_index(["gene", "cluster"])
+            u = uv["rows"].set_index(["gene", "cluster"])
+            both = m.index.intersection(u.index)
+            m, u = m.loc[both], u.loc[both]
+            ok = (m["n_pathogenic"] > 0) & (m["n_benign"] > 0)
+            m, u = m[ok], u[ok]
+            diff = m["mcc"] - u["mcc"]
+            REG.num(f"ResMedMCC{panel}MV", float(m["mcc"].median()), fmt=".2f",
+                    source=f"median per-gene MV MCC over {len(m)} genes with both classes, {path.name}")
+            REG.num(f"ResMedMCC{panel}UV", float(u["mcc"].median()), fmt=".2f",
+                    source=f"median per-gene UV MCC over {len(u)} genes with both classes, {path.name}")
+            REG.num(f"Res{panel}GenesImproved", int((diff > 1e-9).sum()), source="per-gene MV MCC > UV MCC",
+                    words=True)
+            REG.num(f"Res{panel}GenesWorse", int((diff < -1e-9).sum()), source="per-gene MV MCC < UV MCC",
+                    words=True)
+            REG.num(f"Res{panel}GenesCompared", len(diff),
+                    source="genes with both MV and UV and both classes", words=True)
+    REG.num("NumGenesTotal", len(all_genes), source="union of functional/predictor/combined genes, "
+            "case-normalized, FGFR1-4 separate", words=True)
+    REG.num("NumLabelseqGenes", len(config.LABELSEQ_GENES), source="config.LABELSEQ_GENES", words=True)
+
+    # -- VUS -----------------------------------------------------------------
+    for panel in ("Functional", "Predictor", "Combined"):
+        p = Path(config.PAPER_VUS_RECLASSIFICATION_DIR) / f"{panel.lower()}_true_clinvar_vus_points.csv"
+        if not REG.require(p, f"{panel} ClinVar VUS points"):
+            continue
+        d = pd.read_csv(p)
+        pts = d["our_points"].fillna(0)
+        REG.num(f"ResVUS{panel}N", len(d), source=p.name, inputs=[p])
+        REG.num(f"ResVUS{panel}Genes", d["gene"].nunique(), source=p.name, words=True)
+        REG.pct(f"ResVUS{panel}DetPct", int((pts != 0).sum()), len(d), source=p.name)
+        REG.pct(f"ResVUS{panel}PathPct", int((pts > 0).sum()), len(d), source=p.name)
+        REG.pct(f"ResVUS{panel}BenPct", int((pts < 0).sum()), len(d), source=p.name)
+
+    # -- conflict + correlation (panel_wide_analysis / correlation_analysis) --
+    cdir = Path(config.PAPER_CORRELATION_DIR)
+    for panel in ("functional", "predictor", "combined"):
+        p = cdir / f"panel_{panel}_by_gene.csv"
+        if not REG.require(p, f"{panel} panel-wide conflict table"):
+            continue
+        d = pd.read_csv(p).dropna(subset=["pct_conflict"])
+        cap = panel.capitalize()
+        REG.pct(f"ResConflict{cap}Pct", int(d["n_gnomad_conflicting"].sum()),
+                int(d["n_gnomad_for_conflict"].sum()),
+                source=f"{p.name}: conflicting / all population variants (same denominator as pct_conflict)")
+        top = d.sort_values("pct_conflict", ascending=False).iloc[0]
+        REG.num(f"ResConflict{cap}MaxPct", float(top["pct_conflict"]), fmt=".1f", source=p.name)
+        REG.text(f"ResConflict{cap}MaxGene", f"\\textit{{{top['gene']}}}", source=p.name)
+    for label, fname in (("Functional", "functional_correlation_table.csv"),
+                         ("Predictor", "predictor_correlation_table.csv"),
+                         ("Cross", "cross_correlation_table.csv")):
+        p = cdir / fname
+        if not REG.require(p, f"{label} correlation table"):
+            continue
+        d = pd.read_csv(p)
+        d["abs_rho"] = d["spearman_rho"].abs()
+        for role_value, short in (("P/LP", "PLP"), ("B/LB", "BLB"), ("gnomAD", "GnomAD")):
+            sub = d[d["class"] == role_value].dropna(subset=["abs_rho"])
+            if sub.empty:
+                continue
+            REG.num(f"ResMedianRho{label}{short}", float(sub["abs_rho"].median()), fmt=".2f", source=fname)
+            REG.num(f"ResCorrPairs{label}{short}", len(sub), source=fname)
+            if "gene" in sub.columns:
+                REG.num(f"ResCorrGenes{label}{short}", sub["gene"].nunique(), source=fname)
+
+    ev = cdir / "cross_evidence_correlation_table.csv"
+    if REG.require(ev, "functional-vs-predictor evidence correlation table"):
+        d = pd.read_csv(ev)
+        for role_value, short in (("P/LP", "PLP"), ("B/LB", "BLB"), ("gnomAD", "GnomAD")):
+            sub = d[d["class"] == role_value].dropna(subset=["rho_strength"])
+            if sub.empty:
+                continue
+            REG.num(f"ResMedianRhoCrossEv{short}", float(sub["rho_strength"].abs().median()), fmt=".2f",
+                    source=f"{ev.name}: median |Spearman| of aggregated functional vs predictor points")
+            REG.num(f"ResCorrGenesCrossEv{short}", sub["gene"].nunique(), source=ev.name)
+
+    # -- RET -------------------------------------------------------------------
+    if ret_ev is not None:
+        REG.num("ResRETMenTwoN", int(ret_ev["masks"]["MEN2"].sum()), source="phenotype_evidence lists in ms")
+        REG.num("ResRETHirschN", int(ret_ev["masks"]["Hirschsprung"].sum()), source="phenotype_evidence lists in ms")
+        for g, short in (("MEN2", "MenTwo"), ("Hirschsprung", "Hirsch")):
+            m = ret_ev["masks"][g]
+            REG.num(f"ResRET{short}Correct", int((ret_ev["aux_points"][g][m] > 0).sum()),
+                    source=f"{g} variants receiving {g}-specific pathogenic evidence")
+            REG.num(f"ResRET{short}Prior", ret_ev["aux_prior"][g], fmt=".3f", source=f"{g} median prior")
+            REG.num(f"ResRET{short}PLPPoints", int((ret_ev["points"][m] > 0).sum()),
+                    source=f"{g} variants receiving pooled P/LP-vs-B/LB pathogenic evidence")
+    if ret_counts:
+        REG.num("ResRETBenignEvidenceN", ret_counts["benign"], source="ret 3D evidence classes")
+        REG.num("ResRETMenTwoEvidenceN", ret_counts["men2"], source="ret 3D evidence classes")
+        REG.num("ResRETHirschEvidenceN", ret_counts["hirschsprung"], source="ret 3D evidence classes")
+
+    # -- Figure 1 example variant ----------------------------------------------
+    f1 = Path(config.PAPER_CARTOONS_DIR) / "fig1_conflict_facts.json"
+    if REG.require(f1, "Figure 1 example-variant facts"):
+        f = json.loads(f1.read_text())
+        REG.text("ResFigOneGene", f"\\textit{{{f['gene']}}}", source=f1.name)
+        REG.text("ResFigOneVariant", f["variant_p"], source=f1.name)
+        REG.text("ResFigOneAssayA", f["assay_a"].replace(" et al.", " \\textit{et al.}"), source=f1.name)
+        REG.text("ResFigOneAssayB", f["assay_b"].replace(" et al.", " \\textit{et al.}"), source=f1.name)
+        REG.text("ResFigOnePointsA", f"{f['points_a']:+d}", source=f1.name)
+        REG.text("ResFigOnePointsB", f"{f['points_b']:+d}".replace("-", "$-$"), source=f1.name)
+        REG.num("ResFigOnePriorA", f["prior_a"], fmt=".2f", source=f1.name)
+        REG.num("ResFigOnePriorB", f["prior_b"], fmt=".2f", source=f1.name)
+
+    # -- TP53 functional panel + reduced penetrance -----------------------------
+    tp = Path(config.PAPER_FUNCTIONAL_DIR) / "functional_tp53_results_table.csv"
+    if REG.require(tp, "TP53 functional results table"):
+        t = pd.read_csv(tp)
+        t = t[t["threshold"] == EVIDENCE_DIRECTION]
+        mv_t = t[t["method"] == f"MV {TP53_CONFIG}"].head(1)
+        uv_t = t[t["method"] == "UV non-conflicting"].head(1)
+        if not mv_t.empty and not uv_t.empty:
+            REG.num("ResTPFiftyThreeMCCMV", float(mv_t["mcc"].iloc[0]), fmt=".2f", source=tp.name)
+            REG.num("ResTPFiftyThreeMCCUV", float(uv_t["mcc"].iloc[0]), fmt=".2f", source=tp.name)
+            REG.pct("ResTPFiftyThreeDetRateMV", int(mv_t["determinate"].iloc[0]), int(mv_t["total"].iloc[0]), source=tp.name)
+            REG.pct("ResTPFiftyThreeDetRateUV", int(uv_t["determinate"].iloc[0]), int(uv_t["total"].iloc[0]), source=tp.name)
+            REG.num("ResTPFiftyThreeNControls", int(mv_t["total"].iloc[0]), source=tp.name)
+    f7 = Path(config.PAPER_TP53_RPV_DIR) / "fig7_tp53_rpv_facts.json"
+    if REG.require(f7, "TP53 reduced-penetrance classification counts"):
+        f = json.loads(f7.read_text())
+        short = {"B/LB": "BLB", "P/LP": "PLP", "Reduced penetrance": "RPV"}
+        cls = {"benign_like": "Benign", "intermediate": "Intermediate", "plp_like": "Path", "low_pen_rpv": "LowPen"}
+        for row, counts in f["counts"].items():
+            REG.num(f"ResTPFiftyThree{short[row]}N", sum(counts), source=f7.name)
+            for c, n in zip(f["classes"], counts):
+                REG.num(f"ResTPFiftyThree{short[row]}{cls[c]}", n, source=f7.name)
+
+    # -- Extended Data: per-gene performance table -------------------------------
+    sys.path.insert(0, str(_ROOT / "mv_analysis" / "figures" / "scripts"))
+    import make_panel_performance as mpp
+    rows = []
+    for panel, title in (("functional", "Functional"), ("predictor", "Computational"),
+                         ("combined", "Combined")):
+        d = mpp.per_gene(Path(config.PAPER_FIGURES_DIR) / mpp.PANELS[panel][0])
+        d = d.sort_values("label")
+        for _, r in d.iterrows():
+            mcc = (f"{r['uv_mcc']:.2f} & {r['mv_mcc']:.2f}" if r["both_classes"] else "-- & --")
+            rows.append(f"{title} & {r['label']} & {int(r['n']):,} & {mcc} & "
+                        f"{100 * r['uv_det']:.0f} & {100 * r['mv_det']:.0f} \\\\")
+    body = ("\\begin{tabular}{llrrrrr}\n\\toprule\n"
+            "Evidence & Gene & Controls & \\multicolumn{2}{c}{MCC} & \\multicolumn{2}{c}{Determinate rate (\\%)} \\\\\n"
+            " & & & Indep. & Joint & Indep. & Joint \\\\\n\\midrule\n"
+            + "\n".join(rows) + "\n\\bottomrule\n\\end{tabular}\n")
+    tdir = Path(config.MANUSCRIPT_GENERATED_DIR) / "tables"
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "mv_gene_performance.tex").write_text(body)
+    REG.output(tdir / "mv_gene_performance.tex", "A", "Extended Data per-gene performance table")
+
+    # -- figures -------------------------------------------------------------
+    dest = Path(config.MANUSCRIPT_GENERATED_DIR)
+    dest.mkdir(parents=True, exist_ok=True)
+    for name, rel in MANUSCRIPT_FIGURES.items():
+        src = figs / rel
+        if not src.exists():
+            REG._fail_soft("missing-figure", f"{name}: {src} does not exist")
+            continue
+        _link_figure(src, dest / name)
+        _record_linked_figure(REG, name, src)
+    tp53 = sorted(Path(config.PAPER_TP53_RPV_DIR).glob("TP53_*_RPV_penetrance_hist.png"))
+    best = _tp53_best_config()
+    pick = next((p for p in tp53 if p.name.startswith(f"TP53_{best}_")), tp53[0] if tp53 else None)
+    if pick is not None:
+        _link_figure(pick, dest / "tp53_rpv_penetrance.png")
+        _record_linked_figure(REG, "tp53_rpv_penetrance.png", pick)
+
+    REG.write(config.MANUSCRIPT_FIGURE_DIR, old_values={}, highlight_changed=True,
+              placeholder_unregistered=True, generator="mv_analysis/analyze_mv_pipeline_output.py")
+    return REG
+
+
+def _link_figure(src, link):
+    """Point the manuscript at the pipeline's own output file -- one copy of
+    every figure, so the manuscript can never hold a stale duplicate."""
+    link = Path(link)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(Path(src).resolve())
+
+
+def _record_linked_figure(REG, name, src):
+    """Record a symlinked figure in the build report and flag it if its
+    source predates the fits it is drawn from (PAPER_RESULTS_JSON) -- the
+    only way a linked figure can be stale, since there is no copy to drift."""
+    import datetime as _dt
+    src = Path(src)
+    fits_mtime = Path(config.PAPER_RESULTS_JSON).stat().st_mtime
+    stale = src.stat().st_mtime < fits_mtime
+    REG.figures[name] = {"path": str(src), "exists": True, "mtime": src.stat().st_mtime,
+                         "mtime_iso": _dt.datetime.fromtimestamp(src.stat().st_mtime).isoformat(timespec="seconds"),
+                         "fresh_this_run": not stale, "part": "A", "inputs": []}
+    if stale:
+        REG._fail_soft("stale-figure", f"{name}: {src} is older than {config.PAPER_RESULTS_JSON}")
+
+
+TP53_CONFIG = "4c_unc"  # TP53 uses 4 components throughout (author decision, 2026-10-07)
+
+
+def _tp53_best_config():
+    """TP53's configuration for every manuscript number and figure: fixed at
+    TP53_CONFIG rather than chosen by MCC."""
+    return TP53_CONFIG
+
+
 # %% [markdown]
 # ## Section 10: manuscript-number summary
 #
@@ -526,7 +945,8 @@ def main():
     ap.add_argument("--sections", nargs="+", default=["all"],
                      choices=["all", "aggregate", "scatter", "results-tables", "predictor-individual",
                               "confusion", "ret", "card11", "tp53", "vus-brnich",
-                              "vus-points-by-panel", "per-gene-diagnostics", "summary"])
+                              "vus-points-by-panel", "per-gene-diagnostics", "summary",
+                              "cartoons", "correlation", "ret-phenotype", "figures", "manuscript"])
     ap.add_argument("--path-percentile", type=float, default=RUN_KWARGS["path_percentile"],
                      help="Percentile of the bootstrap LR+ distribution a pathogenic call must clear "
                           "(ben_percentile derives as 100 - this, matching analysis.run()'s own "
@@ -630,6 +1050,22 @@ def main():
     # docstring for the cost rationale; must be requested explicitly.
     if "per-gene-diagnostics" in sections:
         run_per_gene_diagnostics()
+
+    ret_ev = ret_counts = None
+    if run_all or "ret-phenotype" in sections or "manuscript" in sections:
+        ret_ev, ret_counts = run_ret_phenotype_specific_evidence(run_kwargs=run_kwargs)
+
+    if run_all or "cartoons" in sections:
+        run_cartoons()
+
+    if run_all or "correlation" in sections:
+        run_correlation_and_conflict()
+
+    if run_all or "figures" in sections:
+        run_manuscript_figures()
+
+    if run_all or "manuscript" in sections:
+        run_manuscript(ret_counts=ret_counts, ret_ev=ret_ev)
 
     if run_all or "summary" in sections:
         print_manuscript_summary(functional_table, predictor_table, combined_table,

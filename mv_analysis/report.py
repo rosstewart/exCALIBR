@@ -49,12 +49,52 @@ def points_to_confusion_thresholded(labels, points, path_threshold, ben_threshol
     return pd.DataFrame(cm, index=['B/LB', 'P/LP'], columns=['Benign', 'Indeterminate', 'Pathogenic'])
 
 
-def _eval_labels(ms, p_idx, b_idx):
+def _both_modality_mask(ms):
+    """True for rows observed in >=1 predictor dim AND >=1 functional dim --
+    used to ALWAYS restrict "combined" gene-set evaluation (confusion
+    matrices, VUS, MCC/accuracy/AUC, gene-performance scatter) to the
+    intersection subset, regardless of whether the underlying fit was
+    trained on the union population (the default/intended fitting policy,
+    see hpc/prepare.py's combined branch) or an intersection-only one.
+    Scoring a trust_global-fit model against a subset of its own training
+    population is not a train/test mismatch, just a smaller/cleaner eval
+    set -- confirmed on real data this session (BRCA1: union gives 2835
+    variants, only 2.1% with every dim observed, 78% single-modality,
+    which otherwise dominates and inflates/distorts MCC on genes with few
+    cross-modality-observed variants).
+
+    A no-op for non-"combined" gene-sets (callers only apply this when
+    gene_set == "combined"; it's meaningless for single-modality ms's)."""
+    from src.assay_calibration.multivariate_data.predictors import PREDICTOR_DATASET_NAMES
+    predictor_names = set(PREDICTOR_DATASET_NAMES.values())
+    scores = np.asarray(ms.scores, dtype=float)
+    dataset_names = list(ms.dataset_names)
+    pred_idx = [i for i, n in enumerate(dataset_names) if n in predictor_names]
+    func_idx = [i for i, n in enumerate(dataset_names) if n not in predictor_names]
+    pred_observed = ~np.all(np.isnan(scores[:, pred_idx]), axis=1) if pred_idx else np.zeros(len(scores), dtype=bool)
+    func_observed = ~np.all(np.isnan(scores[:, func_idx]), axis=1) if func_idx else np.zeros(len(scores), dtype=bool)
+    return pred_observed & func_observed
+
+
+def _eval_labels(ms, p_idx, b_idx, gene_set=None):
     sa = ms.sample_assignments
     n = sa.shape[0]
     plp_mask = sa[:, p_idx].astype(bool) if p_idx is not None else np.zeros(n, dtype=bool)
     blb_mask = sa[:, b_idx].astype(bool) if b_idx is not None else np.zeros(n, dtype=bool)
     eval_mask = plp_mask | blb_mask
+    # Evaluate (MV and UV alike) only on variants the MV model calibrates --
+    # those measured in at least one of its dimensions. A dimension-restricted
+    # ms (one disjoint cluster, e.g. BRCA2's Sahu 2023 exon-13 group, or a fit
+    # that left out a poorly connected assay) keeps every control row, and the
+    # UV baseline aggregates all of the gene's assays, so without this the UV
+    # side was scored on variants that were never in the MV space.
+    eval_mask = eval_mask & ~np.isnan(np.asarray(ms.scores, dtype=float)).all(axis=1)
+    # Any combined gene-set label ("combined", or the scatter's
+    # "combined-all-evidence" UV-source variant) -- previously only the exact
+    # string "combined" matched, so the gene-performance scatter's panel C
+    # was silently evaluated on the union.
+    if str(gene_set).startswith("combined"):
+        eval_mask = eval_mask & _both_modality_mask(ms)
     return eval_mask, plp_mask[eval_mask].astype(int)
 
 
@@ -92,7 +132,7 @@ def _rows_for_points(method, pts_eval, labels, extra=None):
 def _mv_metric_rows(analysis, modes, mode_labels, **run_kwargs):
     """Two rows (one per CLASSIFICATION_THRESHOLDS entry) per (config, mode)."""
     all_results = analysis.compare_partial_pattern_modes(modes=modes, **run_kwargs)
-    eval_mask, labels = _eval_labels(analysis.ms, analysis.p_idx, analysis.b_idx)
+    eval_mask, labels = _eval_labels(analysis.ms, analysis.p_idx, analysis.b_idx, gene_set=analysis.gene_set)
 
     rows = []
     for mode, results in all_results.items():
@@ -137,6 +177,8 @@ def _uv_metric_rows(gene, gene_set, ms, p_idx, b_idx):
     # "combined" dispatches successfully but to the FUNCTIONAL-ONLY loader,
     # which returned None for BRCA1/BRCA2 (undocumented as unverified
     # outside TP53-shaped data) instead of the working merged baseline.
+    orig_gene_set = gene_set  # _eval_labels needs the UN-remapped name ("combined",
+                              # not "combined-all-evidence") to apply the intersection mask
     gene_set = _UV_DISPATCH_GENE_SET.get(gene_set, gene_set)
     if gene_set == "combined":
         gene_set = "combined-all-evidence"
@@ -147,7 +189,7 @@ def _uv_metric_rows(gene, gene_set, ms, p_idx, b_idx):
         # non-conflicting/max rule spanning every individual source as a
         # single flat pool (what load_uv_points+aggregate_*(mat) would do
         # here). See uv_sources.aggregate_functional_plus_predictor.
-        eval_mask, labels = _eval_labels(ms, p_idx, b_idx)
+        eval_mask, labels = _eval_labels(ms, p_idx, b_idx, gene_set=orig_gene_set)
         rows = []
         for key, aggregator in [("UV non-conflicting", uv_agg.aggregate_nonconflicting),
                                  ("UV max", uv_agg.aggregate_max)]:
@@ -165,7 +207,7 @@ def _uv_metric_rows(gene, gene_set, ms, p_idx, b_idx):
     if uv is None:
         return pd.DataFrame(), None
     names, mat = uv
-    eval_mask, labels = _eval_labels(ms, p_idx, b_idx)
+    eval_mask, labels = _eval_labels(ms, p_idx, b_idx, gene_set=orig_gene_set)
 
     rows = []
     for key, pts in [("UV non-conflicting", uv_agg.aggregate_nonconflicting(mat)),
@@ -181,7 +223,11 @@ def _uv_metric_rows(gene, gene_set, ms, p_idx, b_idx):
 # translated here rather than renaming either side, since both names are
 # already used elsewhere (cockpit CLI --gene-set choices vs. this
 # dispatcher's existing call sites).
-_UV_DISPATCH_GENE_SET = {"predictor": "predictor-mv"}
+# "integrated" -> "integrated-functional": without it the results tables
+# silently had NO UV rows for any plain-integrated gene (BRCA1, GCK, LDLR, ...)
+# while the gene-performance scatter (which passes "integrated-functional"
+# directly) did, so pooled UV and pooled MV covered different genes.
+_UV_DISPATCH_GENE_SET = {"predictor": "predictor-mv", "integrated": "integrated-functional"}
 
 
 def individual_predictor_comparison(gene, ms, gene_set, p_idx, b_idx, all_evidence=False):
@@ -207,7 +253,7 @@ def individual_predictor_comparison(gene, ms, gene_set, p_idx, b_idx, all_eviden
     if uv is None:
         return pd.DataFrame()
     names, mat = uv
-    eval_mask, labels = _eval_labels(ms, p_idx, b_idx)
+    eval_mask, labels = _eval_labels(ms, p_idx, b_idx, gene_set=gene_set)
 
     rows = []
     for i, name in enumerate(names):

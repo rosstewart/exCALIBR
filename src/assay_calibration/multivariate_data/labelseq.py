@@ -28,6 +28,13 @@ def _labelseq_ms_cache_dir(data_path: str, log10_activity: bool,
 def _labelseq_gene_cache_path(cache_dir: Path, gene: str) -> Path:
     return cache_dir / f"{gene}.pkl"
 
+
+def _labelseq_manifest_path(cache_dir: Path) -> Path:
+    """Lists every gene a full build produced, so a ``genes=None`` call can be
+    served from the per-gene cache without reading the source file to learn
+    the gene list."""
+    return cache_dir / "genes.txt"
+
 VEP_CONSEQUENCE_MAPPING = {
     "splice_acceptor_variant": "splice_site_variant",
     "splice_region_variant": "splicing_variant",
@@ -169,6 +176,12 @@ def build_labelseq_multiscoresets(
         except OSError:
             return False
 
+    manifest = _labelseq_manifest_path(cache_dir)
+    if use_cache and not explicit_df and genes is None and manifest.exists():
+        # A full build is served from the cache too (previously only
+        # genes=[...] calls were, so every genes=None caller rebuilt all 17
+        # genes, ~10 min, and rewrote every pickle).
+        genes = manifest.read_text().split()
     if use_cache and not explicit_df and genes is not None:
         wanted_lower = [g.lower() for g in genes]
         if all(_cache_fresh(g) for g in wanted_lower):
@@ -211,6 +224,8 @@ def build_labelseq_multiscoresets(
             for gene, ms in gene_ms.items():
                 with open(_labelseq_gene_cache_path(cache_dir, gene), "wb") as f:
                     pickle.dump(ms, f)
+            if build_all:
+                manifest.write_text("\n".join(sorted(gene_ms)) + "\n")
         except OSError as e:
             print(f"  [labelseq cache] couldn't write to {cache_dir}: {e}")
     return gene_ms

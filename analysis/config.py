@@ -41,6 +41,13 @@ DATASET_CONFIGS = _env(
     "/home/rcstewart/exCALIBR/src/igvf_configs/dataset_configs_aug_2026.json",
 )
 
+# Train/val splits for --oob evidence (run_igvf_batch.py --splits-file),
+# matching the current master TSV. Stale versions are archived under
+# /data/ross/assay_calibration/archive/stale_splits_20261006/.
+SPLITS_FILE = _env(
+    "EXCALIBR_SPLITS_FILE", "/data/ross/assay_calibration/dataset_splits_recovered_20260917.pkl"
+)
+
 # Precomputed bootstrap fits (gzipped JSON of full per-bootstrap component
 # params/weights) — the --precomputed-fits input to run_igvf_batch.py.
 # Needed only for plots that overlay the fitted mixture density (MSH2 example,
@@ -50,8 +57,23 @@ PRECOMPUTED_FITS = _env(
     "/data/ross/assay_calibration/pp_final_clinvar2025_bootstraps/final_clinvar2025_bootstrap_results.json.gz",
 )
 
-# Where generated figures are written by default.
-FIGURE_DIR = _env("EXCALIBR_FIGURE_DIR", str(Path(OUTPUT_DIR) / "figures"))
+# Output layout (all real files under OUTPUT_DIR; ~/exCALIBR/manuscript/ holds
+# gitignored symlinks to these, and ExCALIBR_latex_src/Figures -> figures/):
+#   exploratory_figures/     every figure the notebook draws (working tree)
+#   figures/                 Overleaf `Figures/`: only what main.tex/supplement.tex
+#                            include (copied from exploratory_figures/ at the end
+#                            of each run), plus generated/ (macros.tex, tables)
+#   tables/                  LaTeX table files and IGVF data-release CSVs
+#   supplementary_data/      Supplementary Data 1-3
+#   submission/              flattened .tex (no personal macros) for Nature Genetics
+#   pillar_project_figures/  IGVF Pillar Project outputs (other paper)
+FIGURE_DIR = _env("EXCALIBR_FIGURE_DIR", str(Path(OUTPUT_DIR) / "exploratory_figures"))
+MANUSCRIPT_FIGURE_DIR = _env("EXCALIBR_MANUSCRIPT_FIGURE_DIR", str(Path(OUTPUT_DIR) / "figures"))
+TABLES_DIR = _env("EXCALIBR_TABLES_DIR", str(Path(OUTPUT_DIR) / "tables"))
+SUPP_DATA_DIR = _env("EXCALIBR_SUPP_DATA_DIR", str(Path(OUTPUT_DIR) / "supplementary_data"))
+SUBMISSION_DIR = _env("EXCALIBR_SUBMISSION_DIR", str(Path(OUTPUT_DIR) / "submission"))
+ZENODO_DATA_DIR = _env("EXCALIBR_ZENODO_DATA_DIR", str(Path(OUTPUT_DIR) / "zenodo_data"))  # bootstrap fits + splits (analysis/data_deposit.py)
+PILLAR_FIGURE_DIR = _env("EXCALIBR_PILLAR_FIGURE_DIR", str(Path(OUTPUT_DIR) / "pillar_project_figures"))
 
 # Dataset name mapping CSV (Old_names, New_names columns) — optional, used to
 # translate legacy reported names to current CSV dataset names.
@@ -76,14 +98,21 @@ DATASET_NAMES_CSV = _env(
 
 YILE_DIR = _env("EXCALIBR_YILE_DIR", "/data/ross/assay_calibration/flagship/yile")
 
-OR_ESTIMATES_CSV = _env(
-    "EXCALIBR_OR_ESTIMATES_CSV",
-    "/data/ross/assay_calibration/paper/ExCALIBR-or-estimates-2026-02-09.csv.gz",
+# All of Us biobank odds-ratio-by-evidence-strength estimates (long format:
+# Grouping/Calibration x Consequence x Group/Range per Dataset/Predictor).
+# Replaces the old, separately-maintained OR_ESTIMATES_CSV + YURIY_OR_CSV
+# pair -- see analysis.gene_performance_scatter.load_aou_or_estimates.
+AOU_OR_ESTIMATES_TSV = _env(
+    "EXCALIBR_AOU_OR_ESTIMATES_TSV",
+    "/data/ross/assay_calibration/paper/AoU-OR-estimates_2026-10-02.tsv.gz",
 )
-
-YURIY_OR_CSV = _env(
-    "EXCALIBR_YURIY_OR_CSV",
-    "/data/ross/assay_calibration/paper/yuriy_odds_ratios.csv",
+# TP53 All of Us estimates, delivered separately (same columns; one
+# Dataset/Predictor per TP53 assay under Grouping/Calibration == "ExCALIBR",
+# which the main file lacks). Its rows replace any rows for the same
+# Dataset/Predictor in AOU_OR_ESTIMATES_TSV.
+AOU_TP53_OR_ESTIMATES_TSV = _env(
+    "EXCALIBR_AOU_TP53_OR_ESTIMATES_TSV",
+    "/data/ross/assay_calibration/paper/excalibr-TP53-OR-estimates_2026-10-05.tsv.gz",
 )
 
 # Brnich et al. OddsPath evidence-code CSV (columns: Dataset, "Evidence Code
@@ -95,6 +124,10 @@ OP_EVIDENCE_CODES_CSV = _env(
     "EXCALIBR_OP_EVIDENCE_CODES_CSV",
     "/data/ross/assay_calibration/dataframe/OddsPath_calibrations.csv",
 )
+# OddsPath CSV rows that supersede another row for the same assay (updated
+# OddsPath calibration): {superseded row: superseding row}. The superseding
+# row's values are used under the superseded (calibrated-dataset) name.
+OP_SUPERSEDED_BY = {"MSH2_Jia_2021": "MSH2_Scott_2022"}
 
 EVIDENCE_COUNTS_DIR = _env(
     "EXCALIBR_EVIDENCE_COUNTS_DIR",
@@ -110,9 +143,13 @@ DATASET_MEASUREMENTS_CSV = _env(
     "EXCALIBR_DATASET_MEASUREMENTS_CSV",
     "/data/ross/assay_calibration/dataset_measurements.csv",
 )
+# Same file as CURATED_DATASET_METADATA_CSV below (current dataset names,
+# built from ASSAY_CURATION_CSV by analysis/build_curated_metadata.py), so
+# Fig. 6 / the VAMP-seq & SGE numbers and Supplementary Data 1 share one
+# metadata source.
 ASSAY_METHOD_MAP_CSV = _env(
     "EXCALIBR_ASSAY_METHOD_MAP_CSV",
-    "/data/ross/assay_calibration/dataframe/excalibr_datasets_oldnames.csv",
+    str(Path(__file__).resolve().parent / "manuscript_curated" / "dataset_metadata.csv"),
 )
 
 # ClinGen Gene-Disease Validity curations (mode-of-inheritance per gene) --
@@ -265,7 +302,7 @@ PATHOMECHANISM_OUTPUT_DIR = _env(
 # rather than recomputing it live; rerun that script (with --with-yang) to
 # refresh it if pipeline output changes.
 EXCALIBR_DATASETS_TABLE_CSV = _env(
-    "EXCALIBR_DATASETS_TABLE_CSV", "/data/ross/assay_calibration/dataframe/excalibr_datasets.csv"
+    "EXCALIBR_DATASETS_TABLE_CSV", "/data/ross/assay_calibration/dataframe/excalibr_datasets_2026-10-05.csv"
 )
 
 # Bootstrap-count-reduction experiment (tests/benchmark_bootstrap_reduction.py)
@@ -313,6 +350,90 @@ PREDICTOR_EVIDENCE_SOURCE_CSV = _env(
     "EXCALIBR_PREDICTOR_EVIDENCE_SOURCE_CSV",
     "/data/ross/assay_calibration/IGVFFI1443TQDN.csv.gz",
 )
+
+
+# ---------------------------------------------------------------------------
+# Manuscript build (analyze_pipeline_output.py -> Figures/generated/)
+# ---------------------------------------------------------------------------
+
+# Nature Genetics manuscript sources; the registry scans these for macro uses.
+MANUSCRIPT_TEX_DIR = _env(
+    "EXCALIBR_MANUSCRIPT_TEX_DIR", str(Path(__file__).resolve().parent.parent / "ExCALIBR_latex_src")
+)
+
+# Fit-quality cutoff for the normalized Yang distance (main text "below 0.2").
+YANG_GOOD_FIT_THRESHOLD = 0.2
+
+# Per-dataset cache of every bootstrap's Yang distance (shared by the batch
+# table, the fit-quality numbers and Extended Data Fig. 1), and the number of
+# parallel workers used when a dataset has to be (re)computed.
+YANG_CACHE_DIR = _env("EXCALIBR_YANG_CACHE_DIR", str(Path(OUTPUT_DIR).parent / "yang_distance_cache"))
+YANG_N_JOBS = int(_env("EXCALIBR_YANG_N_JOBS", "32"))
+# CDF-grid resolution for every Yang distance in the manuscript (table, fit
+# numbers, ED Fig. 1); 2000 is ~4-5x faster than 10000 for <0.1% change in
+# medians (see analysis/run_build_excalibr_datasets_table.py). Reported in Methods.
+YANG_N_GRID = int(_env("EXCALIBR_YANG_N_GRID", "2000"))
+# Held-out (out-of-bag) Yang distances: computed on each bootstrap's held-out
+# variants (python -m analysis.skew_locked_yang --split val, which also writes
+# the per-dataset held-out sample sizes) and reported only for samples with
+# at least YANG_HELDOUT_MIN_N held-out variants.
+YANG_HELDOUT_CSV = _env("EXCALIBR_YANG_HELDOUT_CSV", str(Path(SKEW_LOCKED_BOOTSTRAP_RESULTS).parent
+                                                          / "yang_skew_locked_vs_regular_val.csv"))
+YANG_HELDOUT_MIN_N = int(_env("EXCALIBR_YANG_HELDOUT_MIN_N", "5"))
+
+# Hand-curated per-dataset metadata for Supplementary Data 1 (citation, PMID,
+# description, assay type, model system, disease, VAMP-seq/SGE, IGVF-produced,
+# Woo-style post-processed intervals), keyed by current pipeline dataset name.
+# Cache for the slow Part A computation steps (analysis/step_cache.py).
+STEP_CACHE_DIR = _env("EXCALIBR_STEP_CACHE_DIR", "/data/ross/assay_calibration/manuscript_step_cache")
+
+# IGVF logo marking IGVF-produced datasets in Fig. 6 (point heatmap).
+IGVF_LOGO_PNG = _env("EXCALIBR_IGVF_LOGO_PNG", "/data/ross/assay_calibration/paper/igvf_logo.png")
+
+# Assay curation spreadsheet (one row per assay; column meanings in the
+# definitions file). analysis/build_curated_metadata.py turns it into
+# CURATED_DATASET_METADATA_CSV below. Older metadata files (dataset
+# descriptions, excalibr_datasets_oldnames.csv, var_effect_measurements_
+# dataset.csv) are archived under
+# /data/ross/assay_calibration/archive/assay_metadata_20261006/.
+ASSAY_CURATION_CSV = _env(
+    "EXCALIBR_ASSAY_CURATION_CSV",
+    "/data/ross/assay_calibration/dataframe/pillar_project_assay_curation.csv",
+)
+ASSAY_CURATION_COLUMN_DEFINITIONS_CSV = _env(
+    "EXCALIBR_ASSAY_CURATION_COLUMN_DEFINITIONS_CSV",
+    "/data/ross/assay_calibration/dataframe/pillar_project_assay_curation_column_definitions.csv",
+)
+CURATED_DATASET_METADATA_CSV = _env(
+    "EXCALIBR_CURATED_DATASET_METADATA_CSV",
+    str(Path(__file__).resolve().parent / "manuscript_curated" / "dataset_metadata.csv"),
+)
+
+# Review aid: render every generated number that differs from the
+# pre-automation manuscript (or is new) in red. Turn off once reviewed.
+HIGHLIGHT_CHANGED_NUMBERS = _env("EXCALIBR_HIGHLIGHT_CHANGED_NUMBERS", "1") == "1"
+
+# Explicit, reasoned exemptions from the manuscript build's staleness checks:
+# {input path: reason}. Every waiver is copied into build_report.md.
+STALENESS_WAIVERS: dict = {}
+
+# Run every notebook part (A manuscript, B Pillar Project, C IGVF release,
+# D diagnostics) by default; MANUSCRIPT_ONLY=1 skips B-D for a faster build.
+MANUSCRIPT_ONLY = os.environ.get("MANUSCRIPT_ONLY", "0") == "1"
+STRICT = os.environ.get("EXCALIBR_STRICT", "0") == "1"
+
+
+def require(path: str, what: str) -> bool:
+    """Like `warn_if_missing`, but inverted (True = present) and raising in
+    strict mode (EXCALIBR_STRICT=1), so a headless manuscript build fails
+    loudly instead of silently skipping a figure/table."""
+    if not path or not Path(path).exists():
+        msg = f"{what}: path not found ({path})"
+        if STRICT and str(path) not in STALENESS_WAIVERS:
+            raise FileNotFoundError(msg)
+        print(f"  SKIP {msg}")
+        return False
+    return True
 
 
 def warn_if_missing(path: str, what: str) -> bool:

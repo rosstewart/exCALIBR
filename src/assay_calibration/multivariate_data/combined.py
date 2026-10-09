@@ -43,7 +43,24 @@ def build_functional_scoresets(
     keep_mask drops any row without a P/LP/B/LB/gnomAD/Synonymous
     sample_assignment) -- needed by callers that want to score true
     ClinVar-VUS variants under the combined functional+predictor fit.
+
+    TP53 special-case: the generic ``df``/``datasets`` (sourced from
+    DEFAULT_INTEGRATED_DATAFRAME) gives a functional panel that does NOT
+    match TP53's own dedicated "tp53" gene-set (different datasets
+    entirely -- confirmed missing KawOligo/log_TempSens, which need
+    preprocessing only src/assay_calibration/multivariate_data/tp53.py
+    implements). Every "combined" ms-building call site in the repo calls
+    this function directly before build_combined_multiscoreset, so fixing
+    it here (rather than patching each call site) makes TP53's combined
+    functional panel use the exact same data as "tp53" everywhere at once.
+    ``datasets``/``clinvar_release``/``population_type``/
+    ``regularization_type`` are ignored for TP53 -- tp53.py's ingestion
+    reads its own dedicated raw files and has no equivalent knobs.
     """
+    if gene == "TP53":
+        from .tp53 import build_tp53_functional_scoresets
+        return build_tp53_functional_scoresets()
+
     df_gene = df[df["Gene"] == gene]
     scoresets = []
     for ds_name in datasets:
@@ -261,6 +278,15 @@ def build_combined_multiscoreset(
         for ps in predictor_scoresets:
             split_predictor_clinvar_leakage(ps, functionally_assayed_variants)
     predictor_names = [PREDICTOR_DATASET_NAMES.get(p, p) for p in have]
+
+    if gene == "TP53":
+        # build_functional_scoresets already swapped in tp53.py's own
+        # dedicated panel for TP53 (see its docstring) -- the caller's
+        # functional_dataset_names is still the OLD generic-panel name list
+        # (same length, wrong names) since callers build it independently
+        # of functional_scoresets. Use each scoreset's own name instead of
+        # trusting the caller's stale list.
+        functional_dataset_names = [s.scoreset_name for s in functional_scoresets]
 
     combined = MultiPredictorFunctionalScoreset.from_predictor_and_functional(
         predictor_scoresets,

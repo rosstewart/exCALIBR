@@ -221,3 +221,278 @@ def plot_phenotype_evidence(
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"Saved phenotype evidence plot to {save_path}")
     return fig
+
+
+# ---------------------------------------------------------------------------
+# RET phenotype-specific evidence from the canonical fit (MEN2A/B vs
+# Hirschsprung vs benign), rendered like the reference interactive HTML
+# (pre_092026_em_fixes/experimental_staged_fit/
+# ret_stagedinit_men2_hirschsprung_combined_evidence.html) but computed from
+# the paper's canonical RET fit instead of that pre-fix staged-init K=6 fit.
+# ---------------------------------------------------------------------------
+RET_PHENOTYPE_ROLES = {"MEN2": 4, "Hirschsprung": 5}
+RET_PHENOTYPE_COLORS = {"MEN2": "#8B0000", "Hirschsprung": "#800080"}
+RET_AXIS_LABELS = {"ret_abundance_HSP90i": "Abundance (HSP90i)",
+                   "ret_abundance_No_treatment": "Abundance",
+                   "ret_activity_No_treatment": "Activity"}
+
+
+def _with_phenotype_samples(ms, masks: Dict[str, np.ndarray], roles: Dict[str, int]):
+    """Shallow copy of `ms` with one extra sample-assignment column per
+    phenotype group, at the fixed role index given in `roles` (4, 5, ...),
+    so MVCalibrationAnalysis's auxiliary-pathogenic path can address them.
+    The phenotype variants also stay in role 0 (P/LP), exactly as in the
+    fit itself."""
+    import copy
+    new = copy.copy(ms)
+    n_roles = max(roles.values()) + 1
+    sa = np.zeros((ms.scores.shape[0], max(n_roles, ms._sample_assignments.shape[1])), dtype=bool)
+    sa[:, :ms._sample_assignments.shape[1]] = ms._sample_assignments.astype(bool)
+    for name, role in roles.items():
+        sa[:, role] = masks[name]
+    new._sample_assignments = sa
+    new.sample_counts = sa.sum(axis=0)
+    names = list(getattr(ms, "_sample_names", []))
+    names += [""] * (sa.shape[1] - len(names))
+    for name, role in roles.items():
+        names[role] = name
+    new._sample_names = names
+    return new
+
+
+def _posthoc_phenotype_weights(fit_inner, X_by_group, n_iter: int = 500, tol: float = 1e-10):
+    """Mixing weights of each phenotype group on the fit's FROZEN components:
+    iterate the fitter's own weight update (update_steps.get_sample_weights,
+    the same conditional-maximization step the EM uses for every sample)
+    to convergence, starting from the fit's own P/LP weights."""
+    from src.assay_calibration.fit_utils.cfusn.update_steps import get_sample_weights
+    if fit_inner.get("cat_spec"):
+        raise NotImplementedError("post hoc phenotype weights don't support categorical-dim fits")
+    params = []
+    for p in fit_inner["component_params"]:
+        Delta = np.array(p[1], dtype=float)
+        if Delta.ndim == 2 and Delta.shape[1] == 1:
+            Delta = Delta.ravel()
+        params.append((np.array(p[0], dtype=float), Delta, np.array(p[2], dtype=float)))
+    w0 = np.asarray(fit_inner["weights"], dtype=float)[0]
+    rows = []
+    for X in X_by_group:
+        w = w0[None, :].copy()
+        ind = np.ones((X.shape[0], 1), dtype=bool)
+        for _ in range(n_iter):
+            w_new = get_sample_weights(X, ind, params, w, multivariate=True)
+            if np.abs(w_new - w).max() < tol:
+                w = w_new
+                break
+            w = w_new
+        rows.append(w[0])
+    return np.array(rows)
+
+
+def ret_phenotype_evidence(results_json: str, dataset_name: str = "ret_labelseq_mv",
+                           config_name: Optional[str] = None, run_kwargs=None, ms=None):
+    """MEN2A/B-specific and Hirschsprung-specific evidence for RET variants.
+
+    TODO(next rerun): canonically the phenotype groups should enter the fit
+    itself as their own samples (their weight rows estimated during EM, like
+    TP53's RPV or CARD11's cohorts). The paper fits were run without them, so
+    for now each group's weights are estimated POST HOC on every bootstrap's
+    frozen components (_posthoc_phenotype_weights) and scored through
+    MVCalibrationAnalysis's existing auxiliary-pathogenic path (each group vs
+    the benign reference, with its own prior). Once the rerun includes the
+    phenotype samples, drop the post-hoc step and read the fitted rows.
+
+    Returns dict(ms, coords_names, config, points, aux_points{group},
+    aux_lr_median{group}, aux_prior{group}, masks).
+    """
+    from mv_analysis import mv_cockpit as cockpit
+    from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
+    run_kwargs = dict(run_kwargs or cockpit.DEFAULT_RUN_KWARGS)
+    if ms is None:
+        ms = build_labelseq_multiscoresets(genes=["ret"])["ret"]
+    masks = ret_phenotype_masks(ms)
+    if config_name is None:
+        config_name = cockpit.pick_best_canonical_config(
+            "ret", "labelseq", ms, results_json, dataset_name, run_kwargs)
+
+    ms_aug = _with_phenotype_samples(ms, masks, RET_PHENOTYPE_ROLES)
+    analysis = build_gene_set_analysis(
+        ms_aug, "ret", results_json, dataset_name=dataset_name, gene_set="labelseq",
+        auxiliary_pathogenic_indices=sorted(RET_PHENOTYPE_ROLES.values()))
+    analysis.configs = [config_name]
+
+    groups = sorted(RET_PHENOTYPE_ROLES, key=RET_PHENOTYPE_ROLES.get)
+    X_by_group = [ms.scores[masks[g]] for g in groups]
+    n_aug = 0
+    for bd in analysis.raw_boots.values():
+        entry = bd.get(config_name) if isinstance(bd, dict) else None
+        if not entry:
+            continue
+        inner = entry.get("fit", entry)
+        if inner is None or not inner.get("component_params"):
+            continue
+        w = np.asarray(inner["weights"], dtype=float)
+        extra = _posthoc_phenotype_weights(inner, X_by_group)
+        n_rows = max(RET_PHENOTYPE_ROLES.values()) + 1
+        full = np.zeros((max(n_rows, w.shape[0]), w.shape[1]))
+        full[:w.shape[0]] = w
+        for g, row in zip(groups, extra):
+            full[RET_PHENOTYPE_ROLES[g]] = row
+        inner["weights"] = full.tolist()
+        n_aug += 1
+    print(f"  RET phenotype weights estimated post hoc on {n_aug} bootstrap fits ({config_name})")
+
+    analysis.run(partial_pattern_mode="trust_global", **run_kwargs)
+    res = analysis.results[config_name]
+    aux = res.get("aux_results", {})
+    out = dict(ms=ms, masks=masks, config=config_name, dims=list(ms.dataset_names),
+               points=np.asarray(res["points"]), aux_points={}, aux_lr_median={}, aux_prior={})
+    for g in groups:
+        a = aux[RET_PHENOTYPE_ROLES[g]]
+        out["aux_points"][g] = np.asarray(a["points"])
+        out["aux_lr_median"][g] = np.asarray(a["lr_median"])
+        out["aux_prior"][g] = float(a["median_prior"])
+    return out
+
+
+def plot_ret_phenotype_evidence_3d(ev: dict, html_path: Optional[str] = None,
+                                   png_path: Optional[str] = None, camera=None,
+                                   label_variants: bool = False, title: Optional[str] = None):
+    """Slide-36 layout: each variant is drawn once, colored by the evidence it
+    receives -- benign evidence (blue scale) if its P/LP-vs-B/LB points are
+    negative, otherwise MEN2-specific (red scale) or Hirschsprung-specific
+    (purple scale) pathogenic evidence, whichever phenotype gives it more
+    points (ties broken by the larger median log LR+), otherwise grey. The
+    curated MEN2A/B and Hirschsprung variants are drawn larger and outlined;
+    ``label_variants`` also writes each curated variant's name (e.g. M918T)
+    next to it, and every point's hover text gives its points under each
+    phenotype."""
+    import plotly.graph_objects as go
+    ms, masks = ev["ms"], ev["masks"]
+    X = ms.scores
+    complete = ~np.isnan(X).any(axis=1)
+    pts = ev["points"]
+    pm, ph = ev["aux_points"]["MEN2"], ev["aux_points"]["Hirschsprung"]
+    lm, lh = ev["aux_lr_median"]["MEN2"], ev["aux_lr_median"]["Hirschsprung"]
+    men2_wins = (pm > ph) | ((pm == ph) & (lm >= lh))
+    benign = pts < 0
+    men2 = ~benign & men2_wins & (pm > 0)
+    hirsch = ~benign & ~men2_wins & (ph > 0)
+    none = ~(benign | men2 | hirsch)
+    labels = [RET_AXIS_LABELS.get(d, d) for d in ev["dims"]]
+
+    names = np.array([""] * len(X), dtype=object)
+    if label_variants:
+        idx = build_hgvs3_index(ms)
+        for v in RET_MEN2A_VARIANTS + RET_MEN2B_VARIANTS + RET_HIRSCHSPRUNG_VARIANTS:
+            i = idx.get(_short_to_hgvs3(v))
+            if i is not None:
+                names[i] = v
+    hover = np.array([f"{n + ': ' if n else ''}P/LP vs B/LB {int(a)}, MEN2A/B {int(b)}, "
+                      f"Hirschsprung {int(c)}" for n, a, b, c in zip(names, pts, pm, ph)], dtype=object)
+
+    def _trace(mask, values, scale, cmax, name, size, outline, colorbar_x=None, cbar_title=None):
+        m = mask & complete
+        marker = dict(size=size, opacity=0.9, line=dict(width=1.2 if outline else 0.3,
+                                                       color="#111111" if outline else "#999999"))
+        if values is None:
+            marker["color"] = "#c8c8c8"
+        else:
+            marker.update(color=values[m], colorscale=scale, cmin=0, cmax=cmax,
+                          showscale=colorbar_x is not None)
+            if colorbar_x is not None:
+                marker["colorbar"] = dict(title=dict(text=cbar_title), x=colorbar_x, len=0.6)
+        labelled = label_variants and outline
+        return go.Scatter3d(x=X[m, 0], y=X[m, 1], z=X[m, 2],
+                            mode="markers+text" if labelled else "markers",
+                            text=names[m] if labelled else None, textposition="top center",
+                            textfont=dict(size=11, color="#111111"),
+                            hovertext=hover[m], hoverinfo="text",
+                            name=f"{name} (n={int(m.sum())})", marker=marker)
+
+    blues = [[0, "#deebf7"], [1, "#08306b"]]
+    reds = [[0, "#fee0d2"], [1, RET_PHENOTYPE_COLORS["MEN2"]]]
+    purples = [[0, "#f2e6f7"], [1, RET_PHENOTYPE_COLORS["Hirschsprung"]]]
+    curated = masks["MEN2"] | masks["Hirschsprung"]
+    traces = [
+        _trace(none & ~curated, None, None, 8, "No evidence", 4, False),
+        _trace(benign & ~curated, -pts, blues, 8, "Benign evidence", 5, False, 1.00, "Benign<br>points"),
+        _trace(men2 & ~curated, pm, reds, 8, "MEN2A/B evidence", 6, False, 1.10, "MEN2A/B<br>points"),
+        _trace(hirsch & ~curated, ph, purples, 8, "Hirschsprung evidence", 6, False, 1.20,
+               "Hirschsprung<br>points"),
+        _trace(masks["MEN2"], pm, reds, 8, "MEN2A/B variants", 10, True),
+        _trace(masks["Hirschsprung"], ph, purples, 8, "Hirschsprung variants", 10, True),
+    ]
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        scene=dict(xaxis_title=labels[0], yaxis_title=labels[1], zaxis_title=labels[2]),
+        legend=dict(x=0.0, y=1.0), margin=dict(l=0, r=0, t=40 if title else 10, b=0),
+        title=dict(text=title) if title else None,
+        scene_camera=camera or dict(eye=dict(x=1.6, y=1.6, z=0.9)),
+    )
+    if html_path:
+        Path(html_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.write_html(str(html_path))
+        print(f"wrote {html_path}")
+    if png_path:
+        _ret_evidence_3d_static(X, complete, dict(none=none, benign=benign, men2=men2, hirsch=hirsch),
+                                dict(benign=-pts, men2=pm, hirsch=ph), masks, labels, png_path)
+    return fig, dict(benign=int((benign & complete).sum()), men2=int((men2 & complete).sum()),
+                     hirschsprung=int((hirsch & complete).sum()), none=int((none & complete).sum()))
+
+
+def _ret_evidence_3d_static(X, complete, classes, values, masks, labels, png_path,
+                            elev=18, azim=-55):
+    """Static (matplotlib) counterpart of plot_ret_phenotype_evidence_3d's
+    Plotly figure, for the manuscript -- Plotly's image export needs a Chrome
+    install this environment does not have. Same classes and colors."""
+    with plt.rc_context({"font.size": 7, "font.family": "sans-serif",
+                         "font.sans-serif": ["DejaVu Sans", "Arial", "Helvetica"],
+                         "pdf.fonttype": 42}):
+        _ret_evidence_3d_static_body(X, complete, classes, values, masks, labels, png_path,
+                                     elev, azim)
+
+
+def _ret_evidence_3d_static_body(X, complete, classes, values, masks, labels, png_path,
+                                 elev, azim):
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    cmaps = {
+        "benign": LinearSegmentedColormap.from_list("ben", ["#deebf7", "#08306b"]),
+        "men2": LinearSegmentedColormap.from_list("men2", ["#fee0d2", RET_PHENOTYPE_COLORS["MEN2"]]),
+        "hirsch": LinearSegmentedColormap.from_list("hir", ["#f2e6f7", RET_PHENOTYPE_COLORS["Hirschsprung"]]),
+    }
+    norm = Normalize(0, 8)
+    curated = masks["MEN2"] | masks["Hirschsprung"]
+    fig = plt.figure(figsize=(6.4, 3.8))
+    ax = fig.add_axes([-0.02, 0.0, 0.72, 1.0], projection="3d")
+    m = classes["none"] & complete & ~curated
+    ax.scatter(X[m, 0], X[m, 1], X[m, 2], s=3, c="#c8c8c8", alpha=0.6, linewidths=0)
+    for key in ("benign", "men2", "hirsch"):
+        m = classes[key] & complete & ~curated
+        ax.scatter(X[m, 0], X[m, 1], X[m, 2], s=6, c=cmaps[key](norm(values[key][m])),
+                   alpha=0.85, linewidths=0.15, edgecolors="#555555")
+    for g, key in (("MEN2", "men2"), ("Hirschsprung", "hirsch")):
+        m = masks[g] & complete
+        v = np.clip(values[key][m], 0, 8)
+        ax.scatter(X[m, 0], X[m, 1], X[m, 2], s=28, c=cmaps[key](norm(v)), alpha=1.0,
+                   linewidths=0.8, edgecolors="#111111", depthshade=False)
+    ax.set_xlabel(labels[0], labelpad=2)
+    ax.set_ylabel(labels[1], labelpad=2)
+    ax.set_zlabel(labels[2], labelpad=2)
+    ax.tick_params(labelsize=6, pad=0)
+    ax.view_init(elev=elev, azim=azim)
+    fig.text(0.855, 0.8, "Evidence points", ha="center", fontsize=7)
+    for i, (key, title) in enumerate((("benign", "Benign"), ("men2", "MEN2A/B"),
+                                      ("hirsch", "Hirsch-\nsprung"))):
+        cax = fig.add_axes([0.745 + 0.09 * i, 0.22, 0.014, 0.48])
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmaps[key])
+        cb = fig.colorbar(sm, cax=cax)
+        cax.set_title(title, fontsize=6.5, pad=4)
+        cb.ax.tick_params(labelsize=6, length=2)
+        if key == "benign":
+            cb.set_ticks([0, 2, 4, 6, 8])
+            cb.set_ticklabels(["0", "-2", "-4", "-6", "-8"])
+    Path(png_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png_path, dpi=300)
+    plt.close(fig)
+    print(f"wrote {png_path}")

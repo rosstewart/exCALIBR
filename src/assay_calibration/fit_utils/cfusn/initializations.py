@@ -390,8 +390,19 @@ def kmeans_init_mv(X, **kwargs):
                         cov += (1e-8 - eigvals.min()) * np.eye(K_dim)
 
                 if latent_q == 1:
-                    # Restricted MSN: Delta is (p,) vector
-                    Delta = rng.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
+                    # Restricted MSN: Delta is a (p,) vector, initialized like
+                    # one CFUSN column -- data-driven sign and magnitude along
+                    # the leading eigenvector, flipped by this cluster's
+                    # lambdaIndex bit. (Previously a random +/-0.1 draw per
+                    # dimension that ignored both the data and lambdaIndex, so
+                    # q=1 sign-pattern restarts, greedy included, only ever
+                    # varied the random seed.)
+                    cluster_pattern_idx = (lambdaIndex // (n_sign_per_cluster ** c)) % n_sign_per_cluster
+                    Delta = _init_delta_matrix(
+                        cov, K_dim, 1, Xc=None if small_cluster else Xc,
+                        cluster_sign_pattern=np.array([1 - (cluster_pattern_idx & 1) * 2]),
+                        rng=rng,
+                    ).ravel()
                     Gamma = cov - np.outer(Delta, Delta)
                     eigvals_G = np.linalg.eigvalsh(Gamma)
                     if eigvals_G.min() < 1e-8:
@@ -427,6 +438,10 @@ def kmeans_init_mv(X, **kwargs):
 
                 component_parameters.append((mu, Delta, Gamma))
 
+            if kwargs.get("reference_params") is not None:
+                component_parameters = _align_skew_to_reference(
+                    component_parameters, kwargs["reference_params"])
+
             component_parameters.sort(key=lambda p: p[0][0])
 
             if constrained:
@@ -446,6 +461,49 @@ def kmeans_init_mv(X, **kwargs):
             continue
 
     raise ValueError(f"Failed init after 100 attempts: {last_error}")
+
+
+def _align_skew_to_reference(component_parameters, reference_params):
+    """EXPERIMENTAL (kmeans_init_mv's ``reference_params``): keep the k-means
+    clusters' locations and scales, but point each cluster's initial skewness
+    in the direction of the reference component it matches (closest means,
+    one-to-one). Used to carry a sign pattern chosen once on the full data
+    into every bootstrap without carrying its parameters: lambdaIndex flips
+    are relative to each cluster's own data-driven sign and indexed by
+    k-means cluster order, which differs between bootstraps, so the index
+    alone does not transfer. Unmatched clusters, and matches to a Gaussian
+    (zero-skew) reference, are left unchanged."""
+    from scipy.optimize import linear_sum_assignment
+    ref = [(np.asarray(m, float), np.asarray(D, float)) for m, D, _ in reference_params]
+    mus = [np.asarray(p[0], float) for p in component_parameters]
+    cost = np.array([[np.nansum((mu - rm) ** 2) for rm, _ in ref] for mu in mus])
+    rows, cols = linear_sum_assignment(cost)
+    out = list(component_parameters)
+    for r, c in zip(rows, cols):
+        mu, Delta, Gamma = out[r]
+        D = np.asarray(Delta, float)
+        R = ref[c][1]
+        if np.abs(R).max() < 1e-12 or np.abs(D).max() < 1e-12:
+            continue
+        if D.ndim == 1:
+            Rv = R.ravel() if R.ndim == 1 or R.shape[1] == 1 else R[:, np.argmax(np.abs(R).sum(axis=0))]
+            new = np.abs(D) * np.where(Rv >= 0, 1.0, -1.0)
+            Gamma = Gamma + np.outer(D, D) - np.outer(new, new)
+            eg = np.linalg.eigvalsh(Gamma)
+            if eg.min() < 1e-8:
+                Gamma = Gamma + (1e-8 - eg.min()) * np.eye(len(new))
+        else:
+            R2 = R.reshape(len(R), -1)
+            new = D.copy()
+            used = set()
+            for j in range(D.shape[1]):
+                cos = [abs(D[:, j] @ R2[:, k]) if k not in used else -1 for k in range(R2.shape[1])]
+                k = int(np.argmax(cos))
+                used.add(k)
+                if D[:, j] @ R2[:, k] < 0:
+                    new[:, j] = -D[:, j]  # column sign flips leave Delta Delta^T, hence Gamma, unchanged
+        out[r] = (mu, new, Gamma)
+    return out
 
 
 def default_anchor_groups(K, S):
@@ -719,7 +777,14 @@ def kmeans_init_mv_anchored(X, sample_indicators, **kwargs):
             cov += (1e-8 - eigvals.min()) * np.eye(K_dim)
 
         if latent_q == 1:
-            Delta = rng.uniform(-0.1, 0.1, size=K_dim) * np.sqrt(np.diag(cov))
+            # See kmeans_init_mv's q=1 branch: data-driven sign and magnitude,
+            # flipped by this component's lambdaIndex bit.
+            cluster_pattern_idx = (lambdaIndex // (n_sign_per_cluster ** c)) % n_sign_per_cluster
+            Delta = _init_delta_matrix(
+                cov, K_dim, 1, Xc=Xc,
+                cluster_sign_pattern=np.array([1 - (cluster_pattern_idx & 1) * 2]),
+                rng=rng,
+            ).ravel()
             Gamma = cov - np.outer(Delta, Delta)
             eigvals_G = np.linalg.eigvalsh(Gamma)
             if eigvals_G.min() < 1e-8:

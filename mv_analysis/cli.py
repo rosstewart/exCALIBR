@@ -68,6 +68,8 @@ def main():
                          "to score a fit that was trained on all 16 dimensions; "
                          "mismatching the two trips MVCalibrationAnalysis's shape guard.")
     ap.add_argument("--rpvs-all", action="store_true")
+    ap.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default="jitter",
+                    help="[tp53] must match the fit's hpc/prepare.py --kawoligo-mode")
     ap.add_argument("--kawoligo-seed", type=int, default=0)
     ap.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,
                      help="[tp53] required by hpc/prepare.py's TP53 dispatch; "

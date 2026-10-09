@@ -66,6 +66,21 @@ def is_notebook() -> bool:
     return "ipykernel" in sys.modules or "IPython" in sys.modules
 
 
+INTERNAL_DATASET_SUFFIXES = ("_clinvar_2018",)
+
+
+def display_name(dataset) -> str:
+    """User-facing dataset name: internal pipeline suffixes (the
+    "_clinvar_2018" marker for datasets calibrated against 2018 ClinVar
+    controls) are dropped. Use for every figure label and output file; the
+    suffixed name stays the internal key."""
+    name = str(dataset)
+    for suffix in INTERNAL_DATASET_SUFFIXES:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name
+
+
 def pretty_method(method: str) -> str:
     return {
         "tavtigian": "Tavtigian",
@@ -89,7 +104,7 @@ def save_and_show(fig, path: Path, dpi: int = 300):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     print(f"  Saved: {path}")
-    if is_notebook():
+    if is_notebook() and plt.get_backend().lower() != "agg":
         plt.show()
     else:
         plt.close(fig)

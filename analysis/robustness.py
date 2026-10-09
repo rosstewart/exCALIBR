@@ -67,6 +67,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from analysis import config as cfg
+from analysis.plot_common import display_name
 from analysis.discovery import (
     discover_outputs, resolve_component, recompute_points_from_calibration,
 )
@@ -738,7 +739,7 @@ def plot_downsample_robustness_curve(
         ax.legend(fontsize=8)
         ax.grid(linewidth=0.5, alpha=0.3)
 
-    fig.suptitle(f"{base_dataset}: downsampling robustness", fontsize=13, fontweight="bold")
+    fig.suptitle(f"{display_name(base_dataset)}: downsampling robustness", fontsize=13, fontweight="bold")
     fig.tight_layout()
     if figure_dir is not None:
         save_and_show(fig, Path(figure_dir) / f"robustness_downsample_{base_dataset}.png")
@@ -788,7 +789,7 @@ def plot_discordance_robustness_distribution(
         ax.legend(fontsize=8)
         ax.grid(linewidth=0.5, alpha=0.3)
 
-    fig.suptitle(f"{base_dataset}: label discordance robustness", fontsize=13, fontweight="bold")
+    fig.suptitle(f"{display_name(base_dataset)}: label discordance robustness", fontsize=13, fontweight="bold")
     fig.tight_layout()
     if figure_dir is not None:
         save_and_show(fig, Path(figure_dir) / f"robustness_discordance_{base_dataset}.png")
@@ -1370,7 +1371,7 @@ def plot_robustness_confusion_matrix_grid(
                 spine.set_visible(False)
 
             if row == 0:
-                ax.set_title(dataset, fontsize=12, fontweight="bold", pad=10)
+                ax.set_title(display_name(dataset), fontsize=12, fontweight="bold", pad=10)
             if col == 0:
                 ax.set_ylabel(f"{row_label}\nClinVar Classification", fontsize=10)
 
@@ -1430,13 +1431,99 @@ def plot_robustness_confusion_matrix_grid(
         plt.close(fig)
 
 
+def oddspath_from_controls(is_pathogenic, func_class, prior: float = 0.1) -> Dict[str, object]:
+    """OddsPath (Brnich et al. 2020) from control labels and author
+    functional classes ("Abnormal"/"Normal"; anything else is ignored for
+    P2 but counted in P1).
+
+    OddsPath = [P2 (1 - P1)] / [(1 - P2) P1], with P1 the fraction of
+    pathogenic controls overall and P2 the fraction pathogenic among controls
+    in a functional class. A class with no misclassified controls gets one
+    (benign added to Abnormal, pathogenic added to Normal), as in Brnich et al.
+    Evidence strengths use the same Tavtigian thresholds as ExCALIBR at
+    `prior` (Fig. 5B): pathogenic level l if OddsAbnormal >= c**(l/8),
+    benign level -l if OddsNormal <= c**(-l/8).
+    """
+    from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
+    is_p = np.asarray(is_pathogenic, dtype=bool)
+    cls = np.asarray([str(c).strip().lower() for c in func_class])
+    n_p, n_b = int(is_p.sum()), int((~is_p).sum())
+    out = {"pathogenic_controls": n_p, "benign_controls": n_b, "pseudocounts": []}
+    if n_p == 0 or n_b == 0:
+        out.update(odds_abnormal=np.nan, odds_normal=np.nan, ps3=0, bs3=0)
+        return out
+    p1 = n_p / (n_p + n_b)
+    p_abn, b_abn = int((is_p & (cls == "abnormal")).sum()), int((~is_p & (cls == "abnormal")).sum())
+    p_nor, b_nor = int((is_p & (cls == "normal")).sum()), int((~is_p & (cls == "normal")).sum())
+    if b_abn == 0:
+        b_abn += 1
+        out["pseudocounts"].append("benign added to abnormal")
+    if p_nor == 0:
+        p_nor += 1
+        out["pseudocounts"].append("pathogenic added to normal")
+
+    def _odds(p_cls, b_cls):
+        if p_cls + b_cls == 0:
+            return np.nan
+        p2 = p_cls / (p_cls + b_cls)
+        return (p2 * (1 - p1)) / ((1 - p2) * p1) if p2 < 1 else np.inf
+
+    odds_abn, odds_nor = _odds(p_abn, b_abn), _odds(p_nor, b_nor)
+    c = get_tavtigian_constant(prior)
+    ps3 = max([lvl for lvl in (1, 2, 4, 8) if np.isfinite(odds_abn) and odds_abn >= c ** (lvl / 8)] or [0])
+    bs3 = -max([lvl for lvl in (1, 2, 4, 8) if np.isfinite(odds_nor) and odds_nor <= c ** (-lvl / 8)] or [0])
+    out.update(abnormal_pathogenic=p_abn, abnormal_benign=b_abn, normal_pathogenic=p_nor, normal_benign=b_nor,
+               odds_abnormal=odds_abn, odds_normal=odds_nor, ps3=ps3, bs3=bs3)
+    return out
+
+
+def oddspath_from_scoreset(scoreset, prior: float = 0.1) -> Dict[str, object]:
+    """OddsPath evidence for a (possibly perturbed) Scoreset: controls are its
+    P/LP (column 0) and B/LB (column 1) sample members, functional classes its
+    per-row author labels (carried through Scoreset.from_scoreset)."""
+    sa = np.asarray(scoreset.sample_assignments)
+    is_ctrl = sa[:, 0].astype(bool) | sa[:, 1].astype(bool)
+    return oddspath_from_controls(sa[is_ctrl, 0].astype(bool), np.asarray(scoreset._auth_labels)[is_ctrl], prior)
+
+
+def compute_robustness_oddspath(base_datasets: List[str], discordance_pcts=(0.01, 0.10), seeds=range(10),
+                                dataframe: Optional[str] = None, prior: float = 0.1):
+    """{base_dataset: {("reference", None, 0): (ps3, bs3), ("discordance", pct, seed): (ps3, bs3)}}
+    for base datasets whose controls carry author functional classes, using the
+    same perturbations as the robustness fits (analysis/build_robustness_dataset.py:
+    Scoreset.from_scoreset(base, discordance_pct=pct, perturbation_seed=seed))."""
+    from analysis.build_robustness_dataset import build_base_scoresets
+    from src.assay_calibration.data_utils.dataset import Scoreset
+    path = dataframe or cfg.DATASET_TSV
+    df = pd.read_csv(path, sep="\t" if str(path).endswith((".tsv", ".tsv.gz")) else ",", low_memory=False)
+    out = {}
+    for name, base in build_base_scoresets(df, list(base_datasets)).items():
+        sa = np.asarray(base.sample_assignments)
+        labels = np.asarray(base._auth_labels)[sa[:, 0].astype(bool) | sa[:, 1].astype(bool)]
+        if not any(str(x).strip().lower() in ("abnormal", "normal") for x in labels):
+            print(f"  OddsPath: SKIP {name} (no author functional classes among controls)")
+            continue
+        res = {("reference", None, 0): oddspath_from_scoreset(base, prior)}
+        for pct in discordance_pcts:
+            for seed in seeds:
+                res[("discordance", pct, seed)] = oddspath_from_scoreset(
+                    Scoreset.from_scoreset(base, discordance_pct=pct, perturbation_seed=seed), prior)
+        out[name] = res
+    return out
+
+
 def robustness_seed_metrics_table(
     robustness_summaries: Dict[str, pd.DataFrame],
     robustness_max_strengths: Dict[str, Dict[Tuple[str, float, int], Tuple[int, int]]],
     perturbation_type: str,
     base_datasets: List[str],
+    oddspath: Optional[Dict[str, Dict[Tuple, Dict]]] = None,
 ) -> pd.DataFrame:
-    """One row per (base_dataset, level) grid cell -- same population
+    """`oddspath` (optional, compute_robustness_oddspath output) adds
+    op_ps3_*/op_bs3_* columns: Brnich OddsPath evidence under the same label
+    perturbations (NaN for datasets without author functional classes).
+
+    One row per (base_dataset, level) grid cell -- same population
     plot_robustness_confusion_matrix_grid draws (that cell's seed-to-seed
     accuracy/coverage/max-strength spread), as a tidy table instead of a
     figure caption. Row order matches the grid: control first, then levels
@@ -1489,7 +1576,19 @@ def robustness_seed_metrics_table(
             else:
                 maxp_p25 = maxp_p50 = maxp_p75 = maxb_p25 = maxb_p50 = maxb_p75 = None
 
+            op_cells = {}
+            op_res = (oddspath or {}).get(dataset)
+            if op_res is not None:
+                if row_key == "control":
+                    vals = [op_res[k] for k in op_res if k[0] == "reference"]
+                else:
+                    vals = [op_res[k] for k in op_res if k[0] == perturbation_type and np.isclose(k[1], row_key)]
+                for key in ("ps3", "bs3"):
+                    v = [r[key] for r in vals]
+                    q = np.percentile(v, [25, 50, 75]) if v else (None, None, None)
+                    op_cells.update({f"op_{key}_p25": q[0], f"op_{key}_p50": q[1], f"op_{key}_p75": q[2]})
             rows.append({
+                **op_cells,
                 "base_dataset": dataset, "level_label": level_label, "n_seeds": len(sub),
                 "accuracy_p25": acc_p25, "accuracy_p50": acc_p50, "accuracy_p75": acc_p75,
                 "coverage_p25": cov_p25, "coverage_p50": cov_p50, "coverage_p75": cov_p75,
@@ -1838,7 +1937,7 @@ def plot_bootstrap_reduction_config_summary(
             ax_lr.legend(fontsize=7, loc="center left", bbox_to_anchor=(1, 0.5))
         ax_lr.grid(linewidth=0.5, alpha=0.3)
 
-    fig.suptitle(f"{dataset_name}: bootstrap-count reduction ({len(levels_sorted)} levels: {levels_sorted})",
+    fig.suptitle(f"{display_name(dataset_name)}: bootstrap-count reduction ({len(levels_sorted)} levels: {levels_sorted})",
                  fontsize=13, fontweight="bold")
     fig.tight_layout()
     if figure_dir is not None:

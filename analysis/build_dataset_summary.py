@@ -196,7 +196,7 @@ def compute_yang_distances_all(
     yang_dist_synonymous (median across bootstraps per sample).
     """
     from analysis.legacy_fits import load_scoreset_and_fits, resolve_component_for
-    from analysis.yang_distance import compute_bootstrap_yang_distances_parallel
+    from analysis.yang_distance import cached_bootstrap_yang_distances
 
     rows = []
     already_done = set()
@@ -221,17 +221,23 @@ def compute_yang_distances_all(
                 precomputed_fits=precomputed_fits, dataset_configs_path=dataset_configs_path,
                 n_c=n_c, benign_method=benign_method,
             )
-            yd = compute_bootstrap_yang_distances_parallel(
-                dataset, n_c, fits, scoreset, dataset_to_splits=None, n_jobs=n_jobs,
+            # Shared per-dataset cache with Extended Data Fig. 1 (same n_grid).
+            yd = cached_bootstrap_yang_distances(
+                dataset, n_c, fits, scoreset, cache_dir=cfg.YANG_CACHE_DIR,
+                output_dir=output_dir or cfg.OUTPUT_DIR, dataset_to_splits=None, n_jobs=n_jobs,
                 n_grid=n_grid,
             )
-            rows.append({
-                "dataset": dataset,
-                "yang_dist_plp": float(np.nanmedian(yd["pathogenic"])),
-                "yang_dist_blb": float(np.nanmedian(yd["benign"])),
-                "yang_dist_gnomad": float(np.nanmedian(yd["gnomad"])),
-                "yang_dist_synonymous": float(np.nanmedian(yd["synonymous"])),
-            })
+            row = {"dataset": dataset}
+            for col, key in (("plp", "pathogenic"), ("blb", "benign"), ("gnomad", "gnomad"),
+                             ("synonymous", "synonymous")):
+                vals = np.asarray(yd[key], dtype=float)
+                row[f"yang_dist_{col}"] = float(np.nanmedian(vals)) if np.isfinite(vals).any() else np.nan
+                # Interval columns for Supplementary Data 1's "median (lo-hi)" cells.
+                for q in (2.5, 5, 25, 75, 95, 97.5):
+                    row[f"yang_dist_{col}_p{q:g}"] = (
+                        float(np.nanpercentile(vals, q)) if np.isfinite(vals).any() else np.nan
+                    )
+            rows.append(row)
             if checkpoint_path:
                 pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
         except (FileNotFoundError, KeyError, ValueError) as e:

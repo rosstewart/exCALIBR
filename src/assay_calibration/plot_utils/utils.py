@@ -38,6 +38,12 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from adjustText import adjust_text  # pip install adjustText
 
+
+def _display_dataset(name) -> str:
+    """Figure-label dataset name: the internal "_clinvar_2018" suffix is dropped."""
+    name = str(name)
+    return name[: -len("_clinvar_2018")] if name.endswith("_clinvar_2018") else name
+
 def plot_scoreset(scoreset:Scoreset, summary: Dict, scoreset_fits: List[Dict], score_range, use_median_prior,use_2c_equation, n_c, benign_method, C):
     fig, ax = plt.subplots(2,scoreset.n_samples, figsize=(5*scoreset.n_samples,10),sharex=True,sharey=False)
     for sample_num in range(scoreset.n_samples):
@@ -349,7 +355,7 @@ def plot_initial_vs_final_skew(dataset_name, observations, initial_params, final
 
     ax.plot([], [], linestyle="--", color="black", label="initial")
     ax.plot([], [], linestyle="-", color="black", label="final")
-    ax.set_title(dataset_name, fontsize=10)
+    ax.set_title(_display_dataset(dataset_name), fontsize=10)
     ax.legend(fontsize=7, loc="upper left")
 
     if annotate_params:
@@ -438,7 +444,7 @@ def plot_summary(scoreset: Scoreset, fits: List[Dict], summary:Dict, score_range
     point_values = sorted(list(set([abs(int(k)) for k in summary['point_ranges'].keys()])))
     tauP,tauB,_ = list(map(np.log, thresholds_from_prior(summary['prior'],point_values)) )
     priors = np.percentile(np.array(summary['priors']),[5,50,95])
-    ax.set_title(f"{dataset} ({n_c}, median:{use_median_prior},em:{not use_2c_equation}): prior: {priors[1]:.3f} ({priors[0]:.3f}-{priors[2]:.3f}), C: {C}")
+    ax.set_title(f"{_display_dataset(dataset)} ({n_c}, median:{use_median_prior},em:{not use_2c_equation}): prior: {priors[1]:.3f} ({priors[0]:.3f}-{priors[2]:.3f}), C: {C}")
     add_thresholds(tauP, tauB, ax)
     ax.set_xlabel("Score")
     ax.set_ylabel("Log LR+")
@@ -895,7 +901,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     elif scoreset.sample_counts[0] == 0:
         config = str(config).replace("(benign)","(NU)").replace("(avg)","(NU)").replace("(synonymous)","(NU)")
         
-    fig.suptitle(f"{dataset} - {n_c}{relax_code} {config}", fontsize=16, y=0.998)
+    fig.suptitle(f"{_display_dataset(dataset)} - {n_c}{relax_code} {config}", fontsize=16, y=0.998)
     
     return fig
 
@@ -954,7 +960,7 @@ def plot_scores_only(dataset, scoreset, bins=None):
         ax_fit.set_ylim([0, max_hist_density * 1.1])
         ax_fit.grid(linewidth=0.5, alpha=0.3)
 
-    fig.suptitle(dataset, fontsize=18, fontweight="heavy", y=1.02)
+    fig.suptitle(_display_dataset(dataset), fontsize=18, fontweight="heavy", y=1.02)
     return fig
 
 def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, score_range, config, n_c, n_samples, relax=False, flipped=False, debug=False):
@@ -1069,7 +1075,7 @@ def plot_scoreset_example_publication(dataset, scoreset, indv_summary, fits, sco
             sample_name = "gnomAD"
 
         if plot_idx == 0:
-            ax.set_title(dataset, fontsize=12, fontweight='bold', pad=8)
+            ax.set_title(_display_dataset(dataset), fontsize=12, fontweight='bold', pad=8)
         
         # if sample_name != "gnomAD":
         #     ax.set_title(f"{sample_name} (n={sample_mask.sum():,d})", fontsize=16, fontweight='bold')
@@ -3059,6 +3065,10 @@ def compute_classification_metrics(confusion_matrix):
         'lr_plus_benign': float(lr_plus_benign),
         'dor_pathogenic': float(dor_pathogenic),
         'dor_benign': float(dor_benign),
+        # Positive predictive value / false discovery rate of pathogenic calls
+        # (determinate calls only), from the counts.
+        'ppv': float(TP / (TP + FP)) if (TP + FP) > 0 else float('nan'),
+        'fdr': float(FP / (TP + FP)) if (TP + FP) > 0 else float('nan'),
     }
 
 def compute_aggregate_metrics(danzs, auths, dataset_names):

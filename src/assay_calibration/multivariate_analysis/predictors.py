@@ -53,6 +53,7 @@ def analyze_combined_gene(
         functional_scoresets = build_functional_scoresets(functional_df, gene, functional_datasets)
         ms = build_combined_multiscoreset(
             gene, functional_scoresets, functional_datasets, predictor_data_dir,
+            require_both_modalities=False,
         )
         if ms is None:
             raise ValueError(f"could not build combined MultiPredictorFunctionalScoreset for {gene}")

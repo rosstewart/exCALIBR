@@ -81,6 +81,7 @@ def build_gene_set_analysis(
         benign_method=benign_method,
         dataset_name=dataset_name,
         dataset_suffix=dataset_suffix,
+        gene_set=gene_set,
         **(mvcal_kwargs or {}),
     )
 

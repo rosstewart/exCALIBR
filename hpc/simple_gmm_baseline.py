@@ -62,10 +62,10 @@ SAMPLE_NUM_BLB = 1
 SAMPLE_NUM_GNOMAD = 2
 SAMPLE_NUM_SYNON = 3
 
-_DEFAULT_DATAFRAME = (
-    "/data/ross/assay_calibration/dataframe/"
-    "integrated_variant_effect_dataset_merged_89datasets.tsv.gz"
-)
+from analysis import config as _cfg
+
+# The current master dataframe (analysis.config.DATASET_TSV), never a pinned file.
+_DEFAULT_DATAFRAME = _cfg.DATASET_TSV
 _DEFAULT_PRIOR = 0.1
 
 

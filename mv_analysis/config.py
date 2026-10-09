@@ -164,7 +164,19 @@ PAPER_TP53_RPV_DIR = f"{PAPER_FIGURES_DIR}/tp53_rpv"
 PAPER_RET_EVIDENCE_DIR = f"{PAPER_FIGURES_DIR}/ret_evidence"
 PAPER_CARD11_PHENOTYPE_DIR = f"{PAPER_FIGURES_DIR}/card11_phenotype"
 PAPER_CARTOONS_DIR = f"{PAPER_FIGURES_DIR}/cartoons"
+PAPER_CORRELATION_DIR = f"{PAPER_FIGURES_DIR}/correlation"
 PAPER_CACHE_DIR = f"{PAPER_FIGURES_DIR}/.cache"
+
+# The manuscript source tree (ExCALIBR_MV.tex / ExCALIBR_MV_supp.tex). The
+# paper notebook's "manuscript" section writes Figures/generated/macros.tex
+# here and copies every figure the .tex includes from PAPER_FIGURES_DIR into
+# Figures/generated/, mirroring analysis/analyze_pipeline_output.py's
+# MANUSCRIPT_FIGURE_DIR for the univariate paper.
+MANUSCRIPT_DIR = _env("MV_MANUSCRIPT_DIR", os.path.join(_ROOT, "ExCALIBR-MV_latex_092026"))
+MANUSCRIPT_MAIN_TEX = os.path.join(MANUSCRIPT_DIR, "ExCALIBR_MV.tex")
+MANUSCRIPT_SUPP_TEX = os.path.join(MANUSCRIPT_DIR, "ExCALIBR_MV_supp.tex")
+MANUSCRIPT_FIGURE_DIR = os.path.join(MANUSCRIPT_DIR, "Figures")
+MANUSCRIPT_GENERATED_DIR = os.path.join(MANUSCRIPT_FIGURE_DIR, "generated")
 
 # The three computational predictors calibrated together for the "predictor"
 # and "combined" gene-sets (see src/assay_calibration/multivariate_data/
@@ -252,7 +264,7 @@ def list_gene_cluster_variants(gene: str, gene_set: str, results_json: str = Non
 
 
 def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
-                               min_overlap_rows: int = 30):
+                               min_overlap_rows: int = 30, results_json: str = None):
     """Build `gene`'s MultiScoreset restricted to disjoint assay-dimension
     cluster `cluster_idx` (0 = most informative, matching
     `Fit._select_all_calibration_clusters`'s ranking -- same ranking
@@ -278,10 +290,49 @@ def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
 
     import numpy as np
     from src.assay_calibration.fit_utils.fit import Fit
+    from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
     obs = np.asarray(ms.scores, dtype=float)
     clusters = []
     if obs.ndim == 2 and obs.shape[1] > 1:
         clusters = Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
+
+    # Match the dimensions the STORED fit was trained on. Fits record their
+    # datasets ("assay_datasets") since per-cluster job generation; older fits
+    # (e.g. jobs_all_100b_3f_092026) do not, and were trained under the older
+    # largest-by-dimension-count selection -- for BRCA2 that is the 4-dim
+    # Sahu_2023 cluster, which the current informativeness ranking puts
+    # SECOND, and for KCNH2 a 2-dim subset of 3 connected dims. Scoring the
+    # current cluster_idx subset against such a fit trips the fit-vs-dataset
+    # shape guard, so pick the candidate subset the fit actually used.
+    fit_info = _stored_fit_dims(gene, gene_set, cluster_idx, results_json)
+    if fit_info is not None:
+        fit_names, fit_ndim = fit_info
+        if fit_names:
+            dims = [ms.dataset_names.index(n) for n in fit_names if n in ms.dataset_names]
+            if len(dims) == len(fit_names):
+                if len(dims) < obs.shape[1]:
+                    select_dims(ms, dims)
+                return ms
+        candidates = []
+        if cluster_idx < len(clusters):
+            candidates.append(list(clusters[cluster_idx]))
+        candidates += [list(c) for c in clusters]
+        if obs.ndim == 2 and obs.shape[1] > 1:
+            candidates.append(list(Fit._select_calibration_dims(obs, min_overlap_rows=min_overlap_rows)))
+            # the old largest-by-count component, from the pairwise-overlap graph
+            candidates += sorted([list(c) for c in clusters], key=len, reverse=True)
+        candidates.append(list(range(obs.shape[1])))
+        for dims in candidates:
+            if len(dims) == fit_ndim:
+                if len(dims) < obs.shape[1]:
+                    if list(dims) != candidates[0]:
+                        print(f"  [{gene}] scoring stored fit on its {fit_ndim} fitted dims "
+                              f"{[ms.dataset_names[i] for i in dims]} (not cluster {cluster_idx + 1} "
+                              f"of the current ranking)")
+                    select_dims(ms, dims)
+                return ms
+        # No candidate matches; fall through so the shape guard reports it.
+
     if len(clusters) <= 1:
         return ms
     if cluster_idx >= len(clusters):
@@ -289,9 +340,34 @@ def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
             f"{gene}/{gene_set} has only {len(clusters)} qualifying cluster(s), "
             f"requested cluster_idx={cluster_idx}."
         )
-    from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
     select_dims(ms, clusters[cluster_idx])
     return ms
+
+
+def _stored_fit_dims(gene, gene_set, cluster_idx, results_json=None):
+    """(assay_datasets or None, n_dims) of the stored fit for this gene/
+    cluster in `results_json` (default PAPER_RESULTS_JSON), or None if absent."""
+    results_json = results_json or PAPER_RESULTS_JSON
+    try:
+        from mv_analysis.gene_performance_scatter import _load_raw
+        raw = _load_raw(results_json)
+        name = canonical_dataset_name(gene, gene_set, results_json=results_json)
+        if cluster_idx:
+            name = _cluster_suffixed_name(name, cluster_idx)
+        boots = raw.get(name)
+    except Exception:
+        return None
+    if not boots:
+        return None
+    for b in boots.values():
+        for entry in (b or {}).values():
+            fit = (entry or {}).get("fit") if isinstance(entry, dict) else None
+            if fit and fit.get("component_params"):
+                # + categorical dims (experimental location-model fits keep
+                # them out of the continuous component_params)
+                n_cat = len((fit.get("cat_spec") or {}).get("positions", []))
+                return entry.get("assay_datasets"), len(fit["component_params"][0][0]) + n_cat
+    return None
 
 
 def staged_init_results_path(gene: str, gene_set: str, n_components: int = 6) -> str:
@@ -352,7 +428,7 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
             f"gene_set={gene_set!r} does not support regularization_type={regularization_type!r} -- "
             f"no unlabeled bulk is retained at ingestion. Supported: {GENE_SETS_SUPPORTING_ALL_ASSAYED}."
         )
-    if gene_set == "tp53" and redundancy_collapse_preset is None:
+    if gene_set in ("tp53", "combined") and redundancy_collapse_preset is None:
         # Deferred import from hpc/prepare.py -- the single source of truth
         # for this default (mv_analysis/build.py already imports prepare.py
         # directly the same way, confirming it's import-safe: no top-level
@@ -413,12 +489,14 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
             get_functionally_assayed_protein_variants, DEFAULT_INTEGRATED_DATAFRAME,
         )
         from src.assay_calibration.multivariate_data.predictors import DEFAULT_GENES
-        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+        from src.assay_calibration.multivariate_data.common import (
+            resolve_clinvar_release, functional_datasets_for_gene,
+        )
         target_genes = list(genes) if genes else list(DEFAULT_GENES)
         df_integrated = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
         ms_map = {}
         for gene in target_genes:
-            datasets = sorted(df_integrated[df_integrated["Gene"] == gene]["Dataset"].unique())
+            datasets = functional_datasets_for_gene(df_integrated, gene)
             if not datasets:
                 print(f"  [{gene}] no functional datasets, skipping")
                 continue
@@ -427,7 +505,17 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
             functionally_assayed = get_functionally_assayed_protein_variants(df_integrated, gene, datasets)
             ms = build_combined_multiscoreset(
                 gene, functional_scoresets, datasets, PREDICTOR_RAW_DATA_DIR,
-                functionally_assayed_variants=functionally_assayed)
+                functionally_assayed_variants=functionally_assayed,
+                # Explicit union, matching what the fit was actually trained
+                # on (hpc/prepare.py's combined branch also locks this to
+                # False) -- analysis-side callers rely entirely on
+                # mv_analysis.report._eval_labels's gene_set="combined"
+                # masking to restrict to the intersection subset at
+                # evaluation time, rather than pre-filtering the ms itself
+                # (which would mismatch the stored fit's variant/weight-row
+                # shape, same issue seen for TP53/BRCA2's role-count
+                # mismatch warnings this session).
+                require_both_modalities=False)
             if ms is None:
                 print(f"  [{gene}] could not build combined ms, skipping")
                 continue

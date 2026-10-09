@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--datasets", nargs="+", default=None,
                          help="Restrict to these dataset names (default: every dataset discovered under --output-dir)")
     parser.add_argument("--out-dir", default=None,
-                         help=f"Directory to write the CSVs to (default: {cfg.FIGURE_DIR}/tables)")
+                         help=f"Directory to write the CSVs to (default: {cfg.TABLES_DIR})")
     parser.add_argument("--no-predictor-table", action="store_true",
                          help="Skip the predictor-only table (analysis.config.PREDICTOR_EVIDENCE_SOURCE_CSV)")
     parser.add_argument("--no-dataframe-with-points", action="store_true",
@@ -54,7 +54,7 @@ def main():
     output_dir = Path(args.output_dir or cfg.OUTPUT_DIR)
     dataset_tsv = args.dataset_tsv or cfg.DATASET_TSV
     dataset_configs_path = args.dataset_configs or cfg.DATASET_CONFIGS
-    out_dir = Path(args.out_dir) if args.out_dir else Path(cfg.FIGURE_DIR) / "tables"
+    out_dir = Path(args.out_dir) if args.out_dir else Path(cfg.TABLES_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tree, model_selections, calibrations = discover_outputs(output_dir)

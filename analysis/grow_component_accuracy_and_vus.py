@@ -26,40 +26,15 @@ import pandas as pd
 
 from mv_analysis import mv_cockpit as cockpit
 from mv_analysis.gene_performance_scatter import fast_results_json, EVIDENCE_DIRECTION
-from mv_analysis.report import _rows_for_points, _eval_labels
+from mv_analysis.report import _rows_for_points, _eval_labels, _both_modality_mask
 from mv_analysis.analyze_mv_pipeline_output import RUN_KWARGS, PREDICTOR_COMBINED_GENES
-from src.assay_calibration.multivariate_data.predictors import (
-    load_predictor_ms, predictor_dataset_label, PREDICTOR_DATASET_NAMES,
-)
+from src.assay_calibration.multivariate_data.predictors import load_predictor_ms, predictor_dataset_label
 from analysis.compute_clinvar_vus_points_by_panel import (
     combined_vus_keys, DEFAULT_INTEGRATED_DATAFRAME,
 )
 
 CONFIG_KEY = "3c_unc_plus1_plp"
 PREDICTOR_DATA_DIR = "/data/ross/assay_calibration/predictor_calibrations/single_gene_calibration_data"
-
-_PREDICTOR_NAMES = set(PREDICTOR_DATASET_NAMES.values())  # {"REVEL", "MutPred2", "AlphaMissense"}
-
-
-def _both_modality_mask(ms):
-    """True for rows observed in >=1 predictor dim AND >=1 functional dim --
-    ALWAYS applied for gene_set="combined" accuracy/VUS evaluation,
-    regardless of whether the underlying fit was trained union-style
-    (jobs_all_100b_3f_092026) or intersection-style (jobs_combined_
-    intersection_*): the two training populations aren't apples-to-apples
-    comparable on accuracy/MCC unless both get scored against the SAME
-    evaluation population. For an intersection-trained ms this is a no-op
-    (every row already satisfies it by construction); for a union-trained
-    ms it correctly excludes the single-modality rows that otherwise
-    dominate the union population (confirmed earlier this session: 78% of
-    BRCA1's union combined rows are single-modality)."""
-    scores = np.asarray(ms.scores, dtype=float)
-    dataset_names = list(ms.dataset_names)
-    pred_idx = [i for i, n in enumerate(dataset_names) if n in _PREDICTOR_NAMES]
-    func_idx = [i for i, n in enumerate(dataset_names) if n not in _PREDICTOR_NAMES]
-    pred_observed = ~np.all(np.isnan(scores[:, pred_idx]), axis=1) if pred_idx else np.zeros(len(scores), dtype=bool)
-    func_observed = ~np.all(np.isnan(scores[:, func_idx]), axis=1) if func_idx else np.zeros(len(scores), dtype=bool)
-    return pred_observed & func_observed
 
 
 def _build_ms(gene, gene_set, require_both_modalities):
@@ -70,9 +45,9 @@ def _build_ms(gene, gene_set, require_both_modalities):
             build_functional_scoresets, build_combined_multiscoreset,
             get_functionally_assayed_protein_variants,
         )
-        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+        from src.assay_calibration.multivariate_data.common import resolve_clinvar_release, functional_datasets_for_gene
         df = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
-        datasets = sorted(df[df["Gene"] == gene]["Dataset"].unique())
+        datasets = functional_datasets_for_gene(df, gene)
         functional_scoresets = build_functional_scoresets(
             df, gene, datasets, clinvar_release=resolve_clinvar_release(gene))
         functionally_assayed = get_functionally_assayed_protein_variants(df, gene, datasets)
@@ -126,18 +101,12 @@ def main():
                 continue
             points = np.asarray(analysis.results[CONFIG_KEY]["points"], dtype=float)
 
-            eval_mask, labels = _eval_labels(ms, analysis.p_idx, analysis.b_idx)
-            if args.gene_set == "combined":
-                # ALWAYS restrict to both-modality-observed rows for combined
-                # -- see _both_modality_mask's docstring for why (union vs.
-                # intersection training populations aren't otherwise
-                # comparable on the same metric).
-                both_mod = _both_modality_mask(ms)
-                keep_within_eval = both_mod[eval_mask]
-                labels = labels[keep_within_eval]
-                pts_eval = points[eval_mask][keep_within_eval]
-            else:
-                pts_eval = points[eval_mask]
+            # _eval_labels applies the both-modality-observed restriction
+            # internally whenever gene_set == "combined" (see
+            # mv_analysis/report.py) -- union vs. intersection training
+            # populations otherwise aren't comparable on the same metric.
+            eval_mask, labels = _eval_labels(ms, analysis.p_idx, analysis.b_idx, gene_set=args.gene_set)
+            pts_eval = points[eval_mask]
 
             rows = _rows_for_points(f"MV {CONFIG_KEY}", pts_eval, labels)
             row = next((r for r in rows if r["threshold"] == EVIDENCE_DIRECTION), None)

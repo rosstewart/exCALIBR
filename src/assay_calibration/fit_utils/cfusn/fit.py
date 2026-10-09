@@ -1,4 +1,7 @@
-from .update_steps import em_iteration, get_sample_weights, gamma_log_prior_total
+from .update_steps import (
+    em_iteration, get_sample_weights, gamma_log_prior_total,
+    sample_specific_responsibilities,
+)
 from .density_utils import get_likelihood, get_q, _ensure_matrix_delta
 from .initializations import (
     kmeans_init, methodOfMomentsInit, kmeans_init_mv, kmeans_init_mv_anchored,
@@ -6,6 +9,8 @@ from .initializations import (
 )
 from . import constraints
 from . import separation
+from . import categorical as _cat
+from . import weight_divergence as _wdiv
 
 import numpy as np
 import logging
@@ -231,6 +236,34 @@ def single_fit(
     if kwargs.get("submerge_steps") is not None:
         raise NotImplementedError("submerge_steps is deprecated")
 
+    # ---- Categorical dims (EXPERIMENTAL, opt-in; see cfusn/categorical.py) ----
+    # With a cat_spec, the full observation matrix is split here: everything
+    # below (xlims, init, the continuous M-step, ridge/cap variances) sees the
+    # CONTINUOUS columns only, and the categorical columns enter as an
+    # additive per-row log-pmf term plus their own closed-form M-step. No
+    # cat_spec (the default) leaves this function bit-identical.
+    cat_spec = kwargs.get("cat_spec")
+    if cat_spec is not None and not isinstance(cat_spec, _cat.CatSpec):
+        cat_spec = _cat.CatSpec.from_dict(cat_spec)
+    cat = None
+    if cat_spec is not None and cat_spec.n_cat > 0:
+        if not mv:
+            raise ValueError("categorical dims require a multivariate fit")
+        if (kwargs.get("dim_proportions") is not None
+                or kwargs.get("dim_weight_transform") is not None
+                or float(kwargs.get("dim_balance_beta", 0.0)) > 0):
+            raise ValueError("categorical dims cannot be combined with experimental dim_weights")
+        observations, cat_labels, cat_has_cont = _cat.split_observations(observations, cat_spec)
+        cat_alpha = kwargs.get("cat_alpha")
+        if cat_alpha is None:
+            cat_alpha = _cat.cat_alpha(
+                cat_labels, cat_spec,
+                tau=kwargs.get("cat_tau", _cat.DEFAULT_TAU),
+                lam=kwargs.get("cat_lambda", _cat.DEFAULT_LAMBDA),
+            )
+        cat = dict(labels=cat_labels, has_cont=cat_has_cont,
+                   alpha=[np.asarray(a, dtype=float) for a in cat_alpha], probs=None)
+
     if mv:
         xlims = tuple(
             (float(np.nanmin(observations[:, d])), float(np.nanmax(observations[:, d])))
@@ -289,6 +322,30 @@ def single_fit(
         )
         monitor_weights = row_dim_w if monitor_weights is None else monitor_weights * row_dim_w
 
+    # force_gaussian pins Delta=0 for the whole fit (see _em_update_cfusn/
+    # _em_update_multivariate's force_gaussian handling) -- dim_weights only
+    # ever affects Delta's M-step, so it has ZERO effect on this restart
+    # mode. Tracking the dim-weighted monitor_weights objective (and
+    # skipping the decrease-check below) for a force_gaussian fit is pure
+    # waste: an extra get_likelihood pass every iteration for no behavioral
+    # difference, AND it disables a monotonicity check this restart's
+    # mu/Gamma-only EM would otherwise still legitimately benefit from
+    # (confirmed on real TP53 data: a force_gaussian restart under
+    # dim_weights ran 3x longer and landed at a WORSE final likelihood than
+    # the matched unweighted restart, solely because skip-revert let it run
+    # past a point the plain-likelihood check would have correctly stopped
+    # at). Gate on force_gaussian so this restart mode is bit-identical to
+    # the unweighted path regardless of dim_weights.
+    dim_weighted_active = dim_weights_per_dim is not None and not kwargs.get("force_gaussian", False)
+
+    # Init routines (kmeans etc.) only see rows with >= 1 continuous value: a
+    # row observed only on categorical dims has nothing for a partial-distance
+    # kmeans to use (zero observed columns).
+    init_obs, init_si = observations, sample_indicators
+    if cat is not None and not cat["has_cont"].all():
+        init_obs = observations[cat["has_cont"]]
+        init_si = sample_indicators[cat["has_cont"]]
+
     # ---- Initialization ----
     if (
         kwargs.get("initial_weights") is not None
@@ -326,7 +383,7 @@ def single_fit(
             try:
                 if mv and init_method == "anchored":
                     initial_params, kmeans = kmeans_init_mv_anchored(
-                        observations, sample_indicators,
+                        init_obs, init_si,
                         n_clusters=N_components,
                         constrained=constrained,
                         init_constraint_adjustment=init_constraint_adjustment,
@@ -334,7 +391,7 @@ def single_fit(
                     )
                 elif mv:
                     initial_params, kmeans = kmeans_init_mv(
-                        observations, n_clusters=N_components,
+                        init_obs, n_clusters=N_components,
                         constrained=constrained,
                         init_constraint_adjustment=init_constraint_adjustment,
                         **kwargs
@@ -383,9 +440,53 @@ def single_fit(
                 for mu_, Delta_, Gamma_ in initial_params
             ]
 
+        if mv and kwargs.get("gaussian_components"):
+            # Same first-E-step reasoning as force_gaussian above, per component.
+            _gc = set(kwargs["gaussian_components"])
+            initial_params = [
+                (mu_, np.zeros_like(Delta_) if j in _gc else Delta_, Gamma_)
+                for j, (mu_, Delta_, Gamma_) in enumerate(initial_params)
+            ]
+
+        W_start = W
         W = get_sample_weights(
             observations, sample_indicators, initial_params, W, multivariate=mv
         )
+
+    # Categorical init: one closed-form categorical M-step on the
+    # responsibilities of the continuous-only initial fit (or the caller's
+    # initial_cat_probs, e.g. from add_component_to_fit), then -- on the
+    # kmeans path -- redo the initial W estimate from the SAME uniform start
+    # with the categorical term included (a replacement, not an extra
+    # fixed-point step, so a component-independent categorical term leaves W
+    # exactly as the all-continuous path would have it).
+    if cat is not None:
+        init_probs = kwargs.get("initial_cat_probs")
+        if init_probs is None:
+            resp0 = sample_specific_responsibilities(
+                observations, sample_indicators, initial_params, W, multivariate=mv,
+            )
+            init_probs = _cat.cat_mstep(cat["labels"], resp0, cat["alpha"],
+                                        sample_weights=sample_weights_per_obs)
+        init_probs = [np.asarray(P, dtype=float) for P in init_probs]
+        for P, L in zip(init_probs, cat_spec.n_levels):
+            if P.shape != (N_components, L):
+                raise ValueError(f"initial_cat_probs shape {P.shape} != {(N_components, L)}")
+        cat["probs"] = init_probs
+        if kwargs.get("initial_weights") is None or kwargs.get("initial_params") is None:
+            W = get_sample_weights(
+                observations, sample_indicators, initial_params, W_start, multivariate=mv,
+                extra_log_pdfs=_cat.cat_log_pdfs(cat["labels"], cat["probs"]),
+            )
+
+    def _cat_kw(probs):
+        if cat is None:
+            return {}
+        return {"cat_state": {"labels": cat["labels"], "probs": probs,
+                              "alpha": cat["alpha"], "has_cont": cat["has_cont"]}}
+
+    def _cat_extra(probs):
+        return None if cat is None else _cat.cat_log_pdfs(cat["labels"], probs)
 
     em_kwargs = {}
 
@@ -404,6 +505,25 @@ def single_fit(
         em_kwargs["sample_weights"] = sample_weights_per_obs
     if dim_weights_per_dim is not None:
         em_kwargs["dim_weights"] = dim_weights_per_dim
+    # Weight-divergence penalty on W (EXPERIMENTAL, opt-in; see
+    # cfusn/weight_divergence.py). Resolved spec {"lambda", "pairs"}; absent
+    # (default) leaves this function bit-identical. The decrease-revert check
+    # stays ON for it -- the penalised W step is a proper GEM step on the
+    # tracked objective below -- so it can't be combined with the modes that
+    # disable that check.
+    wdiv = _wdiv.resolve_weight_divergence(kwargs.get("weight_divergence"), None, sample_indicators.shape[1])
+    if wdiv is not None:
+        if separation_active:
+            raise ValueError("weight_divergence cannot be combined with MV separation (constrained fits)")
+        if dim_weights_per_dim is not None:
+            raise ValueError("weight_divergence cannot be combined with experimental dim_weights")
+        em_kwargs["weight_divergence"] = wdiv
+    if kwargs.get("gaussian_components"):
+        # EXPERIMENTAL, opt-in: per-component family. Listed components keep
+        # Delta pinned at zero (plain Gaussians, exactly as force_gaussian does
+        # for a whole fit); the others stay skewed. Indices refer to the
+        # component order of initial_params (pass them explicitly).
+        em_kwargs["gaussian_components"] = set(kwargs["gaussian_components"])
     if kwargs.get("frozen_components"):
         # Explicit, caller-chosen set of component indices that never update
         # in the M-step for the whole fit -- e.g. growing a fit by adding one
@@ -419,7 +539,15 @@ def single_fit(
     # fit is visibly different from one that converged normally.
     overshoot_stopped = None
 
-    history = [dict(component_params=initial_params, weights=W)]
+    cat_probs = None if cat is None else cat["probs"]
+
+    def _hist(params, weights, probs):
+        entry = dict(component_params=params, weights=weights)
+        if cat is not None:
+            entry["cat_probs"] = probs
+        return entry
+
+    history = [_hist(initial_params, W, cat_probs)]
     # Initial likelihood: no em_iteration has run yet so we must evaluate explicitly.
     # Pass sample_weights so the initial LL is on the same (weighted) objective
     # the M-step will optimise — preserves monotonicity under β>0.
@@ -427,6 +555,7 @@ def single_fit(
         get_likelihood(
             observations, sample_indicators, initial_params, W,
             multivariate=mv, sample_weights=monitor_weights,
+            extra_log_pdfs=_cat_extra(cat_probs),
         ) / len(sample_indicators)
     ])
 
@@ -435,11 +564,18 @@ def single_fit(
     # convergence test below must run against this series or they will see
     # spurious decreases in a fit that is improving correctly. With the ridge
     # disabled gamma_log_prior_total returns 0.0, so `objectives` is elementwise
-    # equal to `likelihoods` and behaviour is bit-identical.
-    def _penalty(params):
-        return gamma_log_prior_total(params, observations, multivariate=mv) / len(sample_indicators)
+    # equal to `likelihoods` and behaviour is bit-identical. With categorical
+    # dims the categorical M-step is MAP under a Dirichlet prior, so its
+    # log-prior joins the penalty for the same reason.
+    def _penalty(params, probs=None, weights=None):
+        pen = gamma_log_prior_total(params, observations, multivariate=mv) / len(sample_indicators)
+        if cat is not None:
+            pen = pen + _cat.cat_log_prior(probs, cat["alpha"]) / len(sample_indicators)
+        if wdiv is not None:
+            pen = pen + wdiv["lambda"] * _wdiv.divergence(weights, wdiv["pairs"])
+        return pen
 
-    objectives = np.array([likelihoods[0] + _penalty(initial_params)])
+    objectives = np.array([likelihoods[0] + _penalty(initial_params, cat_probs, W)])
 
     # ---- First EM iteration ----
     # em_iteration now also returns the per-sample log_pdf cache computed on
@@ -447,22 +583,29 @@ def single_fit(
     # iteration's E-step (whose current_params == this iteration's
     # updated_params), eliminating one full density pass per iteration.
     try:
-        updated_component_params, updated_weights, ll, cached_log_pdfs = em_iteration(
+        _res = em_iteration(
             observations, sample_indicators, initial_params, W,
             constrained, xlims, multivariate=mv, iterNum=0,
-            return_log_pdfs=True, **em_kwargs,
+            return_log_pdfs=True, **em_kwargs, **_cat_kw(cat_probs),
         )
+        if cat is not None:
+            updated_component_params, updated_weights, ll, cached_log_pdfs, cat_probs = _res
+        else:
+            updated_component_params, updated_weights, ll, cached_log_pdfs = _res
     except ZeroDivisionError as e:
         if kwargs.get("raise_on_error", True):
             raise
         print(f"[FIRST EM ITER FAILED] ZeroDivisionError: {e}")
-        return dict(
+        out = dict(
             component_params=initial_params, weights=W,
             likelihoods=[*likelihoods, -np.inf],
             kmeans=kmeans, xlims=xlims, times_submerged=[]
         )
+        if cat is not None:
+            out.update(cat_probs=cat_probs, cat_spec=cat_spec.to_dict(), cat_alpha=cat["alpha"])
+        return out
 
-    if dim_weights_per_dim is not None:
+    if dim_weighted_active:
         # em_iteration's own `ll` was computed against em_kwargs["sample_weights"]
         # (the TRUE M-step weight) -- recompute against monitor_weights instead,
         # so the EM loop's bookkeeping below tracks the dim-weighted proxy
@@ -472,7 +615,7 @@ def single_fit(
             multivariate=mv, sample_weights=monitor_weights,
         ) / len(sample_indicators)
     likelihoods = np.append(likelihoods, ll)
-    objectives = np.append(objectives, ll + _penalty(updated_component_params))
+    objectives = np.append(objectives, ll + _penalty(updated_component_params, cat_probs, updated_weights))
 
     # Best-iterate tracking. EM is monotone in `objectives`, so for a healthy
     # fit the best iterate IS the last one and this is a no-op. It matters on
@@ -483,7 +626,7 @@ def single_fit(
     # than one we already had. Cheap insurance that the returned parameters are
     # the best ones the fit ever reached, whichever exit it takes.
     best_obj = objectives[-1]
-    best_state = (updated_component_params, updated_weights, len(objectives))
+    best_state = (updated_component_params, updated_weights, len(objectives), cat_probs)
 
     if verbose:
         q_label = f" (CFUSN q={latent_q})" if mv and latent_q > 1 else ""
@@ -500,10 +643,7 @@ def single_fit(
                 underwater_time += 1
 
         for it in range(MAX_EM_ITERS):
-            history.append(dict(
-                component_params=updated_component_params,
-                weights=updated_weights
-            ))
+            history.append(_hist(updated_component_params, updated_weights, cat_probs))
             if np.isnan(likelihoods).any():
                 raise ValueError("NaN in likelihoods")
             if np.isnan(updated_weights).any():
@@ -513,15 +653,19 @@ def single_fit(
             # separate get_likelihood needed. The cache is the log_pdfs on the
             # *just-updated* params, which is exactly what next iter's E-step
             # needs (its current_params == this iter's updated_params).
-            updated_component_params, updated_weights, ll, cached_log_pdfs = em_iteration(
+            _res = em_iteration(
                 observations, sample_indicators,
                 updated_component_params, updated_weights,
                 constrained, xlims, multivariate=mv, iterNum=it + 1,
                 cached_log_pdfs=cached_log_pdfs,
-                return_log_pdfs=True, **em_kwargs,
+                return_log_pdfs=True, **em_kwargs, **_cat_kw(cat_probs),
             )
+            if cat is not None:
+                updated_component_params, updated_weights, ll, cached_log_pdfs, cat_probs = _res
+            else:
+                updated_component_params, updated_weights, ll, cached_log_pdfs = _res
 
-            if dim_weights_per_dim is not None:
+            if dim_weighted_active:
                 # See the first-iteration block above for why this
                 # recomputation is needed under dim_weights.
                 ll = get_likelihood(
@@ -551,12 +695,12 @@ def single_fit(
                     underwater_time += 1
 
             likelihoods = np.append(likelihoods, ll)
-            objectives = np.append(objectives, ll + _penalty(updated_component_params))
+            objectives = np.append(objectives, ll + _penalty(updated_component_params, cat_probs, updated_weights))
 
             if objectives[-1] > best_obj:
                 best_obj = objectives[-1]
                 best_state = (updated_component_params, updated_weights,
-                              len(objectives))
+                              len(objectives), cat_probs)
 
             # Separation (tempering + repulsion) deliberately trades likelihood
             # for non-overlap, so the penalised objective is not EM-monotone in
@@ -578,7 +722,8 @@ def single_fit(
             # restart budget. best_state/best_obj tracking above (already
             # keyed off the matched weighted `objectives` series) is the
             # safety net here, exactly as it already is for separation fits.
-            dim_weighted_active = dim_weights_per_dim is not None
+            # (dim_weighted_active, defined earlier, is already False for a
+            # force_gaussian restart -- see its definition for why.)
             if it > 0 and objectives[-1] < objectives[-2] and not separation_active \
                     and not dim_weighted_active:
                 decrease = objectives[-2] - objectives[-1]
@@ -635,6 +780,8 @@ def single_fit(
                     # better of the two iterates.
                     updated_component_params = history[-1]["component_params"]
                     updated_weights = history[-1]["weights"]
+                    if cat is not None:
+                        cat_probs = history[-1]["cat_probs"]
                     likelihoods = likelihoods[:-1]
                     objectives = objectives[:-1]
                     break
@@ -667,7 +814,7 @@ def single_fit(
         # series to match so the reported likelihood describes the parameters
         # actually returned.
         if best_state is not None and objectives[-1] < best_obj:
-            updated_component_params, updated_weights, best_len = best_state
+            updated_component_params, updated_weights, best_len, cat_probs = best_state
             likelihoods = likelihoods[:best_len]
             objectives = objectives[:best_len]
 
@@ -678,9 +825,7 @@ def single_fit(
             if is_underwater and not violated:
                 times_submerged.append(underwater_time)
 
-        history.append(dict(
-            component_params=updated_component_params, weights=updated_weights
-        ))
+        history.append(_hist(updated_component_params, updated_weights, cat_probs))
         if verbose:
             pbar.close()
         # The final density-ratio check applies only to the retained univariate
@@ -696,12 +841,15 @@ def single_fit(
             raise
         import traceback
         warnings.warn(f"Failed fit: {e}\n{traceback.format_exc()}")
-        return dict(
+        out = dict(
             component_params=updated_component_params,
             weights=updated_weights,
             likelihoods=[*likelihoods, -np.inf],
             kmeans=kmeans, xlims=xlims, times_submerged=[]
         )
+        if cat is not None:
+            out.update(cat_probs=cat_probs, cat_spec=cat_spec.to_dict(), cat_alpha=cat["alpha"])
+        return out
 
     if overshoot_stopped is not None:
         _it, _dec, _rel = overshoot_stopped
@@ -712,7 +860,7 @@ def single_fit(
             f"normally."
         )
 
-    return dict(
+    out = dict(
         component_params=updated_component_params,
         weights=updated_weights,
         likelihoods=likelihoods,
@@ -725,6 +873,14 @@ def single_fit(
         initial_params=initial_params,
         latent_q=latent_q,
     )
+    if cat is not None:
+        out.update(cat_probs=cat_probs, cat_spec=cat_spec.to_dict(), cat_alpha=cat["alpha"])
+    if wdiv is not None:
+        # The penalised series the EM is monotone in (likelihoods alone need
+        # not be), and the resolved spec, for diagnostics.
+        out.update(objectives=objectives, weight_divergence=dict(wdiv),
+                   weight_divergence_R=_wdiv.divergence(updated_weights, wdiv["pairs"]))
+    return out
 
 
 def _init_component_from_class(observations, sample_indicators, target_sample_idx,
@@ -757,30 +913,107 @@ def _init_component_from_class(observations, sample_indicators, target_sample_id
     multivariate/CFUSN fits are stored natively in this form (see
     _em_update_multivariate/_em_update_cfusn's own `updated[c] = (mu_cand,
     Delta_cand, Gamma_cand)`), no canonical-form conversion needed.
+
+    Thin wrapper around _init_component_from_mask (the sample-class mask is
+    the only thing specific to this caller); kept as its own name since
+    add_component_to_fit's target_sample_idx callers already use it.
     """
     mask = sample_indicators[:, target_sample_idx].astype(bool)
-    Xc = np.asarray(observations)[mask]
+    return _init_component_from_mask(
+        observations, sample_indicators, mask, latent_q, rng,
+        old_params=old_params, old_weights=old_weights,
+        residual_frac=residual_frac, multivariate=multivariate,
+    )
+
+
+def _init_component_from_mask(observations, sample_indicators, mask, latent_q, rng,
+                              old_params=None, old_weights=None,
+                              residual_frac=0.4, multivariate=True, min_rows=None):
+    """Method-of-moments init for ONE new component, seeded from an
+    arbitrary row mask's worst-explained residual (see
+    _init_component_from_class's docstring for the residual-vs-raw-mean
+    rationale -- identical here, just generalized off a boolean row mask
+    instead of one sample-class column). Used both by
+    _init_component_from_class (mask = one sample class) and directly by
+    add_component_to_fit's target_mask path (e.g. "rows where a sparse
+    dimension is observed", which can span multiple sample classes).
+
+    When the mask spans multiple sample classes, residual-scoring uses
+    EACH row's OWN originating class's mixing weights (not a single shared
+    weight vector) -- log_joint_densities takes one weight vector per call,
+    so this scores each class's masked rows separately against its own
+    `old_weights` row and reassembles the per-row log-mixture-density in
+    the mask's original order before ranking by residual.
+
+    ``min_rows`` (EXPERIMENTAL, opt-in) overrides the default
+    ``max(10, p + 2)`` minimum for very small targets (e.g. a 4-variant
+    sample). Below p + 2 rows the masked covariance is rank-deficient, so it
+    is shrunk toward the pooled covariance of all rows,
+    (n * cov_mask + (p + 2) * cov_pool) / (n + p + 2). With ``min_rows=None``
+    (default) behaviour is unchanged.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    observations = np.asarray(observations)
+    Xc = observations[mask]
     keep = ~np.all(np.isnan(Xc), axis=1)
     Xc = Xc[keep]
     p = Xc.shape[1]
-    if len(Xc) < max(10, p + 2):
+    need = max(10, p + 2) if min_rows is None else max(int(min_rows), 2)
+    if len(Xc) < need:
         raise ValueError(
-            f"add_component_to_fit: target class {target_sample_idx} has only "
-            f"{len(Xc)} usable observations (need at least {max(10, p + 2)})"
+            f"add_component_to_fit: target mask has only {len(Xc)} usable "
+            f"observations (need at least {need})"
         )
+    # Two-level fallback per-dimension mean, used below only for a dimension
+    # that ends up entirely missing within the narrower worst-explained
+    # residual subset (confirmed to happen in practice: a 59-row KawOligo
+    # mask narrowed to a ~24-row residual subset with zero Kotler_RFS/
+    # Funk_RFS coverage) -- first the FULL (pre-residual-narrowing) masked
+    # population's mean; if a dimension has zero coverage even there (also
+    # confirmed: KawOligo's full 59-row mask itself never co-occurs with
+    # Funk_RFS/Kotler_RFS at all in this data), the GLOBAL (all-rows) mean.
+    # Previously this left mu=NaN for such dims with no warning beyond a
+    # "Mean of empty slice" RuntimeWarning, silently producing a NaN
+    # component (confirmed: propagated all the way into a returned fit's
+    # component_params). np.errstate suppresses the same expected warning
+    # at each fallback level; if a dimension is NaN even at the global
+    # level (would mean it has literally zero data anywhere, which
+    # shouldn't happen for any dimension actually included in the fit),
+    # that's caught by the isfinite check below rather than silently
+    # propagating.
+    with np.errstate(invalid="ignore"):
+        full_mask_mean = np.nanmean(Xc, axis=0)
+        global_mean = np.nanmean(observations, axis=0)
+    full_mask_mean = np.where(np.isfinite(full_mask_mean), full_mask_mean, global_mean)
 
     if old_params is not None and old_weights is not None:
         from .density_utils import log_joint_densities
         from scipy.special import logsumexp
-        class_weights = np.asarray(old_weights)[target_sample_idx]
-        lw = log_joint_densities(Xc, old_params, class_weights, multivariate=multivariate)
-        log_mix = logsumexp(lw, axis=0)  # (Nc,) total mixture log-density per point
-        n_residual = max(max(10, p + 2), int(np.ceil(residual_frac * len(Xc))))
+        old_weights = np.asarray(old_weights)
+        # Row -> originating sample class, restricted to the kept (non-all-NaN) rows.
+        row_sample = np.argmax(sample_indicators[mask][keep].astype(int), axis=1)
+        log_mix = np.empty(len(Xc))
+        for s in np.unique(row_sample):
+            sel = row_sample == s
+            lw = log_joint_densities(Xc[sel], old_params, old_weights[s], multivariate=multivariate)
+            log_mix[sel] = logsumexp(lw, axis=0)
+        n_residual = max(need, int(np.ceil(residual_frac * len(Xc))))
         n_residual = min(n_residual, len(Xc))
         worst_idx = np.argsort(log_mix)[:n_residual]
         Xc = Xc[worst_idx]
 
-    mu = np.nanmean(Xc, axis=0)
+    with np.errstate(invalid="ignore"):
+        mu = np.nanmean(Xc, axis=0)
+    missing_dim = ~np.isfinite(mu)
+    if missing_dim.any():
+        mu = np.where(missing_dim, full_mask_mean, mu)
+        if not np.isfinite(mu).all():
+            raise ValueError(
+                "add_component_to_fit: dimension(s) "
+                f"{np.where(~np.isfinite(mu))[0].tolist()} have zero coverage "
+                "across the ENTIRE target mask (not just its residual subset) "
+                "-- cannot seed a new component's mean for them."
+            )
     cov = np.zeros((p, p))
     for d1 in range(p):
         for d2 in range(d1, p):
@@ -788,6 +1021,17 @@ def _init_component_from_class(observations, sample_indicators, target_sample_id
             if both.sum() >= 2:
                 cov[d1, d2] = np.cov(Xc[both, d1], Xc[both, d2])[0, 1]
             cov[d2, d1] = cov[d1, d2]
+    if min_rows is not None and len(Xc) < p + 2:
+        pool = observations[~np.all(np.isnan(observations), axis=1)]
+        cov_pool = np.zeros((p, p))
+        for d1 in range(p):
+            for d2 in range(d1, p):
+                both = ~np.isnan(pool[:, d1]) & ~np.isnan(pool[:, d2])
+                if both.sum() >= 2:
+                    cov_pool[d1, d2] = np.cov(pool[both, d1], pool[both, d2])[0, 1]
+                cov_pool[d2, d1] = cov_pool[d1, d2]
+        kappa = p + 2
+        cov = (len(Xc) * cov + kappa * cov_pool) / (len(Xc) + kappa)
     cov += 1e-6 * np.eye(p)
     eigvals = np.linalg.eigvalsh(cov)
     if eigvals.min() < 1e-8:
@@ -807,39 +1051,47 @@ def _init_component_from_class(observations, sample_indicators, target_sample_id
 
 
 def add_component_to_fit(
-    observations, sample_indicators, fit_result, target_sample_idx,
-    constrained=False, multivariate=True, latent_q=2, **kwargs
+    observations, sample_indicators, fit_result, target_sample_idx=None,
+    target_mask=None, constrained=False, multivariate=True, latent_q=2, **kwargs
 ):
     """Grow an already-converged fit by ONE new component, initialized from
-    and primarily driven by `target_sample_idx`'s (e.g. P/LP) own data,
-    while every pre-existing component is FROZEN (held byte-identical)
-    throughout -- see update_steps.py's `frozen_components` kwarg, added
-    specifically for this use case.
+    and primarily driven by a target subset of the data (a sample class,
+    or an arbitrary row mask -- see ``target_sample_idx``/``target_mask``
+    below), while every pre-existing component is FROZEN (held byte-
+    identical) throughout -- see update_steps.py's `frozen_components`
+    kwarg, added specifically for this use case.
 
-    Rationale: a uniform sample-weighting scheme (sample_balance_beta/
-    sample_weight_transform) reweights the WHOLE EM objective and can
-    degrade the fit's quality on the bulk/majority classes to help a small
-    one (confirmed on real data: log/ln-weighted predictor-mv fits showed
-    flat marginal LR+ and density curves that didn't track the real
-    per-class histograms). Growing the fit instead -- keep the normal,
-    unweighted fit's K components exactly as they converged, then add one
-    new (K+1-th) component -- cannot degrade the existing classes' fit at
-    all, since their parameters never change; it can only add explanatory
-    power for whichever class the new component ends up being responsible
+    Rationale: a uniform reweighting scheme (sample_balance_beta/
+    sample_weight_transform, or -- a newer instance of the same lesson --
+    the experimental per-dimension dim_weights in compute_dim_weights)
+    reweights the WHOLE EM objective and can degrade the fit's quality on
+    the bulk/majority classes (or dimensions) to help a small one
+    (confirmed on real data: log/ln-weighted predictor-mv fits showed flat
+    marginal LR+ and density curves that didn't track the real per-class
+    histograms; and, separately, dim_weights measurably WORSENED the
+    overall fit on real TP53 data rather than helping its target sparse
+    dimensions -- see the dim_weights experiments this function's
+    target_mask generalization was added to compare against). Growing the
+    fit instead -- keep the normal, unweighted fit's K components exactly
+    as they converged, then add one new (K+1-th) component -- cannot
+    degrade the existing classes'/dimensions' fit at all, since their
+    parameters never change; it can only add explanatory power for
+    whichever class/row-subset the new component ends up being responsible
     for.
 
     Mechanics: the new component is seeded via method-of-moments directly
-    on `target_sample_idx`'s own observations (see
-    _init_component_from_class) and given a modest initial per-class
-    mixing weight (manually set below, not re-estimated from data, since
-    there's no existing weight for a component that didn't exist before).
-    The subsequent EM iterations use the STANDARD (unmodified) E-step --
-    responsibilities and per-class mixing weights are computed across all
-    K+1 components for every class, not just the target one -- so if other
-    classes also end up assigning the new component real responsibility,
-    the mixing-weight re-estimation naturally reflects that; only the new
-    component's own M-step is live (via frozen_components), everything
-    else is standard, already-validated EM machinery.
+    on the target subset's own observations (see _init_component_from_mask)
+    and given a modest initial mixing weight on every sample class that
+    contributes rows to the target subset (manually set below, not
+    re-estimated from data, since there's no existing weight for a
+    component that didn't exist before). The subsequent EM iterations use
+    the STANDARD (unmodified) E-step -- responsibilities and per-class
+    mixing weights are computed across all K+1 components for every class,
+    not just the target one(s) -- so if other classes also end up
+    assigning the new component real responsibility, the mixing-weight
+    re-estimation naturally reflects that; only the new component's own
+    M-step is live (via frozen_components), everything else is standard,
+    already-validated EM machinery.
 
     Parameters
     ----------
@@ -847,15 +1099,32 @@ def add_component_to_fit(
         A converged single_fit(...) return value (K components) -- reused
         as the K+1 fit's starting point. Not re-validated for convergence
         here; pass in whatever fit_result you trust.
-    target_sample_idx : int
+    target_sample_idx : int, optional
         Sample-indicator column (e.g. the P/LP class) whose data seeds the
-        new component's initialization and starting mixing weight.
+        new component's initialization and starting mixing weight. Mutually
+        exclusive with ``target_mask``; exactly one must be given.
+    target_mask : array-like of bool, optional
+        Arbitrary row mask (e.g. "rows where a sparse dimension is
+        observed") to seed the new component from instead of a single
+        sample class -- can span multiple sample classes. Every sample
+        class with at least one row in the mask gets an initial share on
+        the new component (see below); classes with none get none, but
+        this IS a hard constraint in practice: a zero mixing weight gives
+        a -inf log-weight, so its posteriors and therefore its
+        re-estimated weight stay exactly 0 (which is what makes a
+        single-class target an exclusive component).
+    min_rows : int, optional (EXPERIMENTAL)
+        Overrides the default target-row minimum (see
+        _init_component_from_mask) for very small targets.
     **kwargs : forwarded to single_fit (e.g. fit_seed, max_em_iters,
         num_fits-level concerns are the caller's responsibility -- this
         runs exactly one fit, not a multi-restart search).
 
     Returns the same dict shape as single_fit, now with K+1 components.
     """
+    if (target_sample_idx is None) == (target_mask is None):
+        raise ValueError("add_component_to_fit: pass exactly one of target_sample_idx, target_mask")
+
     old_params = list(fit_result["component_params"])
     old_weights = np.asarray(fit_result["weights"], dtype=float)
     K = len(old_params)
@@ -864,25 +1133,60 @@ def add_component_to_fit(
         raise ValueError(f"fit_result weights shape {old_weights.shape} inconsistent with {K} components")
 
     rng = kwargs.get("rng") or np.random.RandomState(kwargs.get("fit_seed"))
+    min_rows = kwargs.pop("min_rows", None)
 
-    new_component = _init_component_from_class(
-        observations, sample_indicators, target_sample_idx, latent_q, rng,
+    if target_mask is None:
+        mask = sample_indicators[:, target_sample_idx].astype(bool)
+    else:
+        mask = np.asarray(target_mask, dtype=bool)
+
+    # Categorical dims (EXPERIMENTAL): the new component's continuous block is
+    # seeded from the continuous columns only; its categorical probs from the
+    # target mask's smoothed category frequencies, appended below the frozen
+    # components' existing probs (which single_fit then keeps unchanged).
+    seed_obs = observations
+    cat_spec = kwargs.get("cat_spec")
+    if cat_spec is not None:
+        if not isinstance(cat_spec, _cat.CatSpec):
+            cat_spec = _cat.CatSpec.from_dict(cat_spec)
+        seed_obs, labels, _ = _cat.split_observations(observations, cat_spec)
+        alpha = kwargs.get("cat_alpha") or fit_result.get("cat_alpha")
+        if alpha is None:
+            alpha = _cat.cat_alpha(labels, cat_spec,
+                                   tau=kwargs.get("cat_tau", _cat.DEFAULT_TAU),
+                                   lam=kwargs.get("cat_lambda", _cat.DEFAULT_LAMBDA))
+        alpha = [np.asarray(a, dtype=float) for a in alpha]
+        new_pi = _cat.cat_probs_from_mask(labels, mask, alpha)
+        kwargs["initial_cat_probs"] = [
+            np.vstack([np.asarray(P, dtype=float), new_pi[c][None, :]])
+            for c, P in enumerate(fit_result["cat_probs"])
+        ]
+        kwargs["cat_alpha"] = alpha
+
+    new_component = _init_component_from_mask(
+        seed_obs, sample_indicators, mask, latent_q, rng,
         old_params=old_params, old_weights=old_weights, multivariate=multivariate,
+        min_rows=min_rows,
     )
     new_params = old_params + [new_component]
 
-    # Expand weights from (S, K) to (S, K+1): the target class starts with
-    # a modest share on the new component (taken proportionally from its
-    # existing K-column weights, which are rescaled down so the row still
-    # sums to 1); every other class starts at exactly 0 on the new
-    # component -- not a hard constraint (the E-step/weight-reestimation
-    # is standard and can move any class's weight onto the new component
-    # if the data supports it), just a neutral starting point.
+    # Expand weights from (S, K) to (S, K+1): every sample class with at
+    # least one row in the target mask starts with a modest share on the
+    # new component (taken proportionally from its existing K-column
+    # weights, which are rescaled down so the row still sums to 1); every
+    # other class starts at exactly 0 on the new component, and stays there:
+    # a zero weight's -inf log-weight keeps its posteriors, and so its
+    # re-estimated weight, at exactly 0. Single-class case (target_sample_idx)
+    # reduces to exactly the original one-row behaviour.
     INITIAL_TARGET_SHARE = 0.3
+    mask_rows_per_class = (sample_indicators.astype(bool) & mask[:, None]).sum(axis=0)
+    qualifies = mask_rows_per_class > 0
+    if not qualifies.any():
+        raise ValueError("add_component_to_fit: target mask has no rows in any sample class")
     new_col = np.zeros((S, 1))
-    new_col[target_sample_idx, 0] = INITIAL_TARGET_SHARE
+    new_col[qualifies, 0] = INITIAL_TARGET_SHARE
     expanded_weights = np.concatenate([old_weights, new_col], axis=1)
-    expanded_weights[target_sample_idx, :K] *= (1.0 - INITIAL_TARGET_SHARE)
+    expanded_weights[qualifies, :K] *= (1.0 - INITIAL_TARGET_SHARE)
 
     return single_fit(
         observations, sample_indicators, K + 1,

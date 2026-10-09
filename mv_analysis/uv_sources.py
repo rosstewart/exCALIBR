@@ -66,6 +66,7 @@ from src.assay_calibration.multivariate_analysis.compare_uv_mv import (
 )
 from src.assay_calibration.multivariate_data.labelseq import build_labelseq_dataframe
 from src.assay_calibration.multivariate_data.predictors import PREDICTORS
+from src.assay_calibration.multivariate_data.common import is_derived_dataset
 
 
 def _dataset_configs():
@@ -108,7 +109,10 @@ def _discover_exc_pp_datasets(gene, uv_calib_dir=None):
     uv_calib_dir = uv_calib_dir or config.EXC_PP_CLINVAR2025_UV_CALIB
     root = Path(uv_calib_dir)
     prefix = f"{gene.upper()}_"
-    return sorted(p.name for p in root.iterdir() if p.is_dir() and p.name.upper().startswith(prefix))
+    # Derived datasets (composites/meta-analyses) are excluded so the
+    # independent baseline uses the same sources as the joint model.
+    return sorted(p.name for p in root.iterdir()
+                  if p.is_dir() and p.name.upper().startswith(prefix) and not is_derived_dataset(p.name))
 
 
 # ── card11 ───────────────────────────────────────────────────────────────

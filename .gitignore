@@ -23,4 +23,10 @@ __pycache__/
 tests/cfusn_simulations/results/*.csv
 mv_analysis/figures/
 
-ExCALIBR_latex_092026
+ExCALIBR-MV_latex_092026
+ExCALIBR_latex_src
+test
+
+# Manuscript build outputs: symlinks into OUTPUT_DIR on /data (see analysis/config.py)
+manuscript/
+analysis/manuscript_table_templates/archive_20261007/
