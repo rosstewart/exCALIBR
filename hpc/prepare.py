@@ -803,12 +803,47 @@ def _cluster_suffixed_label(dataset_label: str, cluster_idx: int) -> str:
     return f"{dataset_label[:pos]}_cluster{cluster_idx + 1}{dataset_label[pos:]}"
 
 
+PATHOGENIC_REFERENCE_COLS = (1, 2, 3)  # B/LB, population (gnomAD), synonymous
+
+
+def pathogenic_share_proportions(ms, tau):
+    """sample_proportions for the pathogenic-share weighting, or None (unweighted).
+
+    Pathogenic samples are column 0 (P/LP) plus every sample column after the
+    four standard ones -- the gene set's auxiliary pathogenic samples (CARD11
+    BENTA/CADINS, TP53 RPV, RET phenotype groups). They are all scaled by one
+    factor f = max(1, tau * reference / pathogenic), where reference is the
+    total of whichever of B/LB, population and synonymous exist; nothing is
+    ever down-weighted. Counts are over variants with at least one observed
+    dimension. Returns None when tau is 0/None, there are no pathogenic or no
+    reference samples, or f == 1 (the dataset already meets the share), so
+    those jobs are byte-identical to unweighted ones.
+    """
+    if not tau:
+        return None, 1.0
+    sa = np.asarray(ms.sample_assignments).astype(bool)
+    X = np.asarray(ms.scores, dtype=float)
+    observed = ~np.isnan(X).all(axis=1) if X.ndim == 2 else ~np.isnan(X)
+    n = sa[observed].sum(axis=0).astype(float)
+    path_cols = [0] + list(range(4, len(n)))
+    n_path = n[path_cols].sum()
+    n_ref = n[[c for c in PATHOGENIC_REFERENCE_COLS if c < len(n)]].sum()
+    if n_path == 0 or n_ref == 0:
+        return None, 1.0
+    f = max(1.0, tau * n_ref / n_path)
+    if f == 1.0:
+        return None, 1.0
+    p = n.copy()
+    p[path_cols] *= f
+    return p.tolist(), f
+
+
 def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS, NUM_FITS,
                                   component_range, constraint_modes, latent_q, init_strategy,
                                   min_overlap_rows=30, sample_balance_beta=None,
                                   sample_weight_transform=None,
                                   extra_cjob_fields=None, master_seed=DEFAULT_MASTER_SEED,
-                                  greedy_restarts=False):
+                                  greedy_restarts=False, pathogenic_share=None):
     """Shared bootstrap x component x constraint job-generation loop, backed
     by Fit.generate_fit_jobs. Used by every multivariate pipeline in this
     file: the integrated-dataframe multi-assay genes (BRCA1/PTEN/MSH2/
@@ -835,6 +870,10 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
     keeps `dataset_label`/`save_dir` unsuffixed (so single-cluster genes --
     the common case -- are completely unaffected); additional clusters get
     "_cluster2"/"_cluster3"/... inserted (see `_cluster_suffixed_label`).
+
+    ``pathogenic_share`` (tau): upweight the pathogenic samples to a share tau
+    of the reference samples (see pathogenic_share_proportions); the jobs carry
+    the resulting sample_proportions with anchor_weight_scale=True.
     """
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -860,9 +899,13 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                 min_overlap_rows=min_overlap_rows, sample_balance_beta=sample_balance_beta,
                 sample_weight_transform=sample_weight_transform,
                 extra_cjob_fields=cluster_extra_fields, master_seed=master_seed,
-                greedy_restarts=greedy_restarts,
+                greedy_restarts=greedy_restarts, pathogenic_share=pathogenic_share,
             ))
         return all_jobs
+
+    proportions, path_factor = pathogenic_share_proportions(ms, pathogenic_share)
+    if pathogenic_share:
+        print(f"  {dataset_label}: pathogenic share {pathogenic_share:g} -> factor {path_factor:.2f}")
 
     constrained_flags = []
     if "con" in constraint_modes:
@@ -889,6 +932,9 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                     fit_kwargs["sample_balance_beta"] = sample_balance_beta
                 if sample_weight_transform is not None and sample_weight_transform != "none":
                     fit_kwargs["sample_weight_transform"] = sample_weight_transform
+                if proportions is not None:
+                    fit_kwargs["sample_proportions"] = proportions
+                    fit_kwargs["anchor_weight_scale"] = True
                 if greedy_restarts:
                     fit_kwargs["greedy_restarts"] = True
                 elif NUM_FITS is not None:
@@ -924,6 +970,9 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             "multivariate": True,
             "num_fits_total": sum(_count_eventual_fits(v) for v in jobs_by_key.values()),
         }
+        if pathogenic_share:
+            cjob["pathogenic_share"] = pathogenic_share
+            cjob["pathogenic_factor"] = path_factor
         if extra_cjob_fields:
             cjob.update(extra_cjob_fields)
         cjob.update(jobs_by_key)
@@ -936,7 +985,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
                                 clinvar_release, component_range, constraint_modes,
                                 latent_q, init_strategy, population_type,
                                 master_seed=DEFAULT_MASTER_SEED, regularization_type=None,
-                                greedy_restarts=False):
+                                greedy_restarts=False, pathogenic_share=None):
     from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
 
     gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
@@ -963,6 +1012,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
         component_range, constraint_modes, latent_q, init_strategy,
         extra_cjob_fields={"assay_datasets": list(ms.dataset_names)},
         master_seed=master_seed, greedy_restarts=greedy_restarts,
+        pathogenic_share=pathogenic_share,
     )
 
 
@@ -990,12 +1040,27 @@ def _build_gene_set_ms_map(gene_set, args):
 
     if gene_set == "labelseq":
         from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
-        return build_labelseq_multiscoresets(
+        ms_map = build_labelseq_multiscoresets(
             regularization_type=getattr(args, "regularization_type", None))
+        if "ret" in ms_map and not getattr(args, "ret_posthoc_phenotypes", False):
+            # RET's MEN2 / Hirschsprung groups enter the fit as their own
+            # samples (roles 4, 5), as CARD11's BENTA / CADINS do. The variants
+            # also stay in role 0 (P/LP), so each bootstrap's one-hot
+            # resolution puts a variant in one of its samples; P/LP evaluation
+            # is unchanged. mv_analysis.phenotype_evidence reads the fitted rows.
+            from mv_analysis.phenotype_evidence import (
+                _with_phenotype_samples, ret_phenotype_masks, RET_PHENOTYPE_ROLES)
+            ms_map["ret"] = _with_phenotype_samples(
+                ms_map["ret"], ret_phenotype_masks(ms_map["ret"]), RET_PHENOTYPE_ROLES)
+        return ms_map
 
     if gene_set == "card11":
         from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset
         return {"CARD11": build_card11_multiscoreset()}
+
+    if gene_set == "phenotype_sub":
+        from mv_analysis.phenotype_submodels import build_phenotype_submodel_ms_map
+        return build_phenotype_submodel_ms_map()
 
     if gene_set == "combined":
         from src.assay_calibration.multivariate_data.combined import (
@@ -1255,6 +1320,7 @@ def _generate_jobs_for_gene_ms_map(gene_set, gene_ms_map, args):
             extra_cjob_fields={"gene_set": gene_set, "assay_datasets": list(ms.dataset_names)},
             master_seed=args.seed,
             greedy_restarts=getattr(args, "greedy_restarts", False),
+            pathogenic_share=getattr(args, "pathogenic_share_value", None),
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1366,6 +1432,7 @@ def _generate_integrated_jobs(df, gene_groups, args):
             master_seed=args.seed,
             regularization_type=getattr(args, "regularization_type", None),
             greedy_restarts=getattr(args, "greedy_restarts", False),
+            pathogenic_share=getattr(args, "pathogenic_share_value", None),
         )
         for gene, datasets in gene_groups.items()
     )
@@ -1457,6 +1524,7 @@ def _generate_predictor_mv_jobs(by_gene, args):
             sample_weight_transform=getattr(args, "sample_weight_transform", None),
             master_seed=args.seed,
             greedy_restarts=getattr(args, "greedy_restarts", False),
+            pathogenic_share=getattr(args, "pathogenic_share_value", None),
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1493,8 +1561,9 @@ def run_predictor_mv(args):
 # in priority order)
 # =============================================================================
 
-_MV_ALL_PIPELINE_CHOICES = ["integrated", "fgfr", "tp53", "labelseq", "card11", "predictor-mv", "combined"]
-_MV_ALL_GENE_SET_PIPELINES = {"fgfr", "tp53", "labelseq", "card11", "combined"}
+_MV_ALL_PIPELINE_CHOICES = ["integrated", "fgfr", "tp53", "labelseq", "card11", "predictor-mv", "combined",
+                            "phenotype_sub"]
+_MV_ALL_GENE_SET_PIPELINES = {"fgfr", "tp53", "labelseq", "card11", "combined", "phenotype_sub"}
 
 
 def run_mv_all(args):
@@ -1569,6 +1638,69 @@ def _resolve_constraints(constraint_list: list[str]) -> list[str]:
         else:
             modes.add(c)
     return sorted(modes)
+
+
+def _add_pathogenic_share_arg(p):
+    p.add_argument("--pathogenic-share", type=float, nargs="+", default=None, metavar="TAU",
+                   help="Upweight P/LP and auxiliary pathogenic samples to a share TAU of the "
+                        "reference samples (B/LB + population + synonymous; see "
+                        "pathogenic_share_proportions). Each TAU becomes its own condition "
+                        "<output-dir>/tau_<TAU>/, and all conditions are merged into one job "
+                        "array in the order given (e.g. 0.1 0 0.2 puts every tau=0.1 job "
+                        "first). TAU=0 is the unweighted fit.")
+
+
+def _merge_condition_manifests(output_root: str, condition_labels: list, target_array_size: int) -> None:
+    """Repack every condition's jobs (built under <output_root>/<label>/jobs/)
+    into one shared <output_root>/jobs/ array, in condition order. Each job is
+    tagged with its condition so hpc/run_array_task.py writes results to
+    <output_root>/<label>/<dataset_name>/, the per-condition tree
+    hpc/aggregate_results.py --per-condition aggregates.
+    """
+    all_jobs, conditions, n_bootstraps = [], {}, None
+    for label in condition_labels:
+        jobs_dir = Path(output_root) / label / "jobs"
+        with open(jobs_dir / "job_index.json") as f:
+            index = json.load(f)
+        n_bootstraps = index["n_bootstraps"]
+        start = len(all_jobs)
+        for array_file in sorted(jobs_dir.glob("array_*.pkl")):
+            with open(array_file, "rb") as f:
+                cjobs = pickle.load(f)
+            for cjob in cjobs:
+                cjob["condition"] = label
+            all_jobs.extend(cjobs)
+            array_file.unlink()  # superseded by the merged copy below
+        conditions[label] = {"job_index_range": [start, len(all_jobs)],
+                             **{k: v for k, v in index.items() if k not in
+                                ("total_jobs", "num_arrays", "jobs_per_array", "job_index")}}
+    print(f"\nMerging {len(all_jobs)} jobs from {len(condition_labels)} condition(s) "
+          f"{condition_labels} into one job array under {output_root}/jobs/")
+    total_jobs, num_arrays = _save_manifest(output_root, all_jobs, target_array_size, n_bootstraps,
+                                            {"condition_order": list(condition_labels),
+                                             "conditions": conditions})
+    _print_next_steps(output_root, total_jobs, num_arrays)
+    print("\nAggregate each condition separately once its jobs finish:")
+    print(f"  python {_SCRIPT_DIR}/aggregate_results.py {output_root} --per-condition")
+
+
+def run_pathogenic_share_conditions(args):
+    """Build one condition per --pathogenic-share value (each through the
+    subcommand's normal builder, into <output-dir>/tau_<TAU>/) and merge them
+    into one job array in the order given."""
+    root = args.output_dir
+    labels = []
+    for tau in args.pathogenic_share:
+        label = f"tau_{tau:g}"
+        print(f"\n{'#' * 80}\nCondition {label} (pathogenic share {tau:g})\n{'#' * 80}")
+        sub = copy.copy(args)
+        sub.output_dir = os.path.join(root, label)
+        sub.pathogenic_share_value = tau if tau > 0 else None
+        args.func(sub)
+        labels.append(label)
+    if getattr(args, "list_only", False):
+        return
+    _merge_condition_manifests(root, labels, args.target_array_size)
 
 
 def _add_common_args(p):
@@ -1750,7 +1882,8 @@ def main():
     p_multi.add_argument("--list-only", action="store_true",
                          help="Print gene groups and exit")
     p_multi.add_argument("--gene-set", default="integrated",
-                         choices=["integrated", "fgfr", "tp53", "labelseq", "card11", "combined"],
+                         choices=["integrated", "fgfr", "tp53", "labelseq", "card11", "combined",
+                                  "phenotype_sub"],
                          help="Ingestion source (default: integrated, the pre-existing "
                               "BRCA1/PTEN/MSH2/pillar-project path via --dataframe/--datasets). "
                               "Other values use the pluggable multivariate_data/*.py ingestion "
@@ -1949,6 +2082,8 @@ def main():
                        help="[fgfr] fit FGFR1/2/3/4 as separate MultiScoresets instead of "
                             "the default: one pooled MultiScoreset across all target genes")
     p_mv_all.set_defaults(func=run_mv_all)
+    for p in (p_multi, p_pred, p_mv_all):
+        _add_pathogenic_share_arg(p)
 
     args = parser.parse_args()
 
@@ -1971,7 +2106,10 @@ def main():
     print("=" * 80)
     print(f"ExCALIBR job manifest — mode: {args.mode}  (workers: {args.n_jobs})")
     print("=" * 80)
-    args.func(args)
+    if getattr(args, "pathogenic_share", None):
+        run_pathogenic_share_conditions(args)
+    else:
+        args.func(args)
 
 
 if __name__ == "__main__":

@@ -1481,8 +1481,30 @@ class MVCalibrationAnalysis:
             liberal_marginal_monotonicity=True,
             pathomechanism_method=None,
             partial_pattern_mode="trust_global",
-            n_jobs=-1):
+            n_jobs=-1,
+            drop_inconsistent_boots=False,
+            inconsistency_margin=0.5,
+            inconsistency_min_consensus=0.5,
+            inconsistency_rule="margin",
+            inconsistency_rho_max=0.1):
         """Run analysis for all configs.
+
+        drop_inconsistent_boots : bool, default False (EXPERIMENTAL, opt-in)
+            Drop bootstrap fits whose evidence disagrees with their siblings'
+            -- e.g. collapsed fits where one component absorbs the data and
+            every variant gets the same LR+ (seen on kras), which pass the
+            invalid-prior check when the prior estimate lands at an ordinary
+            value. Label-free: for each valid bootstrap, the Spearman
+            correlation rho between its log LR+ (all scored variants) and the
+            median log LR+ of the OTHER bootstraps; a fit is dropped when its
+            LR+ is constant, or rho < median(rho) - ``inconsistency_margin``.
+            Applied only when the siblings themselves agree
+            (median(rho) >= ``inconsistency_min_consensus``): a gene whose
+            data genuinely can't separate the classes has no consensus to
+            disagree with, so nothing is dropped.
+            ``inconsistency_rule="strict"`` drops only clear collapses: a
+            constant LR+, or rho <= ``inconsistency_rho_max`` (no agreement
+            at all), instead of the relative margin.
 
         pathomechanism_method : {None, "subtraction", "masking"}, default None
             None (default): estimate the scalar prior from the raw
@@ -1597,6 +1619,40 @@ class MVCalibrationAnalysis:
 
             priors = np.array(priors)
             lr_matrix = np.array(lr_matrix)
+
+            if drop_inconsistent_boots and len(lr_matrix) >= 5:
+                from scipy.stats import rankdata
+                scored_rows = ~np.all(np.isnan(scores), axis=1)
+                Lr = lr_matrix[:, scored_rows]
+                rho = np.full(len(Lr), np.nan)
+                for i in range(len(Lr)):
+                    if np.nanstd(Lr[i]) < 1e-9:
+                        continue
+                    cons = np.nanmedian(np.delete(Lr, i, axis=0), axis=0)
+                    ok = np.isfinite(Lr[i]) & np.isfinite(cons)
+                    if ok.sum() > 2 and np.std(cons[ok]) > 1e-12:
+                        rho[i] = np.corrcoef(rankdata(Lr[i][ok]), rankdata(cons[ok]))[0, 1]
+                med_rho = float(np.nanmedian(rho)) if np.isfinite(rho).any() else np.nan
+                keep = np.ones(len(lr_matrix), bool)
+                if np.isfinite(med_rho) and med_rho >= inconsistency_min_consensus:
+                    if inconsistency_rule == "strict":
+                        keep = np.isfinite(rho) & (rho > inconsistency_rho_max)
+                    else:
+                        keep = np.isfinite(rho) & (rho >= med_rho - inconsistency_margin)
+                n_drop = int((~keep).sum())
+                print(f"  Inconsistent-bootstrap check: median rho={med_rho:.3f}; dropped {n_drop}/{len(keep)}"
+                      + (f" (rho: {np.round(rho[~keep], 3).tolist()})" if n_drop else ""))
+                if n_drop:
+                    priors, lr_matrix = priors[keep], lr_matrix[keep]
+                    for d_ in (aux_lr_matrices, aux_vsp_lr_matrices, aux_prior_collections):
+                        for fx in d_:
+                            if len(d_[fx]) == len(keep):
+                                d_[fx] = [v for v, k_ in zip(d_[fx], keep) if k_]
+                    n_valid = int(keep.sum())
+                if not hasattr(self, "inconsistent_boot_check"):
+                    self.inconsistent_boot_check = {}
+                self.inconsistent_boot_check[config] = {"rho": rho, "median_rho": med_rho, "dropped": n_drop,
+                                                        "n_valid_before": int(len(keep))}
 
             # ── Prior stability across bootstraps ─────────────────────
             print(f"  Prior across boots: median={np.nanmedian(priors):.4f}, "

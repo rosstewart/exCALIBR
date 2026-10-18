@@ -66,6 +66,7 @@ P, B, G, S = 0, 1, 2, 3
 LATENT_Q = 2
 MAX_EM_ITERS = 2000
 POOL_MULT = 2.0  # pool subsample size as a multiple of the gnomAD count; <= 0: whole pool
+POOL_CAP = None  # optional upper bound on the pool subsample size
 
 GENES = {
     "ret": dict(gene_set="labelseq", pool=True, phenotypes=True),
@@ -78,7 +79,9 @@ GENES = {
 # -- data -------------------------------------------------------------------
 def load_gene(key, pool_type="all_missense_snv"):
     from mv_analysis import config
-    spec = GENES[key]
+    spec = GENES.get(key) or dict(
+        gene_set="labelseq" if key.lower() in config.LABELSEQ_GENES else "integrated",
+        pool=True, phenotypes=key.lower() == "ret")
     gene = key.split("_")[0]
     gs = spec["gene_set"]
     ms = config.build_ms_for_gene_cluster(gs, gene)
@@ -87,14 +90,20 @@ def load_gene(key, pool_type="all_missense_snv"):
     if spec["pool"]:
         mm = config.build_multiscoresets_for_gene_set(gs, genes=[gene], regularization_type=pool_type)
         rms = mm.get(gene.lower()) or mm.get(gene.upper()) or next(iter(mm.values()))
-        assert list(rms.dataset_names) == list(ms.dataset_names)
+        # the pool keeps the fit's own readouts, matched by name (a gene's
+        # stored fit may use a subset of the readouts the pool builder returns)
+        names = list(rms.dataset_names)
+        missing = [n for n in ms.dataset_names if n not in names]
+        if missing:
+            raise ValueError(f"{key}: pool lacks the fit's readouts {missing}")
+        cols = [names.index(n) for n in ms.dataset_names]
         s = rms.sample_assignments.astype(bool)
         # every assayed variant of the pool type except labelled controls
         # (P/LP, B/LB, synonymous: already in the fit as their own samples);
         # gnomAD variants stay in, so the pool is not depleted of them
         labelled = [c for c in (P, B, S) if c < s.shape[1] - 1]
         only = s[:, -1] & ~s[:, labelled].any(axis=1)
-        pool = np.asarray(rms.scores, float)[only]
+        pool = np.asarray(rms.scores, float)[only][:, cols]
         pool = pool[~np.isnan(pool).all(axis=1)]
     roles, masks = {}, {}
     if spec["phenotypes"]:
@@ -143,6 +152,8 @@ def bootstrap_data(d, i, master_seed=DEFAULT_MASTER_SEED):
         rng = np.random.RandomState(seed + 7919)
         n_g = int(sa[:, G].sum())
         size = len(d["pool"]) if POOL_MULT <= 0 else min(int(POOL_MULT * n_g), len(d["pool"]))
+        if POOL_CAP:
+            size = min(size, POOL_CAP)
         sub = d["pool"][rng.choice(len(d["pool"]), size, replace=False)]
         ptr = rng.randint(0, size, size)
         pva = np.setdiff1d(np.arange(size), ptr)

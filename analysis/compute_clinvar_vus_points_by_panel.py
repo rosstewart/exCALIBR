@@ -177,6 +177,28 @@ def combined_vus_keys(df_gene):
     return sorted(set(keys))
 
 
+def _match_fitted_dims(ms, gene, gene_set, build):
+    """Restrict `ms` (built here with VUS rows kept) to exactly the datasets
+    the stored fit was trained on, taken from the canonical labelled-data
+    build (config.build_ms_for_gene_cluster) -- the VUS rows add overlap, so
+    re-deriving the fitted subset from this ms can pick different dims (e.g.
+    KCNH2). `build` rebuilds this ms; it is re-run with derived datasets
+    allowed when the fit predates their exclusion."""
+    from src.assay_calibration.multivariate_data.common import allow_derived_datasets
+    from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
+    stored = config._stored_fit_dims(gene, gene_set, 0, RESULTS_JSON)
+    if stored is not None and stored[1] == ms.n_assays:
+        return ms  # already the fitted space (e.g. TP53's uncollapsed combined fit)
+    names = list(config.build_ms_for_gene_cluster(gene_set, gene, results_json=RESULTS_JSON).dataset_names)
+    if not set(names) <= set(ms.dataset_names):
+        with allow_derived_datasets():
+            ms = build()
+    dims = [list(ms.dataset_names).index(n) for n in names]
+    if len(dims) < ms.n_assays:
+        select_dims(ms, dims)
+    return ms
+
+
 def score_gene(gene, gene_set, ms, dataset_name, vus_keys, variant_index=None):
     """Shared scoring tail: pick best-MCC config, run the MV analysis, pull
     points for the VUS rows. `variant_index`, if given, must already be keyed
@@ -262,11 +284,15 @@ def run_functional_panel(out_path):
             print(f"  {gene}: 0 true ClinVar VUS variants", flush=True)
             continue
         try:
-            ms_map = build_integrated_multiscoresets(genes=[gene], regularization_type="all_assayed")
-            ms = ms_map.get(gene)
+            def _build(gene=gene):
+                return build_integrated_multiscoresets(genes=[gene], regularization_type="all_assayed").get(gene)
+            ms = _build()
             if ms is None:
                 print(f"  SKIP {gene}: no integrated ms built", flush=True)
                 continue
+            # the dimensions the stored fit was trained on (disjoint clusters,
+            # older selections, fits predating the derived-dataset exclusion)
+            ms = _match_fitted_dims(ms, gene, "integrated", _build)
             dataset_name = config.canonical_dataset_name(gene, "integrated", results_json=RESULTS_JSON)
             rows.extend(score_gene(gene, "integrated", ms, dataset_name, vus_keys))
         except Exception as e:
@@ -370,22 +396,23 @@ def run_combined_panel(out_path):
             continue
 
         try:
-            datasets = functional_datasets_for_gene(df_integrated, gene)
-            if not datasets:
-                print(f"  {gene}: no functional datasets, skipping", flush=True)
-                continue
-            clinvar_release = resolve_clinvar_release(gene)
-            functional_scoresets = build_functional_scoresets(
-                df_integrated, gene, datasets, clinvar_release=clinvar_release,
-                regularization_type="all_assayed")
-            functionally_assayed = get_functionally_assayed_protein_variants(df_integrated, gene, datasets)
-            ms = build_combined_multiscoreset(
-                gene, functional_scoresets, datasets, config.PREDICTOR_RAW_DATA_DIR,
-                functionally_assayed_variants=functionally_assayed,
-                require_both_modalities=False)
+            def _build(gene=gene):
+                datasets = functional_datasets_for_gene(df_integrated, gene)
+                if not datasets:
+                    return None
+                functional_scoresets = build_functional_scoresets(
+                    df_integrated, gene, datasets, clinvar_release=resolve_clinvar_release(gene),
+                    regularization_type="all_assayed")
+                functionally_assayed = get_functionally_assayed_protein_variants(df_integrated, gene, datasets)
+                return build_combined_multiscoreset(
+                    gene, functional_scoresets, datasets, config.PREDICTOR_RAW_DATA_DIR,
+                    functionally_assayed_variants=functionally_assayed,
+                    require_both_modalities=False)
+            ms = _build()
             if ms is None:
                 print(f"  SKIP {gene}: could not build combined ms", flush=True)
                 continue
+            ms = _match_fitted_dims(ms, gene, "combined", _build)
             dataset_name = config.canonical_dataset_name(gene, "combined", results_json=RESULTS_JSON)
             rows.extend(score_gene(gene, "combined", ms, dataset_name, vus_keys))
         except Exception as e:

@@ -153,6 +153,34 @@ def sample_cfusn_mixture(component_params, weights_per_sample, sample_sizes, rng
     return X, sample_indicators, true_components
 
 
+def sample_categorical_labels(true_components, cat_probs, rng):
+    """Categorical columns for a location-model mixture (cfusn/categorical.py).
+
+    Given each row's generating component, draw one level per categorical dim
+    from that component's probabilities -- conditionally independent of the
+    row's continuous values given the component, as the model assumes.
+
+    Parameters
+    ----------
+    true_components : (N,) int, from sample_cfusn_mixture
+    cat_probs : list over categorical dims of (K, L_c) arrays
+    rng : np.random.RandomState
+
+    Returns
+    -------
+    (N, C) float array of level codes 0..L_c-1 (float so NaN missingness can
+    be injected afterwards, matching the fitter's encoding).
+    """
+    true_components = np.asarray(true_components, dtype=int)
+    out = np.empty((len(true_components), len(cat_probs)))
+    for c, P in enumerate(cat_probs):
+        P = np.asarray(P, dtype=float)
+        cum = np.cumsum(P[true_components], axis=1)
+        u = rng.rand(len(true_components), 1)
+        out[:, c] = np.minimum((u > cum).sum(axis=1), P.shape[1] - 1)
+    return out
+
+
 # ── Missingness injection ───────────────────────────────────────────────────
 
 def inject_missingness(X, frac_per_dim, rng):

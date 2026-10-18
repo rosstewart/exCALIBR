@@ -154,6 +154,12 @@ def main():
     ap.add_argument("--genes", nargs="+", default=list(GENES))
     ap.add_argument("--components", nargs="+", type=int, default=[3, 4])
     ap.add_argument("--n-bootstraps", type=int, default=20)
+    ap.add_argument("--ablate-default", action="store_true",
+                    help="give the default CFUSN restart the aligned CFUSN restart's k-means seed (so the two "
+                         "differ only in initial skew signs) and save two selections per bootstrap: "
+                         "struct4_<K>c (all four restarts) and struct3_<K>c (without the default)")
+    ap.add_argument("--fixed-k", action="store_true",
+                    help="fit every K in --components (as production does) instead of the BIC choice")
     ap.add_argument("--max-workers", type=int, default=110)
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args()
@@ -185,7 +191,7 @@ def main():
 
         tasks = []
         for key, d in data.items():
-            K = picks[key]
+          for K in (args.components if args.fixed_k else [picks[key]]):
             ref1 = chosen[(key, K, 1)]["component_params"] if chosen[(key, K, 1)] else None
             ref2 = chosen[(key, K, 2)]["component_params"] if chosen[(key, K, 2)] else None
             for i in range(args.n_bootstraps):
@@ -193,32 +199,43 @@ def main():
                 obs, sa = labelled(d["ms"], seed)
                 tr, va = pattern_stratified_bootstrap(obs, sa, seed)
                 base = (key, i, obs[tr], sa[tr], obs[va], sa[va], K)
-                tasks += [base + (0, None, None, 1000 + i, "q0"),
-                          base + (1, ref1, None, 2000 + i, "q1_ref"),
-                          base + (2, ref2, None, 3000 + i, "q2_ref"),
-                          base + (2, None, 0, 4000 + i, "q2_default")]
+                label_k = f"_{K}c"
+                tasks += [base + (0, None, None, 1000 + i, "q0" + label_k),
+                          base + (1, ref1, None, 2000 + i, "q1_ref" + label_k),
+                          base + (2, ref2, None, 3000 + i, "q2_ref" + label_k),
+                          base + (2, None, 0, (3000 if args.ablate_default else 4000) + i, "q2_default" + label_k)]
         print(f"bootstrap fits: {len(tasks)}", flush=True)
         results = list(ex.map(boot_fit, tasks, chunksize=1))
 
+    selections = {"struct": lambda lab: True}
+    if args.ablate_default:
+        selections = {"struct4": lambda lab: True, "struct3": lambda lab: not lab.startswith("q2_default")}
     best = {}
+    restart_log = []
     for key, i, label, f, v, err in results:
         if err:
             print(f"  {key} b{i} {label}: failed {err}", flush=True)
             continue
-        if np.isfinite(v) and ((key, i) not in best or v > best[(key, i)][1]):
-            best[(key, i)] = (f, v, label)
-    wins = {}
-    for (key, i), (f, v, label) in best.items():
+        K = int(label.rsplit("_", 1)[1][:-1])
+        restart_log.append(dict(gene=key, bootstrap=i, K=K, restart=label.rsplit("_", 1)[0], val_ll=v))
+        for sel, keep in selections.items():
+            if keep(label) and np.isfinite(v) and ((sel, key, i, K) not in best or v > best[(sel, key, i, K)][1]):
+                best[(sel, key, i, K)] = (f, v, label)
+    import pandas as pd
+    pd.DataFrame(restart_log).to_csv(out / "restart_val_ll.csv", index=False)
+    wins, per_file = {}, {}
+    for (sel, key, i, K), (f, v, label) in best.items():
         d = data[key]
-        K = picks[key]
-        wins.setdefault(key, {}).setdefault(label, 0)
-        wins[key][label] += 1
+        wins.setdefault(f"{sel}_{key}_{K}c", {}).setdefault(label, 0)
+        wins[f"{sel}_{key}_{K}c"][label] += 1
         entry = {"dataset_name": d["dataset"], "bootstrap_seed": i, "num_components": K, "fit_idx": label,
                  "fit": {"component_params": f["component_params"], "weights": np.asarray(f["weights"])},
                  "val_ll": v, "assay_datasets": list(d["ms"].dataset_names), "calibrated_dims": None,
                  "n_cap_hits": 0}
-        with open(out / d["dataset"] / f"bootstrap_{i}_best_fits.pkl", "wb") as fh:
-            pickle.dump({f"struct_{K}c": entry}, fh)
+        per_file.setdefault((d["dataset"], i), {})[f"{sel}_{K}c"] = entry
+    for (ds, i), entries in per_file.items():
+        with open(out / ds / f"bootstrap_{i}_best_fits.pkl", "wb") as fh:
+            pickle.dump(entries, fh)
     print("winning restart per bootstrap:", json.dumps(wins), flush=True)
     print("Done.", flush=True)
 

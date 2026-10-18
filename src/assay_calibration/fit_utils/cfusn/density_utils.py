@@ -557,7 +557,7 @@ def _component_logpdfs(x, params, multivariate):
     ``params`` is a categorical.MixtureParams (analysis-side fitted mixtures
     with categorical dims). The EM fitter only ever passes plain lists, for
     which this is the original per-component loop."""
-    if getattr(params, "cat_spec", None) is not None:
+    if getattr(params, "cat_spec", None) is not None or getattr(params, "factorial", None) is not None:
         from .categorical import component_logpdf_full
 
         def _base(xc, mu, Delta, Gamma):
@@ -567,7 +567,7 @@ def _component_logpdfs(x, params, multivariate):
 
 
 def joint_densities(x, params, weights, multivariate=False):
-    if getattr(params, "cat_spec", None) is not None:
+    if getattr(params, "cat_spec", None) is not None or getattr(params, "factorial", None) is not None:
         lp = _component_logpdfs(x, params, multivariate)
         return np.array([w * np.exp(l) for l, w in zip(lp, weights)])
     return np.array([

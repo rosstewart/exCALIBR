@@ -130,6 +130,9 @@ def pick_best_canonical_config(gene: str, gene_set: str, ms, results_json: str, 
     wants the stricter clinical-threshold config choice can still ask for it
     explicitly."""
     import gzip, json
+    fixed = config.fixed_mv_config(gene, gene_set)
+    if fixed is not None:
+        return fixed
     with fast_results_json(results_json):
         with gzip.open(results_json, "rt", encoding="utf-8") as f:
             raw = json.load(f)

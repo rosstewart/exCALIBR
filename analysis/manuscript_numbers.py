@@ -375,9 +375,23 @@ class ManuscriptRegistry:
         uses: Dict[str, tuple] = {}
         literals: Dict[str, List[str]] = {}
         includes: List[tuple] = []
-        for order, tex in enumerate(self.tex_paths):
-            if not tex.exists():
+        # Follow the documents' own \input'd .tex files (not Figures/...), e.g.
+        # a shared submission-mode or Extended Data file, and never treat a
+        # macro those files define themselves as a pipeline number.
+        files, defined = [], set()
+        queue = [p for p in self.tex_paths]
+        while queue:
+            tex = queue.pop(0)
+            if tex in files or not tex.exists():
                 continue
+            files.append(tex)
+            text = tex.read_text()
+            defined |= set(re.findall(r"\\(?:re)?newcommand\{\\([A-Za-z]+)\}", text))
+            for m in re.finditer(r"\\input\{([^}]*)\}", re.sub(r"(?<!\\)%.*", "", text)):
+                if not m.group(1).startswith("Figures/"):
+                    child = tex.parent / m.group(1)
+                    queue.append(child if child.suffix == ".tex" else child.with_suffix(".tex"))
+        for order, tex in enumerate(files):
             for lineno, line in enumerate(tex.read_text().splitlines(), 1):
                 code = re.sub(r"(?<!\\)%.*$", "", line)
                 if code.lstrip().startswith("\\newcommand"):
@@ -386,6 +400,7 @@ class ManuscriptRegistry:
                     uses.setdefault(m.group(1), (order, lineno, m.start(), tex.name, line.strip()[:90]))
                 for m in re.finditer(r"\\(?:includegraphics(?:\[[^\]]*\])?|input)\{(Figures/[^}]*)\}", code):
                     includes.append((tex.name, lineno, m.group(1)))
+        uses = {k: v for k, v in uses.items() if k not in defined}
         return uses, includes
 
     # -- export --------------------------------------------------------------------

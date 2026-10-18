@@ -22,6 +22,7 @@ Two recurring shapes cover every gene-set in this package:
    explicit id column. Used by TP53 (16 dims) and CARD11 (2 dims).
 """
 
+import contextlib
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -54,11 +55,29 @@ DERIVED_DATASETS = {
 }
 
 
+_ALLOW_DERIVED = False
+
+
 def is_derived_dataset(name: str) -> bool:
     """True if ``name`` is a DERIVED_DATASETS entry, also matching suffixed
     variants of it (e.g. UV calibration directories ending in a ClinVar-
-    release suffix)."""
+    release suffix). Always False inside ``allow_derived_datasets()``."""
+    if _ALLOW_DERIVED:
+        return False
     return any(name == d or name.startswith(d + "_") for d in DERIVED_DATASETS)
+
+
+@contextlib.contextmanager
+def allow_derived_datasets():
+    """Temporarily keep derived datasets, ONLY to rebuild the data a fit made
+    before their exclusion was trained on, so that fit can still be scored
+    until it is refit (mv_analysis.config.build_ms_for_gene_cluster)."""
+    global _ALLOW_DERIVED
+    prev, _ALLOW_DERIVED = _ALLOW_DERIVED, True
+    try:
+        yield
+    finally:
+        _ALLOW_DERIVED = prev
 
 
 def functional_datasets_for_gene(df: pd.DataFrame, gene: str) -> List[str]:

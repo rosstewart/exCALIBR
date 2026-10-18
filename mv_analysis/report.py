@@ -129,8 +129,38 @@ def _rows_for_points(method, pts_eval, labels, extra=None):
     return rows
 
 
-def _mv_metric_rows(analysis, modes, mode_labels, **run_kwargs):
-    """Two rows (one per CLASSIFICATION_THRESHOLDS entry) per (config, mode)."""
+UV_FALLBACK_MIN_POINTS = 4  # ACMG/Tavtigian "Strong"
+FALLBACK_METHOD_PREFIX = "Joint+UV fallback"  # deliberately not "MV ..." (MV-row selectors use startswith("MV"))
+
+
+def uv_fallback_points(mv_points, mv_lr_median, uv_points, min_points=UV_FALLBACK_MIN_POINTS):
+    """Joint evidence with a univariate fallback: where the joint model is
+    indeterminate (0 points), take the univariate non-conflicting call if it
+    alone reaches ``min_points`` (default: Strong) and agrees in direction
+    with the joint model's median log LR+. Determinate joint calls are never
+    changed. Chosen on 31 genes against cutoffs of 2-3 and interval- or
+    median-based rules (accuracy first)."""
+    mv = np.nan_to_num(np.asarray(mv_points, float))
+    uv = np.nan_to_num(np.asarray(uv_points, float))
+    lean = np.sign(np.nan_to_num(np.asarray(mv_lr_median, float)))
+    use = (mv == 0) & (np.abs(uv) >= min_points) & (lean == np.sign(uv))
+    return np.where(use, uv, mv)
+
+
+def _uv_nonconflicting_points(gene, gene_set, ms):
+    """Per-variant UV non-conflicting points over all of ``ms``'s rows (the
+    same aggregate the 'UV non-conflicting' rows use), or None."""
+    gs = _UV_DISPATCH_GENE_SET.get(gene_set, gene_set)
+    if gs in ("combined", "combined-all-evidence"):
+        return uv_sources.aggregate_functional_plus_predictor(gene, ms, uv_agg.aggregate_nonconflicting)
+    uv = uv_sources.load_uv_points(gene, ms, gs)
+    return None if uv is None else uv_agg.aggregate_nonconflicting(uv[1])
+
+
+def _mv_metric_rows(analysis, modes, mode_labels, uv_points=None, **run_kwargs):
+    """Two rows (one per CLASSIFICATION_THRESHOLDS entry) per (config, mode),
+    plus, when ``uv_points`` is given, the same for the joint evidence with
+    the univariate fallback (uv_fallback_points)."""
     all_results = analysis.compare_partial_pattern_modes(modes=modes, **run_kwargs)
     eval_mask, labels = _eval_labels(analysis.ms, analysis.p_idx, analysis.b_idx, gene_set=analysis.gene_set)
 
@@ -143,6 +173,10 @@ def _mv_metric_rows(analysis, modes, mode_labels, **run_kwargs):
                 continue
             rows.extend(_rows_for_points(
                 f"MV {cfg}", r["points"][eval_mask], labels, extra={"mode": label, "config": cfg}))
+            if uv_points is not None:
+                fb = uv_fallback_points(r["points"], r["lr_median"], uv_points)
+                rows.extend(_rows_for_points(
+                    f"{FALLBACK_METHOD_PREFIX} {cfg}", fb[eval_mask], labels, extra={"mode": label, "config": cfg}))
     return pd.DataFrame(rows)
 
 
@@ -304,10 +338,15 @@ def build_comparison_table(
         auxiliary_pathogenic_indices=auxiliary_pathogenic_indices,
         gene_set=gene_set,
     )
-    mv_table = _mv_metric_rows(analysis, modes, mode_labels, **run_kwargs)
-
     if not compare_uv:
-        return mv_table, None
+        return _mv_metric_rows(analysis, modes, mode_labels, **run_kwargs), None
+
+    try:
+        uv_points = _uv_nonconflicting_points(gene, gene_set, ms)
+    except Exception as e:  # the UV rows below report their own unavailability
+        print(f"  [{gene}/{gene_set}] UV fallback unavailable: {e!r}")
+        uv_points = None
+    mv_table = _mv_metric_rows(analysis, modes, mode_labels, uv_points=uv_points, **run_kwargs)
 
     uv_table, uv_dataset_names = _uv_metric_rows(gene, gene_set, ms, analysis.p_idx, analysis.b_idx)
     if uv_table.empty:

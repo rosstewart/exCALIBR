@@ -56,6 +56,16 @@ def compute_sample_weights(sample_indicators, **kwargs):
         size. NOT the same functional form as sample_weight_transform (power
         law vs. logarithmic) -- no value of beta reproduces a log-weighted fit.
 
+    anchor_weight_scale : bool (default False)
+        Rescale the per-observation weights so the least-weighted sample keeps
+        weight 1 per observation. The Gamma ridge and the low-mass guards use
+        the weighted count as an effective sample size, so weights that sum to
+        ~1 (the normalised sample_proportions branch) shrink every covariance
+        to the ridge prior; with this set, a pure upweighting (e.g. the MV
+        pathogenic-share weighting, hpc/prepare.py --pathogenic-share) never
+        shrinks any sample's effective size. Only ratios still matter for the
+        weighted means, so the default (False) path is unchanged.
+
     Precedence: sample_proportions > sample_weight_transform > sample_balance_beta > none.
     Returns None when nothing requests any reweighting (byte-for-byte the
     original no-op behavior).
@@ -91,6 +101,11 @@ def compute_sample_weights(sample_indicators, **kwargs):
         )
     else:
         return None
+
+    if kwargs.get("anchor_weight_scale", False):
+        nz = per_sample_w[N_per_sample > 0]
+        if nz.size and nz.min() > 0:
+            per_sample_w = per_sample_w / nz.min()
 
     return (sample_indicators.astype(float) * per_sample_w).sum(axis=1)
 

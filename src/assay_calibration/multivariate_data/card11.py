@@ -27,7 +27,7 @@ from ..data_utils.dataset import BasicMultiScoreset
 from .common import build_basicmultiscoreset_from_wide_dataframe
 
 DEFAULT_MASTER_CSV = (
-    "/data/ross/assay_calibration/CARD11/"
+    "/data/ross/assay_calibration/CARD11/results_data101326/"
     "CARD11_master_plus_splice_ClinSig_ClinVar_VariantClass.csv"
 )
 
@@ -72,12 +72,16 @@ def _remap_samples(assignments_str, remap: dict, drop: set):
     return result
 
 
-def build_merged_6sample_dataframe(
+def build_uv_sample_dataframes(
     master_csv: str = DEFAULT_MASTER_CSV,
     df_card11: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-    """Build the merged 6-sample dataframe, equivalent to
-    processed_single_df/merged_6sample.csv.gz.
+) -> dict:
+    """Build the four univariate (score, sample_assignments) dataframes,
+    equivalent to processed_data/{gof_benta,lof_cadins,gof_clinvar,lof_clinvar}.csv.gz.
+
+    Local sample codes: 0 = pathogenic (BENTA / CADINS / ClinVar P/LP),
+    1 = benign (mechanism-specific benign / ClinVar B/LB), 2 = gnomAD,
+    3 = synonymous.
     """
     if df_card11 is None:
         df_card11 = pd.read_csv(master_csv)
@@ -116,6 +120,24 @@ def build_merged_6sample_dataframe(
         (mask_gnomad, "gnomAD present"),
         (mask_synonymous, "synonymous"),
     ])
+    return {
+        "gof_benta": gof_benta,
+        "lof_cadins": lof_cadins,
+        "gof_clinvar": gof_clinvar,
+        "lof_clinvar": lof_clinvar,
+    }
+
+
+def build_merged_6sample_dataframe(
+    master_csv: str = DEFAULT_MASTER_CSV,
+    df_card11: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Build the merged 6-sample dataframe, equivalent to
+    processed_single_df/merged_6sample.csv.gz.
+    """
+    uv = build_uv_sample_dataframes(master_csv=master_csv, df_card11=df_card11)
+    gof_benta, lof_cadins = uv["gof_benta"], uv["lof_cadins"]
+    gof_clinvar, lof_clinvar = uv["gof_clinvar"], uv["lof_clinvar"]
 
     gof_benta_proc = gof_benta.copy()
     gof_benta_proc["_samples"] = gof_benta_proc["sample_assignments"].apply(

@@ -30,3 +30,7 @@ test
 # Manuscript build outputs: symlinks into OUTPUT_DIR on /data (see analysis/config.py)
 manuscript/
 analysis/manuscript_table_templates/archive_20261007/
+
+analysis/oddspath_computation/igvf-scalable-vus-resolution
+analysis/oddspath_computation/output
+tests/cfusn_simulations/results

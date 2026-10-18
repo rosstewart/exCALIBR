@@ -114,16 +114,28 @@ AOU_TP53_OR_ESTIMATES_TSV = _env(
     "EXCALIBR_AOU_TP53_OR_ESTIMATES_TSV",
     "/data/ross/assay_calibration/paper/excalibr-TP53-OR-estimates_2026-10-05.tsv.gz",
 )
+# Collaborators' All of Us workbook (Index, gene exclusion reasons, gene-
+# phenotype pairs, phenotype definitions). Supplementary Data 4 is this
+# workbook plus the OR results the figures plot (supplementary_data.build_sd4).
+AOU_SD4_COLLABORATOR_XLSX = _env(
+    "EXCALIBR_AOU_SD4_COLLABORATOR_XLSX",
+    "/data/ross/assay_calibration/paper/AoU-SD4-collaborator_2026-10-13.xlsx",
+)
 
 # Brnich et al. OddsPath evidence-code CSV (columns: Dataset, "Evidence Code
 # Abnormal", "Evidence Code Normal") — a separate statistical analysis, not
 # produced by run_pipeline.py. Used only for the "author" side of
 # analysis.assay_stats.plot_evidence_comparison; the ExCALIBR side is always
 # computed fresh from pipeline output regardless of whether this file exists.
+# Recomputed from DATASET_TSV by analysis/oddspath_computation/compute_oddspath.py
+# (the collaborators' OddsPath_calculations.ipynb method, every dataset).
 OP_EVIDENCE_CODES_CSV = _env(
     "EXCALIBR_OP_EVIDENCE_CODES_CSV",
-    "/data/ross/assay_calibration/dataframe/OddsPath_calibrations.csv",
+    str(Path(__file__).resolve().parent / "oddspath_computation" / "output" / "OddsPath_calibrations_recomputed.csv"),
 )
+# The collaborators' OddsPath CSV (their run of the notebook on an older copy
+# of the input table); compute_oddspath.py compares against it.
+OP_EVIDENCE_CODES_CSV_COLLABORATOR = "/data/ross/assay_calibration/dataframe/OddsPath_calibrations.csv"
 # OddsPath CSV rows that supersede another row for the same assay (updated
 # OddsPath calibration): {superseded row: superseding row}. The superseding
 # row's values are used under the superseded (calibrated-dataset) name.

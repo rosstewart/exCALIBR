@@ -42,8 +42,11 @@ from src.assay_calibration.fit_utils.fit import Fit, _weighted_val_ll
 
 RESTART_GRID = sorted({1, 5, 8, 10, 16, 20, 30, 32, 40, 50, 100})
 N_SUBSAMPLES = 2000
-_DEFAULT_DATAFRAME = "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
-_DEFAULT_CONFIG = str(_REPO_ROOT / "src" / "igvf_configs" / "dataset_configs_jul_2026.json")
+from analysis import config as _cfg
+
+# Current canonical inputs (analysis.config), never pinned files.
+_DEFAULT_DATAFRAME = _cfg.DATASET_TSV
+_DEFAULT_CONFIG = _cfg.DATASET_CONFIGS
 _NAME_MAP_CSV = "/data/ross/assay_calibration/dataframe/new_dataset_names.csv"
 
 
@@ -374,10 +377,29 @@ def main():
     parser.add_argument("--plot", action="store_true",
                         help="Save a plot_initial_vs_final_skew_grid PNG of each "
                              "dataset's best restart")
+    parser.add_argument("--update-existing", action="store_true",
+                        help="Rerun only --datasets and merge into the existing summary.csv / "
+                             "train_lls.json / sign_change_summary.csv in --results-dir, replacing "
+                             "those datasets' rows (their old checkpoints are moved aside, not reused). "
+                             "See analysis/sweep_staleness.py for which datasets need it.")
     args = parser.parse_args()
+    if args.update_existing and not args.datasets:
+        parser.error("--update-existing requires --datasets")
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.update_existing:
+        import time
+        stale_dir = results_dir / "checkpoints" / f"superseded_{time.strftime('%Y%m%d_%H%M%S')}"
+        for d in args.datasets:
+            for n_c in (2, 3, 4):
+                path = checkpoint_path_for(results_dir / "checkpoints", d, n_c)
+                if path.exists():
+                    stale_dir.mkdir(parents=True, exist_ok=True)
+                    path.rename(stale_dir / path.name)
+        (results_dir / "run.log").rename(results_dir / f"run_before_{time.strftime('%Y%m%d_%H%M%S')}.log") \
+            if (results_dir / "run.log").exists() else None
 
     tee = Tee(results_dir / "run.log")
     sys.stdout = tee
@@ -467,6 +489,18 @@ def main():
             sign_rows.append(res["sign_row"])
         if res.get("plot_record"):
             plot_records.append(res["plot_record"])
+
+    if args.update_existing:
+        # Keep every other dataset's results; replace only the rerun ones.
+        rerun = set(args.datasets)
+        if (results_dir / "train_lls.json").exists():
+            prior = json.load(open(results_dir / "train_lls.json"))
+            train_lls_all = {**{k: v for k, v in prior.items() if k.split("|")[0] not in rerun}, **train_lls_all}
+        for name, rows in (("summary.csv", summary_rows), ("sign_change_summary.csv", sign_rows)):
+            if (results_dir / name).exists():
+                with open(results_dir / name, newline="") as f:
+                    kept = [r for r in csv.DictReader(f) if r["dataset"] not in rerun]
+                rows[:0] = kept
 
     with open(results_dir / "train_lls.json", "w") as f:
         json.dump(train_lls_all, f, indent=2)

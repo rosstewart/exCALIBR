@@ -468,7 +468,11 @@ def build_panel_c(results_json, cache_dir=None):
         # The canonical combined builder (union population, TP53's default
         # Kato-panel collapse) -- the same ms the results tables and the fit
         # use, so the fit-vs-dataset shape guard applies here too.
-        ms = config.build_multiscoresets_for_gene_set("combined", genes=[gene]).get(gene)
+        try:
+            ms = config.build_ms_for_gene_cluster("combined", gene, results_json=results_json)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{gene}] could not build combined ms: {e}")
+            ms = None
         if ms is None:
             print(f"  [{gene}] could not build combined ms, skipping")
             continue

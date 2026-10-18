@@ -186,8 +186,27 @@ def build_gene_deduped_variants(df_primary: pd.DataFrame, use_oob: bool = True) 
             "auth_label": _merge_author_labels(grp["auth_label"]) if "auth_label" in grp.columns else None,
             "is_vus": bool(grp["is_vus"].fillna(False).astype(bool).any()) if "is_vus" in grp.columns else False,
             "n_assays": grp["dataset"].nunique(),
+            # Disagreement across assays (before merging): determinate calls in
+            # both directions. *_n_det = how many assay copies were determinate.
+            **_conflict_fields(grp["points"].to_numpy(),
+                               grp["auth_label"] if "auth_label" in grp.columns else None),
         })
     return pd.DataFrame(rows)
+
+
+def _conflict_fields(points, auth_labels) -> dict:
+    """Per merged variant: number of determinate ExCALIBR / author calls across
+    its assays, and whether they conflict in direction (pathogenic and benign,
+    or abnormal and normal)."""
+    pts = np.asarray(points, dtype=float)
+    pts = pts[np.isfinite(pts)]
+    out = {"points_n_det": int((pts != 0).sum()),
+           "points_conflict": bool((pts > 0).any() and (pts < 0).any())}
+    if auth_labels is not None:
+        lab = auth_labels.dropna().astype(str).str.upper().str.replace("_", " ", regex=False)
+        out["auth_n_det"] = int(lab.isin(["NORMAL", "ABNORMAL"]).sum())
+        out["auth_conflict"] = bool((lab == "NORMAL").any() and (lab == "ABNORMAL").any())
+    return out
 
 
 def build_deduped_confusion_matrix(deduped: pd.DataFrame) -> Optional[pd.DataFrame]:

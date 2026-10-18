@@ -92,9 +92,12 @@ def main():
     ap.add_argument("--pool-type", default="all_assayed")
     ap.add_argument("--n-bootstraps", type=int, default=20)
     ap.add_argument("--max-workers", type=int, default=100)
+    ap.add_argument("--pool-cap", type=int, default=None,
+                    help="random subsample of at most this many pool variants per bootstrap")
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args()
     T.POOL_MULT = 0.0
+    T.POOL_CAP = args.pool_cap
     out = Path(args.output_dir)
     pop = "allassayed"
 

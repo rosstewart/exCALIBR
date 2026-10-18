@@ -847,8 +847,12 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
             ax.grid(True, alpha=0.2, axis='x', which='major')
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
+            # Gene title, with the dataset (without its gene prefix) on a
+            # smaller line below, as in the supplementary OR figures.
             _bold_italic_gene_title(ax, gene_name, "", fontsize=FONTSIZE_AXIS_LABEL,
-                                     x=0.5, y=1.0, ha='center', va='bottom')
+                                     x=0.5, y=1.10, ha='center', va='bottom')
+            ax.text(0.5, 1.01, dataset_short_label(gene_to_dataset[gene_name], gene_name), transform=ax.transAxes,
+                    fontsize=9, ha='center', va='bottom')
 
             if letter == "(C)":
                 ax.text(-0.29, PANEL_LETTER_Y + 0.12, letter, transform=ax.transAxes,
@@ -869,7 +873,7 @@ def plot_combined_analysis(excalibr_path_counts, excalibr_ben_counts,
 
             x_left = bbox_start.x0
             x_right = bbox_end.x1
-            y_bracket = bbox_start.y1 + 0.035
+            y_bracket = bbox_start.y1 + 0.055  # above the gene title and dataset line
             bracket_height = 0.008
 
             fig.add_artist(plt.Line2D([x_left, x_left], [y_bracket, y_bracket + bracket_height],

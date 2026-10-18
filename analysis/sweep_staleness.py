@@ -159,13 +159,28 @@ def restart_rerun_since_tsv(datasets: Iterable[str], checkpoint_dir: Path) -> se
     return out
 
 
-def restart_sweep_stale(datasets: Iterable[str], summary_csv: str = None) -> Dict[str, str]:
+def restart_sweep_stale(datasets: Iterable[str], summary_csv: str = None,
+                        selected_nc: Dict[str, int] = None) -> Dict[str, str]:
+    """Datasets whose restart-sweep results are missing or out of date.
+    `selected_nc` ({dataset: component count}, e.g. from
+    analysis.discovery.resolve_component): a dataset also counts as stale
+    when the sweep has no rows at its selected component count (Supp Table
+    S6 uses only those rows)."""
+    import pandas as pd
+
     summary_csv = summary_csv or cfg.FIT_NUMBER_COMPARISON_SUMMARY_CSV
     found = restart_sweep_found(summary_csv) if Path(summary_csv).exists() else set()
     datasets = list(datasets)
     stale = _config_changes(datasets)
     rerun = restart_rerun_since_tsv(datasets, Path(summary_csv).parent / "checkpoints")
     stale.update(fit_input_changes(SWEEP_INPUT_TSV["restart"], [d for d in datasets if d in found and d not in rerun]))
+    if selected_nc and Path(summary_csv).exists():
+        summary = pd.read_csv(summary_csv, usecols=["dataset", "n_c"])
+        names = restart_sweep_name_map(summary["dataset"].unique())
+        swept = {(names[d], int(n)) for d, n in zip(summary["dataset"], summary["n_c"])}
+        for d in datasets:
+            if d in found and d in selected_nc and (d, int(selected_nc[d])) not in swept:
+                stale.setdefault(d, f"no sweep rows at the selected {int(selected_nc[d])}-component model")
     for d in datasets:
         if d not in found:
             stale[d] = "missing from sweep"

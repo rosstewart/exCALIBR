@@ -237,6 +237,11 @@ class MixtureParams(list):
 def wrap_params(params, fit_dict):
     """Attach ``fit_dict``'s categorical block (if any) to a reconstituted
     params list; a fit without one returns ``params`` unchanged."""
+    if (fit_dict or {}).get("factorial"):
+        # EXPERIMENTAL factorial fits (fit_utils/factorial/export.py): cells
+        # evaluated as sums of per-axis block densities.
+        from ..factorial.export import wrap_factorial
+        return wrap_factorial(params, fit_dict)
     spec = (fit_dict or {}).get("cat_spec")
     if not spec:
         return params
@@ -264,9 +269,15 @@ def component_logpdf_full(x, params, c, base_logpdf):
     log-pmf added; otherwise this is exactly ``base_logpdf(x, *params[c])``.
     """
     spec = get_cat_spec(params)
+    factorial = getattr(params, "factorial", None) is not None
     if spec is None:
+        if factorial:
+            return params.cont_logpdf(x, c)
         return base_logpdf(x, *params[c])
     x = np.atleast_2d(np.asarray(x, dtype=float))
     X_cont, labels, _ = split_observations(x, spec)
-    lp = np.atleast_1d(np.asarray(base_logpdf(X_cont, *params[c]), dtype=float))
+    if factorial:
+        lp = params.cont_logpdf(X_cont, c)
+    else:
+        lp = np.atleast_1d(np.asarray(base_logpdf(X_cont, *params[c]), dtype=float))
     return lp + cat_log_pdfs(labels, [np.asarray(P)[c:c + 1] for P in params.cat_probs])[0]

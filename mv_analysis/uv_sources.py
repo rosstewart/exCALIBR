@@ -318,7 +318,103 @@ def _predictor_raw_variant_order(gene, predictor, predictor_data_dir):
     return df["protein_variant"].reset_index(drop=True)
 
 
-def load_predictor_mv_uv_points(gene, ms, predictor_data_dir=None, uv_calib_dir=None):
+def load_predictor_mv_uv_points(gene, ms, predictor_data_dir=None, uv_calib_dir=None, source=None):
+    """Independently calibrated predictor evidence, (names, points matrix) or
+    None. ``source`` (default config.PREDICTOR_UV_SOURCE): "chen" for Chen et
+    al.'s gene-specific calibrations (the paper's baseline), "excalibr" for
+    our own per-predictor ExCALIBR fits."""
+    source = source or config.PREDICTOR_UV_SOURCE
+    if source == "chen":
+        return load_chen_predictor_uv_points(gene, ms, predictor_data_dir=predictor_data_dir)
+    if source == "excalibr":
+        return load_excalibr_predictor_uv_points(gene, ms, predictor_data_dir, uv_calib_dir)
+    raise ValueError(f"unknown predictor UV source {source!r}")
+
+
+# Chen et al. evidence levels -> points; PP3 applies at score >= threshold,
+# BP4 at score <= threshold, and the strongest level reached wins (reproduces
+# Chen's published per-variant single-gene points exactly).
+_CHEN_PP3 = (("PP3_Supporting", 1), ("PP3_Moderate", 2), ("PP3_Moderate+", 3), ("PP3_Strong", 4))
+_CHEN_BP4 = (("BP4_Supporting", -1), ("BP4_Moderate", -2), ("BP4_Moderate+", -3), ("BP4_Strong", -4))
+# Chen's domain-aggregate column for each predictor, used only where Chen
+# published no gene-specific calibration.
+_CHEN_TABLE_PREDICTOR = {"REVEL": "REVEL", "MP2": "MutPred2", "AM": "AlphaMissense"}
+
+
+@functools.lru_cache(maxsize=1)
+def _chen_thresholds():
+    """{(predictor, GENE): threshold row}, source CSVs plus the figure supplement."""
+    out = {}
+    for predictor, path in config.CHEN_PREDICTOR_THRESHOLDS.items():
+        for _, row in pd.read_csv(path).iterrows():
+            out[(predictor, str(row["Gene"]).upper())] = row
+    sup = pd.read_csv(config.CHEN_PREDICTOR_THRESHOLDS_SUPPLEMENT, comment="#")
+    for _, row in sup.iterrows():
+        out[(row["Predictor"], str(row["Gene"]).upper())] = row
+    return out
+
+
+def chen_points(scores, row):
+    """Chen et al. evidence points for raw predictor scores under one
+    gene's threshold row (NaN score -> NaN)."""
+    s = np.asarray(scores, dtype=float)
+    pts = np.zeros(len(s))
+    for col, v in _CHEN_PP3:
+        if col in row and pd.notna(row[col]):
+            pts = np.where(s >= row[col], v, pts)
+    for col, v in _CHEN_BP4:
+        if col in row and pd.notna(row[col]):
+            pts = np.where(s <= row[col], v, pts)
+    return np.where(np.isnan(s), np.nan, pts)
+
+
+@functools.lru_cache(maxsize=8)
+def _chen_domain_points(gene, predictor):
+    """protein_variant -> Chen domain-aggregate points for one gene/predictor."""
+    col = f"points_{_CHEN_TABLE_PREDICTOR[predictor]}_domain_aggregate"
+    df = pd.read_csv(config.CHEN_PREDICTOR_TABLE, usecols=["gene_symbol", "protein_variant", col],
+                     low_memory=False)
+    df = df[(df["gene_symbol"] == gene) & df[col].notna()]
+    return df.groupby("protein_variant")[col].first().to_dict()
+
+
+def load_chen_predictor_uv_points(gene, ms, predictor_data_dir=None):
+    """Chen et al. gene-specific predictor evidence: the published thresholds
+    applied to the same raw scores the joint model uses. A gene/predictor with
+    no gene-specific calibration (MutPred2 F9) takes Chen's domain-aggregate
+    points instead. Same (names, matrix) shape and names as the ExCALIBR
+    loader, so every consumer is unchanged."""
+    predictor_data_dir = predictor_data_dir or config.PREDICTOR_RAW_DATA_DIR
+    key_index = {vk: i for i, vk in enumerate(ms._variants_kept)}
+    thresholds = _chen_thresholds()
+    names, rows = [], []
+    for predictor in PREDICTORS:
+        path = Path(predictor_data_dir) / gene / f"{gene}_{predictor}.csv.gz"
+        if not path.exists():
+            continue
+        raw = pd.read_csv(path, compression="gzip").dropna(subset=["score", "protein_variant"])
+        raw = raw.groupby("protein_variant", as_index=False)["score"].first()
+        row = np.full(ms.n_variants, np.nan)
+        th = thresholds.get((predictor, gene.upper()))
+        if th is not None:
+            pts = chen_points(raw["score"].values, th)
+            lookup = dict(zip(raw["protein_variant"], pts))
+        else:
+            domain = _chen_domain_points(gene.upper(), predictor)
+            lookup = {pv: domain[pv] for pv in raw["protein_variant"] if pv in domain}
+        for pv, v in lookup.items():
+            idx = key_index.get(pv)
+            if idx is not None:
+                row[idx] = v
+        rows.append(row)
+        names.append(f"{predictor}_{gene}")
+    if not rows:
+        return None
+    return names, np.vstack(rows)
+
+
+def load_excalibr_predictor_uv_points(gene, ms, predictor_data_dir=None, uv_calib_dir=None):
+    """Our own per-predictor ExCALIBR calibrations (PREDICTOR_UV_CALIB_DIR)."""
     predictor_data_dir = predictor_data_dir or config.PREDICTOR_RAW_DATA_DIR
     uv_calib_dir = Path(uv_calib_dir or config.PREDICTOR_UV_CALIB_DIR)
     key_index = {vk: i for i, vk in enumerate(ms._variants_kept)}

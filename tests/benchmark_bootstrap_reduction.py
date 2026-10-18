@@ -42,9 +42,12 @@ from analysis.discovery import recompute_points_from_calibration
 from src.assay_calibration.pipeline.config import PipelineConfig
 from src.assay_calibration.pipeline.utils import load_dataset_from_df
 
-_DEFAULT_PRECOMPUTED_FITS = "/data/ross/assay_calibration/explorer_jobs_pp_merged_89datasets_bootstrap_results.json.gz"
-_DEFAULT_DATAFRAME = "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
-_DEFAULT_CONFIG = str(_REPO_ROOT / "src" / "igvf_configs" / "dataset_configs_jul_2026.json")
+from analysis import config as _cfg
+
+# Current canonical inputs (analysis.config), never pinned files.
+_DEFAULT_PRECOMPUTED_FITS = _cfg.PRECOMPUTED_FITS
+_DEFAULT_DATAFRAME = _cfg.DATASET_TSV
+_DEFAULT_CONFIG = _cfg.DATASET_CONFIGS
 _DEFAULT_LEVELS = [1000, 500, 250, 100, 50, 20]
 
 
@@ -270,12 +273,28 @@ def main():
     parser.add_argument("--datasets", nargs="*", default=None)
     parser.add_argument("--bootstrap-counts", default=",".join(map(str, _DEFAULT_LEVELS)))
     parser.add_argument("--output-dir", default=str(_RESULTS_DIR_DEFAULT))
+    parser.add_argument("--update-existing", action="store_true",
+                        help="Rerun only --datasets: their existing output folders are moved to "
+                             "<output-dir>/_superseded_<timestamp>/ (otherwise every level would be "
+                             "skipped as already computed) and bootstrap_reduction_summary.csv keeps "
+                             "every other dataset's rows. See analysis/sweep_staleness.py.")
     args = parser.parse_args()
+    if args.update_existing and not args.datasets:
+        parser.error("--update-existing requires --datasets")
 
     levels = sorted({int(x) for x in args.bootstrap_counts.split(",")}, reverse=True)
     baseline_n = levels[0]
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.update_existing:
+        import time
+        superseded = output_dir / f"_superseded_{time.strftime('%Y%m%d_%H%M%S')}"
+        old_names = {v: k for k, v in _KNOWN_NAME_ALIASES.items()}
+        for d in args.datasets:
+            for name in {d, old_names.get(d, d)}:
+                if (output_dir / name).is_dir():
+                    superseded.mkdir(exist_ok=True)
+                    (output_dir / name).rename(superseded / name)
 
     print(f"Bootstrap-count levels: {levels} (baseline: {baseline_n})")
 
@@ -400,8 +419,13 @@ def main():
     for dataset_name, rows in pass3_results:
         all_rows.extend(rows)
 
+    summary_path = output_dir / "bootstrap_reduction_summary.csv"
+    if args.update_existing and summary_path.exists():
+        rerun = set(dataset_meta)
+        with open(summary_path, newline="") as f:
+            kept = [r for r in csv.DictReader(f) if r.get("dataset") not in rerun]
+        all_rows = kept + all_rows
     if all_rows:
-        summary_path = output_dir / "bootstrap_reduction_summary.csv"
         with open(summary_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
             writer.writeheader()

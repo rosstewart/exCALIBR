@@ -38,10 +38,29 @@ PREDICTOR_UV_CALIB_DIR = _env(
     "MV_PREDICTOR_UV_CALIB",
     "/data/ross/assay_calibration/predictor_calibrations/predictor_calibration_output")
 
+# Independent (univariate) predictor evidence used as the baseline throughout:
+# "chen" = Chen et al. gene-specific thresholds applied to our raw scores
+# (uv_sources.load_chen_predictor_uv_points); "excalibr" = our own ExCALIBR fits
+# under PREDICTOR_UV_CALIB_DIR (kept for the baseline comparison).
+PREDICTOR_UV_SOURCE = _env("MV_PREDICTOR_UV_SOURCE", "chen")
+CHEN_PREDICTOR_THRESHOLDS = {
+    "REVEL": "/data/ross/assay_calibration/predictor_calibrations/REVEL_gene_specific_calibration.csv",
+    "MP2": "/data/ross/assay_calibration/predictor_calibrations/MP2_gene_specific_calibrations.csv",
+    "AM": "/data/ross/assay_calibration/predictor_calibrations/AM_gene_specific_calibrations.csv",
+}
+# Thresholds missing from the CSVs above but published in Chen et al.'s
+# Supplementary Figure 3 (REVEL JAG1/SCN5A), read from the figure.
+CHEN_PREDICTOR_THRESHOLDS_SUPPLEMENT = os.path.join(_ROOT, "mv_analysis", "data", "chen_predictor_thresholds_supplement.csv")
+# Per-variant Chen evidence table; used only for its domain-aggregate points
+# where Chen published no gene-specific calibration (MutPred2 F9).
+CHEN_PREDICTOR_TABLE = _env(
+    "MV_CHEN_PREDICTOR_TABLE",
+    "/data/ross/assay_calibration/exc_pp_clinvar2025_calib/tables/predictor_only_evidence.csv.gz")
+
 # CARD11 lof/gof UV calibrations, range-based CSV format (different from
 # the point-per-row format used by the three sources above).
 CARD11_UV_CALIB_DIR = _env(
-    "MV_CARD11_UV_CALIB", "/data/ross/assay_calibration/CARD11/calibration_results")
+    "MV_CARD11_UV_CALIB", "/data/ross/assay_calibration/CARD11/results_data101326/calibration_results")
 
 # Raw per-predictor input CSVs (protein_variant, score, sample_assignments)
 # used both to build the predictor-mv MultiScoreset (multivariate_data/
@@ -166,6 +185,12 @@ PAPER_CARD11_PHENOTYPE_DIR = f"{PAPER_FIGURES_DIR}/card11_phenotype"
 PAPER_CARTOONS_DIR = f"{PAPER_FIGURES_DIR}/cartoons"
 PAPER_CORRELATION_DIR = f"{PAPER_FIGURES_DIR}/correlation"
 PAPER_CACHE_DIR = f"{PAPER_FIGURES_DIR}/.cache"
+PAPER_PKNN_DIR = f"{PAPER_FIGURES_DIR}/pknn"
+PAPER_PRODUCTION_OOB_DIR = f"{PAPER_FIGURES_DIR}/production_oob"
+# P-KNN comparison-method runs (comparison_methods/pknn_runs.py) and the
+# production-scored out-of-bag evaluation (production_oob.py, under
+# PKNN_DIR/production_oob): per-dataset inputs and out-of-sample results.
+PKNN_DIR = _env("MV_PKNN_DIR", "/data/ross/assay_calibration/multivariate/pknn_101626")
 
 # The manuscript source tree (ExCALIBR_MV.tex / ExCALIBR_MV_supp.tex). The
 # paper notebook's "manuscript" section writes Figures/generated/macros.tex
@@ -183,6 +208,29 @@ MANUSCRIPT_GENERATED_DIR = os.path.join(MANUSCRIPT_FIGURE_DIR, "generated")
 # predictors.py) -- named here once for the per-individual-predictor
 # comparison (mv_analysis/report.py's individual_predictor_comparison).
 PREDICTOR_NAMES = ("REVEL", "AlphaMissense", "MutPred2")
+
+
+# Per-(gene, gene_set) component counts fixed by author decision instead of
+# chosen by MCC. Every MV config selector (mv_cockpit.pick_best_canonical_config,
+# select_canonical_mv_rows below and its callers) honours this one map.
+FIXED_MV_CONFIGS = {("TP53", "tp53"): "4c_unc"}  # TP53: 4 components throughout (2026-10-07)
+
+
+def fixed_mv_config(gene, gene_set):
+    return FIXED_MV_CONFIGS.get((str(gene).upper(), gene_set))
+
+
+def select_canonical_mv_rows(t):
+    """One MV row per (gene, gene_set, cluster) from a results table already
+    filtered to MV rows at one threshold: the highest-MCC config (ties: more
+    determinate calls), or the fixed config from FIXED_MV_CONFIGS."""
+    if "gene_set" in t.columns:
+        fixed = [fixed_mv_config(g, gs) for g, gs in zip(t["gene"], t["gene_set"])]
+        keep = [f is None or c == f for f, c in zip(fixed, t["config"] if "config" in t.columns
+                                                     else t["method"].str.replace("MV ", "", regex=False))]
+        t = t[keep]
+    keys = [k for k in ("gene", "gene_set", "cluster") if k in t.columns]
+    return t.sort_values(["mcc", "determinate"], ascending=False).groupby(keys, as_index=False).head(1)
 
 
 def canonical_dataset_name(gene: str, gene_set: str, results_json: str = None) -> str:
@@ -284,10 +332,26 @@ def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
     fit-vs-dataset shape guard (`MVCalibrationAnalysis._validate_fit_shape`),
     exactly as it did for BRCA2 before this was understood.
     """
-    ms_map = build_multiscoresets_for_gene_set(gene_set, genes=[gene])
     gene_key = gene.lower() if gene_set == "labelseq" else gene.upper()
-    ms = ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
 
+    def _build():
+        ms_map = build_multiscoresets_for_gene_set(gene_set, genes=[gene])
+        return ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
+
+    return restrict_ms_to_stored_fit(_build(), gene, gene_set, cluster_idx=cluster_idx,
+                                     results_json=results_json, rebuild=_build,
+                                     min_overlap_rows=min_overlap_rows)
+
+
+def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0,
+                              results_json: str = None, rebuild=None, min_overlap_rows: int = 30):
+    """Restrict an already-built MultiScoreset to the dimensions the stored fit
+    for `gene`/`cluster_idx` was trained on (see build_ms_for_gene_cluster).
+    `rebuild`: zero-argument callable that rebuilds the same data, called
+    inside common.allow_derived_datasets() when the stored fit predates the
+    derived-dataset exclusion (it has more dimensions than `ms`). Lets callers
+    that build their own variant population (e.g. keeping ClinVar VUS) share
+    the same dimension matching."""
     import numpy as np
     from src.assay_calibration.fit_utils.fit import Fit
     from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
@@ -305,6 +369,22 @@ def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
     # current cluster_idx subset against such a fit trips the fit-vs-dataset
     # shape guard, so pick the candidate subset the fit actually used.
     fit_info = _stored_fit_dims(gene, gene_set, cluster_idx, results_json)
+    if fit_info is not None and fit_info[1] > obs.shape[1]:
+        # Fit trained before derived (composite) datasets were excluded
+        # (common.DERIVED_DATASETS): rebuild with them so it can still be
+        # scored until refit. Independent baselines still exclude them.
+        from src.assay_calibration.multivariate_data.common import allow_derived_datasets
+        legacy = None
+        if rebuild is not None:
+            with allow_derived_datasets():
+                legacy = rebuild()
+        if legacy is not None and legacy.n_assays > ms.n_assays:
+            print(f"  [{gene}] stored {gene_set} fit predates the derived-dataset exclusion; "
+                  f"scoring it on its original {legacy.n_assays} datasets until refit")
+            ms = legacy
+            obs = np.asarray(ms.scores, dtype=float)
+            clusters = (Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
+                        if obs.ndim == 2 and obs.shape[1] > 1 else [])
     if fit_info is not None:
         fit_names, fit_ndim = fit_info
         if fit_names:

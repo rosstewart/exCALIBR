@@ -290,17 +290,18 @@ def _posthoc_phenotype_weights(fit_inner, X_by_group, n_iter: int = 500, tol: fl
 
 
 def ret_phenotype_evidence(results_json: str, dataset_name: str = "ret_labelseq_mv",
-                           config_name: Optional[str] = None, run_kwargs=None, ms=None):
+                           config_name: Optional[str] = None, run_kwargs=None, ms=None,
+                           posthoc: bool = False):
     """MEN2A/B-specific and Hirschsprung-specific evidence for RET variants.
 
-    TODO(next rerun): canonically the phenotype groups should enter the fit
-    itself as their own samples (their weight rows estimated during EM, like
-    TP53's RPV or CARD11's cohorts). The paper fits were run without them, so
-    for now each group's weights are estimated POST HOC on every bootstrap's
-    frozen components (_posthoc_phenotype_weights) and scored through
-    MVCalibrationAnalysis's existing auxiliary-pathogenic path (each group vs
-    the benign reference, with its own prior). Once the rerun includes the
-    phenotype samples, drop the post-hoc step and read the fitted rows.
+    Fits built by hpc/prepare.py with RET's phenotype groups as their own
+    samples (roles 4, 5) carry fitted weight rows for them, which are read
+    directly. Older fits without those rows (e.g. the 092026 paper run) get
+    each group's weights estimated POST HOC on every bootstrap's frozen
+    components (_posthoc_phenotype_weights); ``posthoc=True`` forces that
+    path even when fitted rows exist. Either way the groups are scored
+    through MVCalibrationAnalysis's auxiliary-pathogenic path (each group vs
+    the benign reference, with its own prior).
 
     Returns dict(ms, coords_names, config, points, aux_points{group},
     aux_lr_median{group}, aux_prior{group}, masks).
@@ -323,7 +324,8 @@ def ret_phenotype_evidence(results_json: str, dataset_name: str = "ret_labelseq_
 
     groups = sorted(RET_PHENOTYPE_ROLES, key=RET_PHENOTYPE_ROLES.get)
     X_by_group = [ms.scores[masks[g]] for g in groups]
-    n_aug = 0
+    n_aug = n_fitted = 0
+    n_rows = max(RET_PHENOTYPE_ROLES.values()) + 1
     for bd in analysis.raw_boots.values():
         entry = bd.get(config_name) if isinstance(bd, dict) else None
         if not entry:
@@ -332,15 +334,18 @@ def ret_phenotype_evidence(results_json: str, dataset_name: str = "ret_labelseq_
         if inner is None or not inner.get("component_params"):
             continue
         w = np.asarray(inner["weights"], dtype=float)
+        if w.shape[0] >= n_rows and not posthoc:
+            n_fitted += 1
+            continue
         extra = _posthoc_phenotype_weights(inner, X_by_group)
-        n_rows = max(RET_PHENOTYPE_ROLES.values()) + 1
         full = np.zeros((max(n_rows, w.shape[0]), w.shape[1]))
         full[:w.shape[0]] = w
         for g, row in zip(groups, extra):
             full[RET_PHENOTYPE_ROLES[g]] = row
         inner["weights"] = full.tolist()
         n_aug += 1
-    print(f"  RET phenotype weights estimated post hoc on {n_aug} bootstrap fits ({config_name})")
+    print(f"  RET phenotype weights: fitted in {n_fitted}, estimated post hoc in {n_aug} "
+          f"bootstrap fits ({config_name})")
 
     analysis.run(partial_pattern_mode="trust_global", **run_kwargs)
     res = analysis.results[config_name]

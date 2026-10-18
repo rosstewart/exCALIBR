@@ -564,8 +564,12 @@ _is_nt = _m["nucleotide_or_aa"].eq("nt")
 _vkey = (_m["Gene"].astype(str) + "|" + _m["Chrom"].astype(str) + "|" + _m["hgvs_c"].astype(str)).where(
     _is_nt, _m["Gene"].astype(str) + "|aa|" + _m["aa_ref"].astype(str) + _m["aa_pos"].astype(str)
     + _m["aa_alt"].astype(str))
-REG.num("DataNumUniqueVariantsHarmonized", _vkey.nunique(),
-        source="unique variants over tree datasets in DATASET_TSV (genomic_variant_key rule)", inputs=[DATASET_TSV])
+# Fixed by the authors: distinct (hgvs_c, hgvs_g) pairs in the IGVF harmonized
+# resource. hgvs_g is not in DATASET_TSV, so it can't be recomputed here; the
+# pipeline's own identity rule (genomic_variant_key) is printed for comparison.
+REG.num("DataNumUniqueVariantsHarmonized", 325808,
+        source="distinct (hgvs_c, hgvs_g) pairs in the IGVF harmonized resource (author-provided; hgvs_g not in DATASET_TSV)")
+print(f"  unique variants by genomic_variant_key (not used in text): {_vkey.nunique():,}")
 _splice = _m.groupby("Dataset")["splice_measure"].agg(lambda s: s.dropna().astype(str).str.strip().eq("Yes").any())
 REG.num("DataNumSpliceDetectingAssays", int(_splice.sum()), source="tree datasets with splice_measure == Yes")
 # gnomAD allele frequencies (no AF filter is applied): common variants among
@@ -621,6 +625,7 @@ REG.num("SuppModelSelectionPct", 100 * (1 - _pcfg.model_selection_alpha), fmt=".
         source="100 * (1 - PipelineConfig.model_selection_alpha)")
 REG.num("MethFixedPrior", FIXED_PRIOR, fmt=".1f", kind="method",
         source="fixed prior: manual-prior rerun, acmgscaler, OddsPath tiering (A6)")
+REG.num("MethFixedPriorPct", 100 * FIXED_PRIOR, fmt=".0f", kind="method", source="MethFixedPrior as a percentage")
 REG.num("ResFitYangThreshold", config.YANG_GOOD_FIT_THRESHOLD, fmt=".1f", kind="method",
         source="config.YANG_GOOD_FIT_THRESHOLD")
 # The text quotes the cited papers' rounded constants (350, 1124); the code's
@@ -632,6 +637,16 @@ REG.num("MethTavtigianCMinPrior", float(_c_grid[np.argmin(_c_vals)]), fmt=".2f",
         source="prior minimizing get_tavtigian_constant (0.01 grid)")
 REG.num("MethTavtigianCMin", float(_c_vals.min()), kind="method", source="min c over prior grid")
 REG.num("MethTavtigianCPriorFour", get_tavtigian_constant(0.4), kind="method", source="c at prior 0.4")
+# Methods/Discussion (Tejura et al. Supplementary Note): -1 point (LR = c^(-1/8))
+# leaves a posterior > 10% once the prior exceeds this value.
+_g_m1 = np.round(np.arange(0.01, 0.6, 0.001), 3)
+_post_m1 = np.array([(q / (1 - q)) * get_tavtigian_constant(float(q)) ** (-1 / 8) for q in _g_m1])
+_post_m1 = _post_m1 / (1 + _post_m1)
+_m1_prior = float(_g_m1[np.argmax(_post_m1 > 0.10)])
+REG.num("MethMinusOneTenPrior", 100 * _m1_prior, fmt=".1f", kind="method",
+        source="prior (%) above which -1 point gives posterior > 10%")
+REG.check("minus-one-ten-prior", 0.10 < _m1_prior < 0.25, f"-1 point posterior exceeds 10% above prior {_m1_prior:.3f}",
+          "main.tex Methods (calibration framework)")
 REG.check("tavtigian-c-0.1", abs(get_tavtigian_constant(0.1) / 350 - 1) < 0.01,
           f"c(0.1) = {get_tavtigian_constant(0.1):.1f} (text: 350)", "main.tex Methods/Calibration framework")
 REG.check("tavtigian-c-0.044", abs(get_tavtigian_constant(0.044) / 1124 - 1) < 0.01,
@@ -707,9 +722,9 @@ from src.assay_calibration.plot_utils.utils import plot_four_datasets_publicatio
 
 FOUR_PANEL_DATASETS = [
     "BRCA1_Findlay_2018_clinvar_2018",
-    "LDLR_Tabet_2025_abundance",
+    "G6PD_IGVF",  # abundance assay assigning no benign evidence (was LDLR_Tabet_2025_abundance, which assigns weak benign)
     "PTEN_Mighell_2018_clinvar_2018",
-    "CRX_Shepherdson_2024",
+    "DDX3X_Radford_2023",  # pathogenic evidence at both score extremes (was CRX_Shepherdson_2024, no evidence)
 ]
 
 def _four_panel_loader(dataset):
@@ -726,8 +741,12 @@ _missing_four_panel = [d for d in FOUR_PANEL_DATASETS if d not in datasets]
 if _missing_four_panel:
     print(f"  SKIP four-dataset model-fit figure: {_missing_four_panel} not in section 1's discovered datasets")
 else:
+    # Fig. 2: count histograms with fitted densities scaled to counts, and an
+    # evidence strip (score range and number of SNVs per evidence strength)
+    # under each dataset instead of threshold lines.
     fig = plot_four_datasets_publication(
         FOUR_PANEL_DATASETS, dataset_configs, {}, set(), loader_fn=_four_panel_loader,
+        EVIDENCE_STRIP=True, COUNTS=True,
     )
     save_and_show(fig, FIGURE_SUBDIRS["manuscript"] / "model_fits_comparison.png")
 REG.figure("fig:fits", FIGURE_SUBDIRS["manuscript"] / "model_fits_comparison.png",
@@ -914,6 +933,24 @@ for _grp, _tag in (("P/LP", "PLP"), ("B/LB", "BLB"), ("VUS", "VUS")):
             source=f"ED Table 2 All row: {_grp} benign %")
 REG.num("ResClinvarVUSDetPct", 100 - _gc.loc["All", ("VUS", "Indeterminate (0)", "%")], fmt=".0f", words=True,
         source="ED Table 2 All row: VUS determinate %")
+# Results: asymmetry of misassigned controls (same OOB arrays as ED Table 2;
+# label columns 0 = B/LB, 2 = P/LP), and how many sit at the weakest level.
+_pts_cv = np.asarray(all_danz_oob_full, dtype=float)
+_lab_cv = np.asarray(all_clinvar_full)[:, :4].astype(bool)
+_fn = _lab_cv[:, 2] & (_pts_cv < 0)
+_fp = _lab_cv[:, 0] & (_pts_cv > 0)
+REG.num("ResClinvarNumPLPBen", int(_fn.sum()), source="P/LP measurements with benign OOB evidence")
+REG.num("ResClinvarNumPLPBenMinusOne", int((_fn & (_pts_cv == -1)).sum()), source="... of which at exactly -1")
+REG.pct("ResClinvarPLPBenMinusOnePct", int((_fn & (_pts_cv == -1)).sum()), int(_fn.sum()), digits=0,
+        source="% of P/LP benign assignments at -1")
+REG.num("ResClinvarNumBLBPath", int(_fp.sum()), source="B/LB measurements with pathogenic OOB evidence")
+REG.num("ResClinvarNumBLBPathPlusOne", int((_fp & (_pts_cv == 1)).sum()), source="... of which at exactly +1")
+REG.pct("ResClinvarBLBPathPlusOnePct", int((_fp & (_pts_cv == 1)).sum()), int(_fp.sum()), digits=0,
+        source="% of B/LB pathogenic assignments at +1")
+REG.check("clinvar-fn-exceeds-fp", int(_fn.sum()) > int(_fp.sum()) and int((_fn & (_pts_cv == -1)).sum()) > int((_fp & (_pts_cv == 1)).sum()),
+          f"P/LP->benign {int(_fn.sum())} (at -1: {int((_fn & (_pts_cv == -1)).sum())}) vs "
+          f"B/LB->pathogenic {int(_fp.sum())} (at +1: {int((_fp & (_pts_cv == 1)).sum())})",
+          "main.tex Results (asymmetric misassignments)")
 
 # %% [markdown]
 # ## A5. Figure 4 (ExCALIBR vs. author) and Extended Data Tables 3-4 (performance)
@@ -1073,6 +1110,23 @@ if deduped_matrix_for_author is not None and deduped_author_matrix is not None:
             source="ED Table 4: ExCALIBR determinate %, each variant counted once")
     REG.num("ResDedupDetAuthorPct", 100 * auth_agg_deduped["coverage"], fmt=".1f",
             source="ED Table 4: author determinate %, each variant counted once")
+    # Cross-assay conflict rates (ED Table 4 scope: ClinVar P/LP and B/LB in
+    # genes with author annotations, variants measured by >= 2 assays): share
+    # whose per-assay determinate calls disagree in direction, over all such
+    # variants and over those with >= 2 determinate calls from that method.
+    from analysis.plot_common import sample_matches as _sm
+    _dv = deduped_variants_with_author
+    _dv = _dv[(_sm(_dv, "Pathogenic/Likely Pathogenic") | _sm(_dv, "Benign/Likely Benign")) & (_dv["n_assays"] >= 2)]
+    REG.num("ResDedupMultiAssayN", len(_dv), source="ED Table 4 scope: P/LP+B/LB variants measured by >= 2 assays")
+    for _m, _tag in (("points", "Excalibr"), ("auth", "Author")):
+        _conf = _dv[f"{_m}_conflict"].astype(bool)
+        _two = _dv[f"{_m}_n_det"] >= 2
+        REG.pct(f"ResDedupConflict{_tag}Pct", int(_conf.sum()), len(_dv), digits=1,
+                source=f"{_tag}: conflicting direction across assays / multi-assay variants")
+        REG.pct(f"ResDedupConflict{_tag}PctOfTwoDet", int(_conf.sum()), int(_two.sum()), digits=1,
+                source=f"{_tag}: conflicting / multi-assay variants with >= 2 determinate calls")
+        print(f"  {_tag}: {int(_conf.sum())} conflicting of {len(_dv)} multi-assay variants "
+              f"({int(_two.sum())} with >= 2 determinate calls)")
     REG.check("dedup-det-excalibr-higher", danz_agg_deduped["coverage"] > auth_agg_deduped["coverage"],
               f"dedup determinate {danz_agg_deduped['coverage']:.3f} vs author {auth_agg_deduped['coverage']:.3f}",
               "main.tex Results (counted-once sentence)")
@@ -1085,7 +1139,7 @@ if danz_agg_both_det is not None:
         _worse.append("fdr")
     REG.check("both-det-every-metric", not _worse,
               f"ExCALIBR not better on both-determinate: {_worse}" if _worse else "ExCALIBR >= author on every metric",
-              "main.tex Methods/Evaluation (both-determinate)")
+              "main.tex Results (both-determinate sentence)")
 # Results numbers: tied to ED Table 3's "All variants" columns.
 _dm, _am = danz_agg_metrics, auth_agg_metrics
 REG.num("NumAuthorAnnotatedDatasets", len(datasets_with_author), source="datasets with determinate author calls")
@@ -1214,7 +1268,8 @@ gene_perf_result = gene_performance_scatter.build_gene_performance_scatter(
 )
 
 # %%
-REG.require(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence CSV (Fig. 5B, Supp Data 3; collaborator)")
+REG.require(config.OP_EVIDENCE_CODES_CSV, "OddsPath evidence CSV (Fig. 5B, Supp Data 3)",
+            newer_than=[config.DATASET_TSV], regen="python -m analysis.oddspath_computation.compute_oddspath")
 REG.require(config.AOU_OR_ESTIMATES_TSV, "All of Us odds-ratio estimates (Fig. 5C, ED Fig. 2; collaborator)")
 REG.require(config.AOU_TP53_OR_ESTIMATES_TSV, "All of Us TP53 odds-ratio estimates (Fig. 5C, ED Fig. 2; collaborator)")
 _AOU_INPUTS = [config.AOU_OR_ESTIMATES_TSV, config.AOU_TP53_OR_ESTIMATES_TSV]
@@ -1222,11 +1277,20 @@ REG.figure("fig:gene_brnich_OR", FIGURE_SUBDIRS["manuscript"] / "gene_brnich_OR.
            inputs=[config.OP_EVIDENCE_CODES_CSV, *_AOU_INPUTS])
 REG.figure("fig:all_OR", FIGURE_SUBDIRS["manuscript"] / "supp_OR.png", inputs=_AOU_INPUTS)
 
-from analysis.supplementary_data import oddspath_resolution
+from analysis.supplementary_data import oddspath_resolution, load_oddspath_csv
 _op_resolved = oddspath_resolution(datasets)
 oddspath_gap_datasets = sorted(d for d, r in _op_resolved.items() if r is None)
 REG.num("NumDatasetsBrnichNA", len(oddspath_gap_datasets), source="calibrated datasets absent from the OddsPath CSV",
         inputs=[config.OP_EVIDENCE_CODES_CSV])
+_op_msh2 = load_oddspath_csv()
+_op_msh2 = _op_msh2[_op_msh2["Dataset"].str.startswith("MSH2")]
+# One MSH2 row (Scott et al. 2022 values under the calibrated MSH2_Jia_2021
+# name), and the calibrated MSH2 dataset resolves to it.
+REG.check("oddspath-msh2-once", len(_op_msh2) == 1
+          and "MSH2_Scott_2022" in str(_op_msh2["Pseudocount Details"].iloc[0])
+          and [r for d, r in _op_resolved.items() if d.startswith("MSH2")] == ["MSH2_Jia_2021"],
+          f"MSH2 OddsPath rows after OP_SUPERSEDED_BY: {len(_op_msh2)} (one, with the Scott et al. 2022 values)",
+          "Fig. 5B / Supp Data 3")
 
 _gr = gene_perf_result.get("gene_results", [])
 _gr_det = [r for r in _gr if r["danz_accuracy"] not in (0, float("inf")) and r["auth_accuracy"] not in (0, float("inf"))]
@@ -1249,6 +1313,20 @@ if not _or.empty:
                      & _or["Cases with variants"].apply(_has_carriers) & (_or["OR_LI"] > 1)]
     REG.num("ResAoUNumSigGenes", _path_rows["Gene"].nunique(), words=True,
             source="genes with a significant pathogenic bin (OR 95% CI > 1)", inputs=_AOU_INPUTS)
+    # Results: the gene-disease pairs without a significant association (same
+    # primary-dataset scope) and whether every pathogenic group of theirs has
+    # <= LOW_CARRIER_MAX carrier cases or controls.
+    _gps6 = gene_performance_scatter
+    _ns_genes = [g for g in _gps6.order_genes_by_disease(_or["Gene"].unique())
+                 if g not in set(_path_rows["Gene"])]
+    REG.num("ResAoUNumNonsigGenes", len(_ns_genes), words=True, source="AoU gene-disease pairs without a significant pathogenic bin")
+    REG.text("ResAoUNonsigGenes", _join([f"\\textit{{{g}}}" for g in _ns_genes]) if _ns_genes else "none",
+             source="genes without a significant pathogenic bin")
+    _ns_p = _or[_or["Gene"].isin(_ns_genes) & _or["Classification"].astype(str).str.startswith("≥")
+                & _or["Cases with variants"].apply(_has_carriers)]
+    REG.check("aou-nonsig-genes-all-low-carrier", bool(len(_ns_p)) and bool(_ns_p.apply(_gps6.is_low_carrier, axis=1).all()),
+              f"non-significant genes {_ns_genes}: {int(_ns_p.apply(_gps6.is_low_carrier, axis=1).sum())}/{len(_ns_p)} pathogenic groups low-carrier",
+              "main.tex Results (All of Us: non-significant pairs all low-carrier)")
     # ED Fig. 2 caption: the dataset shown for each gene, in the figure's order.
     _or_genes = gene_performance_scatter.order_genes_by_disease(_or["Gene"].unique())
     REG.text("ResAoUGeneDatasets", "; ".join(
@@ -1257,6 +1335,31 @@ if not _or.empty:
         source="GENE_TO_DATASET, ED Fig. 2 order")
     REG.num("ResAoUNumGenes", _or["Gene"].nunique(), source="genes in the All of Us OR table (ExCALIBR grouping)",
             inputs=_AOU_INPUTS)
+    # ED Fig. 2 is the all-datasets figure (supp_OR_all_datasets.png): one panel per dataset.
+    _or_all = gene_performance_scatter.load_aou_or_estimates(consequence=OR_CONSEQUENCE)
+    _or_entries = gene_performance_scatter.resolve_gene_dataset_entries(
+        _or_all, gene_performance_scatter.GENE_TO_DATASET,
+        gene_performance_scatter.order_genes_by_disease(_or_all["Gene"].unique()), "all")
+    REG.num("ResAoUNumDatasetsOR", len(_or_entries), source="panels (datasets) in ED Fig. 2 (all-datasets OR figure)",
+            inputs=_AOU_INPUTS)
+    # Results: non-significant pathogenic groups in ED Fig. 2 (95% CI includes 1,
+    # the figure's open circles), split by the low-carrier flag (dashed groups:
+    # <= LOW_CARRIER_MAX carrier cases or controls).
+    _gps = gene_performance_scatter
+    _pg = _or_all[_or_all["Odds Ratio"].notna() & _or_all["Cases with variants"].apply(_gps._has_carriers)
+                  & (_or_all["Classification"].map(_gps._get_strength) > 0)].copy()
+    _pg["nonsig"] = ~((_pg["LogOR_LI"] > 0) | (_pg["LogOR_UI"] < 0))
+    _pg["low"] = _pg.apply(_gps.is_low_carrier, axis=1)
+    for _tag, _sel in (("Low", _pg["low"]), ("High", ~_pg["low"])):
+        REG.num(f"ResAoU{_tag}N", int(_sel.sum()),
+                source=f"ED Fig. 2 pathogenic groups, {'<=' if _tag == 'Low' else '>'} {_gps.LOW_CARRIER_MAX} carrier cases or controls")
+        REG.num(f"ResAoUNonsig{_tag}N", int((_sel & _pg["nonsig"]).sum()), source="... of which non-significant")
+    REG.check("aou-nonsig-mostly-low-carrier",
+              (_pg["low"] & _pg["nonsig"]).sum() > (~_pg["low"] & _pg["nonsig"]).sum(),
+              f"non-significant pathogenic groups: {int((_pg.low & _pg.nonsig).sum())}/{int(_pg.low.sum())} low-carrier vs "
+              f"{int((~_pg.low & _pg.nonsig).sum())}/{int((~_pg.low).sum())} others; well-powered non-significant: "
+              f"{sorted(set(_pg.loc[~_pg.low & _pg.nonsig, 'Dataset']))}",
+              "main.tex Results (All of Us: non-significant groups mostly low-carrier)")
 
 # %% [markdown]
 # ## A7. Extended Data Figure 3 and Extended Data Table 5 (ClinGen Evidence Repository)
@@ -1398,8 +1501,7 @@ REG.num("NumAuthorAnnotatedGenesClinGen", len(clingen_genes_default) if clingen_
 _cg = np.asarray(_clingen_nondedup_conf_dicts["clingen_confusion"]["excalibr"])  # rows BLB, PLP; cols B, I, P
 REG.num("ResClinGenNumPLP", _cg[1].sum(), source="ED Table 5 (PS3/BS3 excluded): P/LP measurements")
 REG.num("ResClinGenNumBLB", _cg[0].sum(), source="ED Table 5 (PS3/BS3 excluded): B/LB measurements")
-REG.check("clingen-no-blb-pathogenic", _cg[0, 2] == 0, f"B/LB assigned pathogenic evidence: {int(_cg[0, 2])}",
-          "main.tex Results (ClinGen)")
+REG.num("ResClinGenNumBLBPath", int(_cg[0, 2]), source="ED Table 5 (PS3/BS3 excluded): B/LB measurements with pathogenic evidence")
 _rec = clingen_records_by_strip[True]
 _plp_ben = _rec[(_rec["clingen_label"] == 1) & (_rec["points"] < 0)]
 REG.num("ResClinGenNumPLPBen", len(_plp_ben), source="ClinGen P/LP with benign ExCALIBR evidence (PS3/BS3 stripped)")
@@ -2005,6 +2107,39 @@ if "ExCALIBR vs. ACMGScaler vs. ExCALIBR (prior=0.1)" in _panel_groups:
     _register_medians(_panel_groups["ExCALIBR vs. ACMGScaler vs. ExCALIBR (prior=0.1)"],
                       {"excalibr": "ExcalibrAcmgSet", "acmgscaler": "Acmg", "excalibr_prior_0.1": "PriorFixed"},
                       "ResCmpAcmgNumMatched")
+# Results (acmgscaler comparison): ExCALIBR on the datasets acmgscaler could
+# not calibrate, and the pooled accuracies of Supplementary Table "pooled
+# acmgscaler" with and without the two LDLR Tabet datasets (several hundred
+# controls each), which the text says drive acmgscaler's small pooled edge.
+if acmgscaler_conf_raw is not None and manual_prior_conf_raw is not None:
+    _no_acmg = [i for i, m in enumerate(acmgscaler_conf_raw) if m is None]
+    REG.num("ResCmpNumNoAcmg", len(_no_acmg), source="calibrated datasets acmgscaler could not calibrate")
+    _df_na = compute_per_dataset_metrics_multi(
+        {"excalibr": [conf_by_method[primary_method][i] for i in _no_acmg]}, [datasets[i] for i in _no_acmg])
+    _acc_na = _df_na["excalibr_accuracy"].to_numpy(dtype=float)
+    REG.num("ResCmpAccMedExcalibrNoAcmg", float(np.median(_acc_na[np.isfinite(_acc_na)])), fmt=".3f",
+            source=f"median per-dataset ExCALIBR accuracy, {len(_df_na)} datasets without acmgscaler calibration")
+
+    def _pooled_acc(keep):
+        _agg_k, _, _ = compute_aggregate_metrics_multi(
+            {m: [v[i] for i in keep] for m, v in (("excalibr", conf_by_method[primary_method]),
+                                                  ("acmgscaler", acmgscaler_conf_raw),
+                                                  ("excalibr_prior_0.1", manual_prior_conf_raw))},
+            [datasets[i] for i in keep])
+        return _agg_k["excalibr"]["accuracy"], _agg_k["acmgscaler"]["accuracy"]
+
+    _all_i = list(range(len(datasets)))
+    _no_ldlr = [i for i in _all_i if not datasets[i].startswith("LDLR_Tabet_2025")]
+    _pe, _pa = _pooled_acc(_all_i)
+    _pe2, _pa2 = _pooled_acc(_no_ldlr)
+    REG.num("ResCmpPooledAccExcalibrAcmgSet", _pe, fmt=".3f", source="pooled accuracy, ExCALIBR (acmgscaler-matched datasets)")
+    REG.num("ResCmpPooledAccAcmg", _pa, fmt=".3f", source="pooled accuracy, acmgscaler")
+    REG.num("ResCmpPooledAccExcalibrNoLDLR", _pe2, fmt=".3f", source="same, without LDLR_Tabet_2025_* datasets")
+    REG.num("ResCmpPooledAccAcmgNoLDLR", _pa2, fmt=".3f", source="same, without LDLR_Tabet_2025_* datasets")
+    REG.check("pooled-acmg-gap-ldlr", (_pa - _pe) > 0 and (_pa2 - _pe2) < 0.5 * (_pa - _pe),
+              f"pooled accuracy gap acmgscaler-ExCALIBR: {_pa - _pe:+.4f} with LDLR, {_pa2 - _pe2:+.4f} without",
+              "main.tex Results (acmgscaler: 'mainly due to two LDLR calibrations')")
+
 if "ExCALIBR vs. GMM / Skew-locked / Pathomechanism" in _panel_groups:
     _abl = _panel_groups["ExCALIBR vs. GMM / Skew-locked / Pathomechanism"]
     _register_medians(_abl, {k: t for k, t in (("excalibr", "Excalibr"), ("skew_locked", "SkewLocked"),
@@ -2494,6 +2629,17 @@ if not config.warn_if_missing(config.FIT_NUMBER_COMPARISON_SUMMARY_CSV, "fit-num
     _rs_excluded = sorted(set(fit_number_summary["pipeline_dataset"]) - set(datasets))
     fit_number_summary = fit_number_summary[fit_number_summary["pipeline_dataset"].isin(datasets)].reset_index(drop=True)
     print(f"  restart sweep restricted to calibrated datasets; not in the manuscript set: {_rs_excluded}")
+    # Only each dataset's selected component count (Supplementary Data 1), not
+    # every 2c/3c fit the sweep ran.
+    _sel_nc = {}
+    for _d in fit_number_summary["pipeline_dataset"].unique():
+        _comps = list(tree.get(_d, {}).keys())
+        if _comps:
+            _sel_nc[_d] = int(resolve_component(_d, _comps, model_selections, dataset_configs).split("_", 1)[0].rstrip("c"))
+    _n_before = len(fit_number_summary)
+    fit_number_summary = fit_number_summary[
+        fit_number_summary["n_c"].astype(int) == fit_number_summary["pipeline_dataset"].map(_sel_nc)].reset_index(drop=True)
+    print(f"  restart sweep restricted to selected components: {len(fit_number_summary)} of {_n_before} rows")
     print(f"Loaded {len(fit_number_summary)} rows, "
           f"{fit_number_summary['dataset'].nunique()} datasets, "
           f"num_fits levels: {sorted(fit_number_summary['num_fits'].unique())}")
@@ -2704,7 +2850,9 @@ if not skew_yang_df.empty:
 # command reruns only those.
 from analysis.sweep_staleness import bootstrap_reduction_stale, restart_sweep_stale, rerun_commands
 _bsr_stale = bootstrap_reduction_stale(datasets)
-_rs_stale = restart_sweep_stale(datasets)
+_rs_stale = restart_sweep_stale(datasets, selected_nc={
+    _d: int(resolve_component(_d, list(tree[_d].keys()), model_selections, dataset_configs).split("_", 1)[0].rstrip("c"))
+    for _d in datasets if tree.get(_d)})
 _sweep_cmds = rerun_commands(_bsr_stale, _rs_stale)
 for _name, _st in (("S5", _bsr_stale), ("S6", _rs_stale)):
     for _d, _why in _st.items():
@@ -2810,8 +2958,18 @@ _sd3_gap_rows = int(((sd3_df["OddsNormal"] == "Not available") & (sd3_df["OddsAb
 REG.check("sd3-gap-matches-macro", _sd3_gap_rows == REG.macros["NumDatasetsBrnichNA"].value,
           f"SD3 has {_sd3_gap_rows} gap rows; \\NumDatasetsBrnichNA = {REG.macros['NumDatasetsBrnichNA'].value}",
           "Supplementary Data 3")
-REG.static("Supplementary Data 4", "All of Us biobank validation workbook, produced by collaborators")
-REG.static("Figures/ross_figs/fig1_cartoon.png", "Fig. 1 conceptual illustration; hand-made, maintained on Overleaf")
+# Supplementary Data 4: the collaborators' All of Us workbook (cohort and
+# phenotype definitions, exclusions) plus the OR results the supplementary OR
+# figure plots, with column definitions (supplementary_data.build_sd4).
+from analysis.supplementary_data import build_sd4
+REG.require(config.AOU_SD4_COLLABORATOR_XLSX, "All of Us workbook (Supp Data 4; collaborator)")
+_sd4_problems = build_sd4(SUPP_DATA_DIR / "SD4_AoU_biobank_validation.xlsx")
+print(f"  SD4 -> {SUPP_DATA_DIR / 'SD4_AoU_biobank_validation.xlsx'}")
+for _p in _sd4_problems:
+    REG.check("sd4", False, _p, "Supplementary Data 4")
+if not _sd4_problems:
+    REG.check("sd4", True, "collaborator sheets + OR results", "Supplementary Data 4")
+REG.static("Figures_preautomation/ross_figs/fig1_cartoon.png", "Fig. 1 conceptual illustration; hand-made, maintained on Overleaf")
 
 # %% [markdown]
 # ## A13. Zenodo data record: bootstrap fits and splits (Data availability)

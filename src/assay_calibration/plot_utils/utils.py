@@ -2389,7 +2389,58 @@ def _bold_italic_gene_title(ax, gene_name, suffix, x=0.5, y=1.0, fontsize=14, ha
     return t_gene, t_suffix
 
 
-def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_MIXTURE_FITS=False, HIDE_COMPONENT_FITS=True, HIDE_COMPONENT_VARIANCE=True, FIRST_ONLY=False, SHOW_PRIOR=True, loader_fn=None):
+# Evidence-strength colors (as in Supplementary Data 2, analysis/extended_data_appendix.py).
+EVIDENCE_STRENGTH_COLORS = {
+    -8: '#4b91a6', -7: '#5DA3BD', -6: '#6FAACE', -5: '#74ABCE', -4: '#7ab5d1',
+    -3: '#99c8dc', -2: '#d0e8f0', -1: '#e4f1f6', 0: '#e0e0e0',
+    1: '#e6b1b8', 2: '#d68f99', 3: '#ca7682', 4: '#b85c6b', 5: '#B1535F',
+    6: '#AA4E58', 7: '#A2484F', 8: '#943744',
+}
+
+
+def _hist_bin_width(x, axis, n_bins):
+    """Freedman-Diaconis bin width, kept between axis/(4*n_bins) and axis/n_bins."""
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    w = axis / n_bins
+    if len(x) >= 4:
+        iqr = np.subtract(*np.percentile(x, [75, 25]))
+        if iqr > 0:
+            w = float(np.clip(2 * iqr / len(x) ** (1 / 3), axis / (4 * n_bins), axis / n_bins))
+    return w
+
+
+def _draw_evidence_strip(ax, point_ranges, x_min, x_max, scores):
+    """SD2-style evidence strip: each evidence level's score range(s) filled in
+    its color (gaps = indeterminate), labelled with the number of `scores`
+    (SNVs) inside when wide enough. Returns the levels drawn."""
+    intervals = [(int(pv), float(r[0]), float(r[1]))
+                 for pv, ranges in point_ranges.items() if int(pv) != 0 for r in (ranges or [])]
+    filled, prev = [], x_min
+    for pv, a, b in sorted(intervals, key=lambda t: t[1]):
+        if a > prev:
+            filled.append((0, prev, a))
+        filled.append((pv, a, b))
+        prev = max(prev, b)
+    if prev < x_max:
+        filled.append((0, prev, x_max))
+    scores = np.asarray(scores, dtype=float)
+    for pv, a, b in filled:
+        lo, hi = max(a, x_min), min(b, x_max)
+        if hi <= lo:
+            continue
+        ax.axvspan(lo, hi, color=EVIDENCE_STRENGTH_COLORS[pv], alpha=1.0, lw=0)
+        n = int(((scores >= a) & (scores < b)).sum())
+        if (hi - lo) > (x_max - x_min) * 0.07 and n:
+            ax.text((lo + hi) / 2, 0.5, f"{n:,}", ha='center', va='center', fontsize=8,
+                    color='white' if abs(pv) >= 7 else 'black')
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([])
+    return {pv for pv, _, _ in filled}
+
+
+def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax_configs, keep_old_list, figsize=(16, 13.33333), HIDE_THRESHOLDS=False, HIDE_MIXTURE_FITS=False, HIDE_COMPONENT_FITS=True, HIDE_COMPONENT_VARIANCE=True, FIRST_ONLY=False, SHOW_PRIOR=True, loader_fn=None, EVIDENCE_STRIP=False, N_HIST_BINS=40, MAX_SAMPLE_ROWS=4, SMALL_SAMPLE_N=10, COUNTS=False):
     """
     Create a 2x2 grid of dataset plots for publication.
     Each panel shows all samples for one dataset stacked vertically.
@@ -2444,6 +2495,7 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
     # Create 2x2 grid for main panels
     outer_grid = GridSpec(2, 2, figure=fig, hspace=0.14, wspace=0.10)
     
+    _strip_levels = set()  # evidence levels drawn in any strip (EVIDENCE_STRIP)
     for panel_idx, (dataset, letter) in enumerate(zip(dataset_names, panel_letters)):
         if FIRST_ONLY and panel_idx > 0:
             continue
@@ -2465,13 +2517,33 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
         panel_col = panel_idx % 2
         
         # Use GridSpecFromSubplotSpec for nested grids
+        # EVIDENCE_STRIP: one extra (shorter) row under the samples for the
+        # SD2-style evidence strip, which replaces the threshold lines.
+        # With EVIDENCE_STRIP the sample rows of every panel fill the same
+        # total height (MAX_SAMPLE_ROWS rows' worth; a panel with fewer
+        # samples, e.g. no synonymous sample, gets taller rows), so the
+        # evidence strips line up across panels.
+        _n_rows = n_samples
         inner_grid = GridSpecFromSubplotSpec(
-            n_samples, 1,
+            _n_rows + (1 if EVIDENCE_STRIP else 0), 1,
             subplot_spec=outer_grid[panel_row, panel_col],
-            hspace=0.08
+            hspace=0.08,
+            height_ratios=([max(MAX_SAMPLE_ROWS, n_samples) / n_samples] * _n_rows + [0.42])
+                          if EVIDENCE_STRIP else [1] * _n_rows,
         )
+        _hide_thresholds = HIDE_THRESHOLDS or EVIDENCE_STRIP
         
         point_ranges = indv_summary['point_ranges']
+
+        _gnomad_bin_width = (score_range[-1] - score_range[0]) / N_HIST_BINS
+        _col = 0
+        for _i, _cnt in enumerate(scoreset.sample_counts):
+            if _cnt == 0:
+                continue
+            if scoreset.sample_names[_i] == "population":
+                _gnomad_bin_width = _hist_bin_width(scoreset.scores[scoreset.sample_assignments[:, _col]],
+                                                    score_range[-1] - score_range[0], N_HIST_BINS)
+            _col += 1
         
         # Plot each sample
         num_skipped = 0
@@ -2489,10 +2561,28 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             if sample_name == "population":
                 sample_name = "gnomAD"
             
-            # Plot histogram
+            # Plot histogram. Bin width per sample: Freedman-Diaconis, kept
+            # between 1/(4*N_HIST_BINS) and 1/N_HIST_BINS of the score axis
+            # (seaborn's per-sample default gives small samples a few very
+            # wide bars; one fixed width is too coarse for narrow, dense
+            # samples such as DDX3X's B/LB). Edges are on a grid anchored at
+            # the axis minimum.
+            _x = np.asarray(scoreset.scores[sample_mask], dtype=float)
+            _axis = score_range[-1] - score_range[0]
+            # Samples with fewer than SMALL_SAMPLE_N variants take the gnomAD
+            # sample's bin width (their own spread can't set one sensibly).
+            if np.isfinite(_x).sum() < SMALL_SAMPLE_N:
+                _w = _gnomad_bin_width
+            else:
+                _w = _hist_bin_width(_x, _axis, N_HIST_BINS)
+            _bins = score_range[0] + _w * np.arange(int(np.ceil(_axis / _w)) + 1)
+            # COUNTS: bars are numbers of variants and the fitted densities
+            # are scaled to match (density x n x bin width).
+            _fit_scale = np.isfinite(_x).sum() * _w if COUNTS else 1.0
             sns.histplot(
                 scoreset.scores[sample_mask],
-                stat='density', ax=ax,
+                bins=_bins,
+                stat='count' if COUNTS else 'density', ax=ax,
                 alpha=sample_alphas[sample_num],
                 color=sample_colors[sample_num]
             )
@@ -2504,7 +2594,7 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             
             if not HIDE_MIXTURE_FITS:
                 # Plot fitted density
-                d = np.nansum(density_sample, axis=1)
+                d = np.nansum(density_sample, axis=1) * _fit_scale
                 d_perc = np.percentile(d, [5, 50, 95], axis=0)
                 
                 ax.plot(score_range, d_perc[1], color='black', alpha=0.5, linewidth=2)
@@ -2513,7 +2603,7 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             if not HIDE_COMPONENT_FITS or not HIDE_COMPONENT_VARIANCE:
                 comp_colors = ["#873A47", "#0E465F", "gray"]
                 for compNum in range(density_sample.shape[1]):
-                    compDensity = density_sample[:,compNum,:]
+                    compDensity = density_sample[:,compNum,:] * _fit_scale
                     d_perc = np.nanpercentile(compDensity,[5,50,95],axis=0)
                     if not HIDE_COMPONENT_FITS:
                         ax.plot(score_range, d_perc[1], linestyle='--', color=comp_colors[compNum], alpha=sample_alphas[compNum], linewidth=2)
@@ -2522,33 +2612,27 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                 
             # Add threshold lines
             handles = []
-            if not HIDE_THRESHOLDS:
+            if not _hide_thresholds:
                 for idx, point_val in enumerate(point_values_to_plot):
-                    # Benign threshold
-                    for pv, score_ranges in point_ranges.items():
-                        if pv == -point_val and score_ranges:
-                            for sr in score_ranges:
-                                threshold_score = sr[0] if not flipped else sr[1]
+                    # One line per inner edge of every score range at this
+                    # strength: each finite range endpoint not shared with the
+                    # next-stronger level. Monotone calibrations get one line
+                    # per strength as before; non-monotone ones (pathogenic
+                    # evidence at both score extremes, e.g. DDX3X) get one per
+                    # side instead of only the first range's.
+                    for sign, color in ((-1, 'b'), (1, 'r')):
+                        ranges = point_ranges.get(sign * point_val, []) or []
+                        stronger = {float(x) for r in (point_ranges.get(sign * (point_val + 1), []) or []) for x in r}
+                        for sr in ranges:
+                            for threshold_score in sr:
+                                threshold_score = float(threshold_score)
+                                if not np.isfinite(threshold_score) or threshold_score in stronger:
+                                    continue
                                 ax.axvline(
-                                    threshold_score, color='b',
+                                    threshold_score, color=color,
                                     linestyle=linestyles[idx],
                                     linewidth=linewidths[idx], alpha=0.7
                                 )
-                                break
-                            break
-                    
-                    # Pathogenic threshold
-                    for pv, score_ranges in point_ranges.items():
-                        if pv == point_val and score_ranges:
-                            for sr in score_ranges:
-                                threshold_score = sr[1] if not flipped else sr[0]
-                                ax.axvline(
-                                    threshold_score, color='r',
-                                    linestyle=linestyles[idx],
-                                    linewidth=linewidths[idx], alpha=0.7
-                                )
-                                break
-                            break
                     
                     # Create handle for legend
                     if len(point_ranges.get(point_val, [])) != 0 or len(point_ranges.get(-point_val, [])) != 0:
@@ -2581,15 +2665,17 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                             (sample_num == len(scoreset.sample_counts) - 2 and
                              scoreset.sample_counts[-1] == 0))
             
-            if is_last_sample and panel_idx >= 2:
+            if is_last_sample and panel_idx >= 2 and not EVIDENCE_STRIP:
                 ax.set_xlabel("Assay score", fontsize=12)
             else:
-                if not is_last_sample:
-                    ax.set_xticks([])
+                if not is_last_sample or EVIDENCE_STRIP:
+                    ax.tick_params(axis='x', labelbottom=False)
+                    if not is_last_sample:
+                        ax.set_xticks([])
                 ax.set_xlabel("")
 
             if panel_idx % 2 == 0:
-                ax.set_ylabel("Density", fontsize=12)
+                ax.set_ylabel("Count" if COUNTS else "Density", fontsize=12)
             else:
                 ax.set_ylabel("")
             ax.set_xlim([score_range[0], score_range[-1]])
@@ -2630,7 +2716,7 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
 
             ax.add_artist(hist_legend)
 
-            if not HIDE_THRESHOLDS:
+            if not _hide_thresholds:
                 # Add point ranges legend on the right (or "No evidence" text)
                 if handles:
                     # Create points legend on the right
@@ -2658,8 +2744,32 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
             ax.grid(True, alpha=0.3, axis='both', linewidth=0.5)
             ax.set_axisbelow(True)
             ax.tick_params(labelsize=8)
-    
+
+        if EVIDENCE_STRIP:
+            ax_strip = fig.add_subplot(inner_grid[_n_rows, 0], sharex=ax)
+            _strip_scores = getattr(scoreset, "snv_scores", None)
+            if _strip_scores is None:
+                _strip_scores = scoreset.scores
+            _levels_drawn = _draw_evidence_strip(ax_strip, {int(k): v for k, v in point_ranges.items()},
+                                                 score_range[0], score_range[-1], _strip_scores)
+            _strip_levels |= _levels_drawn
+            ax_strip.tick_params(labelsize=8)
+            if panel_idx % 2 == 0:
+                ax_strip.set_ylabel("Evidence", fontsize=10, rotation=0, ha='right', va='center')
+            if panel_idx >= 2:
+                ax_strip.set_xlabel("Assay score", fontsize=12)
+
     plt.tight_layout()
+
+    if EVIDENCE_STRIP:
+        # One shared key for the evidence strips (strongest pathogenic to
+        # strongest benign), placed just below the lowest strip.
+        _lv = [pv for pv in range(8, -9, -1) if pv in _strip_levels]
+        _y0 = min(a.get_position().y0 for a in fig.axes)
+        fig.legend(handles=[Patch(facecolor=EVIDENCE_STRENGTH_COLORS[pv], edgecolor='none',
+                                  label=f"{pv:+d}" if pv else "0") for pv in _lv],
+                   loc='upper center', ncol=len(_lv), frameon=False, fontsize=10,
+                   bbox_to_anchor=(0.5, _y0 - 0.045), handlelength=1.2, columnspacing=0.8)
 
     return fig
 

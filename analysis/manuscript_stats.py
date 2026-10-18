@@ -379,7 +379,7 @@ def latex_bootstrap_reduction_metrics_table(table_df: pd.DataFrame) -> str:
         r"\label{tab:bootstrap_reduction_metrics}",
         r"\begin{tabular}{lccccccc}",
         r"\toprule",
-        r"Bootstraps & $n$ & Accuracy & Determinate \% & Sensitivity & Specificity & DOR & MCC \\",
+        r"Bootstraps & $n$ & Accuracy & Determinate rate & Sensitivity & Specificity & DOR & MCC \\",
         r"\midrule",
     ]
     for _, row in table_df.iterrows():
@@ -484,7 +484,7 @@ def latex_robustness_metrics_table(table_df: pd.DataFrame, perturbation_type: st
         rf"\label{{tab:robustness_{perturbation_type}_metrics}}",
         r"\begin{tabular}{llcccc" + ("cc" if with_op else "") + "}",
         r"\toprule",
-        r"Dataset & Level & Accuracy & Determinate \% & Max Pathogenic & Max Benign"
+        r"Dataset & Level & Accuracy & Determinate rate & Max Pathogenic & Max Benign"
         + (r" & OddsPath PS3 & OddsPath BS3" if with_op else "") + r" \\",
         r"\midrule",
     ]

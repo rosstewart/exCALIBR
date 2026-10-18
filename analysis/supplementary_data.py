@@ -263,3 +263,91 @@ def build_sd3(datasets: List[str], op_csv: Optional[str] = None) -> (pd.DataFram
     if unused:
         problems.append(f"OddsPath CSV rows not matching any calibrated dataset (omitted): {unused}")
     return out, problems
+
+
+# ---------------------------------------------------------------------------
+# Supplementary Data 4: collaborators' All of Us workbook + OR results
+# ---------------------------------------------------------------------------
+
+SD4_OR_COLUMN_DEFINITIONS = [
+    ("Gene", "Official HGNC symbol for the gene analyzed."),
+    ("Dataset", "The experimental assay dataset used for the given gene."),
+    ("Classification", "The classification used to define the set of variants analyzed; i.e., a threshold on the "
+                       "calibrated evidence points (e.g. \u2265 +2: all variants with at least +2 points; "
+                       "\u2264 -2: all variants with at most -2 points). Groups are cumulative and overlap."),
+    ("Odds Ratio", "The point estimate of the odds ratio computed for association between the set of variants and "
+                   "the gene-associated phenotype (logistic regression adjusted for sex, age and 16 genetic "
+                   "ancestry principal components)."),
+    ("OR_LI", "The lower bound of the 95% confidence interval of the odds ratio estimate."),
+    ("OR_UI", "The upper bound of the 95% confidence interval of the odds ratio estimate."),
+    ("p-value", "The Wald test p-value for the OR estimate."),
+    ("Cases with variants", "Number of case participants carrying one or more variants in the set. All of Us "
+                            "reports counts of 20 or fewer only as \u201c\u2264 20\u201d."),
+    ("Controls with variants", "Number of control participants carrying one or more variants in the set "
+                               "(\u201c\u2264 20\u201d as above)."),
+    ("significant", "True if the 95% confidence interval of the odds ratio excludes 1."),
+    ("Low carrier counts", "True if carrier cases or carrier controls are 20 or fewer; these estimates are "
+                           "imprecise and are drawn with dashed whiskers in the supplementary OR figure."),
+]
+
+
+def sd4_or_results() -> "pd.DataFrame":
+    """The OR rows the supplementary OR figure (ED Fig. 2) plots: every
+    dataset of every gene, ExCALIBR grouping, consequence "All" (main file
+    with the TP53 file's rows replacing TP53), as prepare_or_display_table
+    builds them, plus the low-carrier flag."""
+    from analysis import gene_performance_scatter as gps
+    from analysis.plot_common import display_name
+
+    df = gps.load_aou_or_estimates(consequence="All")
+    order = gps.order_genes_by_disease(df["Gene"].unique())
+    out = gps.prepare_or_display_table(df, gps.GENE_TO_DATASET, gene_order=order, dataset_mode="all").copy()
+    out["Low carrier counts"] = out.apply(gps.is_low_carrier, axis=1)
+    out["Dataset"] = out["Dataset"].map(display_name)
+    cols = [c for c, _ in SD4_OR_COLUMN_DEFINITIONS if c in out.columns]
+    return out[cols].reset_index(drop=True)
+
+
+def build_sd4(out_path, collaborator_xlsx=None) -> List[str]:
+    """Write Supplementary Data 4: the collaborators' workbook (sheets kept
+    as-is) plus "OR results" and "OR results column definitions", with the
+    Index sheet extended to list them. Returns problems."""
+    import shutil
+    import openpyxl
+
+    problems = []
+    src = Path(collaborator_xlsx or cfg.AOU_SD4_COLLABORATOR_XLSX)
+    if not src.exists():
+        return [f"collaborator SD4 workbook missing: {src}"]
+    out_path = Path(out_path)
+    shutil.copy2(src, out_path)
+    or_df = sd4_or_results()
+    if or_df.empty:
+        problems.append("no OR results rows")
+    wb = openpyxl.load_workbook(out_path)
+    for name in ("OR results", "OR results column definitions"):
+        if name in wb.sheetnames:
+            del wb[name]
+    ws = wb.create_sheet("OR results")
+    ws.append(list(or_df.columns))
+    for row in or_df.itertuples(index=False):
+        ws.append([None if (isinstance(v, float) and np.isnan(v)) else (v.item() if hasattr(v, "item") else v)
+                   for v in row])
+    wd = wb.create_sheet("OR results column definitions")
+    wd.append(["Column Name", "Description"])
+    for c, d in SD4_OR_COLUMN_DEFINITIONS:
+        if c in or_df.columns:
+            wd.append([c, d])
+    if "Index" in wb.sheetnames:
+        idx = wb["Index"]
+        listed = {str(r[0].value) for r in idx.iter_rows(min_row=2) if r and r[0].value is not None}
+        for name, what in (("OR results", "Odds ratios of disease for carriers of variants meeting each "
+                                          "evidence-strength threshold, for every dataset shown in the "
+                                          "supplementary OR figure"),
+                           ("OR results column definitions", "Definitions of the columns of the OR results sheet")):
+            if name not in listed:
+                idx.append([name, what])
+    else:
+        problems.append("collaborator workbook has no Index sheet")
+    wb.save(out_path)
+    return problems

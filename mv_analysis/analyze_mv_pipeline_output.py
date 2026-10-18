@@ -85,6 +85,7 @@ import pandas as pd
 from mv_analysis import config
 from mv_analysis import mv_cockpit as cockpit
 from mv_analysis import report
+from mv_analysis import uv_sources, uv_agg
 from mv_analysis import phenotype_evidence as pheno
 from mv_analysis import tp53_rpv_report
 from mv_analysis.gene_performance_scatter import build_gene_performance_figure, PLAIN_INTEGRATED_GENES, EVIDENCE_DIRECTION
@@ -518,13 +519,14 @@ def run_correlation_and_conflict():
 
 
 def run_manuscript_figures():
-    """The composed manuscript figures (Figures 1, 2, 3-5 A-B, 7), drawn from
-    outputs the other sections write: conflict tables (correlation), the GCK
-    precompute, the per-gene results tables, and the TP53 RPV scores."""
+    """The composed manuscript figures (Figures 1, 2, 3-5, 7 and the P-KNN
+    Extended Data figure), drawn from outputs the other sections write:
+    conflict tables (correlation), the GCK precompute, the per-gene results
+    tables, the TP53 RPV scores and the P-KNN / out-of-bag comparison."""
     import subprocess
     scripts = _ROOT / "mv_analysis" / "figures" / "scripts"
     for script in ("make_fig1_conflict.py", "make_fig2_method.py",
-                   "make_panel_performance.py", "make_fig7_tp53_rpv.py"):
+                   "make_panel_performance.py", "make_fig7_tp53_rpv.py", "make_pknn_comparison.py"):
         subprocess.run([sys.executable, str(scripts / script)], check=True)
 
 
@@ -552,6 +554,7 @@ MANUSCRIPT_FIGURES = {
     "fig7_tp53_rpv_classification.pdf": "tp53_rpv/fig7_tp53_rpv_classification.pdf",
     "mv_confusion_matrices.png": "confusions/mv_confusion_matrices.png",
     "mv_brnich_comparison.png": "brnich_comparison/mv_brnich_comparison.png",
+    "fig_pknn_comparison.pdf": "pknn/fig_pknn_comparison.pdf",
 }
 
 
@@ -569,7 +572,7 @@ def _pooled_from_table(table, method_prefix, keys=None):
     if t.empty:
         return None
     if method_prefix == "MV":
-        t = t.sort_values(["mcc", "determinate"], ascending=False).groupby(["gene", "cluster"], as_index=False).head(1)
+        t = config.select_canonical_mv_rows(t)
     if keys is not None:
         t = t[t.set_index(["gene", "cluster"]).index.isin(keys)]
     s = t[["TP", "TN", "FP", "FN", "total", "determinate"]].sum()
@@ -580,6 +583,250 @@ def _pooled_from_table(table, method_prefix, keys=None):
 def _gene_label(g):
     g = str(g)
     return ["FGFR1", "FGFR2", "FGFR3", "FGFR4"] if g.upper().startswith("FGFR") else [g.upper()]
+
+
+def run_predictor_baseline_comparison(genes=PREDICTOR_COMBINED_GENES):
+    """Independent predictor calibration: our own per-predictor ExCALIBR fits
+    vs Chen et al.'s gene-specific calibrations (the paper's baseline), on the
+    same ClinVar evaluation set as the predictor results tables. One row per
+    gene, source and predictor (plus the nonconflicting aggregate), at the
+    evidence-direction threshold. Writes predictor_baseline_comparison.csv."""
+    rows = []
+    for gene in genes:
+        try:
+            ms = config.build_multiscoresets_for_gene_set("predictor", genes=[gene])[gene]
+            dataset_name = config.canonical_dataset_name(gene, "predictor", results_json=config.PAPER_RESULTS_JSON)
+            analysis = cockpit.build_gene_set_analysis(ms, gene.lower(), config.PAPER_RESULTS_JSON,
+                                                       dataset_name=dataset_name, gene_set="predictor")
+            eval_mask, labels = report._eval_labels(ms, analysis.p_idx, analysis.b_idx, gene_set="predictor")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{gene}] predictor baseline comparison skipped: {e}")
+            continue
+        for source in ("excalibr", "chen"):
+            uv = uv_sources.load_predictor_mv_uv_points(gene, ms, source=source)
+            if uv is None:
+                continue
+            names, mat = uv
+            series = [(n.split("_")[0], mat[i]) for i, n in enumerate(names)]
+            series.append(("aggregate", uv_agg.aggregate_nonconflicting(mat)))
+            for predictor, pts in series:
+                pts_eval = np.nan_to_num(np.asarray(pts, float)[eval_mask], nan=0.0)
+                r = [x for x in report._rows_for_points(source, pts_eval, labels)
+                     if x["threshold"] == EVIDENCE_DIRECTION][0]
+                rows.append({"gene": gene, "source": source, "predictor": predictor, **r})
+    out = pd.DataFrame(rows)
+    path = Path(config.PAPER_PREDICTOR_DIR) / "predictor_baseline_comparison.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(path, index=False)
+    if not out.empty:
+        agg = out[out["predictor"] == "aggregate"]
+        print(agg.pivot_table(index="gene", columns="source", values=["mcc", "determinate"]).round(3).to_string())
+    print(f"wrote {path}")
+    return out
+
+
+def run_combined_single_predictor_comparison(genes=PREDICTOR_COMBINED_GENES):
+    """Combined-evidence analogue of run_predictor_baseline_comparison: the
+    independent baseline that adds functional evidence (nonconflicting rule
+    across assays) to ONE predictor's points (Chen et al.), for each predictor,
+    alongside the standard baseline adding the predictors' nonconflicting
+    aggregate -- on the combined evaluation set (variants with at least one
+    functional and one predictor score). Writes
+    combined_single_predictor_comparison.csv."""
+    rows = []
+    for gene in genes:
+        try:
+            ms = config.build_ms_for_gene_cluster("combined", gene, results_json=config.PAPER_RESULTS_JSON)
+            dataset_name = config.canonical_dataset_name(gene, "combined", results_json=config.PAPER_RESULTS_JSON)
+            analysis = cockpit.build_gene_set_analysis(ms, gene.lower(), config.PAPER_RESULTS_JSON,
+                                                       dataset_name=dataset_name, gene_set="combined")
+            eval_mask, labels = report._eval_labels(ms, analysis.p_idx, analysis.b_idx, gene_set="combined")
+            functional = uv_sources.load_combined_uv_points(gene, ms)
+            predictor = uv_sources.load_predictor_mv_uv_points(gene, ms)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{gene}] combined single-predictor comparison skipped: {e}")
+            continue
+        if functional is None or predictor is None:
+            continue
+        func = np.nan_to_num(uv_agg.aggregate_nonconflicting(functional[1]), nan=0.0)
+        names, mat = predictor
+        series = [(n.split("_")[0], mat[i]) for i, n in enumerate(names)]
+        series.append(("aggregate", uv_agg.aggregate_nonconflicting(mat)))
+        for pred, pts in series:
+            total = func + np.nan_to_num(np.asarray(pts, float), nan=0.0)
+            r = [x for x in report._rows_for_points("chen", total[eval_mask], labels)
+                 if x["threshold"] == EVIDENCE_DIRECTION][0]
+            rows.append({"gene": gene, "source": "chen", "predictor": pred, **r})
+    out = pd.DataFrame(rows)
+    path = Path(config.PAPER_COMBINED_DIR) / "combined_single_predictor_comparison.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(path, index=False)
+    if not out.empty:
+        print(out.pivot_table(index="gene", columns="predictor", values="mcc").round(3).to_string())
+    print(f"wrote {path}")
+    return out
+
+
+PKNN_PANEL_DIRS = {"functional": config.PAPER_FUNCTIONAL_DIR, "predictor": config.PAPER_PREDICTOR_DIR,
+                   "combined": config.PAPER_COMBINED_DIR}
+PKNN_METHODS = {  # setting file -> method label in the comparison tables
+    "main": "P-KNN LOO",
+    "gnomadreg": "P-KNN LOO (gnomAD regularization)",
+    "N5": "P-KNN LOO (N=5)",
+    "N25": "P-KNN LOO (N=25)",
+    "N50": "P-KNN LOO (N=50)",
+    "genomewide": "P-KNN genome-wide",
+}
+def run_pknn_analyses(workers=4, inner=8):
+    """Compute every P-KNN result the comparison uses (prep, leave-one-out
+    settings, genome-wide predictors, score concordance, VUS); finished
+    outputs are skipped. CPU-heavy on first run (hours)."""
+    from mv_analysis.comparison_methods import pknn_runs
+    pknn_runs.run_all(workers=workers, inner=inner)
+
+
+def run_production_oob_evaluation(workers=12, inner=2):
+    """Out-of-bag evaluation under production scoring on the paper's own
+    bootstrap splits, for MV, P-KNN and supervised classifiers
+    (mv_analysis/production_oob.py). Writes production_oob_comparison.csv:
+    one row per dataset and method, evidence-direction metrics on the
+    paper's evaluation rows; variants never out of bag are excluded for all
+    methods."""
+    from mv_analysis import production_oob
+    from mv_analysis.comparison_methods import supervised
+    import json
+    root = production_oob.run_all(workers=workers, inner=inner)
+    rows = []
+    for f in sorted(root.glob("*.csv")):
+        o = pd.read_csv(f)
+        meta = json.load(open(Path(config.PKNN_DIR) / "prep" / f"{f.stem}.json"))
+        never = int((o["n_oob"] == 0).sum())
+        o = o[o["n_oob"] > 0]
+        for method in ["mv_insample", "MV", "P-KNN", *supervised.MODELS]:
+            if method not in o.columns:
+                continue
+            pts = o[method].to_numpy(float)
+            r = [x for x in report._rows_for_points(method, np.nan_to_num(pts, nan=0.0), o["label"].to_numpy(int))
+                 if x["threshold"] == EVIDENCE_DIRECTION][0]
+            rows.append({"key": f.stem, "panel": meta["panel"], "gene_set": meta["gene_set"], "gene": meta["gene"],
+                         "n_never_oob": never, "n_unscored": int(np.isnan(pts).sum()),
+                         "min_oob_splits": int(o["n_oob"].min()), "det_rate": r["determinate"] / r["total"], **r})
+    out = pd.DataFrame(rows)
+    out_dir = Path(config.PAPER_PRODUCTION_OOB_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_dir / "production_oob_comparison.csv", index=False)
+    if not out.empty:
+        both = out[(out["n_pathogenic"] > 0) & (out["n_benign"] > 0)]
+        print(both.pivot_table(index="panel", columns="method", values="mcc", aggfunc="median").round(3).to_string())
+    print(f"wrote {out_dir / 'production_oob_comparison.csv'}")
+    return out
+
+
+def run_pknn_comparison():
+    """P-KNN (Lin & Brandes 2026) beside MV and the independent baseline on
+    every per-gene evaluation (comparison_methods/pknn_runs.py writes the
+    out-of-sample points to config.PKNN_DIR; run_pknn_analyses runs it). Writes, without touching the existing tables:
+      {panel}/{panel}_pknn_comparison.csv  one row per gene and P-KNN setting
+          (results-table schema, evidence-direction threshold)
+      pknn/pknn_per_gene.csv  MV (in-sample), UV, every P-KNN setting, and MV
+          vs P-KNN out of bag on the paper's bootstrap splits, per gene
+      pknn/pknn_vus.csv  VUS evidence split, P-KNN vs MV
+    P-KNN points use ExCALIBR's LR base at the gene prior (points column);
+    points_pknn_logbase (P-KNN's own base) is summarized as a sensitivity."""
+    import json
+    root = Path(config.PKNN_DIR)
+    out_dir = Path(config.PAPER_PKNN_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metas = {p.stem: json.load(open(p)) for p in sorted((root / "prep").glob("*.json"))}
+    rows = []
+    for key, m in metas.items():
+        for setting, method in PKNN_METHODS.items():
+            f = root / key / f"{setting}.csv"
+            if not f.exists():
+                continue
+            d = pd.read_csv(f)
+            d = d[d["query"]]
+            for col, tag in (("points", ""), ("points_pknn_logbase", " [P-KNN LR base]")):
+                if col not in d.columns:
+                    continue
+                # P-KNN returns no score (NaN) when too many of its bootstraps
+                # resample no P/LP variant (mutual-information weights 0/0):
+                # scored as no evidence, and counted
+                pts = d[col].to_numpy(float)
+                r = [x for x in report._rows_for_points(method + tag, np.nan_to_num(pts, nan=0.0),
+                                                        d["label"].to_numpy(int))
+                     if x["threshold"] == EVIDENCE_DIRECTION][0]
+                rows.append({"panel": m["panel"], "gene_set": m["gene_set"], "gene": m["gene"], "key": key,
+                             "setting": setting, "prior": m["prior"], "fold_scheme": d["fold_scheme"].iloc[0],
+                             "n_unscored": int(np.isnan(pts).sum()), **r})
+    pk = pd.DataFrame(rows)
+    if pk.empty:
+        print("no P-KNN outputs under", root)
+        return pk
+    for panel, pdir in PKNN_PANEL_DIRS.items():
+        sub = pk[pk["panel"] == panel]
+        if not sub.empty:
+            sub.to_csv(Path(pdir) / f"{panel}_pknn_comparison.csv", index=False)
+
+    # one row per gene: MV / UV from the paper tables, P-KNN settings, MV OOB
+    sys.path.insert(0, str(_ROOT / "mv_analysis" / "figures" / "scripts"))
+    import make_panel_performance as mpp
+    per = []
+    for panel in PKNN_PANEL_DIRS:
+        d = mpp.per_gene(Path(config.PAPER_FIGURES_DIR) / mpp.PANELS[panel][0])
+        d = d.assign(panel=panel)
+        per.append(d)
+    per = pd.concat(per, ignore_index=True)
+    gs_of = {(m["panel"], m["gene"]): k for k, m in metas.items()}
+    per["key"] = [gs_of.get((p, g)) for p, g in zip(per["panel"], per["gene"])]
+    main_pk = pk[~pk["method"].str.endswith("]")]
+    wide = main_pk.pivot_table(index="key", columns="setting", values=["mcc", "determinate", "total"], aggfunc="first")
+    wide.columns = [f"pknn_{s}_{v}" for v, s in wide.columns]
+    for s in PKNN_METHODS:
+        if f"pknn_{s}_determinate" in wide.columns:
+            wide[f"pknn_{s}_det"] = wide[f"pknn_{s}_determinate"] / wide[f"pknn_{s}_total"]
+    per = per.merge(wide, left_on="key", right_index=True, how="left")
+    # matched out-of-bag comparison under production scoring (section
+    # "production-oob", run_production_oob_evaluation)
+    oob_f = Path(config.PAPER_PRODUCTION_OOB_DIR) / "production_oob_comparison.csv"
+    if oob_f.exists():
+        o = pd.read_csv(oob_f)
+        o = o[o["method"].isin(["MV", "P-KNN"])]
+        w = o.pivot_table(index="key", columns="method", values=["mcc", "det_rate"], aggfunc="first")
+        w.columns = [f"{'mv' if m == 'MV' else 'pknn'}_oob_{'det' if v == 'det_rate' else 'mcc'}" for v, m in w.columns]
+        per = per.merge(w, left_on="key", right_index=True, how="left")
+    per.to_csv(out_dir / "pknn_per_gene.csv", index=False)
+
+    vus_f = root / "vus" / "pknn_vus_points.csv"
+    if vus_f.exists():
+        v = pd.read_csv(vus_f)
+        rows = []
+        for panel, setting in (("functional", "main"), ("predictor", "genomewide"), ("predictor", "main"),
+                               ("combined", "main")):
+            mv_f = Path(config.PAPER_VUS_RECLASSIFICATION_DIR) / f"{panel}_true_clinvar_vus_points.csv"
+            gs = {"functional": ("labelseq", "integrated"), "predictor": ("predictor-mv",),
+                  "combined": ("combined",)}[panel]
+            sub = v[v["gene_set"].isin(gs) & (v["setting"] == setting)]
+            if sub.empty or not mv_f.exists():
+                continue
+            mv = pd.read_csv(mv_f)
+            mv["variant_key"] = mv["variant_key"].astype(str)
+            both = sub.merge(mv[["gene", "variant_key", "our_points"]], on=["gene", "variant_key"], how="inner")
+            pk_name = {"main": "P-KNN per gene", "genomewide": "P-KNN genome-wide"}[setting]
+            for method, col in (("MV", "our_points"), (pk_name, "pknn_points")):
+                if method == "MV" and any(r["panel"] == panel and r["method"] == "MV" for r in rows):
+                    continue
+                x = both[col]
+                rows.append(dict(panel=panel, method=method, n_vus=len(x), n_genes=both["gene"].nunique(),
+                                 pathogenic=int((x >= 1).sum()), benign=int((x <= -1).sum()),
+                                 indeterminate=int(((x > -1) & (x < 1)).sum())))
+        pd.DataFrame(rows).to_csv(out_dir / "pknn_vus.csv", index=False)
+    show = per[["panel", "gene", "mv_mcc", "uv_mcc"] + [c for c in ("mv_oob_mcc", "pknn_oob_mcc", "pknn_main_mcc",
+                                                                     "pknn_genomewide_mcc")
+                                                       if c in per.columns]]
+    print(show.round(3).to_string(index=False))
+    print(f"wrote {out_dir}")
+    return per
 
 
 def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
@@ -735,6 +982,7 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
                 source=f"{p.name}: conflicting / all population variants (same denominator as pct_conflict)")
         top = d.sort_values("pct_conflict", ascending=False).iloc[0]
         REG.num(f"ResConflict{cap}MaxPct", float(top["pct_conflict"]), fmt=".1f", source=p.name)
+        REG.num(f"ResConflict{cap}Genes", len(d), source=f"{p.name}: genes in this conflict-rate row")
         REG.text(f"ResConflict{cap}MaxGene", f"\\textit{{{top['gene']}}}", source=p.name)
     for label, fname in (("Functional", "functional_correlation_table.csv"),
                          ("Predictor", "predictor_correlation_table.csv"),
@@ -763,6 +1011,152 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
             REG.num(f"ResMedianRhoCrossEv{short}", float(sub["rho_strength"].abs().median()), fmt=".2f",
                     source=f"{ev.name}: median |Spearman| of aggregated functional vs predictor points")
             REG.num(f"ResCorrGenesCrossEv{short}", sub["gene"].nunique(), source=ev.name)
+
+    # Dependence of independently calibrated evidence POINTS given the true
+    # class (correlation_analysis.evidence_point_dependence and its summaries).
+    cats = {"functional-functional": "Func", "predictor-predictor": "Pred",
+            "functional-predictor": "Cross", "functional-predictor (aggregated)": "CrossAgg"}
+    classes = {"P/LP": "PLP", "B/LB": "BLB", "gnomAD": "GnomAD"}
+    pts = cdir / "evidence_point_dependence_table.csv"
+    if REG.require(pts, "evidence-point dependence table"):
+        d = pd.read_csv(pts)
+        for (cat, cls), sub in d.dropna(subset=["rho_points"]).groupby(["category", "class"]):
+            if cat not in cats or cls not in classes:
+                continue
+            tag = f"{cats[cat]}{classes[cls]}"
+            REG.num(f"ResPtsRho{tag}", float(sub["rho_points"].median()), fmt=".2f",
+                    source=f"{pts.name}: median Spearman of evidence points, {cat}, {cls}")
+            REG.num(f"ResPtsPairs{tag}", len(sub), source=pts.name)
+            REG.num(f"ResPtsGenes{tag}", sub["gene"].nunique(), source=pts.name)
+    err = cdir / "evidence_error_dependence_summary.csv"
+    if REG.require(err, "evidence error co-occurrence summary"):
+        d = pd.read_csv(err)
+        for r in d.to_dict("records"):
+            if r["category"] not in cats or r["class"] not in classes:
+                continue
+            tag = f"{cats[r['category']]}{classes[r['class']]}"
+            REG.num(f"ResErrGenes{tag}", int(r["genes"]), source=f"{err.name}: genes in the error analysis")
+            REG.num(f"ResErrGivenErr{tag}", 100 * r["p_err2_given_err1"], fmt=".1f",
+                    source=f"{err.name}: % wrong-direction evidence from one source when the other is wrong")
+            REG.num(f"ResErrGivenOk{tag}", 100 * r["p_err2_given_not_err1"], fmt=".1f",
+                    source=f"{err.name}: % wrong-direction evidence from one source when the other is not")
+            if pd.notna(r.get("mh_or", np.nan)):
+                REG.num(f"ResErrMHOR{tag}", float(r["mh_or"]), fmt=".1f", source=f"{err.name}: Mantel-Haenszel OR")
+                REG.text(f"ResErrMHP{tag}", f"{r['mh_p']:.1g}" if r["mh_p"] >= 1e-3 else "$<$0.001",
+                         source=f"{err.name}: Mantel-Haenszel test of OR = 1")
+    chk = cdir / "evidence_summing_check.csv"
+    if REG.require(chk, "evidence summing check"):
+        d = pd.read_csv(chk)
+        for r in d.itertuples():
+            if r.category not in cats:
+                continue
+            tag = f"{cats[r.category]}{r.direction.capitalize()}"
+            for col, name in (("implied_lr_both", "Implied"), ("observed_lr_both", "Observed"),
+                              ("observed_over_implied", "Ratio")):
+                v = getattr(r, col)
+                if np.isfinite(v):
+                    fmt = ".2f" if name == "Ratio" else (".0f" if v >= 10 else ".2g")
+                    REG.num(f"ResSumLR{name}{tag}", float(v), fmt=fmt,
+                            source=f"{chk.name}: {col}, pooled over genes and source pairs")
+
+    # Independent predictor calibration: ExCALIBR vs Chen et al. (baseline).
+    pb = Path(config.PAPER_PREDICTOR_DIR) / "predictor_baseline_comparison.csv"
+    if REG.require(pb, "predictor baseline comparison"):
+        d = pd.read_csv(pb)
+        both = d[(d["n_pathogenic"] > 0) & (d["n_benign"] > 0)]
+        for src, short in (("excalibr", "Excalibr"), ("chen", "Chen")):
+            for pred, pshort in (("aggregate", ""), ("REVEL", "REVEL"), ("AM", "AM"), ("MP2", "MP")):
+                sub = both[(both["source"] == src) & (both["predictor"] == pred)]
+                if sub.empty:
+                    continue
+                REG.num(f"ResPredBase{pshort}MedMCC{short}", float(sub["mcc"].median()), fmt=".2f",
+                        source=f"{pb.name}: median per-gene MCC, {src}, {pred}")
+                s = d[(d["source"] == src) & (d["predictor"] == pred)][["determinate", "total"]].sum()
+                REG.pct(f"ResPredBase{pshort}DetRate{short}", int(s["determinate"]), int(s["total"]),
+                        source=f"{pb.name}: pooled determinate rate, {src}, {pred}")
+        agg = both[both["predictor"] == "aggregate"].pivot_table(index="gene", columns="source", values="mcc")
+        if {"excalibr", "chen"} <= set(agg.columns):
+            agg = agg.dropna()
+            REG.num("ResPredBaseGenes", len(agg), source=f"{pb.name}: genes with both classes")
+            REG.num("ResPredBaseChenBetter", int((agg["chen"] > agg["excalibr"] + 1e-9).sum()), source=pb.name)
+            REG.num("ResPredBaseChenWorse", int((agg["chen"] < agg["excalibr"] - 1e-9).sum()), source=pb.name)
+
+    # Joint calibration against baselines built from each predictor alone
+    # (Figures 4C and 5C), counted on the same genes the figures plot.
+    sys.path.insert(0, str(_ROOT / "mv_analysis" / "figures" / "scripts"))
+    import make_panel_performance as mpp_single
+    for panel, ptag in (("predictor", "Pred"), ("combined", "Comb")):
+        src = Path(config.PAPER_FIGURES_DIR) / mpp_single.SINGLE_PREDICTOR_PANELS[panel][0]
+        if not REG.require(src, f"{panel} single-predictor comparison"):
+            continue
+        d = mpp_single.per_gene(Path(config.PAPER_FIGURES_DIR) / mpp_single.PANELS[panel][0])
+        s = mpp_single.single_predictor_mcc(d, panel)
+        for key, short in (("REVEL", "REVEL"), ("AM", "AM"), ("MP2", "MP")):
+            diff = (s["mv_mcc"] - s[f"{key}_mcc"]).dropna()
+            for name, val in (("Better", (diff > 1e-9).sum()), ("Tied", (diff.abs() <= 1e-9).sum()),
+                              ("Worse", (diff < -1e-9).sum()), ("Genes", len(diff))):
+                REG.num(f"ResSingle{ptag}{short}{name}", int(val),
+                        source=f"{src.name}: joint vs {key}-only baseline, per-gene MCC")
+
+    # P-KNN (Lin & Brandes 2026) against joint calibration, both out of sample:
+    # genome-wide P-KNN (gene held out) for predictors (Figure 4D), and P-KNN
+    # calibrated per gene on the joint model's bootstrap splits (Extended
+    # Data); joint calibration out of bag on its own splits, production rule
+    pk_dir = Path(config.PAPER_PKNN_DIR)
+    pg = pk_dir / "pknn_per_gene.csv"
+    if REG.require(pg, "P-KNN per-gene comparison"):
+        d = pd.read_csv(pg)
+        d = d[d["both_classes"]]
+
+        def _pair(tag, x, a, b, det_a, det_b, what):
+            diff = x[a] - x[b]
+            REG.num(f"{tag}Genes", len(x), source=f"{pg.name}: {what}, genes with both classes")
+            REG.num(f"{tag}MedMCCMV", float(x[a].median()), fmt=".2f", source=f"{pg.name}: {a} median")
+            REG.num(f"{tag}MedMCC", float(x[b].median()), fmt=".2f", source=f"{pg.name}: {b} median")
+            REG.num(f"{tag}MedDetMV", 100 * float(x[det_a].median()), fmt=".1f", source=f"{pg.name}: {det_a} median (%)")
+            REG.num(f"{tag}MedDet", 100 * float(x[det_b].median()), fmt=".1f", source=f"{pg.name}: {det_b} median (%)")
+            REG.num(f"{tag}MVBetter", int((diff > 1e-9).sum()), source=f"{pg.name}: {a} > {b}")
+            REG.num(f"{tag}MVWorse", int((diff < -1e-9).sum()), source=f"{pg.name}: {a} < {b}")
+
+        # sensitivity of the per-gene comparison to P-KNN's settings: median
+        # per-gene MCC difference (joint as reported minus P-KNN leave-one-out)
+        meds = [float((x["mv_mcc"] - x[f"pknn_{st}_mcc"]).dropna().median())
+                for _, x in d.groupby("panel") for st in ("main", "N5", "N25", "N50", "gnomadreg")
+                if f"pknn_{st}_mcc" in x.columns and x[f"pknn_{st}_mcc"].notna().any()]
+        if meds:
+            REG.num("ResPKNNSensMin", min(meds), fmt=".2f", source=f"{pg.name}: smallest median MCC gap over settings")
+            REG.num("ResPKNNSensMax", max(meds), fmt=".2f", source=f"{pg.name}: largest median MCC gap over settings")
+        pred = d[d["panel"] == "predictor"].dropna(subset=["mv_oob_mcc", "pknn_genomewide_mcc"])
+        if not pred.empty:
+            _pair("ResPKNNPredGW", pred, "mv_oob_mcc", "pknn_genomewide_mcc", "mv_oob_det", "pknn_genomewide_det",
+                  "joint out of bag vs genome-wide P-KNN")
+        for panel, ptag in (("functional", "Func"), ("predictor", "Pred"), ("combined", "Comb")):
+            x = d[d["panel"] == panel].dropna(subset=["mv_oob_mcc", "pknn_oob_mcc"])
+            if not x.empty:
+                _pair(f"ResPKNN{ptag}OOB", x, "mv_oob_mcc", "pknn_oob_mcc", "mv_oob_det", "pknn_oob_det",
+                      f"{panel}: joint vs per-gene P-KNN, both out of bag")
+    oob_f = Path(config.PAPER_PRODUCTION_OOB_DIR) / "production_oob_comparison.csv"
+    if REG.require(oob_f, "production-scored out-of-bag evaluation"):
+        o = pd.read_csv(oob_f)
+        o = o[o["method"] == "MV"]
+        REG.num("ResOOBMinSplits", int(o["min_oob_splits"].min()), source=f"{oob_f.name}: fewest out-of-bag fits")
+        REG.num("ResOOBNeverMax", int(o["n_never_oob"].max()), source=f"{oob_f.name}: most never-out-of-bag variants")
+        n_oob = np.concatenate([pd.read_csv(f)["n_oob"].to_numpy() for f in
+                                sorted((Path(config.PKNN_DIR) / "production_oob").glob("*.csv"))])
+        n_oob = n_oob[n_oob > 0]
+        for name, q in (("ResOOBMedSplits", 50), ("ResOOBSplitsLo", 25), ("ResOOBSplitsHi", 75)):
+            REG.num(name, int(round(np.percentile(n_oob, q))), source="production_oob/*.csv: out-of-bag fits per variant")
+    pv = pk_dir / "pknn_vus.csv"
+    if REG.require(pv, "P-KNN VUS evidence"):
+        v = pd.read_csv(pv)
+        for panel, ptag, method in (("functional", "Func", "P-KNN per gene"), ("predictor", "Pred", "P-KNN genome-wide"),
+                                    ("combined", "Comb", "P-KNN per gene")):
+            r = v[(v["panel"] == panel) & (v["method"] == method)]
+            if r.empty:
+                continue
+            r = r.iloc[0]
+            REG.pct(f"ResPKNNVUS{ptag}PathPct", int(r["pathogenic"]), int(r["n_vus"]), source=f"{pv.name}: {method}")
+            REG.pct(f"ResPKNNVUS{ptag}BenPct", int(r["benign"]), int(r["n_vus"]), source=f"{pv.name}: {method}")
 
     # -- RET -------------------------------------------------------------------
     if ret_ev is not None:
@@ -853,6 +1247,7 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
     if pick is not None:
         _link_figure(pick, dest / "tp53_rpv_penetrance.png")
         _record_linked_figure(REG, "tp53_rpv_penetrance.png", pick)
+    _prune_unreferenced_figures(REG, dest)
 
     REG.write(config.MANUSCRIPT_FIGURE_DIR, old_values={}, highlight_changed=True,
               placeholder_unregistered=True, generator="mv_analysis/analyze_mv_pipeline_output.py")
@@ -866,6 +1261,24 @@ def _link_figure(src, link):
     if link.is_symlink() or link.exists():
         link.unlink()
     link.symlink_to(Path(src).resolve())
+
+
+def _prune_unreferenced_figures(REG, dest):
+    """Remove figure symlinks in the manuscript's generated folder that no .tex
+    file includes, so copying the manuscript folder (e.g. to Overleaf) carries
+    only the paper's own figures. Only symlinks are removed -- the pipeline's
+    outputs stay where they are -- and macros/tables are never touched."""
+    _, includes = REG._scan_tex()
+    used = {Path(rel).name for _, _, rel in includes}
+    used |= {n + ext for n in used for ext in (".pdf", ".png")}  # extensionless \includegraphics
+    removed = []
+    for f in Path(dest).iterdir():
+        if f.is_symlink() and f.name not in used:
+            f.unlink()
+            removed.append(f.name)
+    REG.figures = {k: v for k, v in REG.figures.items() if k not in removed}
+    if removed:
+        print(f"  Removed {len(removed)} figure link(s) the manuscript does not include: {', '.join(sorted(removed))}")
 
 
 def _record_linked_figure(REG, name, src):
@@ -883,7 +1296,7 @@ def _record_linked_figure(REG, name, src):
         REG._fail_soft("stale-figure", f"{name}: {src} is older than {config.PAPER_RESULTS_JSON}")
 
 
-TP53_CONFIG = "4c_unc"  # TP53 uses 4 components throughout (author decision, 2026-10-07)
+TP53_CONFIG = config.FIXED_MV_CONFIGS[("TP53", "tp53")]  # 4 components throughout (author decision, 2026-10-07)
 
 
 def _tp53_best_config():
@@ -946,7 +1359,8 @@ def main():
                      choices=["all", "aggregate", "scatter", "results-tables", "predictor-individual",
                               "confusion", "ret", "card11", "tp53", "vus-brnich",
                               "vus-points-by-panel", "per-gene-diagnostics", "summary",
-                              "cartoons", "correlation", "ret-phenotype", "figures", "manuscript"])
+                              "cartoons", "correlation", "ret-phenotype", "figures", "manuscript",
+                              "predictor-baselines", "pknn", "production-oob"])
     ap.add_argument("--path-percentile", type=float, default=RUN_KWARGS["path_percentile"],
                      help="Percentile of the bootstrap LR+ distribution a pathogenic call must clear "
                           "(ben_percentile derives as 100 - this, matching analysis.run()'s own "
@@ -1054,6 +1468,17 @@ def main():
     ret_ev = ret_counts = None
     if run_all or "ret-phenotype" in sections or "manuscript" in sections:
         ret_ev, ret_counts = run_ret_phenotype_specific_evidence(run_kwargs=run_kwargs)
+
+    if run_all or "predictor-baselines" in sections:
+        run_predictor_baseline_comparison()
+        run_combined_single_predictor_comparison()
+
+    if run_all or "production-oob" in sections:
+        run_production_oob_evaluation()
+
+    if run_all or "pknn" in sections:
+        run_pknn_analyses()
+        run_pknn_comparison()
 
     if run_all or "cartoons" in sections:
         run_cartoons()
