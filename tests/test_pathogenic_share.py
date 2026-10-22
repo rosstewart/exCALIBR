@@ -25,9 +25,17 @@ def _sa(counts):
     return np.array(rows)
 
 
-def _ms(counts, n_dims=2):
-    sa = _sa(counts)
-    return SimpleNamespace(sample_assignments=sa, scores=np.zeros((len(sa), n_dims)))
+STANDARD = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "population", "Synonymous"]
+
+
+def _ms(counts, names=None, n_dims=2):
+    """Like a MultiScoreset: empty sample columns are dropped from
+    sample_assignments and sample_names alike."""
+    names = names or (STANDARD + [f"phenotype {i}" for i in range(len(counts) - 4)])
+    keep = [i for i, n in enumerate(counts) if n > 0]
+    sa = _sa([counts[i] for i in keep])
+    return SimpleNamespace(sample_assignments=sa, sample_names=[names[i] for i in keep],
+                           scores=np.zeros((len(sa), n_dims)))
 
 
 def test_default_weights_unchanged():
@@ -57,7 +65,18 @@ def test_factor_rule_edge_cases():
     assert prepare.pathogenic_share_proportions(_ms([0, 50, 100, 40]), 0.1) == (None, 1.0)  # nothing to weight
     assert prepare.pathogenic_share_proportions(_ms([100, 50, 100, 40]), 0.1) == (None, 1.0)  # share already met
     p, f = prepare.pathogenic_share_proportions(_ms([2, 0, 300, 0]), 0.1)  # no B/LB or syn: weight vs gnomAD
-    assert np.isclose(f, 15.0) and np.isclose(p[0], 30.0)
+    assert np.isclose(f, 15.0) and np.isclose(p[0], 30.0) and len(p) == 2
+
+
+def test_roles_by_name_not_position():
+    # araf-like: no P/LP, so column 0 is B/LB and must not be upweighted
+    assert prepare.pathogenic_share_proportions(_ms([0, 6, 771, 525]), 0.1) == (None, 1.0)
+    # TP53-like: empty synonymous placeholder moves RPV to column 3
+    names = ["P/LP", "B/LB", "gnomAD", "Synonymous", "RPV"]
+    ms = _ms([271, 134, 487, 0, 22], names=names)
+    assert prepare.sample_roles(ms) == ["primary", "benign", "population", "pathogenic"]
+    p, f = prepare.pathogenic_share_proportions(ms, 0.2)
+    assert np.isclose(f, 0.2 * (134 + 487) / (271 + 22)) or f == 1.0
 
 
 def test_merge_condition_order(tmp_path):

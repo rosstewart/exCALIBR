@@ -368,11 +368,26 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
     # SECOND, and for KCNH2 a 2-dim subset of 3 connected dims. Scoring the
     # current cluster_idx subset against such a fit trips the fit-vs-dataset
     # shape guard, so pick the candidate subset the fit actually used.
+    def _candidates(obs, clusters):
+        cands = []
+        if cluster_idx < len(clusters):
+            cands.append(list(clusters[cluster_idx]))
+        cands += [list(c) for c in clusters]
+        if obs.ndim == 2 and obs.shape[1] > 1:
+            cands.append(list(Fit._select_calibration_dims(obs, min_overlap_rows=min_overlap_rows)))
+            # the old largest-by-count component, from the pairwise-overlap graph
+            cands += sorted([list(c) for c in clusters], key=len, reverse=True)
+        cands.append(list(range(obs.shape[1])))
+        return cands
+
     fit_info = _stored_fit_dims(gene, gene_set, cluster_idx, results_json)
-    if fit_info is not None and fit_info[1] > obs.shape[1]:
+    if fit_info is not None and (fit_info[1] > obs.shape[1] or (
+            not fit_info[0] and not any(len(c) == fit_info[1] for c in _candidates(obs, clusters)))):
         # Fit trained before derived (composite) datasets were excluded
         # (common.DERIVED_DATASETS): rebuild with them so it can still be
         # scored until refit. Independent baselines still exclude them.
+        # Also when no current subset has the fit's dimension count (BRCA2:
+        # the paper fit's 4-dim Sahu_2023 cluster included the global score).
         from src.assay_calibration.multivariate_data.common import allow_derived_datasets
         legacy = None
         if rebuild is not None:
@@ -393,15 +408,7 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
                 if len(dims) < obs.shape[1]:
                     select_dims(ms, dims)
                 return ms
-        candidates = []
-        if cluster_idx < len(clusters):
-            candidates.append(list(clusters[cluster_idx]))
-        candidates += [list(c) for c in clusters]
-        if obs.ndim == 2 and obs.shape[1] > 1:
-            candidates.append(list(Fit._select_calibration_dims(obs, min_overlap_rows=min_overlap_rows)))
-            # the old largest-by-count component, from the pairwise-overlap graph
-            candidates += sorted([list(c) for c in clusters], key=len, reverse=True)
-        candidates.append(list(range(obs.shape[1])))
+        candidates = _candidates(obs, clusters)
         for dims in candidates:
             if len(dims) == fit_ndim:
                 if len(dims) < obs.shape[1]:

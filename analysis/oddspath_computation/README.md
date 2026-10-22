@@ -8,6 +8,12 @@ collaborators' method, porting
 `config.OP_EVIDENCE_CODES_CSV`, which feeds Fig. 5B, `\NumDatasetsBrnichNA`,
 Supplementary Data 3 and the D6 summary.
 
+The notebook and two of its inputs (`data/input/maves/CHEK2_Gebbia_2024.xlsx`
+and the curation sheet `data/input/maves/Supplementary_Data_3.xlsx`) come from
+the collaborators' repository, which is not part of this one. Clone it here
+first (results in `output/` were produced at commit `b240dea`):
+
+    git clone https://github.com/bbi-lab/igvf-scalable-vus-resolution analysis/oddspath_computation/igvf-scalable-vus-resolution
     python -m analysis.oddspath_computation.compute_oddspath [--tsv PATH] [--out-dir DIR]
 
 Run it again whenever `DATASET_TSV` changes. The build's `REG.require` flags

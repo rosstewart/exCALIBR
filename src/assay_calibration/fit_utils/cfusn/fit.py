@@ -11,6 +11,7 @@ from . import constraints
 from . import separation
 from . import categorical as _cat
 from . import weight_divergence as _wdiv
+from . import tied_population as _tied
 
 import numpy as np
 import logging
@@ -533,6 +534,24 @@ def single_fit(
         if dim_weights_per_dim is not None:
             raise ValueError("weight_divergence cannot be combined with experimental dim_weights")
         em_kwargs["weight_divergence"] = wdiv
+    # Tied population weights (EXPERIMENTAL, opt-in; see
+    # cfusn/tied_population.py): W[pop] = pi W[P/LP] + (1 - pi) W[benign],
+    # applied to the initial W too so the tracked objective is on the tied
+    # model from the first iteration. Absent (default): bit-identical.
+    tied = _tied.resolve_tied_population(kwargs.get("tied_population"), sample_indicators.shape[1])
+    if tied is not None:
+        if separation_active or wdiv is not None:
+            raise ValueError("tied_population cannot be combined with MV separation or weight_divergence")
+        em_kwargs["tied_population"] = tied
+        W = _tied.tie(W, tied, counts=sample_indicators.sum(axis=0))
+    if kwargs.get("gamma_noise_floor") is not None:
+        # Per-readout measurement-noise variances; no component's Gamma may
+        # fall below diag(these) (update_steps._floor_gamma_at_noise).
+        em_kwargs["gamma_noise_floor"] = np.asarray(kwargs["gamma_noise_floor"], dtype=float)
+    if kwargs.get("weight_neff", "weighted") != "weighted":
+        # Covariance-ridge observation count under sample weights
+        # (update_steps._component_n_eff).
+        em_kwargs["weight_neff"] = kwargs["weight_neff"]
     if kwargs.get("gaussian_components"):
         # EXPERIMENTAL, opt-in: per-component family. Listed components keep
         # Delta pinned at zero (plain Gaussians, exactly as force_gaussian does

@@ -195,6 +195,12 @@ def _summarize_clnsig(series):
 def prepare_variants(tsv: str) -> pd.DataFrame:
     """The notebook's variant table up to cell 20 (one row per MaveDB variant),
     for every dataset (no curation-sheet subsetting)."""
+    missing = [f for f in ("CHEK2_Gebbia_2024.xlsx", "Supplementary_Data_3.xlsx")
+               if not (INPUT_MAVES_DIR / f).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"{missing} not found under {INPUT_MAVES_DIR}; clone the collaborators' repository first:\n"
+            f"    git clone https://github.com/bbi-lab/igvf-scalable-vus-resolution {NOTEBOOK_REPO}")
     pp = pd.read_csv(tsv, sep="\t", low_memory=False)
     pp = flag_chek2(pp)
     pp = flag_splice(pp)

@@ -35,7 +35,7 @@ def _mcc(tp, tn, fp, fn):
 
 def mv_rows(run_dir, panel):
     path = Path(run_dir) / "figures" / PANELS[panel][0]
-    if not path.exists():
+    if not path.exists() or path.stat().st_size < 10:  # absent or empty (no fits for this panel)
         return None
     t = pd.read_csv(path)
     t = t[(t["threshold"] == EVIDENCE) & t["method"].str.startswith("MV")]

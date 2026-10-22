@@ -136,20 +136,23 @@ def pick_best_canonical_config(gene: str, gene_set: str, ms, results_json: str, 
     with fast_results_json(results_json):
         with gzip.open(results_json, "rt", encoding="utf-8") as f:
             raw = json.load(f)
-        configs = sorted(raw[dataset_name]["0"].keys())
+        configs = sorted(next(iter(raw[dataset_name].values())).keys())  # any bootstrap (partial runs may lack "0")
         table, _ = build_comparison_table(
             gene.lower(), gene_set, ms, results_json, dataset_name=dataset_name,
             modes=["trust_global"], compare_uv=False, **run_kwargs,
         )
         sub = table[table["threshold"] == threshold]
-        best_config, best_mcc = None, -1
+        # Same rule as config.select_canonical_mv_rows: highest MCC, ties broken
+        # by more determinate calls.
+        best_config, best_key = None, None
         for cfg in configs:
             row = sub[sub["config"] == cfg]
-            if row.empty:
+            if row.empty or row["mcc"].isna().all():
                 continue
-            mcc = row["mcc"].max()
-            if mcc is not None and mcc > best_mcc:
-                best_mcc, best_config = mcc, cfg
+            r = row.sort_values(["mcc", "determinate"], ascending=False).iloc[0]
+            key = (r["mcc"], r["determinate"])
+            if best_key is None or key > best_key:
+                best_key, best_config = key, cfg
         return best_config or configs[0]
 
 

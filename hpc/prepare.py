@@ -803,18 +803,66 @@ def _cluster_suffixed_label(dataset_label: str, cluster_idx: int) -> str:
     return f"{dataset_label[:pos]}_cluster{cluster_idx + 1}{dataset_label[pos:]}"
 
 
-PATHOGENIC_REFERENCE_COLS = (1, 2, 3)  # B/LB, population (gnomAD), synonymous
+def sample_roles(ms):
+    """Role of each column of ``ms.sample_assignments`` (empty samples are
+    dropped there, so positions shift: a gene with no P/LP starts at B/LB, and
+    TP53's empty synonymous placeholder moves RPV to column 3), from
+    ``ms.sample_names``, which is aligned with it. Roles: "primary" (P/LP, or a
+    phenotype sub-model's phenotype group), "pathogenic" (auxiliary pathogenic
+    samples: phenotype groups, TP53 RPV), "benign", "population", "synonymous".
+    """
+    roles = []
+    for name in ms.sample_names:
+        n = str(name).lower()
+        if "population" in n or "gnomad" in n:
+            roles.append("population")
+        elif "synonymous" in n:
+            roles.append("synonymous")
+        elif n == "b/lb" or "benign" in n:
+            roles.append("benign")
+        elif n in ("p/lp", "phenotype") or n.startswith("pathogenic"):
+            roles.append("primary")
+        else:
+            roles.append("pathogenic")
+    return roles
+
+
+def noise_floor_variances(ms, min_n=20):
+    """Per-readout measurement-noise variances for the covariance floor
+    (cfusn update_steps._floor_gamma_at_noise): the robust variance
+    (1.4826 * MAD)^2 of synonymous variants -- functionally wild-type, so
+    their spread is the assay's noise -- or of B/LB when fewer than ``min_n``
+    synonymous variants are observed on a readout. None if neither has
+    ``min_n`` on any readout; readouts without an estimate are NaN (no floor
+    on them)."""
+    sa = np.asarray(ms.sample_assignments).astype(bool)
+    X = np.asarray(ms.scores, dtype=float)
+    roles = sample_roles(ms)
+    out = []
+    for j in range(X.shape[1]):
+        var = None
+        for role in ("synonymous", "benign"):
+            cols = [i for i, r in enumerate(roles) if r == role]
+            if not cols:
+                continue
+            x = X[sa[:, cols].any(axis=1), j]
+            x = x[~np.isnan(x)]
+            if len(x) >= min_n:
+                var = float((1.4826 * np.median(np.abs(x - np.median(x)))) ** 2)
+                break
+        out.append(var if var else float("nan"))
+    return out if np.isfinite(out).any() else None
 
 
 def pathogenic_share_proportions(ms, tau):
     """sample_proportions for the pathogenic-share weighting, or None (unweighted).
 
-    Pathogenic samples are column 0 (P/LP) plus every sample column after the
-    four standard ones -- the gene set's auxiliary pathogenic samples (CARD11
-    BENTA/CADINS, TP53 RPV, RET phenotype groups). They are all scaled by one
-    factor f = max(1, tau * reference / pathogenic), where reference is the
-    total of whichever of B/LB, population and synonymous exist; nothing is
-    ever down-weighted. Counts are over variants with at least one observed
+    Pathogenic samples are P/LP plus the gene set's auxiliary pathogenic samples
+    (CARD11 BENTA/CADINS, TP53 RPV, RET phenotype groups), identified by name
+    (sample_roles). They are all scaled by one factor
+    f = max(1, tau * reference / pathogenic), where reference is the total of
+    whichever of B/LB, population and synonymous exist; nothing is ever
+    down-weighted. Counts are over variants with at least one observed
     dimension. Returns None when tau is 0/None, there are no pathogenic or no
     reference samples, or f == 1 (the dataset already meets the share), so
     those jobs are byte-identical to unweighted ones.
@@ -825,9 +873,11 @@ def pathogenic_share_proportions(ms, tau):
     X = np.asarray(ms.scores, dtype=float)
     observed = ~np.isnan(X).all(axis=1) if X.ndim == 2 else ~np.isnan(X)
     n = sa[observed].sum(axis=0).astype(float)
-    path_cols = [0] + list(range(4, len(n)))
+    roles = sample_roles(ms)
+    path_cols = [i for i, r in enumerate(roles) if r in ("primary", "pathogenic")]
+    ref_cols = [i for i, r in enumerate(roles) if r in ("benign", "population", "synonymous")]
     n_path = n[path_cols].sum()
-    n_ref = n[[c for c in PATHOGENIC_REFERENCE_COLS if c < len(n)]].sum()
+    n_ref = n[ref_cols].sum()
     if n_path == 0 or n_ref == 0:
         return None, 1.0
     f = max(1.0, tau * n_ref / n_path)
@@ -843,7 +893,8 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                                   min_overlap_rows=30, sample_balance_beta=None,
                                   sample_weight_transform=None,
                                   extra_cjob_fields=None, master_seed=DEFAULT_MASTER_SEED,
-                                  greedy_restarts=False, pathogenic_share=None):
+                                  greedy_restarts=False, pathogenic_share=None,
+                                  fit_options=None):
     """Shared bootstrap x component x constraint job-generation loop, backed
     by Fit.generate_fit_jobs. Used by every multivariate pipeline in this
     file: the integrated-dataframe multi-assay genes (BRCA1/PTEN/MSH2/
@@ -900,12 +951,24 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                 sample_weight_transform=sample_weight_transform,
                 extra_cjob_fields=cluster_extra_fields, master_seed=master_seed,
                 greedy_restarts=greedy_restarts, pathogenic_share=pathogenic_share,
+                fit_options=fit_options,
             ))
         return all_jobs
 
     proportions, path_factor = pathogenic_share_proportions(ms, pathogenic_share)
     if pathogenic_share:
         print(f"  {dataset_label}: pathogenic share {pathogenic_share:g} -> factor {path_factor:.2f}")
+    fit_options = fit_options or {}
+    tied_spec = None
+    if fit_options.get("tied_population"):
+        from src.assay_calibration.fit_utils.cfusn.tied_population import spec_from_roles
+        tied_spec = spec_from_roles(sample_roles(ms))
+        print(f"  {dataset_label}: tied population {tied_spec if tied_spec else 'not applicable (fit free)'}")
+    noise_floor = None
+    if fit_options.get("noise_floor"):
+        noise_floor = noise_floor_variances(ms)
+        print(f"  {dataset_label}: noise floor (SD; nan = no floor on that readout) "
+              f"{np.round(np.sqrt(noise_floor), 3).tolist() if noise_floor else 'not available (no floor)'}")
 
     constrained_flags = []
     if "con" in constraint_modes:
@@ -935,6 +998,12 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                 if proportions is not None:
                     fit_kwargs["sample_proportions"] = proportions
                     fit_kwargs["anchor_weight_scale"] = True
+                if fit_options.get("weight_neff", "weighted") != "weighted" and proportions is not None:
+                    fit_kwargs["weight_neff"] = fit_options["weight_neff"]
+                if tied_spec is not None:
+                    fit_kwargs["tied_population"] = tied_spec
+                if noise_floor is not None:
+                    fit_kwargs["gamma_noise_floor"] = noise_floor
                 if greedy_restarts:
                     fit_kwargs["greedy_restarts"] = True
                 elif NUM_FITS is not None:
@@ -970,6 +1039,9 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             "multivariate": True,
             "num_fits_total": sum(_count_eventual_fits(v) for v in jobs_by_key.values()),
         }
+        if (fit_options.get("tied_population") or fit_options.get("noise_floor")
+                or fit_options.get("weight_neff", "weighted") != "weighted"):
+            cjob["fit_options"] = dict(fit_options, tied_population_spec=tied_spec, noise_floor_var=noise_floor)
         if pathogenic_share:
             cjob["pathogenic_share"] = pathogenic_share
             cjob["pathogenic_factor"] = path_factor
@@ -985,7 +1057,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
                                 clinvar_release, component_range, constraint_modes,
                                 latent_q, init_strategy, population_type,
                                 master_seed=DEFAULT_MASTER_SEED, regularization_type=None,
-                                greedy_restarts=False, pathogenic_share=None):
+                                greedy_restarts=False, pathogenic_share=None, fit_options=None):
     from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
 
     gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
@@ -1012,7 +1084,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
         component_range, constraint_modes, latent_q, init_strategy,
         extra_cjob_fields={"assay_datasets": list(ms.dataset_names)},
         master_seed=master_seed, greedy_restarts=greedy_restarts,
-        pathogenic_share=pathogenic_share,
+        pathogenic_share=pathogenic_share, fit_options=fit_options,
     )
 
 
@@ -1321,6 +1393,7 @@ def _generate_jobs_for_gene_ms_map(gene_set, gene_ms_map, args):
             master_seed=args.seed,
             greedy_restarts=getattr(args, "greedy_restarts", False),
             pathogenic_share=getattr(args, "pathogenic_share_value", None),
+            fit_options=_fit_options(args),
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1433,6 +1506,7 @@ def _generate_integrated_jobs(df, gene_groups, args):
             regularization_type=getattr(args, "regularization_type", None),
             greedy_restarts=getattr(args, "greedy_restarts", False),
             pathogenic_share=getattr(args, "pathogenic_share_value", None),
+            fit_options=_fit_options(args),
         )
         for gene, datasets in gene_groups.items()
     )
@@ -1525,6 +1599,7 @@ def _generate_predictor_mv_jobs(by_gene, args):
             master_seed=args.seed,
             greedy_restarts=getattr(args, "greedy_restarts", False),
             pathogenic_share=getattr(args, "pathogenic_share_value", None),
+            fit_options=_fit_options(args),
         )
 
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
@@ -1648,6 +1723,28 @@ def _add_pathogenic_share_arg(p):
                         "<output-dir>/tau_<TAU>/, and all conditions are merged into one job "
                         "array in the order given (e.g. 0.1 0 0.2 puts every tau=0.1 job "
                         "first). TAU=0 is the unweighted fit.")
+    p.add_argument("--tied-population", action="store_true",
+                   help="Tie the population (gnomAD) sample's mixing weights to "
+                        "pi * W[P/LP] + (1 - pi) * W[B/LB + synonymous] during the fit "
+                        "(cfusn/tied_population.py: population containment). Datasets "
+                        "without P/LP, a benign reference or a population sample fit free.")
+    p.add_argument("--noise-floor", action="store_true",
+                   help="Floor every component's covariance at the per-readout measurement "
+                        "noise, estimated from synonymous (else B/LB) variants "
+                        "(noise_floor_variances), so small samples cannot form spikes.")
+    p.add_argument("--weight-neff", choices=["weighted", "kish"], default="weighted",
+                   help="Observation count behind each component's covariance ridge under "
+                        "--pathogenic-share: 'weighted' = weighted mass (upweighted samples "
+                        "count as extra observations); 'kish' = Kish effective sample size "
+                        "(upweighting moves components but adds no information). No effect "
+                        "on unweighted (TAU=0) jobs.")
+
+
+def _fit_options(args):
+    """--weight-neff / --tied-population as the fit_options dict job generation takes."""
+    return {"weight_neff": getattr(args, "weight_neff", "weighted"),
+            "tied_population": bool(getattr(args, "tied_population", False)),
+            "noise_floor": bool(getattr(args, "noise_floor", False))}
 
 
 def _merge_condition_manifests(output_root: str, condition_labels: list, target_array_size: int) -> None:

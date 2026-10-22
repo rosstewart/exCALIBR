@@ -1176,6 +1176,54 @@ def gamma_log_prior_total(component_params, observations, multivariate=True):
     return float(total)
 
 
+def _component_n_eff(z, sample_weights, kwargs):
+    """Observation count behind one component's Gamma ridge.
+
+    Default: the weighted mass sum(z * w). ``weight_neff="kish"``: the Kish
+    effective sample size (sum z w)^2 / sum z w^2, with responsibilities as
+    frequencies and sample weights as importance weights. Upweighting a sample
+    then moves the component but does not add information: a component of n
+    upweighted points keeps n_eff ~ n, so the ridge holds its covariance to what
+    n points support. Equals sum(z) when every weight is 1.
+    """
+    if sample_weights is None:
+        return float(z.sum())
+    zw = z * sample_weights
+    if kwargs.get("weight_neff", "weighted") == "kish":
+        denom = float((zw * sample_weights).sum())
+        return float(zw.sum()) ** 2 / denom if denom > 0 else 0.0
+    return float(zw.sum())
+
+
+def _floor_gamma_at_noise(Gamma, noise_var):
+    """Measurement-noise floor (opt-in, ``gamma_noise_floor``): no component
+    is narrower than the assay's noise, Gamma_FF >= diag(noise_var_F) on the
+    readouts F with a noise estimate (NaN entries: no floor on that readout),
+    so a few variants cannot form a spike the readouts cannot resolve. The F
+    block is clipped as generalized eigenvalues in the noise-whitened space,
+    D^{1/2} max(I, D^{-1/2} Gamma_FF D^{-1/2}) D^{1/2}, and the increase (PSD)
+    is added back to Gamma, so Gamma stays PSD. With every readout floored
+    this is the constrained maximiser of the covariance Q-term (affine to the
+    identity case _floor_gamma_eigenvalues documents). None: unchanged.
+    """
+    if noise_var is None:
+        return Gamma
+    nv = np.asarray(noise_var, dtype=float)
+    F = np.flatnonzero(np.isfinite(nv) & (nv > 0))
+    G = 0.5 * (np.asarray(Gamma, dtype=float) + np.asarray(Gamma, dtype=float).T)
+    if not len(F):
+        return G
+    d = np.sqrt(nv[F])
+    W = G[np.ix_(F, F)] / np.outer(d, d)
+    eig, vec = np.linalg.eigh(W)
+    if eig.min() >= 1.0:
+        return G
+    delta = (vec @ np.diag(np.maximum(eig, 1.0) - eig) @ vec.T) * np.outer(d, d)
+    out = G.copy()
+    out[np.ix_(F, F)] += delta
+    return out
+
+
 def _regularize_gamma_candidate(Gamma_new, n_eff, observations):
     """Dispatch to whichever Gamma regularisation is enabled."""
     if USE_GAMMA_RIDGE:
@@ -1843,8 +1891,14 @@ def get_sample_weights(
 def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
                                current_weights, multivariate=False,
                                return_log_pdfs=False, sample_weights=None,
-                               extra_log_pdfs=None, weight_divergence=None):
+                               extra_log_pdfs=None, weight_divergence=None,
+                               tied_population=None):
     """Compute updated weights AND normalised log-likelihood in a single density pass.
+
+    ``tied_population``: optional resolved spec (cfusn/tied_population.py,
+    EXPERIMENTAL). When given, the W step ties the population row to
+    pi * W[P/LP] + (1 - pi) * W[benign] (an MM step on the same minoriser, so
+    EM stays monotone); None (default) leaves this function bit-identical.
 
     ``weight_divergence``: optional resolved {"lambda", "pairs"} spec
     (cfusn/weight_divergence.py, EXPERIMENTAL). When given, the closed-form
@@ -1877,7 +1931,8 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
     S, Kc  = current_weights.shape
     N      = observations.shape[0]
     upd_w  = np.zeros_like(current_weights)
-    nbar   = np.zeros_like(current_weights) if weight_divergence is not None else None
+    nbar   = (np.zeros_like(current_weights)
+              if weight_divergence is not None or tied_population is not None else None)
     sw_all = None if sample_weights is None else np.asarray(sample_weights)
     cache  = [None] * S                              # cache (Kc, N_s) log_pdfs
     full   = [None] * S                              # cache + extra (what W/LL use)
@@ -1930,7 +1985,10 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
             nbar[i] = (P.sum(1) if sw_all is None
                        else P @ sw_all[mask])        # sw-weighted expected counts
 
-    if nbar is not None:
+    if tied_population is not None:
+        from .tied_population import tied_weight_update
+        upd_w = tied_weight_update(nbar, current_weights, tied_population)
+    elif nbar is not None:
         from .weight_divergence import penalized_weight_update
         upd_w = penalized_weight_update(nbar, current_weights, weight_divergence["pairs"],
                                         float(weight_divergence["lambda"]) * N)
@@ -2292,6 +2350,7 @@ def em_iteration(observations, sample_indicators, current_component_params,
     """
     cat_state = kwargs.pop("cat_state", None)
     weight_divergence = kwargs.pop("weight_divergence", None)
+    tied_population = kwargs.pop("tied_population", None)
     mv = multivariate
     constraint_mode = kwargs.get("constraint_mode", separation.DEFAULT_CONSTRAINT_MODE)
 
@@ -2399,6 +2458,7 @@ def em_iteration(observations, sample_indicators, current_component_params,
             observations, sample_indicators, updated_params, current_weights,
             multivariate=mv, return_log_pdfs=True, sample_weights=sw,
             extra_log_pdfs=new_extra, weight_divergence=weight_divergence,
+            tied_population=tied_population,
         )
         if cat_state is not None:
             return updated_params, updated_weights, ll, new_log_pdfs, new_probs
@@ -2407,7 +2467,7 @@ def em_iteration(observations, sample_indicators, current_component_params,
     updated_weights, ll = get_sample_weights_and_ll(
         observations, sample_indicators, updated_params, current_weights,
         multivariate=mv, sample_weights=sw, extra_log_pdfs=new_extra,
-        weight_divergence=weight_divergence,
+        weight_divergence=weight_divergence, tied_population=tied_population,
     )
     if cat_state is not None:
         return updated_params, updated_weights, ll, new_probs
@@ -2528,8 +2588,9 @@ def _em_update_multivariate(
         )
 
         # Same covariance-collapse regularisation as the CFUSN path.
-        _n_eff = float((z if sample_weights is None else z * sample_weights).sum())
+        _n_eff = _component_n_eff(z, sample_weights, kwargs)
         Gamma_cand = _regularize_gamma_candidate(Gamma_cand, _n_eff, observations)
+        Gamma_cand = _floor_gamma_at_noise(Gamma_cand, kwargs.get("gamma_noise_floor"))
 
         if stabilize:
             Gamma_cand = separation.regularize_gamma(Gamma_cand, xlims, **kwargs)
@@ -2683,8 +2744,9 @@ def _em_update_cfusn(
         # below is gated behind `stabilize`, and _psd_floor_or_reject only
         # rescues an already non-PSD matrix, so unconstrained fits -- this
         # pipeline's default -- previously had no covariance floor at all.
-        _n_eff = float((z if sample_weights is None else z * sample_weights).sum())
+        _n_eff = _component_n_eff(z, sample_weights, kwargs)
         Gamma_cand = _regularize_gamma_candidate(Gamma_cand, _n_eff, observations)
+        Gamma_cand = _floor_gamma_at_noise(Gamma_cand, kwargs.get("gamma_noise_floor"))
 
         # Covariance ridge: floor the scale so a sharpened component can't
         # collapse to a near-degenerate spike.

@@ -674,7 +674,6 @@ PKNN_METHODS = {  # setting file -> method label in the comparison tables
     "gnomadreg": "P-KNN LOO (gnomAD regularization)",
     "N5": "P-KNN LOO (N=5)",
     "N25": "P-KNN LOO (N=25)",
-    "N50": "P-KNN LOO (N=50)",
     "genomewide": "P-KNN genome-wide",
 }
 def run_pknn_analyses(workers=4, inner=8):
@@ -731,6 +730,8 @@ def run_pknn_comparison():
       pknn/pknn_per_gene.csv  MV (in-sample), UV, every P-KNN setting, and MV
           vs P-KNN out of bag on the paper's bootstrap splits, per gene
       pknn/pknn_vus.csv  VUS evidence split, P-KNN vs MV
+      pknn/pknn_genomewide_controls.csv  genome-wide P-KNN vs MV out of bag:
+          pathogenic evidence on B/LB, P/LP and VUS, per predictor gene
     P-KNN points use ExCALIBR's LR base at the gene prior (points column);
     points_pknn_logbase (P-KNN's own base) is summarized as a sensitivity."""
     import json
@@ -821,6 +822,37 @@ def run_pknn_comparison():
                                  pathogenic=int((x >= 1).sum()), benign=int((x <= -1).sum()),
                                  indeterminate=int(((x > -1) & (x < 1)).sum())))
         pd.DataFrame(rows).to_csv(out_dir / "pknn_vus.csv", index=False)
+
+    # genome-wide P-KNN per predictor gene: pathogenic evidence on B/LB and P/LP
+    # controls (gene held out) beside joint calibration out of bag, and on VUS
+    vus_gw = pd.DataFrame()
+    mv_vus_f = Path(config.PAPER_VUS_RECLASSIFICATION_DIR) / "predictor_true_clinvar_vus_points.csv"
+    if vus_f.exists() and mv_vus_f.exists():
+        v = pd.read_csv(vus_f)
+        v = v[(v["gene_set"] == "predictor-mv") & (v["setting"] == "genomewide")]
+        mv = pd.read_csv(mv_vus_f)
+        mv["variant_key"] = mv["variant_key"].astype(str)
+        vus_gw = v.merge(mv[["gene", "variant_key", "our_points"]], on=["gene", "variant_key"], how="inner")
+        vus_gw["gene"] = vus_gw["gene"].astype(str).str.upper()
+    gw_rows = []
+    for key, m in metas.items():
+        gf, of = root / key / "genomewide.csv", root / "production_oob" / f"{key}.csv"
+        if not (gf.exists() and of.exists()):
+            continue
+        c = pd.read_csv(gf).merge(pd.read_csv(of)[["variant", "MV"]], on="variant")
+        r = {"gene": m["gene"], "key": key}
+        for lab, tag in ((0, "blb"), (1, "plp")):
+            x = c[c["label"] == lab]
+            r[f"n_{tag}"] = len(x)
+            r[f"{tag}_path_pknn_gw"] = int((np.nan_to_num(x["points"].to_numpy(float)) >= 1).sum())
+            r[f"{tag}_path_mv_oob"] = int((x["MV"] >= 1).sum())
+        x = vus_gw[vus_gw["gene"] == str(m["gene"]).upper()] if len(vus_gw) else vus_gw
+        r["n_vus"] = len(x)
+        r["vus_path_pknn_gw"] = int((x["pknn_points"] >= 1).sum()) if len(x) else 0
+        r["vus_path_mv"] = int((x["our_points"] >= 1).sum()) if len(x) else 0
+        gw_rows.append(r)
+    if gw_rows:
+        pd.DataFrame(gw_rows).to_csv(out_dir / "pknn_genomewide_controls.csv", index=False)
     show = per[["panel", "gene", "mv_mcc", "uv_mcc"] + [c for c in ("mv_oob_mcc", "pknn_oob_mcc", "pknn_main_mcc",
                                                                      "pknn_genomewide_mcc")
                                                        if c in per.columns]]
@@ -1119,9 +1151,10 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
             REG.num(f"{tag}MVWorse", int((diff < -1e-9).sum()), source=f"{pg.name}: {a} < {b}")
 
         # sensitivity of the per-gene comparison to P-KNN's settings: median
-        # per-gene MCC difference (joint as reported minus P-KNN leave-one-out)
-        meds = [float((x["mv_mcc"] - x[f"pknn_{st}_mcc"]).dropna().median())
-                for _, x in d.groupby("panel") for st in ("main", "N5", "N25", "N50", "gnomadreg")
+        # per-gene MCC difference (joint out of bag minus P-KNN leave-one-out);
+        # N_cal 50 is not run, as it reaches the size of the smaller genes
+        meds = [float((x["mv_oob_mcc"] - x[f"pknn_{st}_mcc"]).dropna().median())
+                for _, x in d.groupby("panel") for st in ("main", "N5", "N25", "gnomadreg")
                 if f"pknn_{st}_mcc" in x.columns and x[f"pknn_{st}_mcc"].notna().any()]
         if meds:
             REG.num("ResPKNNSensMin", min(meds), fmt=".2f", source=f"{pg.name}: smallest median MCC gap over settings")
@@ -1157,6 +1190,18 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
             r = r.iloc[0]
             REG.pct(f"ResPKNNVUS{ptag}PathPct", int(r["pathogenic"]), int(r["n_vus"]), source=f"{pv.name}: {method}")
             REG.pct(f"ResPKNNVUS{ptag}BenPct", int(r["benign"]), int(r["n_vus"]), source=f"{pv.name}: {method}")
+    gc = pk_dir / "pknn_genomewide_controls.csv"
+    if REG.require(gc, "genome-wide P-KNN evidence on controls and VUS"):
+        g = pd.read_csv(gc)
+        g["blb_rate"] = g["blb_path_pknn_gw"] / g["n_blb"]
+        g = g.sort_values("blb_rate", ascending=False)
+        for (_, r), tag in zip(g.head(2).iterrows(), ("One", "Two")):
+            REG.text(f"ResPKNNGWBLBGene{tag}", f"\\textit{{{r['gene']}}}", source=f"{gc.name}: B/LB given pathogenic evidence, rank {tag}")
+            REG.pct(f"ResPKNNGWBLBPct{tag}", int(r["blb_path_pknn_gw"]), int(r["n_blb"]), source=f"{gc.name}: {r['gene']}")
+        REG.num("ResPKNNGWBLBMVMaxPct", 100 * float((g["blb_path_mv_oob"] / g["n_blb"]).max()), fmt=".1f",
+                source=f"{gc.name}: joint out of bag, largest per-gene B/LB pathogenic rate (%)")
+        REG.pct("ResPKNNGWVUSTopTwoShare", int(g.head(2)["vus_path_pknn_gw"].sum()), int(g["vus_path_pknn_gw"].sum()),
+                source=f"{gc.name}: share of genome-wide P-KNN pathogenic VUS in the two genes above")
 
     # -- RET -------------------------------------------------------------------
     if ret_ev is not None:
@@ -1230,6 +1275,45 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
     tdir.mkdir(parents=True, exist_ok=True)
     (tdir / "mv_gene_performance.tex").write_text(body)
     REG.output(tdir / "mv_gene_performance.tex", "A", "Extended Data per-gene performance table")
+
+    # -- Extended Data: out-of-bag comparison with supervised classifiers --------
+    # on the genes every method can be evaluated on (classifiers need at least
+    # five training controls of each class)
+    if oob_f.exists():
+        o = pd.read_csv(oob_f)
+        names = {"MV": "Joint calibration", "P-KNN": "P-KNN (per gene)",
+                 "B-LR": "Logistic regression", "B-LR-nomiss": "Logistic regression, no missingness indicators",
+                 "B-spline": "Spline logistic regression", "B-GB": "Gradient-boosted trees",
+                 "B-GB-cal": "Gradient-boosted trees, recalibrated"}
+        classifiers = ["B-LR", "B-LR-nomiss", "B-spline", "B-GB", "B-GB-cal"]
+        rows = []
+        for panel, ptag, title in (("functional", "Func", "Functional"), ("predictor", "Pred", "Computational"),
+                                   ("combined", "Comb", "Combined")):
+            x = o[(o["panel"] == panel) & o["method"].isin(names)]
+            mcc = x.pivot_table(index="key", columns="method", values="mcc", aggfunc="first").dropna()
+            det = x.pivot_table(index="key", columns="method", values="det_rate", aggfunc="first").loc[mcc.index]
+            first = True
+            for mth in names:
+                diff = mcc["MV"] - mcc[mth]
+                bw = "-- & --" if mth == "MV" else f"{int((diff > 1e-9).sum())} & {int((diff < -1e-9).sum())}"
+                lead = f"{title} ({len(mcc)})" if first else ""
+                rows.append(f"{lead} & {names[mth]} & {mcc[mth].median():.2f} & {100 * det[mth].median():.0f} & {bw} \\\\")
+                first = False
+            rows.append("\\midrule")
+            worse = {c: int((mcc["MV"] < mcc[c] - 1e-9).sum()) for c in classifiers}
+            top = max(worse, key=worse.get)
+            REG.num(f"ResSup{ptag}Genes", len(mcc), source=f"{oob_f.name}: {panel} genes evaluable by every method")
+            REG.num(f"ResSup{ptag}MaxWorse", worse[top], source=f"{oob_f.name}: {panel}, most genes a classifier beats joint")
+            REG.text(f"ResSup{ptag}MaxWorseMethod", names[top].lower(), source=f"{oob_f.name}: {panel}, that classifier")
+            REG.num(f"ResSup{ptag}MaxWorseMVBetter", int((mcc["MV"] > mcc[top] + 1e-9).sum()),
+                    source=f"{oob_f.name}: {panel}, genes joint beats that classifier")
+            assert all(mcc[c].median() <= mcc["MV"].median() for c in classifiers), \
+                f"{panel}: a classifier's median MCC exceeds joint calibration's; revise the text"
+        body = ("\\begin{tabular}{llrrrr}\n\\toprule\n"
+                "Evidence (genes) & Method & Median MCC & Median determinate rate (\\%) & Joint higher & Joint lower \\\\\n"
+                "\\midrule\n" + "\n".join(rows[:-1]) + "\n\\bottomrule\n\\end{tabular}\n")
+        (tdir / "oob_supervised_baselines.tex").write_text(body)
+        REG.output(tdir / "oob_supervised_baselines.tex", "A", "Extended Data out-of-bag comparison with classifiers")
 
     # -- figures -------------------------------------------------------------
     dest = Path(config.MANUSCRIPT_GENERATED_DIR)

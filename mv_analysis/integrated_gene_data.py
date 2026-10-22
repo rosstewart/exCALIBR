@@ -40,7 +40,11 @@ CACHE_ROOT = Path("/data/ross/assay_calibration/multivariate/experimental_staged
 
 
 def _cache_dir(regularization_type: Optional[str], population_type: Optional[str]) -> Path:
-    return CACHE_ROOT / f"reg{regularization_type}_pop{population_type}"
+    # Derived datasets (common.DERIVED_DATASETS) change the gene groups, so the
+    # legacy rebuild inside allow_derived_datasets() gets its own cache.
+    from src.assay_calibration.multivariate_data import common
+    suffix = "_withderived" if common._ALLOW_DERIVED else ""
+    return CACHE_ROOT / f"reg{regularization_type}_pop{population_type}{suffix}"
 
 
 def build_integrated_multiscoresets(

@@ -19,7 +19,7 @@ Stages:
 Settings (functional / combined use the MV gene prior; predictors 0.0441):
     main       N_calibration 10, regularization = labelled set (TP53 protocol)
     gnomadreg  N_calibration 10, regularization = the gene's gnomAD variants
-    N5/N25/N50 N_calibration sweep, labelled-set regularization
+    N5/N25     N_calibration sweep, labelled-set regularization
 """
 import os
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -50,7 +50,6 @@ SETTINGS = {
     "gnomadreg": dict(n_cal=10, reg="gnomad"),
     "N5": dict(n_cal=5, reg="labelled"),
     "N25": dict(n_cal=25, reg="labelled"),
-    "N50": dict(n_cal=50, reg="labelled"),
 }
 TABLES = {
     "functional": Path(config.PAPER_FUNCTIONAL_DIR) / "functional_all_results_table.csv",
@@ -407,7 +406,7 @@ def stage_selftest(args):
     print(f"points: max diff {np.abs(a - b).max():.4g}; same evidence direction {np.mean(np.sign(np.trunc(a)) == np.sign(np.trunc(b))):.3f}")
 
 
-def run_all(workers=4, inner=8, settings=("main", "gnomadreg", "N5", "N25", "N50")):
+def run_all(workers=4, inner=8, settings=("main", "gnomadreg", "N5", "N25")):
     """Every stage the paper's P-KNN comparison needs, skipping finished
     outputs (called from the analysis notebook's "pknn" section)."""
     args = argparse.Namespace(workers=workers, inner=inner, keys=None, settings=list(settings), folds=None,
