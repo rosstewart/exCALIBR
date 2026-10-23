@@ -109,6 +109,9 @@ def save_results(
             'pct_bootstraps_kept': calibration.get('pct_bootstraps_kept', None),
             'pct_pathogenic_rows_kept': calibration.get('pct_pathogenic_rows_kept', None),
             'point_ranges': calibration['point_ranges'],
+            # Benign blocks removed on the auto-bidirectional path as
+            # [lo, hi, population share] -- see prune_small_benign_blocks.
+            'pruned_benign_islands': calibration.get('pruned_benign_islands', []),
             'dataset': config.dataset_name,
             'relax': True,
             'liberal_monotonicity': config.liberal_monotonicity,

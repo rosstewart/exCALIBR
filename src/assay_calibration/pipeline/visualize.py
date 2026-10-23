@@ -34,6 +34,8 @@ from ..fit_utils.point_ranges import (
     resolve_bidirectional_weight_vectors,
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
+    prune_small_benign_blocks,
+    BENIGN_ISLAND_MIN_FRAC,
     BIDIRECTIONAL_VOTE_THRESHOLD,
     _PATHOMECHANISM_MATCH_FRAC_FLOOR,
 )
@@ -1035,6 +1037,14 @@ def process_component_fits(
     # has no stable identity across bootstrap fits; see git history for the
     # per-fit component-weighted-argmax version this replaced).
     benign_center = float(ben_mean_score) if force_no_postprocess else None
+    # Population-sample scores for prune_small_benign_blocks (bidirectional
+    # path only), shared with the OOB path below via the result dict.
+    benign_island_min_frac = getattr(config, "benign_island_min_frac", BENIGN_ISLAND_MIN_FRAC)
+    benign_island_reference_scores = (
+        np.asarray(scoreset.scores)[np.asarray(scoreset.sample_assignments)[:, gnomad_idx].astype(bool)]
+        if force_no_postprocess and gnomad_idx is not None else np.array([])
+    )
+    pruned_benign_islands = []
 
     # Monotonicity enforcement and extend-to-xlims are integer-point-specific.
     # Continuous uses string-keyed ranges but still needs the outermost P and B
@@ -1127,6 +1137,13 @@ def process_component_fits(
                 point_ranges, config.point_values, score_range[range_subset],
                 liberal=config.liberal_monotonicity,
             )
+            pruned_benign_islands = prune_small_benign_blocks(
+                point_ranges, config.point_values, benign_island_reference_scores,
+                min_frac=benign_island_min_frac,
+            )
+            for lo, hi, share in pruned_benign_islands:
+                logger.info(f"  Pruned benign island [{lo:.4g}, {hi:.4g}]: {share:.2%} of population "
+                            f"sample < {benign_island_min_frac:.0%}")
             clean_bidirectional_pathogenic_evidence(
                 point_ranges, config.point_values, score_range[range_subset],
                 benign_center, liberal=config.liberal_monotonicity, inf=True,
@@ -1190,6 +1207,11 @@ def process_component_fits(
         # path regardless of how this dataset was actually postprocessed.
         'force_no_postprocess': force_no_postprocess,
         'benign_center': benign_center,
+        'benign_island_reference_scores': benign_island_reference_scores,
+        'benign_island_min_frac': benign_island_min_frac,
+        # Saved to *_calibration.json: benign blocks removed by
+        # prune_small_benign_blocks, as [lo, hi, population share].
+        'pruned_benign_islands': pruned_benign_islands,
     }
     # Include pre-filter log_fp so callers can share it with a sibling benign combo.
     # Only populated when return_log_fp_all=True and precomputed_log_fp_all was not given.

@@ -20,6 +20,7 @@ from ..fit_utils.point_ranges import (
     extend_points_to_xlims,
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
+    prune_small_benign_blocks,
 )
 from .config import PipelineConfig
 
@@ -882,6 +883,8 @@ def _process_variant_oob(
     postprocess: bool = True,
     force_no_postprocess: bool = False,
     benign_center: Optional[float] = None,
+    benign_island_reference_scores: Optional[np.ndarray] = None,
+    benign_island_min_frac: float = 0.0,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
@@ -894,11 +897,11 @@ def _process_variant_oob(
     5. calculate_score_ranges (median prior, 5th/95th percentile LR+)
     6. Postprocess -- same branch the global in-bag fit took for this dataset
        (see visualize.py's process_component_fits): bidirectional cleanup
-       (clean_benign_fragments_no_extend + clean_bidirectional_pathogenic_evidence)
-       when force_no_postprocess is True, else the plain
+       (clean_benign_fragments_no_extend + prune_small_benign_blocks +
+       clean_bidirectional_pathogenic_evidence) when force_no_postprocess is True, else the plain
        enforce_monotonicity_point_ranges -> extend_points_to_xlims ->
        enforce_monotonicity_point_ranges sequence, else no postprocessing at all.
-       force_no_postprocess/benign_center are dataset-level values computed once
+       force_no_postprocess/benign_center/benign_island_* are dataset-level values computed once
        from the FULL bootstrap ensemble in visualize.py -- reused verbatim here,
        never recomputed from this variant's (much smaller, noisier) OOB subset.
     9. Flatten and assign points
@@ -956,6 +959,10 @@ def _process_variant_oob(
             # regardless of its raw value (matches visualize.py's
             # `elif force_no_postprocess:` branch).
             clean_benign_fragments_no_extend(pr, point_values, vsr, liberal=liberal)
+            if benign_island_reference_scores is not None:
+                prune_small_benign_blocks(
+                    pr, point_values, benign_island_reference_scores, min_frac=benign_island_min_frac,
+                )
             clean_bidirectional_pathogenic_evidence(
                 pr, point_values, vsr, benign_center, liberal=liberal, inf=True,
             )
@@ -1008,6 +1015,12 @@ def _compute_oob_evidence(
     # purely from disk JSON falls back to "no override" here.
     force_no_postprocess = calibration.get("force_no_postprocess", False)
     benign_center = calibration.get("benign_center", None)
+    # Same population-sample reference + cutoff the in-bag fit used for
+    # prune_small_benign_blocks (also in-memory only; absent -> no pruning).
+    benign_island_reference_scores = calibration.get("benign_island_reference_scores", None)
+    if benign_island_reference_scores is not None:
+        benign_island_reference_scores = np.asarray(benign_island_reference_scores, dtype=float)
+    benign_island_min_frac = calibration.get("benign_island_min_frac", 0.0) or 0.0
     valid_seeds = np.asarray(calibration["valid_bootstrap_seeds"])
 
     oob_map = _build_oob_mapping(scoreset, dataset_splits, valid_seeds)
@@ -1030,6 +1043,8 @@ def _compute_oob_evidence(
             postprocess=postprocess,
             force_no_postprocess=force_no_postprocess,
             benign_center=benign_center,
+            benign_island_reference_scores=benign_island_reference_scores,
+            benign_island_min_frac=benign_island_min_frac,
         )
         for vidx, oob_idx in oob_map.items()
     )

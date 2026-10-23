@@ -31,7 +31,10 @@ DEFAULT_MASTER_CSV = (
     "CARD11_master_plus_splice_ClinSig_ClinVar_VariantClass.csv"
 )
 
-CLINVAR_BENIGN = ["Benign", "Likely benign", "Benign/Likely benign"]
+# The last two are combined labels present in the 10/19/2026 ClinVar column of the
+# v2 master CSV (absent from v1).
+CLINVAR_BENIGN = ["Benign", "Likely benign", "Benign/Likely benign",
+                  "Likely benign/Benign", "Likely benign/Benign/Likely benign"]
 CLINVAR_PATHOGENIC = ["Pathogenic", "Likely pathogenic", "Pathogenic/Likely pathogenic"]
 
 SCORE_COLS = ["lof_score", "gof_score"]

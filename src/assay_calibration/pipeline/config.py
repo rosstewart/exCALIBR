@@ -63,6 +63,12 @@ class PipelineConfig:
     # non-monotonic LR+ curve can still exhibit.
     auto_bidirectional: bool = True
 
+    # On the auto-bidirectional path only: after the benign-side cleanup, drop
+    # any contiguous benign evidence block holding less than this fraction of
+    # the population (gnomAD) sample -- see prune_small_benign_blocks in
+    # fit_utils/point_ranges.py. 0 disables (hidden --no-benign-island-prune).
+    benign_island_min_frac: float = 0.01
+
     benign_method: Literal["benign", "avg", "synonymous"] = "avg"
     manual_prior: float = None  # If set, skip prior estimation and use this value
     population_type: str = "gnomAD"

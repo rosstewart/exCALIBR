@@ -827,6 +827,9 @@ def sample_roles(ms):
     return roles
 
 
+PREDICTOR_READOUTS = ("REVEL", "MutPred2", "AlphaMissense")  # computational scores: no assay noise
+
+
 def noise_floor_variances(ms, min_n=20):
     """Per-readout measurement-noise variances for the covariance floor
     (cfusn update_steps._floor_gamma_at_noise): the robust variance
@@ -834,13 +837,18 @@ def noise_floor_variances(ms, min_n=20):
     their spread is the assay's noise -- or of B/LB when fewer than ``min_n``
     synonymous variants are observed on a readout. None if neither has
     ``min_n`` on any readout; readouts without an estimate are NaN (no floor
-    on them)."""
+    on them). Computational predictor readouts (PREDICTOR_READOUTS) are never
+    floored: they carry no measurement noise, and their benign spread is
+    biological."""
     sa = np.asarray(ms.sample_assignments).astype(bool)
     X = np.asarray(ms.scores, dtype=float)
     roles = sample_roles(ms)
     out = []
     for j in range(X.shape[1]):
         var = None
+        if str(ms.dataset_names[j]) in PREDICTOR_READOUTS:
+            out.append(float("nan"))
+            continue
         for role in ("synonymous", "benign"):
             cols = [i for i, r in enumerate(roles) if r == role]
             if not cols:

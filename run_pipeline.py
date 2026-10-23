@@ -219,6 +219,11 @@ Examples:
                        help="Disable automatic bidirectional-assay detection; use standard "
                             "monotonicity postprocessing unconditionally (or combine with "
                             "--no-postprocess to disable postprocessing entirely).")
+    # Hidden: disable prune_small_benign_blocks on the auto-bidirectional path
+    # (PipelineConfig.benign_island_min_frac -> 0).
+    parser.add_argument("--no-benign-island-prune", dest="benign_island_prune",
+                       action="store_false", default=True,
+                       help=argparse.SUPPRESS)
 
     # Pathomechanism prior (PN/PU mode only)
     parser.add_argument("--pathomechanism-prior",
@@ -386,6 +391,7 @@ Examples:
         liberal_monotonicity=not args.conservative_monotonicity,
         postprocess_point_ranges=not args.no_postprocess,
         auto_bidirectional=args.auto_bidirectional,
+        **({} if args.benign_island_prune else {"benign_island_min_frac": 0.0}),
         benign_method=args.benign_method,
         manual_prior=args.manual_prior,
         population_type=args.population_type,

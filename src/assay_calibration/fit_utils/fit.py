@@ -1012,6 +1012,20 @@ class Fit:
             observations = (observations - scale_mean) / scale_std
             kwargs["_scale_mean"] = scale_mean
             kwargs["_scale_std"] = scale_std
+            # The measurement-noise floor arrives in raw units for every
+            # readout of the scoreset: keep the calibrated readouts and move it
+            # into the standardized space the EM runs in.
+            if kwargs.get("gamma_noise_floor") is not None:
+                nf = np.asarray(kwargs["gamma_noise_floor"], dtype=float)
+                if calibrated_dims is not None and len(nf) != observations.shape[1]:
+                    nf = nf[calibrated_dims]
+                if len(nf) != observations.shape[1]:
+                    raise ValueError(f"gamma_noise_floor has {len(nf)} entries for "
+                                     f"{observations.shape[1]} calibrated dims")
+                nf = nf / scale_std ** 2
+                if cat_spec is not None:  # Gamma covers the continuous columns only
+                    nf = nf[cat_spec.cont_positions]
+                kwargs["gamma_noise_floor"] = nf.tolist()
 
         train_indices = np.arange(len(observations))
         val_indices = np.array([], dtype=int)

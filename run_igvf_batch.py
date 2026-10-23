@@ -174,6 +174,7 @@ def run_single_dataset(
             "postprocess_point_ranges", not getattr(args, "no_postprocess", False)
         ),
         auto_bidirectional=getattr(args, "auto_bidirectional", True),
+        **({} if getattr(args, "benign_island_prune", True) else {"benign_island_min_frac": 0.0}),
         benign_method=benign_method,
         scoreset_flipped_override=overrides.get("scoreset_flipped_override", None),
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
@@ -534,6 +535,7 @@ def _run_one_combo(
             args, "pathomechanism_boundary_joint_prior", "product"
         ),
         auto_bidirectional=getattr(args, "auto_bidirectional", True),
+        **({} if getattr(args, "benign_island_prune", True) else {"benign_island_min_frac": 0.0}),
         spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
         vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
     )
@@ -1301,6 +1303,11 @@ def main():
                             "monotonicity postprocessing unconditionally (or combine with "
                             "--no-postprocess to disable postprocessing entirely). Global, "
                             "batch-wide -- not settable per-dataset via --dataset-configs.")
+    # Hidden: disable prune_small_benign_blocks on the auto-bidirectional path
+    # (PipelineConfig.benign_island_min_frac -> 0).
+    parser.add_argument("--no-benign-island-prune", dest="benign_island_prune",
+                       action="store_false", default=True,
+                       help=argparse.SUPPRESS)
     parser.add_argument("--viz-only", action="store_true",
                        help="Regenerate visualizations only — skip variant tables and calibration JSON save "
                             "(useful for rerunning after fixing a plot bug)")

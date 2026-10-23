@@ -531,6 +531,69 @@ def clean_benign_fragments_no_extend(point_ranges, point_values, score_range=Non
         claimed.append(env)
 
 
+BENIGN_ISLAND_MIN_FRAC = 0.01
+
+
+def prune_small_benign_blocks(point_ranges, point_values, reference_scores,
+                              min_frac=BENIGN_ISLAND_MIN_FRAC):
+    """Auto-bidirectional benign-side pruning of tiny benign blocks (see
+    PipelineConfig.benign_island_min_frac).
+
+    Runs after clean_benign_fragments_no_extend, which keeps benign evidence
+    wherever the percentile-aggregated LR+ curve crosses a benign threshold
+    and never extends it to the score-range edges. On the standard
+    (non-bidirectional) path, extend_points_to_xlims carries benign evidence
+    to an edge, so a stray crossing can't survive on its own; here it can. A
+    curve that barely dips below a threshold over a few grid points (e.g.
+    CARD11 gof_clinvar_v2: 95th-percentile log LR+ 0.0017 below the -1
+    threshold over score 0.063-0.070) then leaves an isolated benign sliver.
+
+    A block is a maximal run of contiguous benign sub-ranges, possibly
+    spanning several benign levels (e.g. -1/-2/-1); an indeterminate gap
+    splits blocks. Each block is judged WHOLE by its share of
+    ``reference_scores`` (the population sample's scores) within [lo, hi]:
+    a block below ``min_frac`` is removed from every benign level (left
+    indeterminate, never reassigned). Judging whole blocks rather than single
+    levels keeps the thin graded shoulders of a genuine benign core (each of
+    which can hold well under 1% of the population on its own) intact.
+
+    ``min_frac`` <= 0 disables pruning. Returns the pruned blocks as a list of
+    [lo, hi, share]. Mutates point_ranges in place for negative point_values
+    only.
+    """
+    if min_frac is None or min_frac <= 0:
+        return []
+    reference_scores = np.asarray(reference_scores, dtype=float)
+    reference_scores = reference_scores[~np.isnan(reference_scores)]
+    if reference_scores.size == 0:
+        return []
+
+    segments = sorted(
+        (lo, hi, -pv) for pv in point_values for lo, hi in point_ranges.get(-pv, [])
+    )
+    if not segments:
+        return []
+
+    blocks = []  # [lo, hi]
+    for lo, hi, _ in segments:
+        if blocks and lo <= blocks[-1][1]:
+            blocks[-1][1] = max(blocks[-1][1], hi)
+        else:
+            blocks.append([lo, hi])
+
+    pruned = []
+    for lo, hi in blocks:
+        share = float(np.mean((reference_scores >= lo) & (reference_scores <= hi)))
+        if share >= min_frac:
+            continue
+        pruned.append([lo, hi, share])
+        for pv in point_values:
+            point_ranges[-pv] = [
+                [a, b] for a, b in point_ranges.get(-pv, []) if not (a >= lo and b <= hi)
+            ]
+    return pruned
+
+
 def clean_bidirectional_pathogenic_evidence(point_ranges, point_values, score_range, benign_center,
                                              liberal=True, inf=True):
     """Auto-bidirectional pathogenic-side cleanup (see PipelineConfig.auto_bidirectional).
