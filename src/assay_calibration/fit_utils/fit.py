@@ -1016,15 +1016,17 @@ class Fit:
             # readout of the scoreset: keep the calibrated readouts and move it
             # into the standardized space the EM runs in.
             if kwargs.get("gamma_noise_floor") is not None:
+                # A vector of variances or a full (p, p) noise covariance.
                 nf = np.asarray(kwargs["gamma_noise_floor"], dtype=float)
+                sub = lambda a, idx: a[idx] if a.ndim == 1 else a[np.ix_(idx, idx)]
                 if calibrated_dims is not None and len(nf) != observations.shape[1]:
-                    nf = nf[calibrated_dims]
+                    nf = sub(nf, calibrated_dims)
                 if len(nf) != observations.shape[1]:
                     raise ValueError(f"gamma_noise_floor has {len(nf)} entries for "
                                      f"{observations.shape[1]} calibrated dims")
-                nf = nf / scale_std ** 2
+                nf = nf / (scale_std ** 2 if nf.ndim == 1 else np.outer(scale_std, scale_std))
                 if cat_spec is not None:  # Gamma covers the continuous columns only
-                    nf = nf[cat_spec.cont_positions]
+                    nf = sub(nf, list(cat_spec.cont_positions))
                 kwargs["gamma_noise_floor"] = nf.tolist()
 
         train_indices = np.arange(len(observations))

@@ -1195,32 +1195,44 @@ def _component_n_eff(z, sample_weights, kwargs):
     return float(zw.sum())
 
 
-def _floor_gamma_at_noise(Gamma, noise_var):
+def _floor_gamma_at_noise(Gamma, noise):
     """Measurement-noise floor (opt-in, ``gamma_noise_floor``): no component
-    is narrower than the assay's noise, Gamma_FF >= diag(noise_var_F) on the
-    readouts F with a noise estimate (NaN entries: no floor on that readout),
-    so a few variants cannot form a spike the readouts cannot resolve. The F
-    block is clipped as generalized eigenvalues in the noise-whitened space,
-    D^{1/2} max(I, D^{-1/2} Gamma_FF D^{-1/2}) D^{1/2}, and the increase (PSD)
-    is added back to Gamma, so Gamma stays PSD. With every readout floored
-    this is the constrained maximiser of the covariance Q-term (affine to the
-    identity case _floor_gamma_eigenvalues documents). None: unchanged.
+    is narrower than the assay's noise on the readouts F with a noise
+    estimate, Gamma_FF >= Sigma_FF, so a few variants cannot form a spike the
+    readouts cannot resolve. ``noise`` is a (p, p) noise covariance Sigma, or
+    a length-p vector of variances (Sigma = diag); readouts whose variance is
+    NaN are not floored, and NaN off-diagonal entries count as 0. The F block
+    is clipped as generalized eigenvalues in the Sigma-whitened space,
+    L max(I, L^-1 Gamma_FF L^-T) L^T with Sigma_FF = L L^T, and the increase
+    (PSD) is added back to Gamma, so Gamma stays PSD. With every readout
+    floored this is the constrained maximiser of the covariance Q-term (affine
+    to the identity case _floor_gamma_eigenvalues documents). None: unchanged.
     """
-    if noise_var is None:
+    if noise is None:
         return Gamma
-    nv = np.asarray(noise_var, dtype=float)
-    F = np.flatnonzero(np.isfinite(nv) & (nv > 0))
+    S = np.asarray(noise, dtype=float)
+    if S.ndim == 1:
+        S = np.diag(S)
+    var = np.diag(S)
+    F = np.flatnonzero(np.isfinite(var) & (var > 0))
     G = 0.5 * (np.asarray(Gamma, dtype=float) + np.asarray(Gamma, dtype=float).T)
     if not len(F):
         return G
-    d = np.sqrt(nv[F])
-    W = G[np.ix_(F, F)] / np.outer(d, d)
+    SF = np.nan_to_num(S[np.ix_(F, F)], nan=0.0)
+    SF = 0.5 * (SF + SF.T)
+    try:
+        L = np.linalg.cholesky(SF)
+    except np.linalg.LinAlgError:
+        L = np.linalg.cholesky(SF + 1e-9 * np.mean(np.diag(SF)) * np.eye(len(F)))
+    Li = np.linalg.inv(L)
+    W = Li @ G[np.ix_(F, F)] @ Li.T
+    W = 0.5 * (W + W.T)
     eig, vec = np.linalg.eigh(W)
     if eig.min() >= 1.0:
         return G
-    delta = (vec @ np.diag(np.maximum(eig, 1.0) - eig) @ vec.T) * np.outer(d, d)
+    delta = L @ (vec @ np.diag(np.maximum(eig, 1.0) - eig) @ vec.T) @ L.T
     out = G.copy()
-    out[np.ix_(F, F)] += delta
+    out[np.ix_(F, F)] += 0.5 * (delta + delta.T)
     return out
 
 

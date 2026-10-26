@@ -862,6 +862,49 @@ def noise_floor_variances(ms, min_n=20):
     return out if np.isfinite(out).any() else None
 
 
+def noise_floor_covariance(ms, min_n=20):
+    """Full measurement-noise covariance for the floor: the per-readout robust
+    variances of noise_floor_variances, with robust correlations between
+    floored readouts -- a 2-D minimum covariance determinant estimate on the
+    variants observed on both readouts in the same reference sample
+    (synonymous, else B/LB) when at least ``min_n`` such variants exist,
+    otherwise 0 (independent noise). The correlation matrix is projected to
+    the nearest valid one (eigenvalues clipped at 1e-6, unit diagonal).
+    (p, p) list with NaN rows/columns for readouts without a floor, or None."""
+    var = noise_floor_variances(ms, min_n=min_n)
+    if var is None:
+        return None
+    from sklearn.covariance import MinCovDet
+    var = np.asarray(var, dtype=float)
+    F = np.flatnonzero(np.isfinite(var))
+    sa = np.asarray(ms.sample_assignments).astype(bool)
+    X = np.asarray(ms.scores, dtype=float)
+    roles = sample_roles(ms)
+    R = np.eye(len(F))
+    for a in range(len(F)):
+        for b in range(a + 1, len(F)):
+            i, j = F[a], F[b]
+            for role in ("synonymous", "benign"):
+                cols = [c for c, r in enumerate(roles) if r == role]
+                if not cols:
+                    continue
+                Z = X[sa[:, cols].any(axis=1)][:, [i, j]]
+                Z = Z[~np.isnan(Z).any(axis=1)]
+                if len(Z) >= min_n:
+                    C = MinCovDet(random_state=0).fit(Z).covariance_
+                    if C[0, 0] > 0 and C[1, 1] > 0:
+                        R[a, b] = R[b, a] = C[0, 1] / np.sqrt(C[0, 0] * C[1, 1])
+                    break
+    eig, vec = np.linalg.eigh(R)
+    R = vec @ np.diag(np.maximum(eig, 1e-6)) @ vec.T
+    d = np.sqrt(np.diag(R))
+    R = R / np.outer(d, d)
+    S = np.full((len(var), len(var)), np.nan)
+    sd = np.sqrt(var[F])
+    S[np.ix_(F, F)] = R * np.outer(sd, sd)
+    return S.tolist()
+
+
 def pathogenic_share_proportions(ms, tau):
     """sample_proportions for the pathogenic-share weighting, or None (unweighted).
 
@@ -974,9 +1017,14 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
         print(f"  {dataset_label}: tied population {tied_spec if tied_spec else 'not applicable (fit free)'}")
     noise_floor = None
     if fit_options.get("noise_floor"):
-        noise_floor = noise_floor_variances(ms)
+        if fit_options.get("noise_floor_shape", "full") == "full":
+            noise_floor = noise_floor_covariance(ms)
+            sd = np.sqrt(np.diag(np.asarray(noise_floor, float))) if noise_floor else None
+        else:
+            noise_floor = noise_floor_variances(ms)
+            sd = np.sqrt(np.asarray(noise_floor, float)) if noise_floor else None
         print(f"  {dataset_label}: noise floor (SD; nan = no floor on that readout) "
-              f"{np.round(np.sqrt(noise_floor), 3).tolist() if noise_floor else 'not available (no floor)'}")
+              f"{np.round(sd, 3).tolist() if noise_floor else 'not available (no floor)'}")
 
     constrained_flags = []
     if "con" in constraint_modes:
@@ -1740,6 +1788,10 @@ def _add_pathogenic_share_arg(p):
                    help="Floor every component's covariance at the per-readout measurement "
                         "noise, estimated from synonymous (else B/LB) variants "
                         "(noise_floor_variances), so small samples cannot form spikes.")
+    p.add_argument("--noise-floor-shape", choices=["full", "diagonal"], default="full",
+                   help="--noise-floor noise covariance: 'full' = robust per-readout variances with "
+                        "robust (MCD) correlations between readouts (noise_floor_covariance); "
+                        "'diagonal' = independent noise per readout (noise_floor_variances).")
     p.add_argument("--weight-neff", choices=["weighted", "kish"], default="weighted",
                    help="Observation count behind each component's covariance ridge under "
                         "--pathogenic-share: 'weighted' = weighted mass (upweighted samples "
@@ -1752,7 +1804,8 @@ def _fit_options(args):
     """--weight-neff / --tied-population as the fit_options dict job generation takes."""
     return {"weight_neff": getattr(args, "weight_neff", "weighted"),
             "tied_population": bool(getattr(args, "tied_population", False)),
-            "noise_floor": bool(getattr(args, "noise_floor", False))}
+            "noise_floor": bool(getattr(args, "noise_floor", False)),
+            "noise_floor_shape": getattr(args, "noise_floor_shape", "full")}
 
 
 def _merge_condition_manifests(output_root: str, condition_labels: list, target_array_size: int) -> None:

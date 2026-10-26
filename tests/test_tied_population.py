@@ -94,3 +94,24 @@ def test_noise_floor_partial_readouts():
     assert np.all(np.linalg.eigvalsh(F) > 0)                            # stays PSD
     full = _floor_gamma_at_noise(spike, np.array([0.04, 0.09]))
     assert np.all(np.linalg.eigvalsh(full / np.sqrt(np.outer([0.04, 0.09], [0.04, 0.09]))) >= 1 - 1e-9)
+
+
+def test_noise_floor_full_covariance():
+    from src.assay_calibration.fit_utils.cfusn.update_steps import _floor_gamma_at_noise
+    var = np.array([0.04, 0.09])
+    # zero correlation: identical to the diagonal floor
+    spike = np.array([[1e-4, 2e-5], [2e-5, 1e-4]])
+    assert np.allclose(_floor_gamma_at_noise(spike, np.diag(var)), _floor_gamma_at_noise(spike, var))
+    # correlated noise allows a component narrower along the low-noise direction
+    r = 0.8
+    S = np.array([[var[0], r * np.sqrt(var[0] * var[1])], [r * np.sqrt(var[0] * var[1]), var[1]]])
+    G = 0.95 * S                                     # just under the full-covariance floor
+    F = _floor_gamma_at_noise(G, S)
+    assert np.allclose(F, S, atol=1e-10)             # raised exactly to Sigma
+    Li = np.linalg.inv(np.linalg.cholesky(S))
+    assert np.linalg.eigvalsh(Li @ F @ Li.T).min() >= 1 - 1e-9
+    D = _floor_gamma_at_noise(G, var)                # the diagonal floor over-widens it
+    assert np.linalg.eigvalsh(Li @ D @ Li.T).max() > 1.5
+    # NaN readout: only the floored block changes
+    P = _floor_gamma_at_noise(spike, np.array([[0.04, np.nan], [np.nan, np.nan]]))
+    assert P[0, 0] >= 0.04 - 1e-12 and np.isclose(P[1, 1], 1e-4)
