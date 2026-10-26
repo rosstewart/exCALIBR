@@ -1204,9 +1204,10 @@ def _floor_gamma_at_noise(Gamma, noise):
     NaN are not floored, and NaN off-diagonal entries count as 0. The F block
     is clipped as generalized eigenvalues in the Sigma-whitened space,
     L max(I, L^-1 Gamma_FF L^-T) L^T with Sigma_FF = L L^T, and the increase
-    (PSD) is added back to Gamma, so Gamma stays PSD. With every readout
-    floored this is the constrained maximiser of the covariance Q-term (affine
-    to the identity case _floor_gamma_eigenvalues documents). None: unchanged.
+    (PSD) is propagated to the unfloored readouts through their regression on
+    F, so Gamma stays PSD and this is the constrained maximiser of the
+    covariance Q-term (affine to the identity case _floor_gamma_eigenvalues
+    documents) whether or not every readout is floored. None: unchanged.
     """
     if noise is None:
         return Gamma
@@ -1231,9 +1232,22 @@ def _floor_gamma_at_noise(Gamma, noise):
     if eig.min() >= 1.0:
         return G
     delta = L @ (vec @ np.diag(np.maximum(eig, 1.0) - eig) @ vec.T) @ L.T
-    out = G.copy()
-    out[np.ix_(F, F)] += 0.5 * (delta + delta.T)
-    return out
+    delta = 0.5 * (delta + delta.T)
+    # Readouts U without a floor: the Q-term factorises into the F marginal
+    # (Gamma_FF, clipped above) and the U|F conditional (regression
+    # B = G_UF G_FF^-1 and residual G_U|F), which the constraint does not
+    # touch, so the constrained maximiser keeps B and G_U|F at their
+    # unconstrained values: Gamma = G + E delta E^T with E = [I; B]. Adding
+    # delta to the F block alone changes B and G_U|F, is not the maximiser,
+    # and lets the EM objective decrease (seen as "likelihood overshoot" stops
+    # on fits with partially floored readouts).
+    U = np.setdiff1d(np.arange(G.shape[0]), F)
+    E = np.zeros((G.shape[0], len(F)))
+    E[F] = np.eye(len(F))
+    if len(U):
+        E[U] = np.linalg.solve(G[np.ix_(F, F)], G[np.ix_(F, U)]).T
+    out = G + E @ delta @ E.T
+    return 0.5 * (out + out.T)
 
 
 def _regularize_gamma_candidate(Gamma_new, n_eff, observations):
