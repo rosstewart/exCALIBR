@@ -237,6 +237,7 @@ def build_combined_multiscoreset(
     predictors: Optional[List[str]] = None,
     functionally_assayed_variants: Optional[Set[str]] = None,
     require_both_modalities: bool = True,
+    predictor_transform: Optional[str] = None,
 ) -> Optional[MultiPredictorFunctionalScoreset]:
     """Join gene's predictor dimensions (REVEL/MP2/AM) with its functional
     dimensions into one MultiPredictorFunctionalScoreset.
@@ -261,6 +262,9 @@ def build_combined_multiscoreset(
     correlation structure. Pass False to restore the old union-only
     behavior.
 
+    ``predictor_transform``: see predictors.df_to_basic_scoreset (default
+    $MV_PREDICTOR_TRANSFORM, else "none"); functional dimensions are untouched.
+
     Returns None if no predictor CSVs are available for ``gene``.
     """
     predictors = list(predictors) if predictors is not None else list(PREDICTORS)
@@ -273,7 +277,8 @@ def build_combined_multiscoreset(
     if not have:
         return None
 
-    predictor_scoresets = [df_to_basic_scoreset(predictor_dfs[p], p) for p in have]
+    predictor_scoresets = [df_to_basic_scoreset(predictor_dfs[p], p, transform=predictor_transform)
+                           for p in have]
     if functionally_assayed_variants:
         for ps in predictor_scoresets:
             split_predictor_clinvar_leakage(ps, functionally_assayed_variants)

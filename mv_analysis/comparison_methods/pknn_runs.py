@@ -89,7 +89,7 @@ def datasets():
 def _prep_one(ds):
     from mv_analysis.gene_performance_scatter import fast_results_json
     from mv_analysis.mv_cockpit import DEFAULT_RUN_KWARGS
-    from mv_analysis.report import _eval_labels
+    from mv_analysis.report import _both_modality_mask, _eval_labels, _uv_nonconflicting_points
     from src.assay_calibration.multivariate_analysis.gene_set_analysis import build_gene_set_analysis
     warnings.filterwarnings("ignore")
     key, gs, gene, cl = ds["key"], ds["gene_set"], ds["gene"], ds["cluster_idx"]
@@ -109,10 +109,16 @@ def _prep_one(ds):
     measured = ~np.isnan(X).all(axis=1)
     labelled = (plp | blb) & measured
     gnomad = (sa[:, an.g_idx] & measured) if an.g_idx is not None else np.zeros(len(X), bool)
+    # population variants on the evaluation footing of the controls (combined:
+    # measured by both evidence types), and the independent baseline's points
+    # for every row, for the evidence-strength distributions
+    gnomad_eval = gnomad & _both_modality_mask(ms) if gs.startswith("combined") else gnomad
+    uv = _uv_nonconflicting_points(gene.lower() if gs == "labelseq" else gene.upper(), gs, ms)  # as mv_cockpit
+    uv_points = np.full(len(X), np.nan) if uv is None else np.nan_to_num(np.asarray(uv, float))
     prior = GENOME_WIDE_PRIOR if gs == "predictor" else float(r["median_prior"])
     np.savez_compressed(
         OUT / "prep" / f"{key}.npz", X=X, plp=plp, blb=blb, labelled=labelled, eval_mask=eval_mask,
-        gnomad=gnomad, variants=np.asarray([str(v) for v in ms.kept_variants]),
+        gnomad=gnomad, gnomad_eval=gnomad_eval, uv_points=uv_points, variants=np.asarray([str(v) for v in ms.kept_variants]),
         dims=np.asarray([str(n) for n in ms.dataset_names]), mv_points=np.asarray(r["points"], float),
         sample_names=np.asarray([str(n) for n in ms.sample_names]), sa=sa)
     meta = dict(ds, dataset_name=dataset_name, prior=prior, mv_median_prior=float(r["median_prior"]),

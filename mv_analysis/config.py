@@ -160,6 +160,15 @@ PAPER_FITS_DIR = _env(
 # paper notebook's stage 0 generates this if it doesn't exist yet.
 PAPER_RESULTS_JSON = _env("MV_PAPER_RESULTS_JSON", f"{PAPER_FITS_DIR}/bootstrap_results.json.gz")
 
+# A run whose predictor readouts were fit on transformed scores (hpc/prepare.py
+# --predictor-transform) carries a predictor_transform.txt marker: rebuild the
+# scores on that same scale, or every predictor LR would be evaluated off-scale.
+# An explicit $MV_PREDICTOR_TRANSFORM still wins.
+_PTX_MARKER = os.path.join(PAPER_FITS_DIR, "predictor_transform.txt")
+if "MV_PREDICTOR_TRANSFORM" not in os.environ and os.path.exists(_PTX_MARKER):
+    with open(_PTX_MARKER) as _f:
+        os.environ["MV_PREDICTOR_TRANSFORM"] = _f.read().strip()
+
 # Run-specific figure output, NOT the paper repo's Figures/mv/ -- matches
 # the tp53_pca10_run/figures precedent; copying into the paper repo is a
 # separate, deliberate step the user does themselves.
@@ -187,6 +196,7 @@ PAPER_CORRELATION_DIR = f"{PAPER_FIGURES_DIR}/correlation"
 PAPER_CACHE_DIR = f"{PAPER_FIGURES_DIR}/.cache"
 PAPER_PKNN_DIR = f"{PAPER_FIGURES_DIR}/pknn"
 PAPER_PRODUCTION_OOB_DIR = f"{PAPER_FIGURES_DIR}/production_oob"
+PAPER_STRENGTH_DIR = f"{PAPER_FIGURES_DIR}/strength"
 # P-KNN comparison-method runs (comparison_methods/pknn_runs.py) and the
 # production-scored out-of-bag evaluation (production_oob.py, under
 # PKNN_DIR/production_oob): per-dataset inputs and out-of-sample results.

@@ -90,8 +90,28 @@ def test_noise_floor_partial_readouts():
     from src.assay_calibration.fit_utils.cfusn.update_steps import _floor_gamma_at_noise
     spike = np.array([[1e-4, 2e-5], [2e-5, 1e-4]])
     F = _floor_gamma_at_noise(spike, np.array([0.04, np.nan]))
-    assert F[0, 0] >= 0.04 - 1e-12 and np.isclose(F[1, 1], 1e-4)      # only readout 0 floored
+    cond = lambda G: (G[1, 0] / G[0, 0], G[1, 1] - G[1, 0] ** 2 / G[0, 0])  # readout 1 | readout 0
+    assert F[0, 0] >= 0.04 - 1e-12 and np.allclose(cond(F), cond(spike))  # only readout 0 floored
     assert np.all(np.linalg.eigvalsh(F) > 0)                            # stays PSD
+    # constrained maximiser of q(G) = -log|G| - tr(G^-1 A): never below any
+    # other feasible G (here: the old block-add answer and random feasible ones)
+    rng = np.random.default_rng(0)
+    A = np.array([[0.02, 0.015, 0.01], [0.015, 0.03, 0.02], [0.01, 0.02, 0.5]])
+    noise = np.array([0.04, 0.06, np.nan])
+    q = lambda G: -np.linalg.slogdet(G)[1] - np.trace(np.linalg.solve(G, A))
+    best = _floor_gamma_at_noise(A, noise)
+    Li = np.linalg.inv(np.linalg.cholesky(np.diag(noise[:2])))
+    assert np.linalg.eigvalsh(Li @ best[:2, :2] @ Li.T).min() >= 1 - 1e-9
+    block = A.copy()
+    block[:2, :2] = best[:2, :2]                    # F block floored, cross terms kept
+    assert q(block) < q(best) - 1e-6
+    for _ in range(200):
+        M = rng.normal(size=(3, 3)) * 0.1
+        S = 0.5 * (M + M.T)
+        S[:2, :2] = M[:2, :2] @ M[:2, :2].T          # stays feasible on F
+        G = best + 0.1 * S
+        if np.linalg.eigvalsh(G).min() > 0:
+            assert q(G) <= q(best) + 1e-9
     full = _floor_gamma_at_noise(spike, np.array([0.04, 0.09]))
     assert np.all(np.linalg.eigvalsh(full / np.sqrt(np.outer([0.04, 0.09], [0.04, 0.09]))) >= 1 - 1e-9)
 
@@ -112,6 +132,6 @@ def test_noise_floor_full_covariance():
     assert np.linalg.eigvalsh(Li @ F @ Li.T).min() >= 1 - 1e-9
     D = _floor_gamma_at_noise(G, var)                # the diagonal floor over-widens it
     assert np.linalg.eigvalsh(Li @ D @ Li.T).max() > 1.5
-    # NaN readout: only the floored block changes
+    # NaN readout: same as the partial vector floor
     P = _floor_gamma_at_noise(spike, np.array([[0.04, np.nan], [np.nan, np.nan]]))
-    assert P[0, 0] >= 0.04 - 1e-12 and np.isclose(P[1, 1], 1e-4)
+    assert P[0, 0] >= 0.04 - 1e-12 and np.allclose(P, _floor_gamma_at_noise(spike, np.array([0.04, np.nan])))

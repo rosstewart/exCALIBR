@@ -3,7 +3,12 @@
 for that panel.
 
     python mv_analysis/merge_condition_results.py <root> \
-        --functional tau_0.1 --predictor tau_0 --combined tau_0.1 [--phenotype tau_0.1]
+        --functional tau_0.1 --predictor tau_0.1 --combined tau_0.1 [--phenotype tau_0.1] \
+        [--override araf_labelseq_mv=tau_0 ...]
+
+--override takes one dataset from another condition, e.g. the genes without
+P/LP, whose correct weighted fit is the unweighted one (pathogenic-share
+factor 1) when a run's weighted condition mis-assigned their sample roles.
 
 reads <root>/<condition>/bootstrap_results.json.gz (hpc/aggregate_results.py
 <root> --per-condition) and writes <root>/final/bootstrap_results.json.gz,
@@ -37,18 +42,21 @@ def main():
     ap.add_argument("--predictor", required=True)
     ap.add_argument("--combined", required=True)
     ap.add_argument("--phenotype", default=None, help="default: the functional choice")
+    ap.add_argument("--override", action="append", default=[], metavar="KEY=COND",
+                    help="take this dataset from COND instead of its panel's condition (repeatable)")
     args = ap.parse_args()
     root = Path(args.root)
     choice = {"functional": args.functional, "predictor": args.predictor, "combined": args.combined,
               "phenotype": args.phenotype or args.functional}
+    override = dict(o.split("=", 1) for o in args.override)
 
     loaded, merged, source = {}, {}, {}
-    for cond in sorted(set(choice.values())):
+    for cond in sorted(set(choice.values()) | set(override.values())):
         with gzip.open(root / cond / "bootstrap_results.json.gz", "rt") as f:
             loaded[cond] = json.load(f)
     for cond, results in loaded.items():
         for key, boots in results.items():
-            if choice[panel_of(key)] == cond:
+            if override.get(key, choice[panel_of(key)]) == cond:
                 merged[key] = boots
                 source[key] = cond
 
@@ -56,7 +64,10 @@ def main():
     out.mkdir(exist_ok=True)
     with gzip.open(out / "bootstrap_results.json.gz", "wt") as f:
         json.dump(merged, f)
-    (out / "conditions.json").write_text(json.dumps({"panel_choice": choice, "dataset_source": source}, indent=1))
+    missing = set(override) - set(merged)
+    assert not missing, f"--override datasets not found: {sorted(missing)}"
+    (out / "conditions.json").write_text(json.dumps({"panel_choice": choice, "overrides": override,
+                                                     "dataset_source": source}, indent=1))
     if (root / "logs").exists() and not (out / "logs").exists():
         os.symlink(root / "logs", out / "logs")
     print(f"{len(merged)} datasets -> {out / 'bootstrap_results.json.gz'}")

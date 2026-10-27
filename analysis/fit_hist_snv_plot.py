@@ -1,12 +1,11 @@
 import matplotlib as mpl
 
 mpl.rcParams['font.family'] = 'sans-serif'
-mpl.rcParams['font.sans-serif'] = [
-    'Arial',
-    'Helvetica',
-    'Nimbus Sans',
-    'DejaVu Sans'
-]
+from src.assay_calibration.plot_utils.style import (  # noqa: E402  shared repository style
+    FONT_SANS, SAMPLE_NAMES, SAMPLE_COLORS, SAMPLE_ALPHAS, STRENGTH_COLOR,
+    BENIGN_THRESHOLD_COLOR, PATHOGENIC_THRESHOLD_COLOR,
+)
+mpl.rcParams['font.sans-serif'] = list(FONT_SANS)
 
 import logging
 logging.getLogger('matplotlib').setLevel(logging.ERROR)
@@ -30,20 +29,8 @@ FONTSIZE_ANNOTATION = 10
 
 TITLE_SPACER = 0.10
 
-SAMPLE_NAMES = ["ClinVar PLP", "ClinVar BLB", "gnomAD", "Synonymous"]
-SAMPLE_COLORS = ['#CA7682', '#1D7AAB', '#A0A0A0', '#6BAA75']
-SAMPLE_ALPHAS = [0.7, 0.5, 0.15, 0.4]
-
-STRENGTH_COLOR = {
-    -8: '#4b91a6', -7: '#5DA3BD', -6: '#6FAACE', -5: '#74ABCE',
-    -4: '#7ab5d1', -3: '#99c8dc', -2: '#d0e8f0', -1: '#e4f1f6',
-    0: '#e0e0e0',
-    1: '#e6b1b8', 2: '#d68f99', 3: '#ca7682', 4: '#b85c6b',
-    5: '#B1535F', 6: '#AA4E58', 7: '#A2484F', 8: '#943744'
-}
-
-BENIGN_THRESHOLD_COLOR = '#2166AC'
-PATHOGENIC_THRESHOLD_COLOR = '#B2182B'
+# Sample colors, the evidence-point ramp and threshold colors come from
+# src/assay_calibration/plot_utils/style.py (imported above).
 
 
 def plot_figure_panel_a(scoreset_2018, indv_summary, fits, score_range, flipped, n_samples,

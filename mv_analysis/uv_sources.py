@@ -449,9 +449,15 @@ FGFR_SOURCE_PATH = "/data/ross/assay_calibration/FGFR/dataframe_processed.csv.gz
 # assays that dir's calibration was fit against, on log-transformed scores
 # (dir name "uv_calib_logscores").
 _FGFR_DIMENSIONS = {"activation": "score_activation", "pemr": "score_pemr", "futr": "score_futr"}
+# Independent FGFR evidence comes from the activation assay only: pemigatinib
+# and futibatinib resistance (pemr/futr) are pharmacogenomic readouts of drug
+# response, not of loss of function, so under the nonconflicting rule they
+# must not remove the activation assay's classification (baseline and
+# conflict rate alike). The joint model still uses all three.
+FGFR_CLASSIFICATION_DIMENSIONS = ("activation",)
 
 
-def load_fgfr_uv_points(gene, ms):
+def load_fgfr_uv_points(gene, ms, dims=FGFR_CLASSIFICATION_DIMENSIONS):
     """UV bridging for FGFR's 3 assay-derived calibrations (activation/pemr/
     futr). No re-fitting -- reuses the already-computed point_ranges in
     each assay's {dim}_3c_calibration.json under config.FGFR_UV_CALIB_DIR.
@@ -482,7 +488,8 @@ def load_fgfr_uv_points(gene, ms):
     key_index = {vk: i for i, vk in enumerate(ms._variants_kept)}
 
     names, rows = [], []
-    for dim, score_col in _FGFR_DIMENSIONS.items():
+    for dim in dims:
+        score_col = _FGFR_DIMENSIONS[dim]
         cal_path = calib_dir / f"{dim}_3c_calibration.json"
         if not cal_path.exists():
             continue

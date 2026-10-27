@@ -526,7 +526,8 @@ def run_manuscript_figures():
     import subprocess
     scripts = _ROOT / "mv_analysis" / "figures" / "scripts"
     for script in ("make_fig1_conflict.py", "make_fig2_method.py",
-                   "make_panel_performance.py", "make_fig7_tp53_rpv.py", "make_pknn_comparison.py"):
+                   "make_panel_performance.py", "make_fig7_tp53_rpv.py", "make_pknn_comparison.py",
+                   "make_strength_distribution.py"):
         subprocess.run([sys.executable, str(scripts / script)], check=True)
 
 
@@ -555,6 +556,7 @@ MANUSCRIPT_FIGURES = {
     "mv_confusion_matrices.png": "confusions/mv_confusion_matrices.png",
     "mv_brnich_comparison.png": "brnich_comparison/mv_brnich_comparison.png",
     "fig_pknn_comparison.pdf": "pknn/fig_pknn_comparison.pdf",
+    "fig_strength_distribution.pdf": "strength/fig_strength_distribution.pdf",
 }
 
 
@@ -721,6 +723,198 @@ def run_production_oob_evaluation(workers=12, inner=2):
     return out
 
 
+STRENGTH_LEVELS = (-8, -4, -2, -1, 0, 1, 2, 4, 8)
+
+
+def floor_strength(points):
+    """Evidence points floored to the standard levels (+-1, +-2, +-4, +-8)."""
+    p = np.nan_to_num(np.asarray(points, float))
+    out = np.zeros_like(p)
+    for lvl in (1, 2, 4, 8):
+        out[p >= lvl] = lvl
+        out[p <= -lvl] = -lvl
+    return out.astype(int)
+
+
+def run_component_selection():
+    """Per gene and evidence type, the joint model with 3 and with 4
+    components side by side: MCC and determinate rate on the controls (the
+    results tables, evidence-direction threshold), the held-out
+    log-likelihood difference (4 minus 3 components, median over bootstrap
+    iterations where both fitted, and the fraction where 4 was higher), the
+    component count each rule picks (highest MCC, ties by determinate calls,
+    as config.select_canonical_mv_rows; or higher median held-out
+    log-likelihood), and the number of valid bootstrap iterations for each.
+    Writes figures/component_selection.csv, plus the median per-gene MCC and
+    pooled counts under each rule for every evidence type."""
+    import gzip
+    with gzip.open(config.PAPER_RESULTS_JSON, "rt") as f:
+        raw = json.load(f)
+    figs = Path(config.PAPER_FIGURES_DIR)
+    rows = []
+    for panel, _, _, rel in PERF_PANELS:
+        t = pd.read_csv(figs / rel)
+        t = t[(t["threshold"] == EVIDENCE_DIRECTION) & t["method"].str.startswith("MV")]
+        if "gene_set" not in t.columns:
+            t = t.assign(gene_set=panel)
+        best = config.select_canonical_mv_rows(t)
+        for (gs, gene, cluster), g in t.groupby(["gene_set", "gene", "cluster"]):
+            cl = 0 if cluster == "gene" else int(str(cluster).replace("cluster", "")) - 1
+            try:
+                key = config.list_gene_cluster_variants(gene, gs, results_json=config.PAPER_RESULTS_JSON)[cl]
+            except Exception:
+                key = None
+            ll = {}
+            for b in (raw.get(key) or {}).values():
+                for c, e in b.items():
+                    if e and e.get("val_ll") is not None and np.isfinite(e["val_ll"]):
+                        ll.setdefault(c, []).append(e["val_ll"])
+            paired = [(b["4c_unc"]["val_ll"] - b["3c_unc"]["val_ll"]) for b in (raw.get(key) or {}).values()
+                      if b.get("3c_unc") and b.get("4c_unc") and b["3c_unc"].get("val_ll") is not None
+                      and b["4c_unc"].get("val_ll") is not None]
+            r = dict(panel=panel, gene_set=gs, gene=gene, cluster=cluster, dataset=key,
+                     n_boot_3=len(ll.get("3c_unc", [])), n_boot_4=len(ll.get("4c_unc", [])),
+                     heldout_ll_diff_4m3=float(np.median(paired)) if paired else np.nan,
+                     frac_boots_4_better=float(np.mean(np.asarray(paired) > 0)) if paired else np.nan)
+            for _, x in g.iterrows():
+                k = str(x["config"])[0]
+                r[f"mcc_{k}"] = x["mcc"]
+                r[f"det_{k}"] = x["determinate"] / x["total"] if x["total"] else np.nan
+                for c in ("TP", "TN", "FP", "FN", "n_pathogenic", "n_benign"):
+                    r[f"{c}_{k}"] = x[c]
+            sel = best[(best["gene_set"] == gs) & (best["gene"] == gene) & (best["cluster"] == cluster)]
+            r["k_by_mcc"] = int(str(sel["config"].iloc[0])[0]) if len(sel) else np.nan
+            r["k_by_heldout"] = (4 if r["heldout_ll_diff_4m3"] > 0 else 3) if paired else np.nan
+            rows.append(r)
+    d = pd.DataFrame(rows)
+    d.to_csv(figs / "component_selection.csv", index=False)
+    for panel, g in d.groupby("panel"):
+        both = g[(g["n_pathogenic_3"] > 0) & (g["n_benign_3"] > 0)]
+        for rule in ("k_by_mcc", "k_by_heldout"):
+            pick = lambda col: np.array([r[f"{col}_{int(r[rule])}"] if np.isfinite(r[rule]) else np.nan
+                                         for _, r in both.iterrows()], float)
+            print(f"{panel:10s} {rule:13s} genes {len(both)}  median MCC {np.nanmedian(pick('mcc')):.3f}  "
+                  f"median det {np.nanmedian(pick('det')):.3f}  FP {np.nansum(pick('FP')):.0f}  FN {np.nansum(pick('FN')):.0f}  "
+                  f"agree {int((both['k_by_mcc'] == both['k_by_heldout']).sum())}/{len(both)}")
+    print(f"wrote {figs / 'component_selection.csv'}")
+    return d
+
+
+def run_conflict_and_agreement():
+    """Two checks of what joint calibration does with dependent sources, on
+    the canonical models re-scored by the P-KNN prep stage:
+      conflict_resolution.csv  per functional gene, population variants whose
+          independently calibrated assays disagree in direction (the conflict
+          rate's numerator) and how many of them receive determinate joint
+          evidence; plus the Figure 1 example variant's joint points
+      agreement.csv  per combined gene, P/LP and B/LB controls on which the
+          independently calibrated functional and predictor evidence (each
+          aggregated by the nonconflicting rule) are both pathogenic, with the
+          joint points and the sum the point system would assign
+    Written to figures/dependence/."""
+    from mv_analysis.comparison_methods import pknn_runs
+    out_dir = Path(config.PAPER_FIGURES_DIR) / "dependence"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    conf_rows, agree_rows = [], []
+    for meta_f in sorted((Path(config.PKNN_DIR) / "prep").glob("*.json")):
+        d, m = pknn_runs.load_prep(meta_f.stem)
+        gs, gene, cl = m["gene_set"], m["gene"], m["cluster_idx"]
+        if m["panel"] not in ("functional", "combined") or gs == "fgfr":
+            continue
+        try:
+            ms = config.build_ms_for_gene_cluster(gs, gene, cluster_idx=cl, results_json=config.PAPER_RESULTS_JSON)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{meta_f.stem}] skipped: {e}")
+            continue
+        assert [str(v) for v in ms.kept_variants] == list(d["variants"]), f"{meta_f.stem}: rows differ from prep"
+        uv_gene = gene.lower() if gs == "labelseq" else gene.upper()
+        joint = np.nan_to_num(d["mv_points"])
+        if m["panel"] == "functional":
+            uv = uv_sources.load_uv_points(uv_gene, ms, report._UV_DISPATCH_GENE_SET.get(gs, gs))
+            if uv is None or len(uv[0]) < 2:
+                continue
+            mat = np.nan_to_num(np.asarray(uv[1], float))
+            conflict = (mat >= 1).any(axis=0) & (mat <= -1).any(axis=0)
+            pop = d["gnomad_eval"] & conflict
+            conf_rows.append(dict(key=meta_f.stem, gene=gene.upper(), n_population=int(d["gnomad_eval"].sum()),
+                                  n_conflicting=int(pop.sum()), n_resolved=int((np.abs(joint[pop]) >= 1).sum()),
+                                  n_resolved_path=int((joint[pop] >= 1).sum()), n_resolved_ben=int((joint[pop] <= -1).sum())))
+        else:
+            f = uv_sources.load_combined_uv_points(uv_gene, ms)
+            pr = uv_sources.load_predictor_mv_uv_points(uv_gene, ms)
+            if f is None or pr is None:
+                continue
+            fa = np.nan_to_num(uv_agg.aggregate_nonconflicting(np.asarray(f[1], float)))
+            pa = np.nan_to_num(uv_agg.aggregate_nonconflicting(np.asarray(pr[1], float)))
+            both = d["eval_mask"] & (fa >= 1) & (pa >= 1)
+            for i in np.flatnonzero(both):
+                agree_rows.append(dict(key=meta_f.stem, gene=gene.upper(), variant=d["variants"][i],
+                                       label="P/LP" if d["plp"][i] else "B/LB", functional=fa[i], predictor=pa[i],
+                                       independent_sum=fa[i] + pa[i], joint=joint[i]))
+    pd.DataFrame(conf_rows).to_csv(out_dir / "conflict_resolution.csv", index=False)
+    pd.DataFrame(agree_rows).to_csv(out_dir / "agreement.csv", index=False)
+    f1 = Path(config.PAPER_CARTOONS_DIR) / "fig1_conflict_facts.json"
+    if f1.exists():
+        facts = json.loads(f1.read_text())
+        key = f"integrated__{facts['gene']}"
+        if (Path(config.PKNN_DIR) / "prep" / f"{key}.json").exists() and facts.get("variant_key"):
+            d, _ = pknn_runs.load_prep(key)
+            hit = np.flatnonzero(np.isin(d["variants"], facts.get("variant_keys") or [facts["variant_key"]]))
+            facts["joint_points"] = int(d["mv_points"][hit[0]]) if len(hit) else None
+            (out_dir / "fig1_variant_joint.json").write_text(json.dumps(facts, indent=1))
+    print(pd.DataFrame(conf_rows).to_string(index=False))
+    print(f"agreement rows: {len(agree_rows)}; wrote {out_dir}")
+
+
+def run_strength_distributions():
+    """Evidence strength assigned by joint and independent calibration to the
+    P/LP and B/LB controls, gnomAD variants and ClinVar VUS of every gene, per
+    evidence type: figures/strength/strength_points.csv (one row per variant
+    and gene, points as assigned) and strength_distribution.csv (the share of
+    each sample at each standard level). Points come from the P-KNN prep
+    stage, which re-scores each gene's canonical joint model on the run and
+    stores the independent (nonconflicting) points for every row; controls
+    and gnomAD variants are taken on the evaluation footing of the results
+    tables (combined: measured by both evidence types). VUS are the paper's
+    reclassification set, matched to the same rows."""
+    from mv_analysis.comparison_methods import pknn_runs
+    out_dir = Path(config.PAPER_STRENGTH_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vus = {}
+    for panel in ("functional", "predictor", "combined"):
+        f = Path(config.PAPER_VUS_RECLASSIFICATION_DIR) / f"{panel}_true_clinvar_vus_points.csv"
+        if f.exists():
+            v = pd.read_csv(f)
+            vus[panel] = {(str(g).upper(), str(k)) for g, k in zip(v["gene"], v["variant_key"])}
+    rows = []
+    for meta_f in sorted((Path(config.PKNN_DIR) / "prep").glob("*.json")):
+        d, m = pknn_runs.load_prep(meta_f.stem)
+        if "uv_points" not in d:
+            continue
+        gene = str(m["gene"]).upper()
+        samples = {"P/LP": d["eval_mask"] & d["plp"], "B/LB": d["eval_mask"] & d["blb"], "gnomAD": d["gnomad_eval"]}
+        if m["panel"] in vus:
+            samples["VUS"] = np.array([(gene, v) in vus[m["panel"]] for v in d["variants"]])
+        for sample, mask in samples.items():
+            for i in np.flatnonzero(mask):
+                rows.append((m["panel"], m["gene_set"], gene, meta_f.stem, sample, d["variants"][i],
+                             d["mv_points"][i], d["uv_points"][i]))
+    pts = pd.DataFrame(rows, columns=["panel", "gene_set", "gene", "key", "sample", "variant",
+                                      "joint_points", "indep_points"])
+    pts.to_csv(out_dir / "strength_points.csv", index=False)
+    dist = []
+    for (panel, sample), g in pts.groupby(["panel", "sample"]):
+        for method, col in (("Joint", "joint_points"), ("Independent", "indep_points")):
+            lv = floor_strength(g[col])
+            for lvl in STRENGTH_LEVELS:
+                dist.append(dict(panel=panel, sample=sample, method=method, level=lvl,
+                                 n=int((lv == lvl).sum()), total=len(g), share=float((lv == lvl).mean())))
+    pd.DataFrame(dist).to_csv(out_dir / "strength_distribution.csv", index=False)
+    print(pts.groupby(["panel", "sample"]).size().to_string())
+    print(f"wrote {out_dir}")
+    return pts
+
+
 def run_pknn_comparison():
     """P-KNN (Lin & Brandes 2026) beside MV and the independent baseline on
     every per-gene evaluation (comparison_methods/pknn_runs.py writes the
@@ -861,6 +1055,304 @@ def run_pknn_comparison():
     return per
 
 
+# -- performance tables -------------------------------------------------------
+PERF_PANELS = (("functional", "Func", "Functional assays", "functional/functional_all_results_table.csv"),
+               ("predictor", "Pred", "Computational predictors", "predictor/predictor_results_table.csv"),
+               ("combined", "Comb", "Functional + predictors", "combined/combined_results_table.csv"))
+PERF_METHODS = (("Joint", "Joint"), ("UV non-conflicting", "Indep"))  # the strongest-call rule is not reported
+
+
+def _per_gene_methods(table_path, threshold=EVIDENCE_DIRECTION):
+    """{method tag: rows indexed by (gene, cluster)} at one threshold: the
+    joint model at its canonical component count, and the independent
+    baseline under the nonconflicting rule, on the genes both cover."""
+    t = pd.read_csv(table_path)
+    t = t[t["threshold"] == threshold]
+    out = {"Joint": config.select_canonical_mv_rows(t[t["method"].str.startswith("MV")])}
+    for method, tag in PERF_METHODS[1:]:
+        out[tag] = t[t["method"] == method]
+    out = {k: v.set_index(["gene", "cluster"]) for k, v in out.items()}
+    keys = out["Joint"].index
+    for v in out.values():
+        keys = keys.intersection(v.index)
+    return {k: v.loc[keys].sort_index() for k, v in out.items()}
+
+
+def _metrics_from_counts(r):
+    """compute_classification_metrics on summed counts (pooled across genes:
+    sums of TP/TN/FP/FN and of each class's indeterminate calls)."""
+    from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+    tp, tn, fp, fn = (int(r[c]) for c in ("TP", "TN", "FP", "FN"))
+    unc_p, unc_b = int(r["n_pathogenic"]) - tp - fn, int(r["n_benign"]) - tn - fp
+    cm = pd.DataFrame([[tn, unc_b, fp], [fn, unc_p, tp]])
+    m = compute_classification_metrics(cm)
+    m.update(total=tp + tn + fp + fn + unc_p + unc_b, determinate=tp + tn + fp + fn,
+             indeterminate=unc_p + unc_b)
+    return m
+
+
+def _fmt_ratio(x):
+    return "$\\infty$" if not np.isfinite(x) else (f"{x:,.0f}" if x >= 100 else f"{x:.1f}")
+
+
+def _write_performance_tables(REG, tdir):
+    """Pooled metrics per evidence type (joint vs independent, nonconflicting
+    rule), in the ExCALIBR paper's format, and one per-gene table per
+    evidence type; registers ResPool* macros."""
+    figs = Path(config.PAPER_FIGURES_DIR)
+    pooled = {}
+    for panel, ptag, title, rel in PERF_PANELS:
+        if not REG.require(figs / rel, f"{panel} results table"):
+            continue
+        per = _per_gene_methods(figs / rel)
+        pooled[panel] = {tag: _metrics_from_counts(per[tag][["TP", "TN", "FP", "FN", "n_pathogenic", "n_benign"]].sum())
+                         for _, tag in PERF_METHODS}
+        pooled[panel]["n_genes"] = len(per["Joint"])
+        for _, tag in PERF_METHODS:
+            m = pooled[panel][tag]
+            for name, key, fmt in (("Acc", "accuracy", ".3f"), ("Sens", "sensitivity", ".3f"),
+                                   ("Spec", "specificity", ".3f"), ("MCC", "mcc", ".3f"), ("PPV", "ppv", ".3f"),
+                                   ("LRPB", "lr_plus_standard", ".1f"), ("LRPR", "lr_plus_pathogenic", ".1f"),
+                                   ("LRBR", "lr_plus_benign", ".1f"), ("DORPB", "dor_standard", ".1f")):
+                if np.isfinite(m[key]):
+                    REG.num(f"ResPool{ptag}{tag}{name}", float(m[key]), fmt=fmt,
+                            source=f"{rel}: pooled {tag}, {key}")
+            REG.pct(f"ResPool{ptag}{tag}DetPct", m["determinate"], m["total"], source=f"{rel}: pooled {tag}")
+            REG.num(f"ResPool{ptag}{tag}FP", int(per[tag]["FP"].sum()), source=f"{rel}: pooled {tag} FP")
+            REG.num(f"ResPool{ptag}{tag}FN", int(per[tag]["FN"].sum()), source=f"{rel}: pooled {tag} FN")
+        REG.num(f"ResPool{ptag}Genes", len(per["Joint"]), source=f"{rel}: genes in the pooled table")
+        REG.num(f"ResPool{ptag}Controls", pooled[panel]["Joint"]["total"], source=f"{rel}: pooled controls")
+
+        # per-gene table: joint vs independent (nonconflicting)
+        rows = []
+        for (gene, cluster), r in per["Joint"].iterrows():
+            u = per["Indep"].loc[(gene, cluster)]
+            label = str(gene).upper() if str(gene).upper() != "FGFR_COMBINED" else "FGFR1/2/3/4"
+            if cluster != "gene":
+                label += f" ({str(cluster).replace('cluster', 'group ')})"
+            both = r["n_pathogenic"] > 0 and r["n_benign"] > 0
+            cells = []
+            for x in (r, u):
+                cells += [f"{x['mcc']:.2f}" if both else "--", f"{x['sensitivity']:.2f}" if r["n_pathogenic"] else "--",
+                          f"{x['specificity']:.2f}" if r["n_benign"] else "--",
+                          _fmt_ratio(x["lr_plus_standard"]) if both else "--",
+                          f"{100 * x['determinate'] / x['total']:.0f}" if x["total"] else "--"]
+            rows.append(f"{label} & {int(r['n_pathogenic'])} & {int(r['n_benign'])} & " + " & ".join(cells) + " \\\\")
+        body = ("\\begin{tabular}{lrr" + "rrrrr" * 2 + "}\n\\toprule\n"
+                " & \\multicolumn{2}{c}{Controls} & \\multicolumn{5}{c}{Joint} & \\multicolumn{5}{c}{Independent} \\\\\n"
+                "\\cmidrule(lr){2-3}\\cmidrule(lr){4-8}\\cmidrule(lr){9-13}\n"
+                "Gene & P/LP & B/LB" + " & MCC & Sens. & Spec. & LR$^+$ & Det.\\ (\\%)" * 2 + " \\\\\n\\midrule\n"
+                + "\n".join(rows) + "\n\\bottomrule\n\\end{tabular}\n")
+        (tdir / f"mv_gene_performance_{panel}.tex").write_text(body)
+        REG.output(tdir / f"mv_gene_performance_{panel}.tex", "A", f"per-gene performance table, {panel}")
+    if not pooled:
+        return
+
+    def _row(label, fn):
+        return label + " & " + " & ".join(fn(pooled[p][tag]) for p, *_ in PERF_PANELS if p in pooled
+                                          for _, tag in PERF_METHODS) + " \\\\"
+    pct = lambda n, m: f"{n:,} ({100 * n / m:.1f}\\%)" if m else "--"
+    lines = [
+        _row("Control variants", lambda m: f"{m['total']:,}"),
+        _row("Determinate", lambda m: pct(m["determinate"], m["total"])),
+        _row("Indeterminate", lambda m: pct(m["indeterminate"], m["total"])),
+        "\\midrule",
+        *[_row(lab, lambda m, k=k: f"{m[k]:.3f}") for lab, k in (
+            ("Accuracy", "accuracy"), ("Sensitivity", "sensitivity"), ("Specificity", "specificity"),
+            ("MCC", "mcc"), ("PPV", "ppv"), ("FDR", "fdr"))],
+        "\\midrule",
+        *[_row(lab, lambda m, k=k: _fmt_ratio(m[k])) for lab, k in (
+            ("LR$^+$ (P vs.\\ B)", "lr_plus_standard"), ("LR$^+$ (P vs.\\ R)", "lr_plus_pathogenic"),
+            ("LR$^+$ (B vs.\\ R)", "lr_plus_benign"), ("DOR (P vs.\\ B)", "dor_standard"),
+            ("DOR (P vs.\\ R)", "dor_pathogenic"), ("DOR (B vs.\\ R)", "dor_benign"))],
+    ]
+    present = [(p, t) for p, _, t, _ in PERF_PANELS if p in pooled]
+    head = (" & " + " & ".join(f"\\multicolumn{{2}}{{c}}{{{t} ({pooled[p]['n_genes']} genes)}}" for p, t in present)
+            + " \\\\\n" + "".join(f"\\cmidrule(lr){{{2 + 2 * i}-{3 + 2 * i}}}" for i in range(len(present)))
+            + "\nMetric" + " & Joint & Independent" * len(present) + " \\\\\n")
+    body = ("\\begin{tabular}{l" + "rr" * len(present) + "}\n\\toprule\n" + head + "\\midrule\n"
+            + "\n".join(lines) + "\n\\bottomrule\n\\end{tabular}\n")
+    (tdir / "mv_pooled_performance.tex").write_text(body)
+    REG.output(tdir / "mv_pooled_performance.tex", "A", "pooled performance table")
+
+
+def _register_revision_macros(REG):
+    """Out-of-bag medians of joint calibration per evidence type, CARD11's
+    per-gene numbers, conflict resolution and agreement (run_conflict_and_
+    agreement), and the fewest retained bootstrap iterations of a reported
+    model (component_selection.csv)."""
+    figs = Path(config.PAPER_FIGURES_DIR)
+    oob_f = Path(config.PAPER_PRODUCTION_OOB_DIR) / "production_oob_comparison.csv"
+    if REG.require(oob_f, "production-scored out-of-bag evaluation"):
+        o = pd.read_csv(oob_f)
+        for panel in ("functional", "predictor", "combined"):
+            x = o[(o["method"] == "MV") & (o["panel"] == panel)]["mcc"].dropna()
+            if len(x):
+                REG.num(f"ResOOBMedMCC{panel.capitalize()}MV", float(x.median()), fmt=".2f",
+                        source=f"{oob_f.name}: joint out of bag, median per-gene MCC ({len(x)} genes)")
+    per = _per_gene_methods(figs / "functional/functional_all_results_table.csv")
+    j, u = per["Joint"].reset_index(), per["Indep"].reset_index()
+    for frame, tag in ((j, "MV"), (u, "UV")):
+        r = frame[frame["gene"].astype(str).str.upper() == "CARD11"]
+        if "gene_set" in r.columns and (r["gene_set"] == "card11").any():
+            r = r[r["gene_set"] == "card11"]
+        if len(r):
+            r = r.iloc[0]
+            REG.num(f"ResGeneCARDMCC{tag}", float(r["mcc"]), fmt=".2f", source=f"functional table: CARD11 {tag}")
+            REG.pct(f"ResGeneCARDDet{tag}", int(r["determinate"]), int(r["total"]), source=f"functional table: CARD11 {tag}")
+    dep = figs / "dependence"
+    cr = dep / "conflict_resolution.csv"
+    if REG.require(cr, "conflict resolution"):
+        c = pd.read_csv(cr)
+        if len(c):
+            REG.num("ResConflictResolvedN", int(c["n_conflicting"].sum()), source=cr.name)
+            REG.pct("ResConflictResolvedPct", int(c["n_resolved"].sum()), int(c["n_conflicting"].sum()),
+                    source=f"{cr.name}: conflicting population variants given determinate joint evidence")
+    fv = dep / "fig1_variant_joint.json"
+    if fv.exists():
+        f = json.loads(fv.read_text())
+        if f.get("joint_points") is not None:
+            REG.text("ResFigOneJointPoints", f"{int(f['joint_points']):+d}".replace("-", "$-$"),
+                     source=f"{fv.name}: joint points of the Figure 1 variant")
+    ag = dep / "agreement.csv"
+    if REG.require(ag, "agreement of functional and predictor evidence"):
+        a = pd.read_csv(ag)
+        a = a[a["label"] == "P/LP"]
+        if len(a):
+            REG.num("ResAgreeN", len(a), source=f"{ag.name}: P/LP controls with both categories pathogenic")
+            REG.num("ResAgreeJointPoints", float(a["joint"].median()), fmt=".0f", source=f"{ag.name}: median joint points")
+            REG.num("ResAgreeSumPoints", float(a["independent_sum"].median()), fmt=".0f", source=f"{ag.name}: median summed points")
+    from mv_analysis.comparison_methods import pknn_runs
+    if (Path(config.PKNN_DIR) / "prep" / "combined__BRCA1.json").exists():
+        d, _ = pknn_runs.load_prep("combined__BRCA1")
+        pred = np.array([any(t in str(n) for t in ("REVEL", "AlphaMissense", "MutPred2")) for n in d["dims"]])
+        obs = ~np.isnan(d["X"])
+        has_f, has_p = obs[:, ~pred].any(axis=1), obs[:, pred].any(axis=1)
+        REG.pct("ResCombBRCAOneTypePct", int((has_f ^ has_p).sum()), int((has_f | has_p).sum()), digits=0,
+                source="prep combined__BRCA1: variants with scores of one evidence category only")
+    cs = figs / "component_selection.csv"
+    if REG.require(cs, "component selection"):
+        c = pd.read_csv(cs)
+        nb = [r[f"n_boot_{int(r['k_by_mcc'])}"] for _, r in c.iterrows() if np.isfinite(r["k_by_mcc"])]
+        if nb:
+            REG.num("ResMinValidBoots", int(min(nb)), source=f"{cs.name}: fewest bootstrap fits at the reported component count")
+
+
+def _pathogenic_factors():
+    """{dataset key: pathogenic-share weight factor f} for the fits in
+    PAPER_FITS_DIR, read once from the array job files (hpc/prepare.py) of
+    the condition each dataset came from (final/conditions.json for a merged
+    run) and cached next to the figures."""
+    import pickle
+    fits = Path(config.PAPER_FITS_DIR)
+    cache = Path(config.PAPER_FIGURES_DIR) / "pathogenic_factors.json"
+    if cache.exists():
+        return json.loads(cache.read_text())
+    cond_f = fits / "conditions.json"
+    source = json.loads(cond_f.read_text())["dataset_source"] if cond_f.exists() else None
+    jobs_dir = fits.parent / "jobs" if cond_f.exists() else fits / "jobs"
+    out = {}
+    for f in sorted(jobs_dir.glob("array_*.pkl")):
+        with open(f, "rb") as fh:
+            jobs = pickle.load(fh)
+        for j in jobs if isinstance(jobs, list) else []:
+            name = j.get("dataset_name")
+            if name in out or (source is not None and source.get(name) != j.get("condition")):
+                continue
+            out[name] = float(j.get("pathogenic_factor") or 1.0)
+            if j.get("pathogenic_share") is not None:
+                out["__tau__"] = max(out.get("__tau__", 0.0), float(j["pathogenic_share"]))
+    cache.write_text(json.dumps(out, indent=1))
+    return out
+
+
+def _write_gene_data_table(REG, tdir):
+    """Per gene and model: evidence sources, variants measured (with the range
+    of the per-source measured share), sample counts, VUS evaluated and the
+    pathogenic-share weight factor; from the P-KNN prep stage's per-gene
+    matrices (the canonical models scored in the paper)."""
+    from mv_analysis.comparison_methods import pknn_runs
+    prep = sorted((Path(config.PKNN_DIR) / "prep").glob("*.json"))
+    if not prep:
+        REG._fail_soft("missing-input", "P-KNN prep (per-gene matrices) for the gene data table")
+        return
+    factors = _pathogenic_factors()
+    if "__tau__" in factors:
+        REG.num("MethPathShareTau", factors["__tau__"], fmt="g", kind="method",
+                source="job files: pathogenic_share (hpc/prepare.py --pathogenic-share)")
+        REG.num("MethPathShareTauPct", 100 * factors["__tau__"], fmt="g", kind="method",
+                source="job files: pathogenic_share, as a percentage")
+    vus_n = {}
+    for panel in ("functional", "predictor", "combined"):
+        f = Path(config.PAPER_VUS_RECLASSIFICATION_DIR) / f"{panel}_true_clinvar_vus_points.csv"
+        if f.exists():
+            v = pd.read_csv(f)
+            vus_n.update({(panel, str(g).upper()): n for g, n in v.groupby("gene").size().items()})
+    order = {"functional": 0, "predictor": 1, "combined": 2}
+    rows, fvals = [], []
+    for meta_f in prep:
+        d, m = pknn_runs.load_prep(meta_f.stem)
+        X = d["X"]
+        measured = ~np.isnan(X).all(axis=1)
+        names = [str(n).lower() for n in d["sample_names"]]
+        syn = d["sa"][:, names.index("synonymous")] & measured if "synonymous" in names else np.zeros(len(X), bool)
+        share = 100 * (~np.isnan(X[measured])).mean(axis=0)
+        f = factors.get(m["dataset_name"], np.nan)
+        fvals.append(f)
+        gene = str(m["gene"]).upper()
+        label = "FGFR1/2/3/4" if gene == "FGFR_COMBINED" else gene
+        if m["cluster_idx"]:
+            label += f" (group {m['cluster_idx'] + 1})"
+        rows.append((order[m["panel"]], m["panel"].capitalize() if m["panel"] != "predictor" else "Predictor", label,
+                     X.shape[1], int(measured.sum()), f"{share.min():.0f}--{share.max():.0f}" if X.shape[1] > 1 else "100",
+                     int(d["plp"].sum()), int(d["blb"].sum()), int(d["gnomad"].sum()), int(syn.sum()),
+                     vus_n.get((m["panel"], gene), 0), f))
+    rows.sort(key=lambda r: (r[0], r[2]))
+    body = ("\\begin{tabular}{llrrrrrrrrr}\n\\toprule\n"
+            "Evidence & Gene & Sources & Variants & Measured per source (\\%) & P/LP & B/LB & gnomAD & Synonymous & VUS & $f$ \\\\\n"
+            "\\midrule\n"
+            + "\n".join(f"{r[1]} & {r[2]} & {r[3]} & {r[4]:,} & {r[5]} & {r[6]:,} & {r[7]:,} & {r[8]:,} & {r[9]:,} & "
+                        f"{r[10]:,} & {'--' if not np.isfinite(r[11]) else f'{r[11]:.1f}'} \\\\" for r in rows)
+            + "\n\\bottomrule\n\\end{tabular}\n")
+    (tdir / "mv_gene_data.tex").write_text(body)
+    REG.output(tdir / "mv_gene_data.tex", "A", "per-gene data table")
+    fv = np.asarray([x for x in fvals if np.isfinite(x)])
+    if len(fv):
+        REG.num("ResWeightNUpweighted", int((fv > 1).sum()), source="pathogenic_factors.json: models with f > 1")
+        REG.num("ResWeightNModels", len(fv), source="pathogenic_factors.json: models")
+        REG.num("ResWeightMaxF", float(fv.max()), fmt=".1f", source="pathogenic_factors.json: largest f")
+
+
+def _register_strength_macros(REG):
+    """ResStr{Func,Pred,Comb}{Joint,Indep}{...}: shares of each sample at
+    each evidence strength (strength/strength_points.csv)."""
+    p = Path(config.PAPER_STRENGTH_DIR) / "strength_points.csv"
+    if not REG.require(p, "evidence-strength distributions"):
+        return
+    d = pd.read_csv(p)
+    for panel, ptag, *_ in PERF_PANELS:
+        x = d[d["panel"] == panel]
+        for method, col in (("Joint", "joint_points"), ("Indep", "indep_points")):
+            for sample, stag in (("P/LP", "PLP"), ("B/LB", "BLB"), ("VUS", "VUS"), ("gnomAD", "Gnomad")):
+                v = np.nan_to_num(x.loc[x["sample"] == sample, col].to_numpy(float))
+                if not len(v):
+                    continue
+                n = len(v)
+                REG.num(f"ResStr{ptag}{stag}N", n, source=f"{p.name}: {panel} {sample}")
+                REG.pct(f"ResStr{ptag}{method}{stag}PathPct", int((v >= 1).sum()), n, source=f"{p.name}")
+                REG.pct(f"ResStr{ptag}{method}{stag}BenPct", int((v <= -1).sum()), n, source=f"{p.name}")
+                REG.pct(f"ResStr{ptag}{method}{stag}StrongPathPct", int((v >= 4).sum()), n, source=f"{p.name}: >= +4")
+                REG.pct(f"ResStr{ptag}{method}{stag}StrongBenPct", int((v <= -4).sum()), n, source=f"{p.name}: <= -4")
+            # errors: how strong are the wrong calls
+            wrong = np.concatenate([np.nan_to_num(x.loc[x["sample"] == "B/LB", col].to_numpy(float)),
+                                    -np.nan_to_num(x.loc[x["sample"] == "P/LP", col].to_numpy(float))])
+            wrong = wrong[wrong >= 1]
+            if len(wrong):
+                REG.num(f"ResStr{ptag}{method}ErrN", len(wrong), source=f"{p.name}: controls with evidence of the wrong direction")
+                REG.pct(f"ResStr{ptag}{method}ErrWeakPct", int((wrong < 4).sum()), len(wrong),
+                        source=f"{p.name}: wrong-direction calls below strong (|points| < 4)")
+
+
 def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
     """Register every manuscript number from the canonical outputs on disk,
     write Figures/generated/macros.tex, and export the included figures."""
@@ -896,16 +1388,14 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
     if tp53_ks:
         REG.num("MethTPFiftyThreeComponentsLow", min(tp53_ks), kind="method", source="TP53_tp53_mv configs")
         REG.num("MethTPFiftyThreeComponentsHigh", max(tp53_ks), kind="method", source="TP53_tp53_mv configs")
-    # restarts per (bootstrap, K): from the array logs' "N bootstraps, M fits" header
-    log_dir = Path(config.PAPER_FITS_DIR) / "logs"
-    per = []
-    for log in sorted(log_dir.glob("array_*.log"))[:200]:
-        m = _re.search(r"(\d+) bootstraps, (\d+) fits", log.read_text(errors="ignore")[:500])
-        if m and int(m.group(1)):
-            per.append(int(m.group(2)) / int(m.group(1)))
-    if per:
-        REG.num("MethNumRestarts", int(round(np.median(per) / len(ks))), kind="method",
-                source=f"array logs: median fits per bootstrap / {len(ks)} component counts")
+    # restarts per (bootstrap, K): the fits per K are indexed 0..M-1 (one per
+    # component family, hpc/prepare.py), and the winner's fit_idx is stored, so
+    # M = largest fit_idx + 1 over every bootstrap and dataset
+    fit_idx = [c["fit_idx"] for boots in raw.values() for b in boots.values()
+               for c in b.values() if c and c.get("fit_idx") is not None]
+    if fit_idx:
+        REG.num("MethNumRestarts", int(max(fit_idx)) + 1, kind="method",
+                source="PAPER_RESULTS_JSON: largest winning fit_idx + 1")
     REG.num("MethPathPercentile", RUN_KWARGS["path_percentile"], kind="method", source="RUN_KWARGS")
     REG.num("MethBenPercentile", 100 - RUN_KWARGS["path_percentile"], kind="method", source="RUN_KWARGS")
 
@@ -1214,6 +1704,15 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
             REG.num(f"ResRET{short}Prior", ret_ev["aux_prior"][g], fmt=".3f", source=f"{g} median prior")
             REG.num(f"ResRET{short}PLPPoints", int((ret_ev["points"][m] > 0).sum()),
                     source=f"{g} variants receiving pooled P/LP-vs-B/LB pathogenic evidence")
+        ap = {g: np.asarray(ret_ev["aux_points"][g], float) for g in ("MEN2", "Hirschsprung")}
+        REG.num("ResRETMenTwoCross", int((ap["Hirschsprung"][ret_ev["masks"]["MEN2"]] > 0).sum()),
+                source="MEN2 variants receiving Hirschsprung-specific pathogenic evidence")
+        REG.num("ResRETHirschCross", int((ap["MEN2"][ret_ev["masks"]["Hirschsprung"]] > 0).sum()),
+                source="Hirschsprung variants receiving MEN2-specific pathogenic evidence")
+        blb = np.asarray(ret_ev["ms"]._sample_assignments)[:, 1].astype(bool)
+        REG.num("ResRETBLBN", int(blb.sum()), source="RET B/LB controls")
+        REG.num("ResRETBLBSpecific", int(((ap["MEN2"] > 0) | (ap["Hirschsprung"] > 0))[blb].sum()),
+                source="RET B/LB controls receiving pathogenic evidence specific to either disease")
     if ret_counts:
         REG.num("ResRETBenignEvidenceN", ret_counts["benign"], source="ret 3D evidence classes")
         REG.num("ResRETMenTwoEvidenceN", ret_counts["men2"], source="ret 3D evidence classes")
@@ -1254,27 +1753,19 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
             REG.num(f"ResTPFiftyThree{short[row]}N", sum(counts), source=f7.name)
             for c, n in zip(f["classes"], counts):
                 REG.num(f"ResTPFiftyThree{short[row]}{cls[c]}", n, source=f7.name)
+        for k, name in (("plp_also_rpv", "ResTPFiftyThreePLPAlsoRPV"),
+                        ("plp_also_rpv_low_pen", "ResTPFiftyThreePLPAlsoRPVLowPen"),
+                        ("blb_low_pen_max_points", "ResTPFiftyThreeBLBLowPenMaxPoints")):
+            if k in f:
+                REG.num(name, int(f[k]), source=f"{f7.name}: {k}")
 
-    # -- Extended Data: per-gene performance table -------------------------------
-    sys.path.insert(0, str(_ROOT / "mv_analysis" / "figures" / "scripts"))
-    import make_panel_performance as mpp
-    rows = []
-    for panel, title in (("functional", "Functional"), ("predictor", "Computational"),
-                         ("combined", "Combined")):
-        d = mpp.per_gene(Path(config.PAPER_FIGURES_DIR) / mpp.PANELS[panel][0])
-        d = d.sort_values("label")
-        for _, r in d.iterrows():
-            mcc = (f"{r['uv_mcc']:.2f} & {r['mv_mcc']:.2f}" if r["both_classes"] else "-- & --")
-            rows.append(f"{title} & {r['label']} & {int(r['n']):,} & {mcc} & "
-                        f"{100 * r['uv_det']:.0f} & {100 * r['mv_det']:.0f} \\\\")
-    body = ("\\begin{tabular}{llrrrrr}\n\\toprule\n"
-            "Evidence & Gene & Controls & \\multicolumn{2}{c}{MCC} & \\multicolumn{2}{c}{Determinate rate (\\%)} \\\\\n"
-            " & & & Indep. & Joint & Indep. & Joint \\\\\n\\midrule\n"
-            + "\n".join(rows) + "\n\\bottomrule\n\\end{tabular}\n")
+    # -- performance tables (pooled, per gene), per-gene data, strength ----------
     tdir = Path(config.MANUSCRIPT_GENERATED_DIR) / "tables"
     tdir.mkdir(parents=True, exist_ok=True)
-    (tdir / "mv_gene_performance.tex").write_text(body)
-    REG.output(tdir / "mv_gene_performance.tex", "A", "Extended Data per-gene performance table")
+    _write_performance_tables(REG, tdir)
+    _write_gene_data_table(REG, tdir)
+    _register_strength_macros(REG)
+    _register_revision_macros(REG)
 
     # -- Extended Data: out-of-bag comparison with supervised classifiers --------
     # on the genes every method can be evaluated on (classifiers need at least
@@ -1444,7 +1935,7 @@ def main():
                               "confusion", "ret", "card11", "tp53", "vus-brnich",
                               "vus-points-by-panel", "per-gene-diagnostics", "summary",
                               "cartoons", "correlation", "ret-phenotype", "figures", "manuscript",
-                              "predictor-baselines", "pknn", "production-oob"])
+                              "predictor-baselines", "pknn", "production-oob", "strength", "component-selection", "dependence"])
     ap.add_argument("--path-percentile", type=float, default=RUN_KWARGS["path_percentile"],
                      help="Percentile of the bootstrap LR+ distribution a pathogenic call must clear "
                           "(ben_percentile derives as 100 - this, matching analysis.run()'s own "
@@ -1557,12 +2048,25 @@ def main():
         run_predictor_baseline_comparison()
         run_combined_single_predictor_comparison()
 
+    # P-KNN's prep stage re-scores each canonical joint model, which the
+    # out-of-bag evaluation and the comparison tables both read
+    if run_all or "pknn" in sections:
+        run_pknn_analyses()
+
     if run_all or "production-oob" in sections:
         run_production_oob_evaluation()
 
     if run_all or "pknn" in sections:
-        run_pknn_analyses()
         run_pknn_comparison()
+
+    if run_all or "strength" in sections:
+        run_strength_distributions()
+
+    if run_all or "component-selection" in sections:
+        run_component_selection()
+
+    if run_all or "dependence" in sections:
+        run_conflict_and_agreement()
 
     if run_all or "cartoons" in sections:
         run_cartoons()

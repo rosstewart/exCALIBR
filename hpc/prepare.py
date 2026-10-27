@@ -1237,6 +1237,7 @@ def _build_gene_set_ms_map(gene_set, args):
                 # doesn't silently change behavior if build_combined_
                 # multiscoreset's own default ever flips again.
                 require_both_modalities=False,
+                predictor_transform=getattr(args, "predictor_transform_value", None),
             )
             if ms is None:
                 print(f"  {gene}: no predictor CSVs under {args.predictor_data_dir}, skipping")
@@ -1640,7 +1641,8 @@ def _generate_predictor_mv_jobs(by_gene, args):
     def process_one(gene, predictor_dfs):
         label = predictor_dataset_label(gene)
         save_dir = os.path.join(output_dir, label)
-        ms, info = build_basic_multi_scoreset(gene, predictor_dfs, standardize=standardize_predictors)
+        ms, info = build_basic_multi_scoreset(gene, predictor_dfs, standardize=standardize_predictors,
+                                              transform=getattr(args, "predictor_transform_value", None))
         if ms is None:
             print(f"  {gene}: skipping — {info}")
             return None
@@ -1855,6 +1857,37 @@ def run_pathogenic_share_conditions(args):
         sub.output_dir = os.path.join(root, label)
         sub.pathogenic_share_value = tau if tau > 0 else None
         args.func(sub)
+        labels.append(label)
+    if getattr(args, "list_only", False):
+        return
+    _merge_condition_manifests(root, labels, args.target_array_size)
+
+
+def run_predictor_transform_conditions(args):
+    """Build one condition per --predictor-transform value (each through the
+    subcommand's normal builder, into <output-dir>/ptx_<TRANSFORM>/, at the one
+    --pathogenic-share value if given) and merge them into one job array. Each
+    condition dir gets a predictor_transform.txt marker, which mv_analysis/
+    config.py reads so scoring rebuilds the scores on the same scale."""
+    from src.assay_calibration.multivariate_data.predictors import PREDICTOR_TRANSFORMS
+    taus = getattr(args, "pathogenic_share", None) or [0]
+    if len(taus) != 1:
+        raise SystemExit("--predictor-transform takes a single --pathogenic-share value")
+    root = args.output_dir
+    labels = []
+    for transform in args.predictor_transform:
+        if transform not in PREDICTOR_TRANSFORMS:
+            raise SystemExit(f"unknown --predictor-transform {transform!r}")
+        label = f"ptx_{transform}"
+        print(f"\n{'#' * 80}\nCondition {label} (predictor transform {transform}, "
+              f"pathogenic share {taus[0]:g})\n{'#' * 80}")
+        sub = copy.copy(args)
+        sub.output_dir = os.path.join(root, label)
+        sub.predictor_transform_value = transform
+        sub.pathogenic_share_value = taus[0] if taus[0] > 0 else None
+        args.func(sub)
+        with open(os.path.join(sub.output_dir, "predictor_transform.txt"), "w") as f:
+            f.write(transform + "\n")
         labels.append(label)
     if getattr(args, "list_only", False):
         return
@@ -2242,6 +2275,13 @@ def main():
     p_mv_all.set_defaults(func=run_mv_all)
     for p in (p_multi, p_pred, p_mv_all):
         _add_pathogenic_share_arg(p)
+        p.add_argument("--predictor-transform", nargs="+", default=None,
+                       metavar="TRANSFORM",
+                       help="Fit the computational predictor readouts (REVEL/MutPred2/"
+                            "AlphaMissense) on a monotone transform of their scores: none, "
+                            "logit, rank_int (multivariate_data/predictors.py). Each value "
+                            "becomes its own condition <output-dir>/ptx_<TRANSFORM>/, merged "
+                            "into one job array. Functional readouts are untouched.")
 
     args = parser.parse_args()
 
@@ -2264,7 +2304,9 @@ def main():
     print("=" * 80)
     print(f"ExCALIBR job manifest — mode: {args.mode}  (workers: {args.n_jobs})")
     print("=" * 80)
-    if getattr(args, "pathogenic_share", None):
+    if getattr(args, "predictor_transform", None):
+        run_predictor_transform_conditions(args)
+    elif getattr(args, "pathogenic_share", None):
         run_pathogenic_share_conditions(args)
     else:
         args.func(args)
