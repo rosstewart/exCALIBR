@@ -11,7 +11,11 @@
 #
 # Override defaults via environment variables:
 #   N_GPUS=8 bash hpc/submit_array_gpu.sh /projects/pedjas_lab/stewart.ro/my_run
-#   N_GPUS=4 SLURM_PARTITION=gpu bash hpc/submit_array_gpu.sh /projects/pedjas_lab/stewart.ro/my_run
+#   N_GPUS=4 SLURM_PARTITION=b200-batch bash hpc/submit_array_gpu.sh /projects/pedjas_lab/stewart.ro/my_run
+#
+# JAX comes from the env's own pip CUDA wheels (pip install "jax[cuda13]"),
+# so no CUDA module is loaded by default; set CUDA_MODULE/CONDA_MODULE to
+# load modules first on a cluster that needs them.
 
 set -euo pipefail
 
@@ -35,21 +39,24 @@ mkdir -p "$OUTPUT_DIR/logs"
 # Override any of these with environment variables before calling this script.
 ACCOUNT="${SLURM_ACCOUNT:-predrag}"
 JOB_NAME="${SLURM_JOB_NAME:-excalibr_bootstrap_gpu}"
-TIME="${SLURM_TIME:-08:00:00}"
+TIME="${SLURM_TIME:-23:59:00}"
 MEM="${SLURM_MEM:-16G}"
 CPUS="${SLURM_CPUS:-4}"
-PARTITION="${SLURM_PARTITION:-gpu}"
+PARTITION="${SLURM_PARTITION:-rtx-batch}"
 GRES="${SLURM_GRES:-gpu:1}"
-N_GPUS="${N_GPUS:-32}"
+N_GPUS="${N_GPUS:-32}"                        # rtx-/b200-batch QOS: 32 GPUs per user
 PYTHON="${PYTHON:-/home/stewart.ro/.conda/envs/pillar_project/bin/python}"
-CUDA_MODULE="${CUDA_MODULE:-cuda/12.1.1}"
-CONDA_MODULE="${CONDA_MODULE:-anaconda3/2024.06}"
+CUDA_MODULE="${CUDA_MODULE:-}"                # e.g. cuda/13.1.1; empty = load nothing
+CONDA_MODULE="${CONDA_MODULE:-}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Each SLURM array element covers this many consecutive array tasks
 TASKS_PER_GPU=$(( (NUM_ARRAYS + N_GPUS - 1) / N_GPUS ))
 
-JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
+# --partition goes on the command line as well: an SBATCH_PARTITION in the
+# environment (e.g. exported in ~/.bashrc) overrides #SBATCH directives in
+# the script, and would send these GPU jobs to a partition without GPUs.
+JOB_ID=$(sbatch --parsable --partition="${PARTITION}" << SBATCH_SCRIPT
 #!/bin/bash
 #SBATCH --account=${ACCOUNT}
 #SBATCH --job-name=${JOB_NAME}
@@ -62,8 +69,21 @@ JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 #SBATCH --partition=${PARTITION}
 #SBATCH --gres=${GRES}
 
-module purge
-module load ${CONDA_MODULE} ${CUDA_MODULE}
+MODULES="${CONDA_MODULE} ${CUDA_MODULE}"
+if [ -n "\${MODULES// /}" ]; then
+    module purge
+    module load \${MODULES}
+fi
+
+# Same thread caps as submit_array.sh: the CPU-side init/val_ll work must not
+# oversubscribe --cpus-per-task. JAX: allocate GPU memory on demand rather
+# than reserving 75% up front, and stream progress lines to the log.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export PYTHONUNBUFFERED=1
 
 START=\$(( \${SLURM_ARRAY_TASK_ID} * ${TASKS_PER_GPU} ))
 END=\$(( START + ${TASKS_PER_GPU} - 1 ))

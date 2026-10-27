@@ -27,7 +27,8 @@ from ..cfusn.initializations import (
     kmeans_init, methodOfMomentsInit, kmeans_init_mv, kmeans_init_mv_anchored,
 )
 from ..cfusn.update_steps import get_sample_weights
-from ..cfusn.fit import _ensure_cfusn_params
+from ..cfusn.fit import _ensure_cfusn_params, compute_sample_weights
+from ..fit import _mv_fit_is_degenerate, _unstandardize_component_params
 from . import batch_em, batch_em_cfusn
 from .init_jax import batch_init_univariate, batch_init_cfusn
 from .batch_em import _log_pdfs, _gather_sample_weights
@@ -58,7 +59,10 @@ def group_fit_specs(fit_specs, max_batch_univariate=MAX_BATCH_UNIVARIATE,
     for (dataset_name, label, num_components, is_mv), specs in groups.items():
         constrained_vals = {s[0]["constrained"] for s in specs}
         force_gaussian_vals = {s[0].get("kwargs", {}).get("force_gaussian", False) for s in specs}
-        if len(constrained_vals) > 1 or len(force_gaussian_vals) > 1:
+        # Multivariate groups mix q=2 / q=1 / Gaussian restarts freely: the
+        # CFUSN batch carries each fit's restart type as its own `mode`.
+        # The univariate batch takes one force_gaussian setting per call.
+        if len(constrained_vals) > 1 or (not is_mv and len(force_gaussian_vals) > 1):
             raise ValueError(
                 f"group_fit_specs: mixed constrained/force_gaussian within "
                 f"({dataset_name}, {label}) — GPU batching requires a uniform "
@@ -101,18 +105,42 @@ def _init_univariate(full_job):
     return initial_params, W
 
 
+# Fit options that change the CPU EM (cfusn/fit.py's em_kwargs) but have no
+# JAX counterpart. Checked for every spec of every chunk, whichever init path
+# runs: an ignored option would silently fit a different model.
+_CPU_ONLY_CFUSN_OPTIONS = {
+    "cat_spec": "categorical dims (cfusn/categorical.py); the JAX batch EM has no categorical term",
+    "weight_divergence": "weight_divergence (cfusn/weight_divergence.py); the JAX batch EM has no penalised W step",
+    "tied_population": "tied_population (cfusn/tied_population.py); the JAX batch EM has no tied W step",
+    "gaussian_components": "per-component gaussian_components; the JAX batch EM masks Delta per fit, not per component",
+    "frozen_components": "frozen_components; the JAX batch EM updates every component",
+    "low_mass_freeze": "low_mass_freeze; the JAX batch EM has no low-mass freeze",
+}
+
+
+def _check_cfusn_supported(full_job):
+    kwargs = full_job.get("kwargs", {})
+    if full_job.get("constrained"):
+        raise NotImplementedError(
+            "constrained multivariate fits are CPU-only (batch_em_cfusn is "
+            "unconstrained-only) -- run with --device cpu"
+        )
+    for key, what in _CPU_ONLY_CFUSN_OPTIONS.items():
+        if kwargs.get(key):
+            raise NotImplementedError(f"{what} -- run with --device cpu")
+    if any(kwargs.get(k) for k in ("dim_proportions", "dim_weight_transform", "dim_balance_beta")):
+        raise NotImplementedError(
+            "per-dimension Delta weights (cfusn/fit.py::compute_dim_weights) are "
+            "CPU-only -- run with --device cpu"
+        )
+    if not kwargs.get("early_stopping", True):
+        raise NotImplementedError("early_stopping=False is CPU-only -- run with --device cpu")
+    if kwargs.get("weight_neff", "weighted") not in ("weighted", "kish"):
+        raise ValueError(f"unknown weight_neff {kwargs['weight_neff']!r}")
+
+
 def _init_cfusn(full_job):
     kwargs = dict(full_job.get("kwargs", {}))
-    if kwargs.get("cat_spec") is not None:
-        raise NotImplementedError(
-            "categorical dims (cfusn/categorical.py) are CPU-only; the JAX batch "
-            "EM has no categorical term -- run with --device cpu"
-        )
-    if kwargs.get("weight_divergence"):
-        raise NotImplementedError(
-            "weight_divergence (cfusn/weight_divergence.py) is CPU-only; the JAX "
-            "batch EM has no penalised W step -- run with --device cpu"
-        )
     kwargs["rng"] = np.random.RandomState(kwargs.get("fit_seed"))
     K = full_job["num_components"]
     constrained = full_job["constrained"]
@@ -352,30 +380,18 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
     if not specs:
         return []
 
+    for spec in specs:
+        _check_cfusn_supported(spec[0])
+    neff_modes = {s[0].get("kwargs", {}).get("weight_neff", "weighted") for s in specs}
+    if len(neff_modes) > 1:
+        raise ValueError(f"chunk mixes weight_neff settings {sorted(neff_modes)}")
+
     K = specs[0][0]["num_components"]
     S = specs[0][0]["train_sample_assignments"].shape[1]
 
     obs_raw = np.stack([np.asarray(s[0]["train_observations"], dtype=float) for s in specs])
     obs_mask_np = ~np.isnan(obs_raw)
     obs_np = np.where(obs_mask_np, obs_raw, 0.0)
-
-    # batch_em_cfusn._m_step now mirrors the CPU M-step: completed-data moments
-    # instead of available-case masking, the Gamma inverse-Wishart ridge, and
-    # the Delta cap's (1 - 2/pi) positive-definiteness correction. That port has
-    # NOT been executed anywhere yet -- no JAX is installed on the machine it was
-    # written on, so tests/test_batch_em_parity.py skipped -- so the first GPU
-    # run should be checked against the CPU path before its results are trusted.
-    if not obs_mask_np.all():
-        import warnings
-        n_missing = int((~obs_mask_np).sum())
-        warnings.warn(
-            f"GPU CFUSN path: {n_missing} missing entries. The missing-data "
-            f"M-step port (completed-data moments + Gamma ridge + corrected "
-            f"Delta cap) has never been executed -- verify against device='cpu' "
-            f"on this data before relying on the result, and run "
-            f"tests/test_batch_em_parity.py now that JAX is available.",
-            stacklevel=2,
-        )
 
     obs = jnp.asarray(obs_np)
     obs_mask = jnp.asarray(obs_mask_np)
@@ -452,18 +468,41 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
         nominal_q = int(valid_specs[0][0].get("nominal_latent_q") or max(per_spec_q))
         mode_np = np.array([_spec_mode(kw, nominal_q) for kw in per_spec_kwargs], dtype=np.int32)
 
-    cfusn_kw = {}
-    if max_em_iters is not None:
-        cfusn_kw["max_em_iters"] = max_em_iters
-    mu, Delta, Gamma, W, failed, it_final, done = batch_em_cfusn.fit_batch_cfusn(
+    # single_fit's iteration cap: the job's own max_em_iters, else the
+    # multivariate default. One compiled loop serves the whole chunk, so the
+    # chunk must agree on it.
+    caps = {int(s[0].get("kwargs", {}).get("max_em_iters", batch_em_cfusn.MV_MAX_EM_ITERS))
+            for s in specs}
+    if len(caps) > 1:
+        raise ValueError(f"chunk mixes max_em_iters settings {sorted(caps)}")
+    cfusn_kw = {"max_em_iters": max_em_iters if max_em_iters is not None else caps.pop()}
+    # Per-observation M-step weights and measurement-noise floor, per fit
+    # (both depend on the bootstrap: its sample counts and _scale_std), built
+    # by the same functions the CPU path uses. Omitted when no fit in the
+    # chunk asks for them, so the default trace is unchanged.
+    sw_list = [compute_sample_weights(s[0]["train_sample_assignments"], **s[0].get("kwargs", {}))
+               for s in specs]
+    if any(w is not None for w in sw_list):
+        N = obs.shape[1]
+        cfusn_kw["sample_w"] = jnp.asarray(np.stack([
+            np.ones(N) if w is None else np.asarray(w, dtype=float) for w in sw_list]))
+        cfusn_kw["neff_kish"] = neff_modes == {"kish"}
+    floors = [s[0].get("kwargs", {}).get("gamma_noise_floor") for s in specs]
+    if any(nf is not None for nf in floors):
+        p = obs.shape[2]
+        factors = [batch_em_cfusn.noise_floor_factors(nf, p) for nf in floors]
+        cfusn_kw["noise_L"] = jnp.asarray(np.stack([L for L, _ in factors]))
+        cfusn_kw["floor_mask"] = jnp.asarray(np.stack([f for _, f in factors]))
+    (mu, Delta, Gamma, W, failed, it_final, done, hit_cap,
+     n_rejected, rejected_mass) = batch_em_cfusn.fit_batch_cfusn(
         obs, obs_mask, sample_idx, S,
         mu0, Delta0, Gamma0, W0,
         mode=jnp.asarray(mode_np),
         **cfusn_kw,
     )
-    mu, Delta, Gamma, W, failed, done = map(np.asarray, (mu, Delta, Gamma, W, failed, done))
+    mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass = map(
+        np.asarray, (mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass))
     it_final_np = int(np.asarray(it_final))
-    hit_cap = ~done
     n_hit_cap = int(hit_cap.sum())
     print(f"  [batch_em_cfusn] iterations: {it_final_np} (batch={len(specs)}, cap_hits={n_hit_cap})", flush=True)
     if use_gpu_init and not any_anchored:
@@ -484,15 +523,41 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
             )
         else:
             xlims = (float(np.nanmin(train_obs)), float(np.nanmax(train_obs)))
+        guard_stats = {}
+        if n_rejected[i] > 0:
+            guard_stats = {"gamma_rejected": int(n_rejected[i]),
+                           "gamma_rejected_max_mass": float(rejected_mass[i])}
         result = {
             "component_params": component_params,
             "weights": weights,
             "xlims": xlims,
             "times_submerged": [],
+            "guard_stats": guard_stats,
         }
+        # Same post-fit handling as Fit.execute_fit_job: a fit whose Gamma
+        # was rejected on a materially-sized component (those components
+        # never left their initialisation) or that ran away to degenerate
+        # params is excluded from selection, and params are scored in the
+        # standardized space they were fit in, then returned in raw units.
+        frozen_dominant = (n_rejected[i] > 0 and len(train_obs) > 0
+                           and rejected_mass[i] >= 0.05 * len(train_obs))
+        if frozen_dominant:
+            import warnings
+            warnings.warn(
+                f"fit excluded: Gamma rejected as indefinite on a component "
+                f"with up to {rejected_mass[i]:.1f} of {len(train_obs)} effective "
+                f"observations ({int(n_rejected[i])} events); "
+                f"those components never left their initialisation."
+            )
         val_ll = None
-        if full_job.get("val_observations") is not None:
+        if frozen_dominant or _mv_fit_is_degenerate(component_params):
+            val_ll = -np.inf
+        elif full_job.get("val_observations") is not None:
             val_ll = _val_ll_cfusn(full_job, component_params, weights)
+        kw = full_job.get("kwargs", {})
+        if kw.get("_scale_mean") is not None and kw.get("_scale_std") is not None:
+            result["component_params"] = _unstandardize_component_params(
+                component_params, kw["_scale_mean"], kw["_scale_std"])
         results.append((bs_seed, label, save_dir, full_job.get("fit_idx"), {
             "dataset_name": full_job.get("dataset_name"),
             "bootstrap_seed": bs_seed,

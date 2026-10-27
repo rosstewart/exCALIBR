@@ -7,7 +7,7 @@ authoring machine — see hpc/README.md and the "gpu" branch's plan). Run
 this file FIRST on the GPU machine, before trusting any GPU output:
 
     source activate excalibr   # or your env
-    pip install "jax[cuda12]"
+    pip install "jax[cuda13]"
     pytest tests/test_batch_em_parity.py -v
 
 Expect to need to debug real bugs here — treat first-run failures as
@@ -372,11 +372,11 @@ def test_max_em_iters_not_binding_cfusn():
         assert packed is not None, f"CFUSN seed={seed}: all CPU inits failed"
         obs, obs_mask, sample_idx, S, mu0, Delta0, Gamma0, W0 = packed
 
-        mu10k, D10k, G10k, W10k, failed10k, it10k, _done10k = batch_em_cfusn.fit_batch_cfusn(
+        mu10k, D10k, G10k, W10k, failed10k, it10k, _done10k, *_ = batch_em_cfusn.fit_batch_cfusn(
             obs, obs_mask, sample_idx, S, mu0, Delta0, Gamma0, W0,
             max_em_iters=10000,
         )
-        mu20k, D20k, G20k, W20k, failed20k, it20k, _done20k = batch_em_cfusn.fit_batch_cfusn(
+        mu20k, D20k, G20k, W20k, failed20k, it20k, _done20k, *_ = batch_em_cfusn.fit_batch_cfusn(
             obs, obs_mask, sample_idx, S, mu0, Delta0, Gamma0, W0,
             max_em_iters=20000,
         )
@@ -401,3 +401,101 @@ def test_max_em_iters_not_binding_cfusn():
             np.asarray(mu10k), np.asarray(mu20k),
             err_msg=f"CFUSN seed={seed}: mu differs despite same it_final",
         )
+
+
+# ---------------------------------------------------------------------------
+# Measurement-noise floor, sample weights, unsupported-option guard
+# ---------------------------------------------------------------------------
+
+def _random_psd(rng, p, scale=1.0):
+    A = rng.normal(size=(p, p)) * scale
+    return A @ A.T + 1e-3 * np.eye(p)
+
+
+@pytest.mark.parametrize("noise_kind", ["full", "partial", "partial_mid", "empty", "satisfied", "vector"])
+def test_floor_gamma_at_noise_matches_numpy(noise_kind):
+    """_floor_gamma_at_noise_jax == cfusn/update_steps._floor_gamma_at_noise,
+    including the partially-floored case (NaN readouts, as in the real
+    floor_full manifests) that propagates the increase through U's
+    regression on F."""
+    from src.assay_calibration.fit_utils.cfusn.update_steps import _floor_gamma_at_noise
+    from src.assay_calibration.fit_utils.jax_batch.batch_em_cfusn import (
+        noise_floor_factors, _floor_gamma_at_noise_jax)
+
+    rng = np.random.RandomState(0)
+    p = 3
+    noises = {
+        "full": _random_psd(rng, p),
+        "partial": np.array([[np.nan, np.nan, np.nan],
+                             [np.nan, np.nan, np.nan],
+                             [np.nan, np.nan, 2.0]]),
+        "partial_mid": np.array([[1.5, np.nan, 0.3],
+                                 [np.nan, np.nan, np.nan],
+                                 [0.3, np.nan, 2.0]]),
+        "empty": np.full((p, p), np.nan),
+        "satisfied": 1e-6 * np.eye(p),
+        "vector": np.array([0.8, np.nan, 1.7]),
+    }
+    noise = noises[noise_kind]
+    Gammas = [_random_psd(rng, p, scale=s) for s in (0.2, 0.5, 1.0, 2.0)]
+    L, f = noise_floor_factors(noise, p)
+    out = np.asarray(_floor_gamma_at_noise_jax(
+        jnp.asarray(np.stack(Gammas)),
+        jnp.asarray(np.stack([L] * len(Gammas))),
+        jnp.asarray(np.stack([f] * len(Gammas)))))
+    for G, G_jax in zip(Gammas, out):
+        np.testing.assert_allclose(G_jax, _floor_gamma_at_noise(G, noise), rtol=1e-9, atol=1e-10)
+
+
+def _weighted_floored_jobs():
+    scoreset = _make_multivariate_scoreset()
+    fitter = Fit(scoreset)
+    # Raw-unit floor on assay1 only (NaN = unfloored), above the variance of
+    # two of the three simulated clusters so it binds.
+    floor = [[np.nan, np.nan], [np.nan, 0.6]]
+    return fitter.generate_fit_jobs(
+        component_range=[3], bootstrap_seed=0, num_fits=3,
+        check_monotonic=False, latent_q=2, master_seed=42,
+        gamma_noise_floor=floor, sample_proportions=[1.0, 1.0, 2.0],
+        anchor_weight_scale=True,
+    )
+
+
+def test_cfusn_parity_floor_and_sample_weights():
+    """GPU path with gamma_noise_floor + sample_proportions/anchor_weight_scale
+    (the floor_full manifests' options) vs the CPU path, from the same init."""
+    from src.assay_calibration.fit_utils.cfusn.update_steps import _floor_gamma_at_noise
+
+    jobs = _weighted_floored_jobs()
+    assert jobs
+    assert jobs[0]["kwargs"].get("gamma_noise_floor") is not None
+    cpu = _run_cpu(jobs)
+    gpu = _run_gpu(jobs, label="3c")
+
+    n_compared = 0
+    for fit_idx, cpu_result in cpu.items():
+        gpu_result = gpu[fit_idx]
+        cpu_params = cpu_result["fit"]["component_params"]
+        if (cpu_result["val_ll"] == -np.inf or gpu_result["val_ll"] == -np.inf
+                or not cpu_params or len(cpu_params[0]) == 0):
+            continue
+        n_compared += 1
+        gpu_params = gpu_result["fit"]["component_params"]
+        for (mu1, _, G1), (mu2, _, G2) in zip(cpu_params, gpu_params):
+            # Both returned in raw units (execute_fit_job un-standardizes).
+            np.testing.assert_allclose(mu1, mu2, rtol=1e-2, atol=1e-2)
+            np.testing.assert_allclose(G1, G2, rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(cpu_result["val_ll"], gpu_result["val_ll"], rtol=1e-2, atol=1e-2)
+
+        # The floor holds on the GPU result, in raw units: Gamma_11 >= 0.6.
+        for _, _, G in gpu_params:
+            assert G[1, 1] >= 0.6 * (1 - 1e-8)
+    assert n_compared > 0
+
+
+def test_cfusn_gpu_rejects_cpu_only_options():
+    jobs = _weighted_floored_jobs()
+    job = {**jobs[0], "dataset_name": "test",
+           "kwargs": {**jobs[0]["kwargs"], "tied_population": {"population": 2}}}
+    with pytest.raises(NotImplementedError, match="tied_population"):
+        run_gpu([(job, job["bootstrap_seed"], "3c", "")])
