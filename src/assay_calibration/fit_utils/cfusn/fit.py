@@ -198,6 +198,17 @@ def compute_dim_weights(observations, **kwargs):
     return dim_w
 
 
+def _cat_pool_rows(sample_indicators, kwargs):
+    """Rows the categorical prior pools over: the population sample
+    (cat_pool_sample, default gnomAD), or every row when it is None or the
+    sample has no rows."""
+    idx = kwargs.get("cat_pool_sample", _cat.DEFAULT_POOL_SAMPLE)
+    S = np.asarray(sample_indicators)
+    if idx is None or S.ndim != 2 or idx >= S.shape[1] or not S[:, idx].any():
+        return None
+    return S[:, idx].astype(bool)
+
+
 def single_fit(
     observations, sample_indicators, N_components, constrained,
     init_method, init_constraint_adjustment, multivariate=False, **kwargs
@@ -276,6 +287,7 @@ def single_fit(
                 cat_labels, cat_spec,
                 tau=kwargs.get("cat_tau", _cat.DEFAULT_TAU),
                 lam=kwargs.get("cat_lambda", _cat.DEFAULT_LAMBDA),
+                rows=_cat_pool_rows(sample_indicators, kwargs),
             )
         cat = dict(labels=cat_labels, has_cont=cat_has_cont,
                    alpha=[np.asarray(a, dtype=float) for a in cat_alpha], probs=None)
@@ -1188,7 +1200,8 @@ def add_component_to_fit(
         if alpha is None:
             alpha = _cat.cat_alpha(labels, cat_spec,
                                    tau=kwargs.get("cat_tau", _cat.DEFAULT_TAU),
-                                   lam=kwargs.get("cat_lambda", _cat.DEFAULT_LAMBDA))
+                                   lam=kwargs.get("cat_lambda", _cat.DEFAULT_LAMBDA),
+                                   rows=_cat_pool_rows(sample_indicators, kwargs))
         alpha = [np.asarray(a, dtype=float) for a in alpha]
         new_pi = _cat.cat_probs_from_mask(labels, mask, alpha)
         kwargs["initial_cat_probs"] = [

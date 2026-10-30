@@ -77,7 +77,7 @@ not oversights):
 
 Usage
 -----
-    python analysis/compute_clinvar_vus_points_by_panel.py
+    python analysis/compute_clinvar_vus_points_by_panel.py [functional predictor combined]
 """
 import sys
 from pathlib import Path
@@ -112,7 +112,7 @@ RUN_KWARGS = dict(DEFAULT_RUN_KWARGS)
 # LABEL-seq's own gene set (lowercase, matching config.LABELSEQ_GENES) +
 # plain-integrated genes (uppercase, matching PLAIN_INTEGRATED_GENES) --
 # see module docstring for why TP53/CARD11/FGFR aren't included.
-_LABELSEQ_GENES = list(config.LABELSEQ_GENES)
+_LABELSEQ_GENES = list(config.LABELSEQ_GENES) if config.paper_includes("labelseq") else []  # held back from the paper
 _INTEGRATED_GENES = list(PLAIN_INTEGRATED_GENES)
 _COMBINED_GENES = list(PREDICTOR_COMBINED_GENES)
 _PREDICTOR_GENES = list(PREDICTOR_COMBINED_GENES)
@@ -220,6 +220,12 @@ def score_gene(gene, gene_set, ms, dataset_name, vus_keys, variant_index=None):
         print(f"  SKIP {gene}: no valid bootstraps for config {best_config}", flush=True)
         return []
     points = np.asarray(analysis.results[best_config]["points"], dtype=float)
+    # independent calibration (nonconflicting rule) on the same rows, for the
+    # joint-vs-independent evidence-strength panels
+    uv = report._uv_nonconflicting_points(gene.lower() if gene_set == "labelseq" else gene.upper(), gene_set, ms)
+    indep = np.full(len(points), np.nan) if uv is None else np.nan_to_num(np.asarray(uv, float))
+    # practice baselines: each predictor alone (predictors), functional + each predictor (combined)
+    single = (report.single_predictor_points(gene.upper(), gene_set, ms) or {}) if gene_set in ("predictor-mv", "combined") else {}
 
     if variant_index is None:
         variant_index = {kv: i for i, kv in enumerate(ms.kept_variants)}
@@ -239,7 +245,9 @@ def score_gene(gene, gene_set, ms, dataset_name, vus_keys, variant_index=None):
             continue
         n_matched += 1
         rows.append({"gene": gene, "gene_set": gene_set, "variant_key": str(v),
-                      "our_points": points[idx], "canonical_config": best_config})
+                      "our_points": points[idx], "indep_points": indep[idx],
+                      **{f"indep_{c}": (single[c][idx] if c in single else np.nan) for c in ("REVEL", "AM", "MP2")},
+                      "canonical_config": best_config})
     print(f"  {gene}: {len(vus_keys)} true ClinVar VUS, {n_matched} matched "
           f"(config={best_config})"
           f"{' [both-modality restricted]' if both_mod is not None else ''}", flush=True)
@@ -422,23 +430,17 @@ def run_combined_panel(out_path):
     return pd.DataFrame(rows)
 
 
-def main():
+def main(panels=("functional", "predictor", "combined")):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    out_functional = OUTPUT_DIR / "functional_true_clinvar_vus_points.csv"
-    df_functional = run_functional_panel(out_functional)
-    print(f"\nSaved {len(df_functional)} rows to {out_functional}", flush=True)
-
-    out_predictor = OUTPUT_DIR / "predictor_true_clinvar_vus_points.csv"
-    df_predictor = run_predictor_panel(out_predictor)
-    print(f"Saved {len(df_predictor)} rows to {out_predictor}", flush=True)
-
-    out_combined = OUTPUT_DIR / "combined_true_clinvar_vus_points.csv"
-    df_combined = run_combined_panel(out_combined)
-    print(f"Saved {len(df_combined)} rows to {out_combined}", flush=True)
+    runners = {"functional": run_functional_panel, "predictor": run_predictor_panel,
+               "combined": run_combined_panel}
+    for panel in panels:
+        out = OUTPUT_DIR / f"{panel}_true_clinvar_vus_points.csv"
+        df = runners[panel](out)
+        print(f"\nSaved {len(df)} rows to {out}", flush=True)
 
     print("\nALL DONE", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:] or ("functional", "predictor", "combined"))

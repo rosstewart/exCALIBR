@@ -62,6 +62,40 @@ CHEN_PREDICTOR_TABLE = _env(
 CARD11_UV_CALIB_DIR = _env(
     "MV_CARD11_UV_CALIB", "/data/ross/assay_calibration/CARD11/results_data101326/calibration_results")
 
+# Univariate ExCALIBR calibrations (3 components, 1,000 bootstraps, B/LB as
+# the benign reference) for the TP53 readouts the integrated calibrations lack,
+# fitted on the joint model's own scores and samples
+# (<dir>/<dataset>/<dataset>_3c_benign_calibration.json). KawOligo is
+# categorical: its levels take the points of the categorical calibration
+# below; the ExCALIBR run on the earlier jittered encoding (tp53.KAWOLIGO_MAP
+# plus noise) is the fallback, scored at each level's jitter-free value
+# (uv_sources._tp53_extra_uv_rows).
+TP53_EXTRA_UV_CALIB_DIR = _env(
+    "MV_TP53_EXTRA_UV_CALIB", "/data/ross/assay_calibration/exc_tp53_missing_uv_3c_102726/calibration")
+TP53_EXTRA_UV_DIMS = {"Kotler_RFS": "TP53_Kotler_RFS", "DN_score": "TP53_DN_score", "log_TempSens": "TP53_TempSens",
+                      "KawOligo": "TP53_KawOligo"}
+# TP53's readouts calibrated in the standard pipeline: calibration dataset ->
+# its column in TP53_ANNOTATED_VARIANTS_PATH (the joint model's input), to
+# which the calibration is applied directly (uv_sources.load_tp53_uv_points)
+TP53_UV_COLUMNS = {
+    **{f"TP53_Kato_2003_{r}_clinvar_2018": r for r in ("WAF1nWT", "MDM2nWT", "BAXnWT", "h1433snWT", "AIP1nWT",
+                                                      "GADD45nWT", "NOXAnWT", "P53R2nWT")},
+    "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": "Giac_WT_Nut",
+    "TP53_Giacomelli_2018_p53null_Nutlin3_clinvar_2018": "Giac_NULL_Nut",
+    "TP53_Giacomelli_2018_p53null_etoposide_clinvar_2018": "Giac_Etop",
+    "TP53_Funk_2025_clinvar_2018": "Funk_RFS",
+}
+# categorical readouts' independent calibration: mv_analysis/categorical_uv.py's
+# design (frequency / shrunk / ordinal), read from <dataset>_categorical/ in
+# TP53_EXTRA_UV_CALIB_DIR; empty falls back to the jittered continuous fit
+TP53_CATEGORICAL_UV_DESIGN = _env("MV_TP53_CATEGORICAL_UV_DESIGN", "shrunk")
+
+# TSC2 (Biar et al. 2026) VAMP-seq / immune SGE / cliPE UV calibrations, the
+# same range-based CSV format as CARD11's (tsc2_calibrations.csv, written by
+# TSC2_Biar/run_uv.sh finalize).
+TSC2_UV_CALIB_DIR = _env(
+    "MV_TSC2_UV_CALIB", "/data/ross/assay_calibration/TSC2/results_data102726/calibration_results")
+
 # Raw per-predictor input CSVs (protein_variant, score, sample_assignments)
 # used both to build the predictor-mv MultiScoreset (multivariate_data/
 # predictors.py) and, here, to bridge predictor UV calibration outputs'
@@ -172,7 +206,23 @@ if "MV_PREDICTOR_TRANSFORM" not in os.environ and os.path.exists(_PTX_MARKER):
 # Run-specific figure output, NOT the paper repo's Figures/mv/ -- matches
 # the tp53_pca10_run/figures precedent; copying into the paper repo is a
 # separate, deliberate step the user does themselves.
-PAPER_FIGURES_DIR = _env("MV_PAPER_FIGURES_DIR", f"{PAPER_FITS_DIR}/figures")
+#
+# Gene sets held back from the paper (2026-10-27: LABEL-seq and CARD11, for a
+# later revision). Every paper output filters on this; with exclusions the
+# outputs go to their own figures dir, leaving the full-panel version in
+# figures/. Reincorporate with MV_PAPER_EXCLUDE_GENE_SETS="".
+PAPER_EXCLUDED_GENE_SETS = tuple(
+    s.strip() for s in _env("MV_PAPER_EXCLUDE_GENE_SETS", "labelseq,card11").split(",") if s.strip())
+PAPER_FIGURES_DIR = _env(
+    "MV_PAPER_FIGURES_DIR",
+    f"{PAPER_FITS_DIR}/figures_excl_{'_'.join(PAPER_EXCLUDED_GENE_SETS)}" if PAPER_EXCLUDED_GENE_SETS
+    else f"{PAPER_FITS_DIR}/figures")
+
+
+def paper_includes(gene_set_or_key):
+    """False for a gene set held back from the paper; accepts a gene-set name
+    or a "{gene_set}__{gene}[__cN]" key."""
+    return str(gene_set_or_key).split("__")[0] not in PAPER_EXCLUDED_GENE_SETS
 
 # Categorized subdirectories under PAPER_FIGURES_DIR -- every save-path call
 # site should build off these rather than hardcoding "{PAPER_FIGURES_DIR}/foo"
@@ -365,10 +415,19 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
     import numpy as np
     from src.assay_calibration.fit_utils.fit import Fit
     from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
+    from src.assay_calibration.multivariate_data.combined import combined_calibration_clusters
+
+    def _clusters(ms, obs):
+        # combined: the functional panel's clusters, each joined by the
+        # predictors -- the same rule hpc/prepare.py generated the fits with
+        if obs.ndim != 2 or obs.shape[1] < 2:
+            return []
+        if gene_set == "combined":
+            return combined_calibration_clusters(obs, list(ms.dataset_names), min_overlap_rows=min_overlap_rows)
+        return Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
+
     obs = np.asarray(ms.scores, dtype=float)
-    clusters = []
-    if obs.ndim == 2 and obs.shape[1] > 1:
-        clusters = Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
+    clusters = _clusters(ms, obs)
 
     # Match the dimensions the STORED fit was trained on. Fits record their
     # datasets ("assay_datasets") since per-cluster job generation; older fits
@@ -408,8 +467,7 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
                   f"scoring it on its original {legacy.n_assays} datasets until refit")
             ms = legacy
             obs = np.asarray(ms.scores, dtype=float)
-            clusters = (Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
-                        if obs.ndim == 2 and obs.shape[1] > 1 else [])
+            clusters = _clusters(ms, obs)
     if fit_info is not None:
         fit_names, fit_ndim = fit_info
         if fit_names:
@@ -430,7 +488,7 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
                 return ms
         # No candidate matches; fall through so the shape guard reports it.
 
-    if len(clusters) <= 1:
+    if len(clusters) <= 1 and not (clusters and len(clusters[0]) < obs.shape[1] and gene_set == "combined"):
         return ms
     if cluster_idx >= len(clusters):
         raise ValueError(
@@ -500,13 +558,13 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
                                        redundancy_collapse_preset=None):
     """MultiScoreset builder dispatch by gene_set -- one entry point for
     every gene_set the paper analysis notebook needs (labelseq, integrated,
-    predictor, card11, tp53, fgfr, combined), instead of each caller
+    predictor, card11, tsc2, tp53, fgfr, combined), instead of each caller
     reimplementing the per-gene-set ingestion logic that used to live only
     inline inside mv_analysis/gene_performance_scatter.py's panel builders.
 
     `regularization_type` (all_assayed staged-init support) only applies to
     labelseq/integrated (GENE_SETS_SUPPORTING_ALL_ASSAYED) -- predictor/
-    combined/card11/tp53/fgfr retain no unlabeled bulk at ingestion
+    combined/card11/tsc2/tp53/fgfr retain no unlabeled bulk at ingestion
     (confirmed this session), so a non-None value there raises rather than
     being silently ignored.
 
@@ -552,6 +610,9 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
     elif gene_set == "card11":
         from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset
         ms_map = {"CARD11": build_card11_multiscoreset()}
+    elif gene_set == "tsc2":
+        from src.assay_calibration.multivariate_data.tsc2 import build_tsc2_multiscoreset
+        ms_map = {"TSC2": build_tsc2_multiscoreset()}
     elif gene_set == "fgfr":
         from src.assay_calibration.multivariate_data.fgfr import build_fgfr_multiscoresets
         # `genes` here filters the RAW paralog names (FGFR1-4) before
@@ -620,7 +681,7 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
     else:
         raise ValueError(
             f"No MultiScoreset builder registered for gene_set={gene_set!r}. Currently registered: "
-            f"'labelseq', 'integrated', 'tp53', 'card11', 'fgfr', 'predictor', 'combined'."
+            f"'labelseq', 'integrated', 'tp53', 'card11', 'tsc2', 'fgfr', 'predictor', 'combined'."
         )
     if redundancy_collapse_preset is not None:
         from src.assay_calibration.multivariate_data import redundancy_collapse as rc

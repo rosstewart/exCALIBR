@@ -33,6 +33,7 @@ def build_functional_scoresets(
     clinvar_release: str = "2026",
     population_type: str = "gnomAD",
     regularization_type: Optional[str] = None,
+    tp53_build_kwargs: Optional[dict] = None,
 ) -> List[Scoreset]:
     """Build one Scoreset per Dataset value for ``gene`` (same construction
     hpc/prepare.py's ``_process_multivariate_gene`` uses for its functional
@@ -56,10 +57,26 @@ def build_functional_scoresets(
     ``datasets``/``clinvar_release``/``population_type``/
     ``regularization_type`` are ignored for TP53 -- tp53.py's ingestion
     reads its own dedicated raw files and has no equivalent knobs.
+
+    TSC2 likewise uses its dedicated "tsc2" panel (tsc2.py: Biar et al. 2026
+    VAMP-seq, immune SGE, cliPE) instead of TSC2_IGVF; ``datasets`` and
+    ``population_type`` are ignored, ``clinvar_release`` sets its labels and
+    ``regularization_type="all_assayed"`` keeps unlabelled rows.
     """
     if gene == "TP53":
+        # tp53_build_kwargs (e.g. kawoligo_mode) are passed through to
+        # tp53.build_tp53_dataframe; unset means tp53.py's defaults.
         from .tp53 import build_tp53_functional_scoresets
-        return build_tp53_functional_scoresets()
+        return build_tp53_functional_scoresets(**(tp53_build_kwargs or {}))
+    if gene == "TSC2":
+        # Same idea for TSC2: the dedicated Biar et al. 2026 panel
+        # (multivariate_data/tsc2.py, the "tsc2" gene-set) replaces the
+        # integrated dataframe's TSC2_IGVF; its labels come from the same
+        # integrated dataframe, at ``clinvar_release``.
+        from .tsc2 import build_tsc2_functional_scoresets
+        return build_tsc2_functional_scoresets(
+            keep_unlabelled=regularization_type == "all_assayed",
+            df_integrated=df, clinvar_release=clinvar_release)
 
     df_gene = df[df["Gene"] == gene]
     scoresets = []
@@ -95,6 +112,10 @@ def get_functionally_assayed_protein_variants(
     split_predictor_clinvar_leakage) rather than trusted on the real,
     jointly-observed row.
     """
+    if gene == "TSC2":
+        # build_functional_scoresets uses tsc2.py's panel for TSC2.
+        from .tsc2 import functionally_assayed_ids
+        return functionally_assayed_ids(df_integrated=df)
     df_gene = df[(df["Gene"] == gene) & (df["Dataset"].isin(datasets))]
     scored = df_gene[
         df_gene[score_col].notna()
@@ -229,6 +250,31 @@ def select_variants(ms, mask: np.ndarray) -> None:
     ms.sample_counts = ms._sample_assignments.sum(axis=0)
 
 
+def combined_calibration_clusters(observations, dataset_names, min_overlap_rows=30):
+    """Disjoint fit clusters for a combined (predictor + functional) dataset:
+    the functional readouts' own clusters (Fit._select_all_calibration_clusters
+    on the functional columns alone, so exactly the functional panel's
+    clusters), each joined by every predictor column. Clustering all columns
+    together instead lets the predictors -- scored on nearly every missense
+    variant -- chain functional readouts that never share a variant into one
+    cluster whose cross-covariances have no data behind them (BRCA2: 15 of 21
+    functional pairs never co-observed). A functional readout outside every
+    functional cluster is dropped, as in the functional panel. Genes without
+    a multi-readout functional cluster (a single functional readout, e.g.
+    JAG1/MSH2) keep the all-column clustering. Column indices returned
+    sorted, clusters most informative first."""
+    from ..fit_utils.fit import Fit
+    pred_names = set(PREDICTOR_DATASET_NAMES.values())
+    P = [i for i, n in enumerate(dataset_names) if n in pred_names]
+    F = [i for i, n in enumerate(dataset_names) if n not in pred_names]
+    obs = np.asarray(observations, dtype=float)
+    if P and len(F) > 1:
+        functional = Fit._select_all_calibration_clusters(obs[:, F], min_overlap_rows=min_overlap_rows)
+        if functional:
+            return [sorted(P + [F[i] for i in c]) for c in functional]
+    return Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
+
+
 def build_combined_multiscoreset(
     gene: str,
     functional_scoresets: List[Scoreset],
@@ -284,8 +330,8 @@ def build_combined_multiscoreset(
             split_predictor_clinvar_leakage(ps, functionally_assayed_variants)
     predictor_names = [PREDICTOR_DATASET_NAMES.get(p, p) for p in have]
 
-    if gene == "TP53":
-        # build_functional_scoresets already swapped in tp53.py's own
+    if gene in ("TP53", "TSC2"):
+        # build_functional_scoresets already swapped in tp53.py's (or tsc2.py's) own
         # dedicated panel for TP53 (see its docstring) -- the caller's
         # functional_dataset_names is still the OLD generic-panel name list
         # (same length, wrong names) since callers build it independently
@@ -299,6 +345,13 @@ def build_combined_multiscoreset(
         predictor_names=predictor_names,
         functional_names=list(functional_dataset_names),
     )
+
+    # Categorical functional dims (TP53's KawOligo; see
+    # tp53.build_tp53_functional_scoresets) carry over by name.
+    cats = {s.scoreset_name: s.categorical_levels for s in functional_scoresets
+            if getattr(s, "categorical_levels", None)}
+    if cats:
+        combined.categorical_dims = cats
 
     if require_both_modalities:
         n_predictor_dims = len(predictor_scoresets)

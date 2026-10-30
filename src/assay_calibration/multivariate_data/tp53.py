@@ -34,8 +34,8 @@ Two dataset-specific quirks made explicit here, per the consolidation plan:
     column (name kept as "log_TempSens" for backward compatibility with
     existing job configs/figure naming, though it is no longer logged) now
     carries raw, untransformed TempSens.
-  - kawoligo_mode="categorical" (EXPERIMENTAL, opt-in; default "jitter" is
-    unchanged): KawOligo is kept as integer level codes (Tetramer=0,
+  - kawoligo_mode="categorical" (the default, DEFAULT_KAWOLIGO_MODE; "jitter"
+    is the earlier encoding, kept for refitting old runs): KawOligo is kept as integer level codes (Tetramer=0,
     Dimer=1, Monomer=2 -- the same order as KAWOLIGO_MAP, i.e. increasing
     pathogenicity), with NO jitter, and the multiscoreset is tagged with
     ``categorical_dims = {"KawOligo": KAWOLIGO_LEVELS}`` so the CFUSN fitter
@@ -78,6 +78,9 @@ KAWOLIGO_LEVELS = ["Tetramer", "Dimer", "Monomer"]
 DEFAULT_KAWOLIGO_SEED = 0
 DEFAULT_KAWOLIGO_JITTER_SIGMA = 0.1
 KAWOLIGO_MODES = ("jitter", "categorical")
+# The one switch for every TP53 build (tp53 and combined gene sets, job
+# generation and analysis): must match the mode the stored fits used.
+DEFAULT_KAWOLIGO_MODE = "categorical"
 
 
 def load_reference_cohorts(cohorts_path: str = DEFAULT_COHORTS_PATH) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -96,7 +99,7 @@ def build_tp53_dataframe(
     cohorts_path: str = DEFAULT_COHORTS_PATH,
     kawoligo_seed: int = DEFAULT_KAWOLIGO_SEED,
     kawoligo_jitter_sigma: float = DEFAULT_KAWOLIGO_JITTER_SIGMA,
-    kawoligo_mode: str = "jitter",
+    kawoligo_mode: str = DEFAULT_KAWOLIGO_MODE,
 ) -> pd.DataFrame:
     """Build the processed TP53 variant dataframe (one row per variant, with
     a 5-class ``sample_assignments`` column), equivalent to
@@ -178,7 +181,7 @@ def build_tp53_functional_scoresets(
         df_tp53 = build_tp53_dataframe(**build_kwargs)
     ids = df_tp53["Variant"].astype(str).to_numpy()
     sa = df_tp53["sample_assignments"].to_numpy()
-    return [
+    scoresets = [
         BasicScoreset(
             scores=df_tp53[col].to_numpy(dtype=float),
             sample_assignments=sa,
@@ -187,6 +190,14 @@ def build_tp53_functional_scoresets(
         )
         for col in SCORE_COLS
     ]
+    # Categorical KawOligo: tag its scoreset with the level names, so a
+    # caller merging these into another multiscoreset (combined.py) can carry
+    # categorical_dims over.
+    if build_kwargs.get("kawoligo_mode", DEFAULT_KAWOLIGO_MODE) == "categorical":
+        for ss in scoresets:
+            if ss.scoreset_name == "KawOligo":
+                ss.categorical_levels = list(KAWOLIGO_LEVELS)
+    return scoresets
 
 
 def build_tp53_multiscoreset(
@@ -205,7 +216,7 @@ def build_tp53_multiscoreset(
     build_tp53_dataframe, or stating how a caller-supplied df_tp53 was
     built), the result carries ``categorical_dims = {"KawOligo": levels}``.
     """
-    kawoligo_mode = build_kwargs.get("kawoligo_mode", "jitter")
+    kawoligo_mode = build_kwargs.get("kawoligo_mode", DEFAULT_KAWOLIGO_MODE)
     if df_tp53 is None:
         df_tp53 = build_tp53_dataframe(**build_kwargs)
 

@@ -78,6 +78,8 @@ def datasets():
             d = d.assign(gene_set=panel)
         best = d.sort_values(["mcc", "determinate"], ascending=False).groupby(["gene_set", "gene", "cluster"]).head(1)
         for r in best.itertuples():
+            if not config.paper_includes(r.gene_set):
+                continue
             cl = 0 if r.cluster == "gene" else int(str(r.cluster).replace("cluster", "")) - 1
             key = f"{r.gene_set}__{r.gene}" + (f"__c{cl}" if cl else "")
             out.append(dict(key=key, panel=panel, gene_set=r.gene_set, gene=r.gene, cluster_idx=cl,
@@ -193,7 +195,7 @@ def _run_one(key, setting, n_jobs, folds):
 
 
 def stage_run(args):
-    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("*.json"))
+    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("*.json") if config.paper_includes(p.stem))
     jobs = [(k, s) for s in args.settings for k in keys if args.force or not (OUT / k / f"{s}.csv").exists()]
     # largest first so the long LOO runs start early
     size = {k: json.load(open(OUT / "prep" / f"{k}.json"))["n_labelled"] for k in keys}
@@ -259,6 +261,79 @@ def stage_genomewide(args):
                           reg="gnomAD (genome-wide)", prior=GENOME_WIDE_PRIOR)).to_csv(out_csv, index=False)
         np.save(OUT / key / "genomewide_post.npy", post.astype(np.float32))
         print(f"  {key}: {e.sum()} scored, calibration {len(cal_g)} (removed {int((~keep).sum())} {meta['gene']}), "
+              f"[{(time.time() - t0) / 60:.1f} min]", flush=True)
+
+
+def stage_genomewide_combined(args):
+    """Genome-wide P-KNN evidence from the three predictors alone for the
+    combined models' evaluation rows (variants with functional and predictor
+    scores), exactly as stage_genomewide (same calibration and regularization
+    sets, N_calibration, prior and LR base, the evaluated gene's labelled
+    variants removed from the calibration set). Combined controls take their
+    labels from the functional data, so not all of them are predictor-model
+    controls; scoring every row keeps one procedure. The comparison adds these
+    points to the functional evidence (run_pknn_comparison)."""
+    _single_threaded()
+    from mv_analysis.comparison_methods import pknn
+    warnings.filterwarnings("ignore")
+    cal, reg = _gw_tables()
+    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("combined__*.json") if config.paper_includes(p.stem))
+    for key in keys:
+        out_csv = OUT / key / "genomewide_predictors.csv"
+        if out_csv.exists() and not args.force:
+            continue
+        d, meta = load_prep(key)
+        dims = [str(x) for x in d["dims"]]
+        idx = [i for i, n in enumerate(dims) if n in GW_TOOLS]
+        cols = [GW_TOOLS[dims[i]] for i in idx]
+        e = d["eval_mask"]
+        q = d["X"][e][:, idx]
+        keep = cal["genename"].astype(str).str.split(";").apply(lambda g: meta["gene"] not in g).to_numpy()
+        cal_g = cal[keep]
+        t0 = time.time()
+        post, drops = pknn.bootstrap_posteriors(cal_g[cols].to_numpy(float), cal_g["ClinVar_annotation"].to_numpy(int),
+                                                q, reg[cols].to_numpy(float), GENOME_WIDE_PRIOR, GW_N_CAL,
+                                                n_jobs=args.inner)
+        p_path, p_ben, pts = pknn.to_points(post, GENOME_WIDE_PRIOR, logbase=GW_LOGBASE)
+        (OUT / key).mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(dict(variant=d["variants"][e], label=d["plp"][e].astype(int), points=pts,
+                          fold_scheme="leave-one-gene-out", n_cal=GW_N_CAL, reg="gnomAD (genome-wide)",
+                          prior=GENOME_WIDE_PRIOR)).to_csv(out_csv, index=False)
+        print(f"  {key}: {e.sum()} scored on {'+'.join(cols)}, calibration {len(cal_g)} "
+              f"[{(time.time() - t0) / 60:.1f} min]", flush=True)
+
+
+def stage_genomewide_ingene(args):
+    """Genome-wide P-KNN as published, the evaluated gene's labelled variants
+    left in the calibration set (in-sample, like the other baselines of the
+    pooled performance table), for the predictor models' evaluation rows and,
+    from the three predictors alone, the combined models' evaluation rows.
+    Settings as stage_genomewide. Writes <key>/genomewide_ingene.csv."""
+    _single_threaded()
+    from mv_analysis.comparison_methods import pknn
+    warnings.filterwarnings("ignore")
+    cal, reg = _gw_tables()
+    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("*.json")
+                               if p.stem.startswith(("predictor__", "combined__")) and config.paper_includes(p.stem))
+    for key in keys:
+        out_csv = OUT / key / "genomewide_ingene.csv"
+        if out_csv.exists() and not args.force:
+            continue
+        d, meta = load_prep(key)
+        dims = [str(x) for x in d["dims"]]
+        idx = [i for i, n in enumerate(dims) if n in GW_TOOLS]
+        cols = [GW_TOOLS[dims[i]] for i in idx]
+        e = d["eval_mask"]
+        t0 = time.time()
+        post, drops = pknn.bootstrap_posteriors(cal[cols].to_numpy(float), cal["ClinVar_annotation"].to_numpy(int),
+                                                d["X"][e][:, idx], reg[cols].to_numpy(float), GENOME_WIDE_PRIOR,
+                                                GW_N_CAL, n_jobs=args.inner)
+        p_path, p_ben, pts = pknn.to_points(post, GENOME_WIDE_PRIOR, logbase=GW_LOGBASE)
+        (OUT / key).mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(dict(variant=d["variants"][e], label=d["plp"][e].astype(int), points=pts,
+                          fold_scheme="in-sample (gene in calibration set)", n_cal=GW_N_CAL,
+                          reg="gnomAD (genome-wide)", prior=GENOME_WIDE_PRIOR)).to_csv(out_csv, index=False)
+        print(f"  {key}: {e.sum()} scored on {'+'.join(cols)}, calibration {len(cal)} (gene included) "
               f"[{(time.time() - t0) / 60:.1f} min]", flush=True)
 
 
@@ -421,6 +496,8 @@ def run_all(workers=4, inner=8, settings=("main", "gnomadreg", "N5", "N25")):
     stage_prep(args)
     stage_run(args)
     stage_genomewide(args)
+    stage_genomewide_combined(args)
+    stage_genomewide_ingene(args)
     if not (OUT / "genomewide_score_concordance.csv").exists():
         stage_concordance(args)
     if not (OUT / "vus" / "pknn_vus_points.csv").exists():
@@ -429,7 +506,7 @@ def run_all(workers=4, inner=8, settings=("main", "gnomadreg", "N5", "N25")):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["prep", "run", "selftest", "genomewide", "concordance", "vus"])
+    ap.add_argument("stage", choices=["prep", "run", "selftest", "genomewide", "genomewide-combined", "genomewide-ingene", "concordance", "vus"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--inner", type=int, default=1)
     ap.add_argument("--keys", nargs="*")
@@ -439,7 +516,9 @@ def main():
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     {"prep": stage_prep, "run": stage_run, "selftest": stage_selftest, "genomewide": stage_genomewide,
-     "concordance": stage_concordance, "vus": stage_vus}[args.stage](args)
+     "genomewide-combined": stage_genomewide_combined, "genomewide-ingene": stage_genomewide_ingene,
+     "concordance": stage_concordance,
+     "vus": stage_vus}[args.stage](args)
 
 
 if __name__ == "__main__":

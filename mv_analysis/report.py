@@ -129,17 +129,16 @@ def _rows_for_points(method, pts_eval, labels, extra=None):
     return rows
 
 
-UV_FALLBACK_MIN_POINTS = 4  # ACMG/Tavtigian "Strong"
+UV_FALLBACK_MIN_POINTS = 3  # functional, predictor and combined panels alike
 FALLBACK_METHOD_PREFIX = "Joint+UV fallback"  # deliberately not "MV ..." (MV-row selectors use startswith("MV"))
 
 
 def uv_fallback_points(mv_points, mv_lr_median, uv_points, min_points=UV_FALLBACK_MIN_POINTS):
     """Joint evidence with a univariate fallback: where the joint model is
     indeterminate (0 points), take the univariate non-conflicting call if it
-    alone reaches ``min_points`` (default: Strong) and agrees in direction
+    alone reaches ``min_points`` (default: 3 points) and agrees in direction
     with the joint model's median log LR+. Determinate joint calls are never
-    changed. Chosen on 31 genes against cutoffs of 2-3 and interval- or
-    median-based rules (accuracy first)."""
+    changed."""
     mv = np.nan_to_num(np.asarray(mv_points, float))
     uv = np.nan_to_num(np.asarray(uv_points, float))
     lean = np.sign(np.nan_to_num(np.asarray(mv_lr_median, float)))
@@ -155,6 +154,26 @@ def _uv_nonconflicting_points(gene, gene_set, ms):
         return uv_sources.aggregate_functional_plus_predictor(gene, ms, uv_agg.aggregate_nonconflicting)
     uv = uv_sources.load_uv_points(gene, ms, gs)
     return None if uv is None else uv_agg.aggregate_nonconflicting(uv[1])
+
+
+def single_predictor_points(gene, gene_set, ms):
+    """{"REVEL", "AM", "MP2": per-variant points over all of ``ms``'s rows}
+    for the practice baselines: each predictor calibrated alone (predictor
+    evidence) or functional evidence (nonconflicting rule across assays) plus
+    that predictor (combined evidence); None if the calibrations are missing."""
+    gs = _UV_DISPATCH_GENE_SET.get(gene_set, gene_set)
+    pred = uv_sources.load_predictor_mv_uv_points(gene, ms)
+    if pred is None:
+        return None
+    names, mat = pred
+    pts = {str(n).split("_")[0]: np.nan_to_num(np.asarray(mat[i], float)) for i, n in enumerate(names)}
+    if gs in ("combined", "combined-all-evidence"):
+        func = uv_sources.load_combined_uv_points(gene, ms)
+        if func is None:
+            return None
+        f = np.nan_to_num(uv_agg.aggregate_nonconflicting(func[1]), nan=0.0)
+        pts = {k: f + v for k, v in pts.items()}
+    return pts
 
 
 def _mv_metric_rows(analysis, modes, mode_labels, uv_points=None, **run_kwargs):
@@ -350,7 +369,7 @@ def build_comparison_table(
 
     uv_table, uv_dataset_names = _uv_metric_rows(gene, gene_set, ms, analysis.p_idx, analysis.b_idx)
     if uv_table.empty:
-        reason = "pending data" if gene_set == "fgfr" else "no bridge/UV source for this gene-set"
+        reason = "pending data" if gene_set in ("fgfr", "tsc2") else "no bridge/UV source for this gene-set"
         print(f"  [{gene}/{gene_set}] UV comparison unavailable ({reason})")
         return mv_table, None
 

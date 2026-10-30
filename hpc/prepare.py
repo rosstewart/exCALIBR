@@ -9,9 +9,9 @@ Sub-commands
   basicscoreset Univariate BasicScoreset from CSV with sample_assignments column
   multivariate  MultiScoreset for multi-assay genes (--gene-set selects the
                 ingestion source: integrated [default] / fgfr / tp53 /
-                labelseq / card11 / combined)
+                labelseq / card11 / tsc2 / combined)
   predictor-mv  BasicMultiScoreset for predictor-score data
-  mv_all        Merge FGFR/TP53/LABEL-seq/CARD11/predictor-mv/combined (--pipelines
+  mv_all        Merge FGFR/TP53/LABEL-seq/CARD11/TSC2/predictor-mv/combined (--pipelines
                 selects which, in priority order) into ONE job array/manifest
 
 Usage
@@ -181,6 +181,11 @@ def _shared_data(jobs: list) -> dict | None:
         "val_sample_assignments": j["val_sample_assignments"],
         "val_variant_indices": j["val_variant_indices"],
     }
+
+
+def _tp53_default_kawoligo_mode():
+    from src.assay_calibration.multivariate_data.tp53 import DEFAULT_KAWOLIGO_MODE
+    return DEFAULT_KAWOLIGO_MODE
 
 
 def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
@@ -982,8 +987,14 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
     observations = np.asarray(ms.scores, dtype=float)
     clusters = []
     if observations.ndim == 2 and observations.shape[1] > 1:
-        clusters = Fit._select_all_calibration_clusters(observations, min_overlap_rows=min_overlap_rows)
-    if len(clusters) > 1:
+        if (extra_cjob_fields or {}).get("gene_set") == "combined":
+            from src.assay_calibration.multivariate_data.combined import combined_calibration_clusters
+            clusters = combined_calibration_clusters(observations, list(ms.dataset_names),
+                                                     min_overlap_rows=min_overlap_rows)
+        else:
+            clusters = Fit._select_all_calibration_clusters(observations, min_overlap_rows=min_overlap_rows)
+    if len(clusters) > 1 or (len(clusters) == 1 and len(clusters[0]) < observations.shape[1]
+                             and (extra_cjob_fields or {}).get("gene_set") == "combined"):
         all_jobs = []
         for cluster_idx, dims in enumerate(clusters):
             cluster_ms = copy.deepcopy(ms)
@@ -1163,7 +1174,7 @@ def _build_gene_set_ms_map(gene_set, args):
         return {"TP53": build_tp53_multiscoreset(
             RPVS_ALL=args.rpvs_all, kawoligo_seed=args.kawoligo_seed,
             kawoligo_jitter_sigma=args.kawoligo_jitter_sigma,
-            kawoligo_mode=getattr(args, "kawoligo_mode", "jitter"),
+            kawoligo_mode=getattr(args, "kawoligo_mode", _tp53_default_kawoligo_mode()),
         )}
 
     if gene_set == "labelseq":
@@ -1185,6 +1196,10 @@ def _build_gene_set_ms_map(gene_set, args):
     if gene_set == "card11":
         from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset
         return {"CARD11": build_card11_multiscoreset()}
+
+    if gene_set == "tsc2":
+        from src.assay_calibration.multivariate_data.tsc2 import build_tsc2_multiscoreset
+        return {"TSC2": build_tsc2_multiscoreset()}
 
     if gene_set == "phenotype_sub":
         from mv_analysis.phenotype_submodels import build_phenotype_submodel_ms_map
@@ -1218,6 +1233,7 @@ def _build_gene_set_ms_map(gene_set, args):
             # 4 genes that are also predictor-mv DEFAULT_GENES.
             functional_scoresets = build_functional_scoresets(
                 df, gene, datasets, clinvar_release=resolve_clinvar_release(gene),
+                tp53_build_kwargs={"kawoligo_mode": getattr(args, "kawoligo_mode", _tp53_default_kawoligo_mode())},
             )
             # Variants with functional data must use the functional side's
             # ClinVar label (fixed at that release); predictor CSVs carry
@@ -1694,9 +1710,9 @@ def run_predictor_mv(args):
 # in priority order)
 # =============================================================================
 
-_MV_ALL_PIPELINE_CHOICES = ["integrated", "fgfr", "tp53", "labelseq", "card11", "predictor-mv", "combined",
-                            "phenotype_sub"]
-_MV_ALL_GENE_SET_PIPELINES = {"fgfr", "tp53", "labelseq", "card11", "combined", "phenotype_sub"}
+_MV_ALL_PIPELINE_CHOICES = ["integrated", "fgfr", "tp53", "labelseq", "card11", "tsc2", "predictor-mv",
+                            "combined", "phenotype_sub"]
+_MV_ALL_GENE_SET_PIPELINES = {"fgfr", "tp53", "labelseq", "card11", "tsc2", "combined", "phenotype_sub"}
 
 
 def run_mv_all(args):
@@ -2057,7 +2073,7 @@ def main():
                               "used by this session's staged-init experiments) or one of "
                               "the SNV-subset variants. Supported for --gene-set "
                               "labelseq and integrated (the default); not yet wired for "
-                              "fgfr/tp53/card11/combined.")
+                              "fgfr/tp53/card11/tsc2/combined.")
     p_multi.add_argument("--n-bootstraps", type=int, default=1000)
     p_multi.add_argument("--num-fits", type=int, default=100,
                          help="Override dynamic NUM_FITS (default: 100). "
@@ -2073,7 +2089,7 @@ def main():
     p_multi.add_argument("--list-only", action="store_true",
                          help="Print gene groups and exit")
     p_multi.add_argument("--gene-set", default="integrated",
-                         choices=["integrated", "fgfr", "tp53", "labelseq", "card11", "combined",
+                         choices=["integrated", "fgfr", "tp53", "labelseq", "card11", "tsc2", "combined",
                                   "phenotype_sub"],
                          help="Ingestion source (default: integrated, the pre-existing "
                               "BRCA1/PTEN/MSH2/pillar-project path via --dataframe/--datasets). "
@@ -2082,10 +2098,10 @@ def main():
     p_multi.add_argument("--rpvs-all", action="store_true",
                          help="[--gene-set tp53] Use the full RPV list instead of the "
                               "high-confidence subset (default: high-confidence only)")
-    p_multi.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default="jitter",
-                         help="[tp53] EXPERIMENTAL: 'categorical' fits KawOligo as a nominal "
-                              "categorical dim (location model) instead of jittered {0,0.5,1} "
-                              "(default: jitter)")
+    p_multi.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default=_tp53_default_kawoligo_mode(),
+                         help="[tp53] 'categorical' fits KawOligo as a nominal categorical dim "
+                              "(location model); 'jitter' is the earlier jittered {0,0.5,1} encoding "
+                              "(default: tp53.DEFAULT_KAWOLIGO_MODE, categorical)")
     p_multi.add_argument("--kawoligo-seed", type=int, default=0,
                          help="[--gene-set tp53] Seed for KawOligo's jitter (default: 0)")
     p_multi.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,
@@ -2260,10 +2276,10 @@ def main():
                        help="['integrated' pipeline only]")
     p_mv_all.add_argument("--rpvs-all", action="store_true",
                        help="[tp53] use the full RPV list instead of the high-confidence subset")
-    p_mv_all.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default="jitter",
-                       help="[tp53] EXPERIMENTAL: 'categorical' fits KawOligo as a nominal "
-                            "categorical dim (location model) instead of jittered {0,0.5,1} "
-                            "(default: jitter)")
+    p_mv_all.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default=_tp53_default_kawoligo_mode(),
+                       help="[tp53] 'categorical' fits KawOligo as a nominal categorical dim "
+                            "(location model); 'jitter' is the earlier jittered {0,0.5,1} encoding "
+                            "(default: tp53.DEFAULT_KAWOLIGO_MODE, categorical)")
     p_mv_all.add_argument("--kawoligo-seed", type=int, default=0,
                        help="[tp53] seed for KawOligo's jitter (default: 0)")
     p_mv_all.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,

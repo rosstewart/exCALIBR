@@ -946,6 +946,15 @@ class MVCalibrationAnalysis:
                 fit = self._reconstitute_params(inner)
                 if fit is None:
                     continue
+                fit_cats = set((inner.get('cat_spec') or {}).get('names', []))
+                ms_cats = set(getattr(self.ms, 'categorical_dims', None) or {})
+                if fit_cats != ms_cats:
+                    raise ValueError(
+                        f"Stored fit for '{self.dataset_name}'/{config} models "
+                        f"{sorted(fit_cats) or 'no'} dimension(s) as categorical, but the "
+                        f"freshly-built MultiScoreset marks {sorted(ms_cats) or 'none'} -- the "
+                        f"data encoding (e.g. tp53.DEFAULT_KAWOLIGO_MODE) does not match the "
+                        f"fit's; re-fit, or build the dataset the way the fit was made.")
                 fit_n_dims = _cat.total_dims(fit['component_params'])
                 if fit_n_dims != ms_n_dims:
                     raise ValueError(

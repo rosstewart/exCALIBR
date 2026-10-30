@@ -34,6 +34,8 @@ def build_ms(args):
         gene = "TP53"
     elif args.gene_set == "card11":
         gene = "CARD11"
+    elif args.gene_set == "tsc2":
+        gene = "TSC2"
     elif args.gene_set == "fgfr" and not args.fgfr_separate:
         gene = "FGFR_combined"
     else:

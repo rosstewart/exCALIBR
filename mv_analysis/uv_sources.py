@@ -17,14 +17,17 @@ Per-gene-set UV data sources
 -----------------------------
 - card11: range-based ``card11_calibrations.csv`` (CARD11_UV_CALIB_DIR),
   parsed via the existing compare_uv_mv.py CSV machinery.
+- tsc2: the same range-based format, ``tsc2_calibrations.csv``
+  (TSC2_UV_CALIB_DIR), one row per Biar et al. 2026 assay, applied to the ms
+  dimension of the same name. Also used for TSC2's combined functional dims.
 - labelseq: one dir per (gene, assay, treatment) under LABELSEQ_UV_CALIB_DIR,
   bridged onto ``ms`` via hgvs_c (compare_uv_mv_agg.py, unchanged).
-- tp53: one dir per dataset under EXC_PP_CLINVAR2025_UV_CALIB, bridged onto
-  TP53's own "Variant" (protein short-form) ids via
-  tp53_annotated_variants.csv's clinvar_HGVS_name column. Verified against
-  real fits (see mv_analysis/README.md).
+- tp53: each of the joint model's readouts with its own calibration
+  (EXC_PP_CLINVAR2025_UV_CALIB, config.TP53_UV_COLUMNS; or
+  TP53_EXTRA_UV_CALIB_DIR) applied to its scores in tp53_annotated_variants.csv,
+  the joint model's input, keyed by "Variant" like the MultiScoreset.
 - combined (predictor+functional -- BRCA1, BRCA2, F9, JAG1, MSH2, SCN5A,
-  TP53, TSC2): same EXC_PP_CLINVAR2025_UV_CALIB source, bridged via the
+  TP53; TSC2 uses the tsc2 source above): same EXC_PP_CLINVAR2025_UV_CALIB source, bridged via the
   integrated dataframe's aa_ref/aa_pos/aa_alt -> short protein_variant
   string (e.g. "A119T"), matching the format these MultiScoresets actually
   key on (confirmed via ms._variants_kept). An earlier version bridged via
@@ -44,7 +47,6 @@ Per-gene-set UV data sources
 """
 import functools
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -133,6 +135,24 @@ def _load_card11_uv_matrix(ms):
     return names, mat
 
 
+# ── tsc2 ─────────────────────────────────────────────────────────────────
+
+def _load_tsc2_uv_matrix(ms):
+    """Biar et al. 2026 TSC2 assays, same range-based CSV as CARD11, each
+    dataset classifying the ms dimension of the same name -- the "tsc2"
+    gene-set's own ms and TSC2's combined ms (whose functional dims are the
+    same three assays, see multivariate_data/combined.py)."""
+    from src.assay_calibration.multivariate_data.tsc2 import DATASET_NAMES
+    csv_path = Path(config.TSC2_UV_CALIB_DIR) / "tsc2_calibrations.csv"
+    if not csv_path.exists():
+        return None
+    names = [n for n in DATASET_NAMES if n in list(ms.dataset_names)]
+    if not names:
+        return None
+    pts = load_and_classify_from_csv(ms, str(csv_path), {n: list(ms.dataset_names).index(n) for n in names})
+    return names, np.vstack([pts[n] for n in names])
+
+
 # ── labelseq ─────────────────────────────────────────────────────────────
 
 @functools.lru_cache(maxsize=1)
@@ -153,67 +173,78 @@ def _load_labelseq_uv_matrix(gene, ms):
 
 # ── tp53 ─────────────────────────────────────────────────────────────────
 
-# clinvar_HGVS_name looks like "NM_000546.6(TP53):c.5A>G (p.Glu2Gly)" --
-# extract "NM_000546.6:c.5A>G" to match the hgvs_c string _extract_hgvs_c
-# pulls out of an exc_pp UV variant_id (e.g.
-# "...NM_000546.6:c.355G>A"), which has no parenthesized gene symbol.
-_TP53_HGVS_C_FROM_CLINVAR_NAME_RE = re.compile(r'(N[MR]_\d+\.\d+)\([^)]*\):(c\.[^\s]+)')
-
-
-def _tp53_hgvs_c_bridge():
-    """{hgvs_c: Variant} built from tp53_annotated_variants.csv, to bridge
-    exc_pp UV variant_ids (nucleotide-level hgvs_c) onto TP53's own
-    BasicMultiScoreset ids (protein short-form "Variant" strings, e.g.
-    "R175H"). clinvar_HGVS_name is only populated for ~30% of all TP53 rows
-    (those ClinVar has an entry for), which caps the achievable bridge --
-    empirically ~71% of exc_pp UV rows with a parseable hgvs_c resolve
-    through this bridge, and ~200 of TP53's 405 P/LP+B/LB eval variants end
-    up with at least one non-NaN UV point call across the 16 datasets
-    (verified against real fits; see mv_analysis/README.md). The remainder
-    aren't a bridging bug so much as a real coverage gap: not every clinical
-    P/LP/B/LB variant was measured by these particular deep-mutational-scan
-    assays, and/or lacks a ClinVar entry to source clinvar_HGVS_name from.
-    """
-    df = pd.read_csv(config.TP53_ANNOTATED_VARIANTS_PATH)
-    bridge = {}
-    for variant, name in zip(df["Variant"], df["clinvar_HGVS_name"]):
-        if pd.isna(name):
-            continue
-        m = _TP53_HGVS_C_FROM_CLINVAR_NAME_RE.search(name)
-        if not m:
-            continue
-        bridge[f"{m.group(1)}:{m.group(2)}"] = variant
-    return bridge
-
-
 def load_tp53_uv_points(ms):
-    datasets = _discover_exc_pp_datasets("TP53")
-    if not datasets:
-        return None
+    """Each TP53 readout's own calibration applied to that readout's scores in
+    the joint model's input table (config.TP53_ANNOTATED_VARIANTS_PATH, keyed
+    by "Variant" like ms): the readouts calibrated in the standard pipeline
+    (config.TP53_UV_COLUMNS; the calibration was fit on the same scores) and
+    those calibrated on the joint model's own scores (_tp53_extra_uv_rows).
+    The comparator therefore uses exactly the joint model's readouts, on every
+    variant they measured."""
     dataset_configs = _dataset_configs()
-    bridge = _tp53_hgvs_c_bridge()
-    key_index = {vk: i for i, vk in enumerate(ms._variants_kept)}  # flat "Variant" strings, not tuples
-    mat = np.full((len(datasets), ms.n_variants), np.nan)
-    used = []
-    for d_i, dataset_name in enumerate(datasets):
-        csv_path = _uv_variants_csv_path(dataset_name, config.EXC_PP_CLINVAR2025_UV_CALIB, dataset_configs)
-        if csv_path is None or not csv_path.exists():
+    df = pd.read_csv(config.TP53_ANNOTATED_VARIANTS_PATH).drop_duplicates("Variant").set_index("Variant")
+    keys = [str(v) for v in ms._variants_kept]
+    datasets, rows = [], []
+    for dataset_name, col in config.TP53_UV_COLUMNS.items():
+        path = _calibration_json_path_for_dataset(dataset_name, config.EXC_PP_CLINVAR2025_UV_CALIB, dataset_configs)
+        if path is None or not path.exists():
             continue
-        df = _load_variants_with_canonical_points(csv_path)
-        hgvs_c = df["variant_id"].map(_extract_hgvs_c)
-        for hc, pts in zip(hgvs_c, df["standard_points"]):
-            if hc is None:
-                continue
-            variant = bridge.get(hc)
-            if variant is None:
-                continue
-            idx = key_index.get(variant)
-            if idx is not None:
-                mat[d_i, idx] = pts
-        used.append(dataset_name)
-    if not used:
+        with open(path) as f:
+            point_ranges = json.load(f)["point_ranges"]
+        x = df[col].reindex(keys).to_numpy(float)
+        row = np.full(len(keys), np.nan)
+        ok = np.isfinite(x)
+        row[ok] = [classify_score_from_point_ranges(float(v), point_ranges) for v in x[ok]]
+        datasets.append(dataset_name)
+        rows.append(row[None, :])
+    extra_names, extra_rows = _tp53_extra_uv_rows(ms)
+    datasets += extra_names
+    rows += extra_rows
+    if not rows:
         return None
-    return datasets, mat
+    return datasets, np.vstack(rows)
+
+
+def _tp53_extra_uv_rows(ms):
+    """([dataset names], [points rows]) for config.TP53_EXTRA_UV_DIMS present in ms."""
+    from src.assay_calibration.multivariate_analysis.compare_uv_mv_agg import classify_score_from_point_ranges
+    names, rows = [], []
+    dims = [str(n) for n in ms.dataset_names]
+    X = np.asarray(ms.scores, float)
+    cat_dims = getattr(ms, "categorical_dims", None) or {}
+    for dim, ds in config.TP53_EXTRA_UV_DIMS.items():
+        if dim not in dims:
+            continue
+        x = X[:, dims.index(dim)]
+        design = config.TP53_CATEGORICAL_UV_DESIGN
+        cat_path = Path(config.TP53_EXTRA_UV_CALIB_DIR) / f"{ds}_categorical" / f"{ds}_{design}_calibration.json"
+        if dim in cat_dims and design and cat_path.exists():
+            # categorical calibration (mv_analysis/categorical_uv.py): points per level
+            with open(cat_path) as f:
+                cal = json.load(f)
+            pts = np.array([cal["points"][lv] for lv in cat_dims[dim]], float)
+            row = np.full(len(x), np.nan)
+            ok = np.isfinite(x)
+            row[ok] = pts[x[ok].astype(int)]
+            names.append(ds)
+            rows.append(row[None, :])
+            continue
+        path = Path(config.TP53_EXTRA_UV_CALIB_DIR) / ds / f"{ds}_3c_benign_calibration.json"
+        if not path.exists():
+            continue
+        with open(path) as f:
+            ranges = json.load(f)["point_ranges"]
+        if dim in cat_dims:
+            # categorical level codes -> the jittered encoding's level values the calibration was fit on
+            from src.assay_calibration.multivariate_data.tp53 import KAWOLIGO_MAP, KAWOLIGO_LEVELS
+            centers = np.array([KAWOLIGO_MAP[lv] for lv in KAWOLIGO_LEVELS])
+            x = np.where(np.isfinite(x), centers[np.nan_to_num(x).astype(int).clip(0, len(centers) - 1)], np.nan)
+        row = np.full(len(x), np.nan)
+        ok = np.isfinite(x)
+        row[ok] = [classify_score_from_point_ranges(float(v), ranges) for v in x[ok]]
+        names.append(ds)
+        rows.append(row[None, :])
+    return names, rows
 
 
 # ── combined / "integrated" genes ───────────────────────────────────────
@@ -236,7 +267,27 @@ def _calibration_json_path_for_dataset(dataset_dir_name, uv_calib_dir, dataset_c
     return Path(uv_calib_dir) / dataset_dir_name / f"{dataset_dir_name}_{n_c}_{benign_method}_calibration.json"
 
 
-def load_combined_uv_points(gene, ms, df_integrated=None):
+SPLICE_CONSEQUENCES = ("splice region", "splice_site_variant", "splice_acceptor_variant", "splice_donor_variant")
+SPLICEAI_COLS = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
+
+
+def _scoreset_valid_rows(rows, spliceai_threshold=0.2):
+    """The rows a Scoreset keeps for one dataset (Scoreset.filter_invalid and
+    its splicing filter, at the defaults the joint model's data are built
+    with): drops rows flagged invalid (Flag == "*") and, for assays that do
+    not detect splicing, splice-consequence and SpliceAI-flagged rows. The
+    independent evidence must come from the same measurements the joint
+    model sees."""
+    if "Flag" in rows.columns:
+        rows = rows[rows["Flag"].ne("*")]
+    if len(rows) and rows["splice_measure"].iloc[0] != "Yes":
+        rows = rows[~rows["simplified_consequence"].astype(str).str.lower().isin(SPLICE_CONSEQUENCES)]
+        cols = [c for c in SPLICEAI_COLS if c in rows.columns]
+        rows = rows[(rows[cols].lt(spliceai_threshold) | rows[cols].isna()).all(axis=1)]
+    return rows
+
+
+def load_combined_uv_points(gene, ms, df_integrated=None, scoreset_filters=True):
     """UV bridging for 'combined'/'integrated' genes -- reads each dataset's
     raw score directly from the integrated dataframe (`auth_reported_score`)
     and classifies it via that dataset's canonical calibration.json, rather
@@ -252,6 +303,10 @@ def load_combined_uv_points(gene, ms, df_integrated=None):
     since we already have that row's aa_ref/aa_pos/aa_alt (or genomic
     coordinates) directly, with no variant_id/hgvs_c matching needed at all.
     """
+    if gene == "TSC2":
+        # TSC2's combined functional dims are the Biar et al. 2026 panel,
+        # not the integrated dataframe's TSC2_IGVF.
+        return _load_tsc2_uv_matrix(ms)
     datasets = _discover_exc_pp_datasets(gene)
     if not datasets:
         return None
@@ -281,6 +336,8 @@ def load_combined_uv_points(gene, ms, df_integrated=None):
         if raw_name is None:
             continue
         rows = sub[sub["Dataset"] == raw_name]
+        if scoreset_filters:
+            rows = _scoreset_valid_rows(rows)
         for row in rows.itertuples(index=False):
             score = getattr(row, "auth_reported_score", None)
             if score is None or pd.isna(score):
@@ -299,6 +356,13 @@ def load_combined_uv_points(gene, ms, df_integrated=None):
             pts = classify_score_from_point_ranges(score, point_ranges)
             mat[d_i, idx] = pts
         used.append(dataset_name)
+    if gene == "TP53":
+        # the readouts calibrated on the joint model's own scores (as in load_tp53_uv_points)
+        extra_names, extra_rows = _tp53_extra_uv_rows(ms)
+        if extra_rows:
+            datasets = list(datasets) + extra_names
+            mat = np.vstack([mat] + extra_rows)
+            used += extra_names
     if not used:
         return None
     return datasets, mat
@@ -406,6 +470,19 @@ def load_chen_predictor_uv_points(gene, ms, predictor_data_dir=None):
             idx = key_index.get(pv)
             if idx is not None:
                 row[idx] = v
+        # rows scored by the ms but absent from the curated CSV (ClinVar VUS
+        # appended by compute_clinvar_vus_points_by_panel.py): the same raw
+        # score, taken from the ms's own column
+        dim = _CHEN_TABLE_PREDICTOR[predictor]
+        if dim in ms.dataset_names:
+            col = np.asarray(ms.scores, float)[:, list(ms.dataset_names).index(dim)]
+            fill = np.isnan(row) & ~np.isnan(col)
+            if fill.any():
+                if th is not None:
+                    row[fill] = chen_points(col[fill], th)
+                else:
+                    for i in np.flatnonzero(fill):
+                        row[i] = domain.get(ms._variants_kept[i], np.nan)
         rows.append(row)
         names.append(f"{predictor}_{gene}")
     if not rows:
@@ -587,14 +664,14 @@ def aggregate_functional_plus_predictor(gene, ms, aggregator, df_integrated=None
 
 # ── plain "integrated" functional-only genes (Panel A) ────────────────────
 
-def load_integrated_functional_uv_points(gene, ms, df_integrated=None):
+def load_integrated_functional_uv_points(gene, ms, df_integrated=None, scoreset_filters=True):
     """Same bridge as load_combined_uv_points (aa_ref/aa_pos/aa_alt -> short
     protein_variant), for genes whose MV fit is functional-only (built via
     combined.py::build_functional_scoresets with no predictor merge, e.g.
     the 15 plain-"integrated" genes in Panel A) -- these share the same
     ms._variants_kept format as the 'combined' gene-set's functional
     dimensions, so the exact same bridging function applies unchanged."""
-    return load_combined_uv_points(gene, ms, df_integrated=df_integrated)
+    return load_combined_uv_points(gene, ms, df_integrated=df_integrated, scoreset_filters=scoreset_filters)
 
 
 # ── dispatcher ───────────────────────────────────────────────────────────
@@ -604,6 +681,8 @@ def load_uv_points(gene, ms, gene_set):
     docstring for the common interface and per-gene-set caveats."""
     if gene_set == "card11":
         return _load_card11_uv_matrix(ms)
+    if gene_set == "tsc2":
+        return _load_tsc2_uv_matrix(ms)
     if gene_set == "labelseq":
         return _load_labelseq_uv_matrix(gene, ms)
     if gene_set == "tp53":

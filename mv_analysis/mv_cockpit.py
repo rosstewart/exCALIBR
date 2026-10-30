@@ -643,7 +643,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gene-set", required=True,
-                     choices=["labelseq", "integrated", "predictor", "combined", "card11", "tp53"])
+                     choices=["labelseq", "integrated", "predictor", "combined", "card11", "tsc2", "tp53"])
     ap.add_argument("--fit-type", default="canonical",
                      choices=["canonical", "paper", "staged_init_all_assayed"])
     ap.add_argument("--genes", nargs="+", default=None,

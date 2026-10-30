@@ -23,8 +23,20 @@ one).
       gene's labelled variants) calibrated on each split's in-bag labelled
       variants; its 100 internal bootstrap posteriors per split are converted
       to log LR+ and pooled over the variant's OOB splits.
-  Classifiers (comparison_methods/supervised.py): trained on each split's
-      in-bag labelled variants; one log LR+ per OOB split.
+  Classifiers (comparison_methods/supervised.py): each split's in-bag
+      labelled variants are divided within class into a fitting set (2/3),
+      on which the classifier is trained, and a calibration set (1/3), on
+      which its score is calibrated to a local likelihood ratio
+      (fit_calibrate_predict); one log LR+ per OOB split (split<i>_cal.npz).
+      Training, calibration and evaluation variants are disjoint; kept as
+      "<model>-local". Primary ("<model>"): cross-fitted ExCALIBR calibration
+      (fit_excalibr_crossfit; split<i>_excalcv.npz): the classifier is trained
+      on all in-bag controls, and its score is calibrated by one ExCALIBR fit
+      on the in-bag controls' out-of-fold scores (5 stratified folds, each
+      scored by the classifier trained on the other four) plus the in-bag
+      population and synonymous variants, with ExCALIBR's own prior; per split,
+      the reason is recorded when it cannot be done. The earlier variant, which
+      assumes calibrated probabilities (fit_predict), is kept as "<model>-raw".
 Metrics: the paper's evaluation rows (report._eval_labels) at the
 evidence-direction threshold. Variants in every bootstrap sample (never OOB)
 are excluded for all methods.
@@ -70,7 +82,7 @@ def keys_with_both_classes(keys=None):
     out = []
     for p in sorted((Path(config.PKNN_DIR) / "prep").glob("*.json")):
         m = json.load(open(p))
-        if (keys is None or m["key"] in keys) and m["eval_P"] > 0 and m["eval_B"] > 0:
+        if (keys is None or m["key"] in keys) and m["eval_P"] > 0 and m["eval_B"] > 0 and config.paper_includes(m["key"]):
             out.append(m["key"])
     return out
 
@@ -158,6 +170,75 @@ def _split_one(key, i, inner):
     return key, i
 
 
+def _split_cal_one(key, i):
+    """Classifier log LR+ for split i's OOB evaluation rows, with a held-out
+    calibration set inside its in-bag labelled rows -> <key>/split<i>_cal.npz."""
+    _single_threaded()
+    from mv_analysis.comparison_methods import supervised
+    warnings.filterwarnings("ignore")
+    f = OUT / key / f"split{i}_cal.npz"
+    if f.exists():
+        return key, i
+    d, meta = RP.load_prep(key)
+    mv = np.load(OUT / key / "mv.npz")
+    oob = mv["oob"][i]
+    X, lab, ev = d["X"], d["labelled"], d["eval_mask"]
+    y = d["plp"].astype(int)
+    tr, te = lab & ~oob, ev & oob
+    rows = np.flatnonzero(te)
+    out = {"rows": rows}
+    for m in supervised.MODELS:
+        v = supervised.fit_calibrate_predict(m, X[tr], y[tr], X[te], seed=int(mv["seeds"][i])) if len(rows) else None
+        if v is not None:
+            out[f"sup_{m}"] = v.astype(np.float32)
+    np.savez_compressed(f, **out)
+    return key, i
+
+
+def _split_excalcv_one(key, i):
+    """Classifier log LR+ for split i's OOB evaluation rows, cross-fitted and
+    calibrated by ExCALIBR (supervised.fit_excalibr_crossfit) ->
+    <key>/split<i>_excalcv.npz: per model its log LR+ and prior, or the
+    reason it could not be calibrated."""
+    _single_threaded()
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    from mv_analysis.comparison_methods import supervised
+    warnings.filterwarnings("ignore")
+    f = OUT / key / f"split{i}_excalcv.npz"
+    if f.exists():
+        return key, i
+    d, meta = RP.load_prep(key)
+    mv = np.load(OUT / key / "mv.npz")
+    oob = mv["oob"][i].astype(bool)
+    tr, te = d["labelled"] & ~oob, d["eval_mask"] & oob
+    out = {"rows": np.flatnonzero(te)}
+    for m in supervised.MODELS:
+        if not te.any():
+            r = "no out-of-bag controls"
+        else:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    r = supervised.fit_excalibr_crossfit(m, d["X"], d["plp"].astype(int), d["sa"], d["sample_names"],
+                                                         tr, te, exclude=oob, seed=int(mv["seeds"][i]))
+            except Exception as e:  # recorded, never silently dropped
+                r = f"error: {type(e).__name__}: {e}"[:300]
+        if isinstance(r, str):
+            out[f"fail_{m}"] = np.array(r)
+        else:
+            out[f"sup_{m}"], out[f"prior_{m}"] = r[0].astype(np.float32), np.float64(r[1])
+    tmp = f.with_suffix(".tmp.npz")
+    np.savez_compressed(tmp, **out)
+    os.replace(tmp, f)
+    return key, i
+
+
+def excalcv_tasks(keys=None):
+    """(key, split) pairs still to compute for the cross-fitted calibration."""
+    return [(k, i) for k in keys_with_both_classes(keys) if (OUT / k / "mv.npz").exists()
+            for i in range(np.load(OUT / k / "mv.npz")["oob"].shape[0])
+            if not (OUT / k / f"split{i}_excalcv.npz").exists()]
+
+
 @lru_cache(maxsize=None)
 def _log_c(prior_rounded):
     from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
@@ -189,6 +270,9 @@ def _collect_one(key):
     n = oob.shape[0]
     pk = {j: [] for j in np.flatnonzero(ev)}
     sup = {m: {j: [] for j in np.flatnonzero(ev)} for m in supervised.MODELS}
+    raw = {m: {j: [] for j in np.flatnonzero(ev)} for m in supervised.MODELS}
+    exc = {m: {j: [] for j in np.flatnonzero(ev)} for m in supervised.MODELS}
+    exc_prior = {m: {j: [] for j in np.flatnonzero(ev)} for m in supervised.MODELS}
     for i in range(n):
         s = np.load(OUT / key / f"split{i}.npz")
         rows = s["rows"]
@@ -201,7 +285,22 @@ def _collect_one(key):
         for m in supervised.MODELS:
             if f"sup_{m}" in s.files:
                 for j, v in zip(rows, s[f"sup_{m}"]):
-                    sup[m][j].append(float(v))
+                    raw[m][j].append(float(v))
+        fe = OUT / key / f"split{i}_excalcv.npz"
+        if fe.exists():
+            e = np.load(fe)
+            for m in supervised.MODELS:
+                if f"sup_{m}" in e.files:
+                    for j, v in zip(e["rows"], e[f"sup_{m}"]):
+                        exc[m][j].append(float(v))
+                        exc_prior[m][j].append(float(e[f"prior_{m}"]))
+        fc = OUT / key / f"split{i}_cal.npz"
+        if fc.exists():
+            c = np.load(fc)
+            for m in supervised.MODELS:
+                if f"sup_{m}" in c.files:
+                    for j, v in zip(c["rows"], c[f"sup_{m}"]):
+                        sup[m][j].append(float(v))
     recs = []
     for j in np.flatnonzero(ev):
         o = oob[:, j]
@@ -219,9 +318,15 @@ def _collect_one(key):
             r["P-KNN"] = _points(np.nanpercentile(v, 5), np.nanpercentile(v, 95), prior, pvals)
             r["pknn_nan_frac"] = float(np.isnan(v).mean())
         for m in supervised.MODELS:
-            if sup[m][j]:
-                v = np.asarray(sup[m][j])
-                r[m] = _points(np.percentile(v, 5), np.percentile(v, 95), prior, pvals)
+            for name, store in ((f"{m}-local", sup), (f"{m}-raw", raw)):
+                if store[m][j]:
+                    v = np.asarray(store[m][j])
+                    r[name] = _points(np.percentile(v, 5), np.percentile(v, 95), prior, pvals)
+            if exc[m][j]:
+                # ExCALIBR-calibrated (primary): thresholds at ExCALIBR's own prior,
+                # the median over the variant's OOB splits
+                v = np.asarray(exc[m][j])
+                r[m] = _points(np.percentile(v, 5), np.percentile(v, 95), float(np.median(exc_prior[m][j])), pvals)
         recs.append(r)
     out = pd.DataFrame(recs)
     out.insert(0, "variant", d["variants"][out["row"]])
@@ -253,6 +358,12 @@ def run_all(workers=12, inner=2, keys=None):
     tasks = [(k, i, inner) for k in keys if (OUT / k / "mv.npz").exists()
              for i in range(np.load(OUT / k / "mv.npz")["oob"].shape[0]) if not (OUT / k / f"split{i}.npz").exists()]
     _pool(_split_one, tasks, workers, "splits")
+    tasks = [(k, i) for k in keys if (OUT / k / "mv.npz").exists()
+             for i in range(np.load(OUT / k / "mv.npz")["oob"].shape[0]) if not (OUT / k / f"split{i}_cal.npz").exists()]
+    _pool(_split_cal_one, tasks, workers, "calibrated classifiers")
+    # the cross-fitted ExCALIBR calibration (~10 h at 100 cores) runs as its own
+    # stage, locally ("excalcv") or on the cluster (hpc/submit_classifier_cal.sh);
+    # collection uses whatever splits it has finished
     for k in keys:
         if (OUT / k / "mv.npz").exists():
             _collect_one(k)
@@ -261,11 +372,26 @@ def run_all(workers=12, inner=2, keys=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["mv", "splits", "collect", "all"])
+    ap.add_argument("stage", choices=["mv", "splits", "cal", "excalcv", "excalcv-tasks", "collect", "all"])
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--inner", type=int, default=2)
     ap.add_argument("--keys", nargs="*")
+    ap.add_argument("--task-file", help="excalcv: JSON list of [key, split] (written by excalcv-tasks)")
+    ap.add_argument("--task-index", type=int, help="excalcv: run tasks index*per .. index*per+per-1 of --task-file")
+    ap.add_argument("--tasks-per-index", type=int, default=1)
     args = ap.parse_args()
+    if args.stage == "excalcv-tasks":
+        tasks = excalcv_tasks(args.keys)
+        Path(args.task_file).write_text(json.dumps(tasks))
+        print(f"{len(tasks)} tasks -> {args.task_file}")
+        return
+    if args.stage == "excalcv" and args.task_file:
+        tasks = [tuple(t) for t in json.loads(Path(args.task_file).read_text())]
+        a = args.task_index * args.tasks_per_index
+        tasks = tasks[a:a + args.tasks_per_index]
+        print(f"excalcv: tasks {a}..{a + len(tasks) - 1}", flush=True)
+        _pool(_split_excalcv_one, tasks, args.workers, "excalcv")
+        return
     OUT.mkdir(parents=True, exist_ok=True)
     keys = keys_with_both_classes(args.keys)
     if args.stage in ("mv", "all"):
@@ -276,6 +402,16 @@ def main():
                  if not (OUT / k / f"split{i}.npz").exists()]
         print(f"splits: {len(tasks)} tasks", flush=True)
         _pool(_split_one, tasks, args.workers, "splits")
+    if args.stage in ("cal", "all"):
+        tasks = [(k, i) for k in keys if (OUT / k / "mv.npz").exists()
+                 for i in range(np.load(OUT / k / "mv.npz")["oob"].shape[0])
+                 if not (OUT / k / f"split{i}_cal.npz").exists()]
+        print(f"calibrated classifiers: {len(tasks)} tasks", flush=True)
+        _pool(_split_cal_one, tasks, args.workers, "cal")
+    if args.stage == "excalcv":
+        tasks = excalcv_tasks(args.keys)
+        print(f"cross-fitted ExCALIBR classifiers: {len(tasks)} tasks", flush=True)
+        _pool(_split_excalcv_one, tasks, args.workers, "excalcv")
     if args.stage in ("collect", "all"):
         for k in keys:
             try:
