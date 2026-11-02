@@ -158,7 +158,9 @@ def _count_eventual_fits(minimal_jobs: list) -> int:
     `n_slots` further candidates at execution time -- so the literal list
     length would undercount, and run_array_task.py's `remaining` bookkeeping
     (seeded from this total) would fire prematurely and drop every candidate
-    past the seed. Counted analytically here instead.
+    past the seed. Counted analytically here instead. This is an upper
+    bound: a slot whose flipped pattern is out of range (K=4, q=2) is skipped
+    at run time (run_array_task.py deducts it then).
     """
     total = 0
     for j in minimal_jobs:

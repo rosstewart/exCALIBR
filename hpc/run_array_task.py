@@ -117,7 +117,7 @@ class GreedyUnit:
 
     __slots__ = ("key", "base_job", "n_patterns", "n_slots", "cur_lambda",
                 "best_val_ll", "slot_ptr", "next_fit_idx", "done",
-                "pending_lambda")
+                "pending_lambda", "n_skipped")
 
     def __init__(self, key, base_job, n_patterns, n_slots, fit_idx_start):
         self.key = key
@@ -130,6 +130,14 @@ class GreedyUnit:
         self.next_fit_idx = fit_idx_start
         self.done = False
         self.pending_lambda = 0        # lambdaIndex of the seed job, already run
+        self.n_skipped = 0             # slots skipped (pattern out of range), not yet accounted
+
+    def take_skipped(self):
+        """Slots skipped since the last call. Each was counted up front as a
+        fit of this bootstrap but never runs, so the caller must deduct them
+        from its pending count."""
+        n, self.n_skipped = self.n_skipped, 0
+        return n
 
     def record_result(self, val_ll):
         """Keep the just-completed candidate's pattern iff it improved on
@@ -148,6 +156,9 @@ class GreedyUnit:
             self.slot_ptr += 1
             cand = next_greedy_lambda(self.cur_lambda, slot, self.n_patterns)
             if cand is None:
+                # e.g. K=4, q=2: n_patterns is capped at 100 < 2**8, so slot 7
+                # (and slot 6 once cur >= 36) has no in-range pattern.
+                self.n_skipped += 1
                 continue
             job = dict(self.base_job)
             job["kwargs"] = dict(self.base_job["kwargs"])
@@ -185,7 +196,8 @@ def _load_skip_datasets(output_dir: Path) -> set:
     return skip
 
 
-def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None:
+def run_array_task(output_dir: str, array_idx: int, device: str = "cpu",
+                   gpu_init: str = "cpu") -> None:
     output_dir = Path(output_dir).resolve()
     jobs_dir = output_dir / "jobs"
     array_file = jobs_dir / f"array_{array_idx:04d}.pkl"
@@ -288,16 +300,10 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
     print(f"Array task {array_idx}: {len(jobs)} bootstraps, {total_fits} fits "
           f"({len(fit_specs)} seeds{', greedy adaptive search' if is_greedy_run else ''}), "
           f"{n_cpus} CPUs")
-    if is_greedy_run and device == "gpu":
-        # The GPU path (run_gpu below) batches a flat fit_specs list through
-        # jax_batch and has no mechanism to generate a GreedyUnit's later
-        # rounds -- it will run only the 3 seed jobs per (bootstrap, K) and
-        # never search further. Flagged loudly rather than silently
-        # under-delivering; adapting the search to JAX's batched/jitted
-        # execution model is separate follow-up work, not attempted here.
-        print("  WARNING: --greedy-restarts has no effect on --device gpu -- "
-              "only the seed sign pattern will run for each mode, with no "
-              "adaptive search. Use --device cpu for the adaptive search.")
+    if is_greedy_run and device == "gpu" and gpu_init == "gpu":
+        # jax_batch's batched init ignores lambdaIndex (it draws its own sign
+        # pattern), so every candidate of the search would start alike.
+        raise ValueError("greedy restarts on --device gpu need --gpu-init cpu")
 
     print(f"Submitting {len(fit_specs)} seed fits across {len(fits_per_bootstrap)} "
           f"bootstrap(s) (device={device})")
@@ -332,20 +338,32 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
         if result and result.get("hit_cap", False):
             cap_hits[key] += 1
 
+        _count_done(bs_seed, save_dir, 1)
+        return val_ll
+
+    def _count_done(bs_seed, save_dir, n):
+        """Deduct n finished (or never-to-run) fits from the bootstrap's
+        pending count, and save its best fits once none remain."""
         bs_key = (bs_seed, save_dir)
-        remaining[bs_key] -= 1
+        remaining[bs_key] -= n
 
         # ── Save as soon as all fits for this bootstrap are done ──
         if remaining[bs_key] == 0:
             save_path = Path(save_dir) / f"bootstrap_{bs_seed}_best_fits.pkl"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
             if save_all_ll:
                 import json as _json
                 (Path(save_dir) / f"bootstrap_{bs_seed}_restart_val_ll.json").write_text(
                     _json.dumps(all_ll.pop(bs_key, [])))
             new_results = {}
-            for (b, lbl, sd), (_, _, res) in best.items():
+            for (b, lbl, sd), (vl, _, res) in best.items():
                 if b == bs_seed and sd == save_dir:
                     n_cap = cap_hits.get((b, lbl, sd), 0)
+                    if not np.isfinite(vl):
+                        # Every restart failed or was excluded (val_ll -inf):
+                        # store no fit, so it is not mistaken for a real one
+                        # downstream and a rerun of this task retries it.
+                        res = None
                     if res is not None:
                         res = {**res, "n_cap_hits": n_cap}
                     new_results[lbl] = res
@@ -365,7 +383,48 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
             total_cap = sum(cap_hits.get((bs_seed, lbl, save_dir), 0) for lbl in new_results)
             cap_str = f"  ⚠ {total_cap} cap hits" if total_cap > 0 else ""
             print(f"  ✓ bootstrap {bs_seed} → {save_path.parent.name}  [{', '.join(components)}]{cap_str}")
-        return val_ll
+
+    def _advance(ukey, bs_seed, label, save_dir, val_ll):
+        """Feed a greedy candidate's held-out val_ll to its unit and return
+        the unit's next fit spec (None when its search is done). Slots the
+        unit skipped are deducted here, since they were counted up front."""
+        unit = units[ukey]
+        unit.record_result(val_ll)
+        nxt = unit.next_spec()
+        skipped = unit.take_skipped()
+        if skipped:
+            _count_done(bs_seed, save_dir, skipped)
+        if nxt is None:
+            return None
+        job, next_fit_idx = nxt
+        unit_of[(bs_seed, label, save_dir, next_fit_idx)] = ukey
+        return (job, bs_seed, label, save_dir)
+
+    unit_of = dict(seed_unit_key)   # (bs_seed, label, save_dir, fit_idx) → unit key, all candidates
+
+    if device == "gpu" and is_greedy_run:
+        # ── GPU + greedy: one batched run_gpu call per round ──
+        # Each unit's next candidate depends only on its own previous
+        # candidate's held-out val_ll, so running every unit's k-th candidate
+        # together gives the same candidates and accept/reject decisions as
+        # the CPU path's rolling frontier below (at most 1 + max n_slots
+        # rounds; later rounds shrink to the q2 searches).
+        from src.assay_calibration.fit_utils.jax_batch.interop import run_gpu
+        frontier = fit_specs
+        n_round = 0
+        while frontier:
+            n_round += 1
+            print(f"  greedy round {n_round}: {len(frontier)} fits", flush=True)
+            next_frontier = []
+            for bs_seed, label, save_dir, fit_idx, result in run_gpu(frontier, use_gpu_init=False):
+                val_ll = _finalize(bs_seed, label, save_dir, fit_idx, result)
+                ukey = unit_of.get((bs_seed, label, save_dir, fit_idx))
+                if ukey is not None:
+                    nxt = _advance(ukey, bs_seed, label, save_dir, val_ll)
+                    if nxt is not None:
+                        next_frontier.append(nxt)
+            frontier = next_frontier
+        return
 
     if device == "gpu" or not is_greedy_run:
         # Original flat submit-all-then-collect path, byte-for-byte
@@ -373,7 +432,13 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
         # never populate `units`).
         if device == "gpu":
             from src.assay_calibration.fit_utils.jax_batch.interop import run_gpu
-            results_iter = run_gpu(fit_specs)
+            # gpu_init="cpu" (default): each fit starts from exactly the
+            # initialization the CPU path uses (interop._init_cfusn ->
+            # kmeans_init_mv), so the GPU path reproduces the CPU path up to
+            # floating-point order. "gpu": jax_batch's batched init -- a
+            # different, deterministic k-means that gives every restart of a
+            # bootstrap the same clustering and can fail on a singular cluster.
+            results_iter = run_gpu(fit_specs, use_gpu_init=(gpu_init == "gpu"))
         else:
             def _cpu_results():
                 with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
@@ -396,34 +461,32 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
     # while every candidate still only depends on that SAME unit's own prior
     # result, never on any other unit's.
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as ex:
-        pending: dict = {}   # future → unit key (or None for non-greedy jobs)
+        pending: dict = {}   # future → its fit spec
         for spec in fit_specs:
-            full_job, bs_seed, label, sd_str = spec
-            fit_idx = full_job.get("fit_idx")
-            ukey = seed_unit_key.get((bs_seed, label, sd_str, fit_idx))
-            pending[ex.submit(_run_one_fit, spec)] = ukey
+            pending[ex.submit(_run_one_fit, spec)] = spec
 
         while pending:
             done, _ = concurrent.futures.wait(
                 pending, return_when=concurrent.futures.FIRST_COMPLETED
             )
             for fut in done:
-                ukey = pending.pop(fut)
+                spec = pending.pop(fut)
                 try:
                     bs_seed, label, save_dir, fit_idx, result = fut.result()
                 except Exception as e:
+                    # the pool itself failed (fit errors are caught in
+                    # _run_one_fit): count it as a failed fit, so the
+                    # bootstrap's pending count still reaches zero
                     print(f"  Future raised: {e}")
-                    continue
+                    full_job, bs_seed, label, save_dir = spec
+                    fit_idx, result = full_job.get("fit_idx"), None
                 val_ll = _finalize(bs_seed, label, save_dir, fit_idx, result)
+                ukey = unit_of.get((bs_seed, label, save_dir, fit_idx))
                 if ukey is None:
                     continue
-                unit = units[ukey]
-                unit.record_result(val_ll)
-                nxt = unit.next_spec()
+                nxt = _advance(ukey, bs_seed, label, save_dir, val_ll)
                 if nxt is not None:
-                    job, _next_fit_idx = nxt
-                    next_spec_tuple = (job, bs_seed, label, save_dir)
-                    pending[ex.submit(_run_one_fit, next_spec_tuple)] = ukey
+                    pending[ex.submit(_run_one_fit, nxt)] = nxt
 
 
 # ---------------------------------------------------------------------------
@@ -441,9 +504,14 @@ if __name__ == "__main__":
                         help="cpu (default): existing per-job ProcessPoolExecutor path. "
                              "gpu: batch jobs through jax_batch and run on GPU "
                              "(see hpc/submit_array_gpu.sh).")
+    parser.add_argument("--gpu-init", choices=["cpu", "gpu"], default="cpu",
+                        help="Initialization for --device gpu. cpu (default): the CPU "
+                             "path's own kmeans init per fit, so results match the CPU "
+                             "path. gpu: jax_batch's batched init (faster, but a different "
+                             "algorithm with different, sometimes failing, starts).")
     args = parser.parse_args()
     if args.end is not None:
         for idx in range(args.array_idx, args.end + 1):
-            run_array_task(args.output_dir, idx, device=args.device)
+            run_array_task(args.output_dir, idx, device=args.device, gpu_init=args.gpu_init)
     else:
-        run_array_task(args.output_dir, args.array_idx, device=args.device)
+        run_array_task(args.output_dir, args.array_idx, device=args.device, gpu_init=args.gpu_init)

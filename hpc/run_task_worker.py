@@ -10,7 +10,8 @@ of these alongside them, on GPU or CPU partitions, and they drain the backlog.
         [--range-job ARRAY_JOB_ID --tasks-per-job N]
 
 A task counts as finished once every bootstrap it covers has its
-bootstrap_<seed>_best_fits.pkl (run_array_task itself also skips completed
+bootstrap_<seed>_best_fits.pkl, under its own condition directory for a
+multi-condition sweep (run_array_task itself also skips completed
 components). Claims are directories under <output_dir>/locks/ (mkdir is
 atomic); a claim whose owning SLURM job is no longer in the queue is stale and
 may be taken over.
@@ -53,31 +54,52 @@ def _in_queue(job_id):
     return bool(out.stdout.strip())
 
 
-def _conditions(out_dir):
-    """dataset -> condition tag (None if untagged), read from the array
-    pickles -- job_index.json does not record it, but run_array_task routes
-    a tagged dataset's results to <output_dir>/<condition>/<dataset>."""
+def _task_results(out_dir):
+    """task -> the result files it produces, read from the array pickles.
+
+    run_array_task writes <output_dir>/[<condition>/]<dataset>/
+    bootstrap_<seed>_best_fits.pkl for each bootstrap of a task. job_index.json
+    records neither the condition nor (for multi-condition sweeps, where one
+    dataset appears under several conditions) which condition a task belongs
+    to, so this is taken from each task's own pickle. Cached in locks/.
+    """
     import pickle
-    cache = out_dir / "locks" / "conditions.json"
+    cache = out_dir / "locks" / "task_results.json"
     if cache.exists():
-        return json.loads(cache.read_text())
-    cond = {}
+        return {int(t): v for t, v in json.loads(cache.read_text()).items()}
+    out = {}
     for f in sorted((out_dir / "jobs").glob("array_*.pkl")):
+        t = int(f.stem.split("_")[1])
         with open(f, "rb") as fh:
+            paths = []
             for cjob in pickle.load(fh):
-                cond.setdefault(cjob["dataset_name"], cjob.get("condition"))
+                c = cjob.get("condition")
+                rel = (f"{c}/" if c else "") + f"{cjob['dataset_name']}/bootstrap_{cjob['bootstrap_seed']}_best_fits.pkl"
+                paths.append(rel)
+        out[t] = paths
     tmp = cache.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(cond))
+    tmp.write_text(json.dumps(out))
     tmp.replace(cache)
-    return cond
+    return out
 
 
-def _task_done(out_dir, jobs, cond):
-    for j in jobs:
-        c = cond.get(j["dataset_name"])
-        base = out_dir / c if c else out_dir
-        if not (base / j["dataset_name"] / f"bootstrap_{j['bootstrap_seed']}_best_fits.pkl").exists():
+def _task_done(out_dir, paths, require_valid=False):
+    """Every result file exists -- and, with require_valid, every component
+    count in it holds a usable fit (not None, finite val_ll), so a task whose
+    failed fits were cleared for refitting counts as not done."""
+    if not require_valid:
+        return all((out_dir / p).exists() for p in paths)
+    import pickle
+    import numpy as np
+    for p in paths:
+        try:
+            with open(out_dir / p, "rb") as fh:
+                res = pickle.load(fh)
+        except (OSError, EOFError, pickle.UnpicklingError):
             return False
+        for r in res.values():
+            if r is None or not np.isfinite(r.get("val_ll", -np.inf)):
+                return False
     return True
 
 
@@ -101,6 +123,15 @@ def main():
     ap.add_argument("--device", choices=["cpu", "gpu"], required=True)
     ap.add_argument("--range-job", default=None)
     ap.add_argument("--tasks-per-job", type=int, default=None)
+    ap.add_argument("--gpu-init", choices=["cpu", "gpu"], default="cpu",
+                    help="initialization for --device gpu (see run_array_task.py)")
+    ap.add_argument("--tasks", default=None,
+                    help="file of task indices (one per line): only these are claimed")
+    ap.add_argument("--require-valid", action="store_true",
+                    help="a task is done only when all its fits are present and valid "
+                         "(for refitting cleared/failed fits in place)")
+    ap.add_argument("--first", default="",
+                    help="comma-separated dataset names whose tasks are claimed first")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the claimable tasks in claim order and exit")
     args = ap.parse_args()
@@ -113,7 +144,7 @@ def main():
     n_tasks = index["num_arrays"]
     locks = out_dir / "locks"
     locks.mkdir(exist_ok=True)
-    cond = _conditions(out_dir)
+    results = _task_results(out_dir)
     me = _me()
 
     per = args.tasks_per_job
@@ -121,14 +152,20 @@ def main():
         # distance from the end of its fixed range: each range's last task first
         order = sorted(range(n_tasks), key=lambda t: ((t // per) * per + per - 1 - t, t))
     else:
-        order = list(range(n_tasks))[::-1]
+        order = list(range(n_tasks))
+    if args.tasks:
+        keep = {int(x) for x in Path(args.tasks).read_text().split()}
+        order = [t for t in order if t in keep]
+    first = {d for d in args.first.split(",") if d}
+    if first:   # stable: keeps the order above within each group
+        order = sorted(order, key=lambda t: by_task[t][0]["dataset_name"] not in first)
 
     print(f"worker {me}: device={args.device}, {n_tasks} tasks", flush=True)
     if args.dry_run:
         positions = {}
         claimable = []
         for t in order:
-            if _task_done(out_dir, by_task[t], cond) or (locks / f"task_{t:04d}").exists():
+            if _task_done(out_dir, results[t], args.require_valid) or (locks / f"task_{t:04d}").exists():
                 continue
             if args.range_job and per:
                 r = t // per
@@ -147,7 +184,7 @@ def main():
         claimed = None
         positions = {}
         for t in order:
-            if _task_done(out_dir, by_task[t], cond):
+            if _task_done(out_dir, results[t], args.require_valid):
                 continue
             if args.range_job and per:
                 r = t // per
@@ -166,7 +203,7 @@ def main():
                     owner = (lock / "owner").read_text().strip()
                 except OSError:
                     continue                 # claim being written right now
-                if owner == me or _in_queue(owner) or _task_done(out_dir, by_task[t], cond):
+                if owner == me or _in_queue(owner) or _task_done(out_dir, results[t], args.require_valid):
                     continue
                 shutil.rmtree(lock, ignore_errors=True)   # stale: owner gone
                 try:
@@ -181,7 +218,7 @@ def main():
             return
         print(f"worker {me}: task {claimed} ({time.strftime('%H:%M:%S')})", flush=True)
         try:
-            run_array_task(str(out_dir), claimed, device=args.device)
+            run_array_task(str(out_dir), claimed, device=args.device, gpu_init=args.gpu_init)
             n_fail = 0
         except SystemExit:
             raise

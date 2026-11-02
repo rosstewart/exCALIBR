@@ -196,8 +196,10 @@ def next_greedy_lambda(cur_lambda, slot, n_patterns):
     tests/cfusn_simulations/sim_init_enumeration_vs_datadriven.py:153-188:
     `cand = cur ^ (1 << slot); if cand >= n_patterns: continue`). `n_patterns`
     is the same `min((2**q)**K, 100)` cap generate_fit_jobs already applies
-    elsewhere, so this only returns None in the (currently unreached, at
-    production's K=3/4) case where K*q >= n_patterns.
+    elsewhere, so this returns None whenever the flipped pattern is out of
+    range -- e.g. K=4, q=2 (n_patterns 100 < 2**8): slot 7 always, slot 6
+    once cur_lambda >= 36. hpc/run_array_task.py deducts such skipped slots
+    from its pending-fit count.
 
     Pure and side-effect-free by design so it can be unit-tested against
     run_greedy's own candidate sequence without touching any fit machinery.

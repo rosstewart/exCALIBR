@@ -232,7 +232,13 @@ def _run_univariate_chunk(specs, use_gpu_init=True, max_em_iters=None):
         results = []
         valid_mask = []
         for spec in specs:
-            init = _init_univariate(spec[0])
+            # A failed init is one failed fit, as in tryToFit, not the end of
+            # the whole chunk.
+            try:
+                init = _init_univariate(spec[0])
+            except Exception as e:
+                print(f"  [init] fit {spec[0].get('fit_idx')} (bootstrap {spec[1]}) failed: {e}", flush=True)
+                init = None
             if init is None:
                 results.append(_failed_result(spec))
                 valid_mask.append(False)
@@ -433,7 +439,13 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
         valid_specs = []
         results = []
         for spec in specs:
-            init = _init_cfusn(spec[0])
+            # A failed init is one failed fit, as in single_fit/tryToFit,
+            # not the end of the whole chunk.
+            try:
+                init = _init_cfusn(spec[0])
+            except Exception as e:
+                print(f"  [init] fit {spec[0].get('fit_idx')} (bootstrap {spec[1]}) failed: {e}", flush=True)
+                init = None
             if init is None:
                 results.append(_failed_result(spec))
                 continue

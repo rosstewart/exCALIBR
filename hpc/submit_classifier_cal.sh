@@ -50,8 +50,7 @@ JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 TQDM_DISABLE=1
 export MV_PKNN_DIR=${BUNDLE} PYTHONPATH=${REPO}
 cd ${REPO}
-${PYTHON} -m mv_analysis.production_oob excalcv --task-file ${TASKS} --task-index \${SLURM_ARRAY_TASK_ID} \\
-    --tasks-per-index ${TASKS_PER_INDEX} --workers ${TASKS_PER_INDEX}
+${PYTHON} -m mv_analysis.production_oob excalcv --task-file ${TASKS} --task-index \${SLURM_ARRAY_TASK_ID} --tasks-per-index ${TASKS_PER_INDEX} --workers ${TASKS_PER_INDEX}
 SBATCH_SCRIPT
 )
 
