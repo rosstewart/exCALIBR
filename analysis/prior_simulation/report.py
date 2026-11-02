@@ -21,34 +21,7 @@ SHORT = dict(zip(ASSAYS, ["A1", "A2", "A3"]))
 LONG = dict(zip(ASSAYS, ["M1 only", "M2 only", "M1 + M2"]))
 CSS_VAR = dict(zip(ASSAYS, ["--a1", "--a2", "--a3"]))
 DETECTED = dict(zip(ASSAYS, [POP_M1_FRAC, 1 - POP_M1_FRAC, 1.0]))
-KEYS = ["experiment", "regime", "true_prior", "delta", "rho", "eps_p", "delta_b", "lab_m1_frac", "assay"]
-
-
-def mean_ci(x):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) < 2:
-        return np.nan, np.nan, np.nan, len(x)
-    m = x.mean()
-    h = sps.t.ppf(0.975, len(x) - 1) * x.std(ddof=1) / np.sqrt(len(x))
-    return m, m - h, m + h, len(x)
-
-
-def summarize(reps):
-    rows = []
-    for key, g in reps.groupby(KEYS, sort=False):
-        o, f = mean_ci(g["oracle"]), mean_ci(g["fit"])
-        rows.append({**dict(zip(KEYS, key)), "expected": g["expected_prior"].iloc[0],
-                     "o_m": o[0], "o_lo": o[1], "o_hi": o[2], "o_n": o[3],
-                     "f_m": f[0], "f_lo": f[1], "f_hi": f[2], "f_n": f[3],
-                     "at05": g["fit_frac_at_em_init"].mean()})
-    return pd.DataFrame(rows)
-
-
-def sel(df, **kw):
-    for k, v in kw.items():
-        df = df[np.isclose(df[k], v)] if isinstance(v, float) else df[df[k] == v]
-    return df
+from analysis.prior_simulation.summary import KEYS, key_numbers, mean_ci, sel, summarize  # noqa: F401
 
 
 # ── SVG helpers ──────────────────────────────────────────────────────────────
@@ -133,7 +106,7 @@ def density_path(x, y, X, Y):
     return "M" + " L".join(f"{X(a):.1f},{Y(b):.1f}" for a, b in zip(x, y))
 
 
-def diagram(base):
+def diagram(base, n_o, n_f):
     """Data generation -> assays -> estimate, with each assay's estimates overlaid."""
     W, H = 1040, 560
     o = [f'<svg viewBox="0 0 {W} {H}" class="diagram" role="img" '
@@ -153,21 +126,21 @@ def diagram(base):
 
     # Column 1: population and samples.
     box(16, 20, 230, 132, "Variants in the gene", [
-        "benign: probability 1 − π",
-        "pathogenic: probability π",
+        "benign: probability P(Y=0)",
+        "pathogenic: probability P(Y=1)",
         "&#160;&#160;via M1: 25% of pathogenic",
         "&#160;&#160;via M2: 75% of pathogenic",
-        "true prior π = 0.25 (varied)",
+        "true P(Y=1) = 0.25 (varied)",
     ])
     box(16, 176, 230, 196, "Samples drawn", [
         "<tspan class='b'>P/LP</tspan>: pathogenic (100)",
         "&#160;&#160;+ label noise ε, mechanism bias",
         "<tspan class='b'>B/LB</tspan>: benign (100)",
         "&#160;&#160;+ label noise δ",
-        "<tspan class='b'>gnomAD</tspan>: mixture, prior π (500)",
+        "<tspan class='b'>gnomAD</tspan>: pathogenic w.p. P(Y=1) (500)",
         "<tspan class='b'>Synonymous</tspan>: benign (200)",
         "sparse: 8/1/50/20 and 3/0/10/6",
-        "20 replicate datasets per setting",
+        f"{n_o} datasets per setting ({n_f} fitted)",
     ])
     arrow(131, 152, 131, 176)
     # Column 2: latent effects.
@@ -263,10 +236,43 @@ def results_table(rows):
     return f"<div class='tw'><table><thead>{head}</thead><tbody>{''.join(body)}</tbody></table></div>"
 
 
+MACROS_TEX = Path("/data/ross/assay_calibration/exc_pp_clinvar2025_calib/figures/generated/macros.tex")
+ED3_TABLE = Path("/data/ross/assay_calibration/exc_pp_clinvar2025_calib/figures/generated/tables/author_performance.tex")
+
+
+def read_macros(path=MACROS_TEX):
+    """{name: rendered value} from the build's macros.tex (colour wrappers stripped)."""
+    import re
+    out = {}
+    for line in Path(path).read_text().splitlines():
+        m = re.match(r"\\newcommand\{\\(\w+)\}\{(.*)\}\s*(%.*)?$", line)
+        if m:
+            v = m.group(2)
+            c = re.match(r"\\textcolor\{\w+\}\{(.*)\}$", v)
+            out[m.group(1)] = c.group(1) if c else v
+    return out
+
+
+def ed3_both_determinate_dor(path=ED3_TABLE):
+    """(ExCALIBR, author) DOR (P vs. B) from ED Table 3's both-determinate columns."""
+    for line in Path(path).read_text().splitlines():
+        if line.startswith("DOR (P vs. B)"):
+            cells = [c.strip(" \\") for c in line.split("&")]
+            return cells[3], cells[4]
+    return "--", "--"
+
+
+# One-off check (scratchpad common_gnomad_evidence.py): the build's 61 common
+# (MAF >= 1%) gnomAD variants joined to the selected calibrations.
+COMMON_GNOMAD = dict(n_calibrated=60, n_benign_only=50, n_indeterminate=9, n_pathogenic=1)
+
+
 def build(out_dir):
     reps = pd.read_csv(out_dir / "paired_replicates.csv")
     tests = pd.read_csv(out_dir / "paired_tests.csv")
     summ = summarize(reps)
+    n_o = int(reps.groupby(KEYS)["oracle"].size().max())
+    n_f = int(reps.groupby(KEYS)["fit"].count().max())
 
     base = sel(summ, experiment="1_clean", regime="rich", true_prior=0.25)
     clean = {reg: sel(summ, experiment="1_clean", regime=reg) for reg in ("rich", "TPK1-like", "KCNH2_Kozek-like")}
@@ -306,64 +312,58 @@ def build(out_dir):
               [0.1, 0.2, 0.3, 0.4], series_for(cor25, "rho", lambda r: f"ρ = {r.rho:.1f}"), ref=0.25),
     ])
 
-    # Numbers quoted in the text.
-    g = lambda df, a, **kw: sel(df, assay=a, **kw).iloc[0]
-    b1, b2, b3 = (g(base, a) for a in ASSAYS)
-    bt = tests[(tests.test == "bias_vs_truth") & (tests.experiment == "1_clean") & (tests.regime == "rich")]
-    n_rich_sig = int((bt.p_holm < 0.05).sum())
-    dv = tests[tests.test == "dev_vs_expectation"]
-    n_dev, n_dev_sig = int(dv.p_holm.notna().sum()), int((dv.p_holm < 0.05).sum())
-    fo = tests[(tests.test == "fit_vs_oracle") & tests.experiment.isin(["1_clean", "4_separation", "5_correlation"])
-               & (tests.regime == "rich")]
-    fo23 = fo[fo.assay != "A1 (M1 only)"]["mean_diff"].abs().max()
-    m75 = {a: g(mech, a, lab_m1_frac=0.75) for a in ASSAYS}
-    np20 = {a: g(noise_p, a, eps_p=0.2) for a in ASSAYS}
-    nb20 = {a: g(noise_b, a, delta_b=0.2) for a in ASSAYS}
-    kc = clean["KCNH2_Kozek-like"]
-    kt = tests[(tests.test == "bias_vs_truth") & (tests.regime == "KCNH2_Kozek-like") & (tests.arm == "fit")
-               & (tests.p_holm < 0.05)]
-    kc_lo, kc_hi = kt["mean_diff"].min(), kt["mean_diff"].max()
-    kc_at05 = sel(kc, assay="A1 (M1 only)")["at05"].mean()
-    sep15 = g(sep, "A1 (M1 only)", delta=1.5)
-    sep25 = g(sel(summ, experiment="4_separation", true_prior=0.1), "A1 (M1 only)", delta=2.5)
-    _ab = bt.assign(ab=bt.mean_diff.abs())
-    bmax = {"A1": _ab[_ab.assay == "A1 (M1 only)"].ab.max(), "A23": _ab[_ab.assay != "A1 (M1 only)"].ab.max()}
+    # Numbers quoted in the text (shared with the manuscript build).
+    K = key_numbers(reps, tests, summ)
+    (b1, b2, b3, bt, n_rich_sig, n_dev, n_dev_sig, fo23, m75, np20, nb20, kc, kc_lo, kc_hi, kc_at05,
+     sep15, sep25, o_bias_max, o_bias_nsig, f23_bias_max, fa1_max, o_dev_max, sep15_o_err,
+     sep25_25, ws_gap_lo, ws_gap_hi, rho6_gap_max) = (
+        K[x] for x in ("b1", "b2", "b3", "bt", "n_rich_sig", "n_dev", "n_dev_sig", "fo23", "m75", "np20", "nb20",
+                       "kc", "kc_lo", "kc_hi", "kc_at05", "sep15", "sep25", "o_bias_max", "o_bias_nsig",
+                       "f23_bias_max", "fa1_max", "o_dev_max", "sep15_o_err",
+                       "sep25_25", "ws_gap_lo", "ws_gap_hi", "rho6_gap_max"))
     t_rows = (
-        [(f"Clean, rich, π = {r.true_prior:.2f}", r) for _, r in clean["rich"].iterrows()]
+        [(f"Clean, rich, P(Y=1) = {r.true_prior:.2f}", r) for _, r in clean["rich"].iterrows()]
         + [(f"P/LP 20% benign", np20[a]) for a in ASSAYS]
         + [(f"B/LB 20% pathogenic", nb20[a]) for a in ASSAYS]
         + [(f"P/LP 75% M1", m75[a]) for a in ASSAYS]
-        + [(f"KCNH2_Kozek-like, π = {r.true_prior:.2f}", r) for _, r in kc.iterrows()]
+        + [(f"KCNH2_Kozek-like, P(Y=1) = {r.true_prior:.2f}", r) for _, r in kc.iterrows()]
     )
 
     resp4a = (
-        "Formally, ExCALIBR estimates the prior from the population sample as the mixing proportion π in "
-        "f<sub>pop</sub>(x) = π f<sub>P</sub>(x) + (1 − π) f<sub>B</sub>(x), where f<sub>P</sub> and f<sub>B</sub> are the "
+        "Formally, ExCALIBR estimates the prior P(Y=1) from the population sample as the mixing proportion in "
+        "p<sub>S<sub>G</sub></sub>(s) = P(Y=1)·p<sub>S<sub>P</sub></sub>(s) + P(Y=0)·p<sub>S<sub>B</sub></sub>(s), where "
+        "p<sub>S<sub>P</sub></sub> and p<sub>S<sub>B</sub></sub> are the "
         "assay-score densities of the pathogenic and benign control variants. When an assay measures only one of a "
-        "gene's disease mechanisms, f<sub>P</sub> is itself a mixture: pathogenic variants acting through the measured "
+        "gene's disease mechanisms, p<sub>S<sub>P</sub></sub> is itself a mixture: pathogenic variants acting through the measured "
         "mechanism score abnormally, and those acting through other mechanisms score normally. If the control variants "
         "are sampled without bias, the pathogenic variants in the population follow the same mixture, so the identity "
-        "still holds and π remains the fraction of pathogenic variants in the population, not the fraction that score "
+        "still holds and P(Y=1) remains the fraction of pathogenic variants in the population, not the fraction that score "
         "abnormally. To test this, we simulated a gene with two disease mechanisms (M1 causing 25% and M2 75% of "
         "pathogenic variants) and three assays measuring M1 only, M2 only, or both (Supplementary Section X). With "
         "100 P/LP, 100 B/LB, 500 population and 200 synonymous variants and a true prior of 0.25, the three assays "
         f"estimated priors of {b1.f_m:.2f}, {b2.f_m:.2f} and {b3.f_m:.2f} with the full ExCALIBR fit "
-        f"({b1.o_m:.2f}, {b2.o_m:.2f} and {b3.o_m:.2f} with the true component distributions; means of 20 simulated "
-        "datasets), although only 6% and 19% of population variants scored abnormally in the M1-only and M2-only "
-        f"assays. Across true priors from 0.05 to 0.40, estimates were within {bmax['A23']:.2f} of the truth for the "
-        f"assays detecting most or all pathogenic variants and within {bmax['A1']:.2f} for the assay detecting 25% of "
-        f"them, and {'none' if n_rich_sig == 0 else n_rich_sig} differed significantly from the truth (two-sided "
-        "Wilcoxon signed-rank test, Holm-corrected). Measuring fewer mechanisms reduced the precision of the estimate "
-        "but not its accuracy."
+        f"({b1.o_m:.2f}, {b2.o_m:.2f} and {b3.o_m:.2f} with the true component distributions; means of {n_f} and "
+        f"{n_o} simulated datasets), although only 6% and 19% of population variants scored abnormally in the M1-only and M2-only "
+        f"assays. Across true priors from 0.05 to 0.40, the estimates with the true component distributions were "
+        f"unbiased for every assay (largest mean error {o_bias_max:.3f}; "
+        f"{'none' if o_bias_nsig == 0 else o_bias_nsig} significant, two-sided Wilcoxon signed-rank test, "
+        "Holm-corrected). The ExCALIBR fit was also unbiased for every assay (largest mean error "
+        f"{max(f23_bias_max, fa1_max):.3f}; none significant). Measuring fewer mechanisms therefore reduces the "
+        "precision of the estimate, but the prior still tracks the fraction of pathogenic variants, not the fraction "
+        "that score abnormally."
     )
     resp4b = (
         "Although this argument is theoretical, two concerns remain. First, an assay could separate pathogenic from "
         "benign variants too poorly for the mixture fit to recover the prior, for example because the likelihood "
         "surface maximized by our EM algorithm becomes flatter. In our simulations, the ExCALIBR fit matched the "
         f"estimates obtained with the true component distributions to within {fo23:.3f} for assays detecting most or "
-        "all pathogenic variants. Only for the assay detecting a minority (25%) of pathogenic variants did the fit "
-        f"drift upward, at low priors and weak separation ({sep25.f_m:.2f} vs. {sep25.o_m:.2f} with the true components "
-        "for a true prior of 0.10 at a 2.5 standard-deviation shift). Second, the argument assumes that the control variants are sampled without bias. Mislabelled controls "
+        "all pathogenic variants, and with the true components the prior stayed within "
+        f"{sep15_o_err:.3f} of the truth even at a 1.5 standard-deviation shift. The fit did run high in one case: "
+        "an assay that detects only a minority (25%) of pathogenic variants and separates them weakly from benign "
+        f"variants. At a 2.5 standard-deviation shift, it estimated {sep25.f_m:.2f} for a true prior of 0.10 and "
+        f"{sep25_25.f_m:.2f} for 0.25 ({sep25.o_m:.2f} and {sep25_25.o_m:.2f} with the true components), because the "
+        "few abnormal-scoring variants are then hard to distinguish from the tail of the normal-scoring peak. "
+        "Second, the argument assumes that the control variants are sampled without bias. Mislabelled controls "
         f"shift the prior modestly and predictably: from a true 0.25 to {min(r.f_m for r in np20.values()):.2f}–"
         f"{max(r.f_m for r in np20.values()):.2f} when 20% of P/LP variants are benign, and to "
         f"{min(r.f_m for r in nb20.values()):.2f}–{max(r.f_m for r in nb20.values()):.2f} when 20% of B/LB variants are "
@@ -371,29 +371,79 @@ def build(out_dir):
         "pathogenic variants in the population. When 75% of P/LP variants act through M1 but only 25% of pathogenic "
         f"population variants do, the M2-only assay estimates a prior of {m75['A2 (M2 only)'].f_m:.2f} and the M1-only "
         f"assay {m75['A1 (M1 only)'].f_m:.2f}, while the assay measuring both mechanisms is unaffected "
-        f"({m75['A3 (M1+M2)'].f_m:.2f}). In every noise and sampling-bias setting, the estimates agreed with the "
-        f"large-sample prediction ({n_dev - n_dev_sig} of {n_dev} tests not significant). An inflated prior therefore "
+        f"({m75['A3 (M1+M2)'].f_m:.2f}). With the true components, every noise and sampling-bias estimate matched "
+        f"its large-sample prediction to within {o_dev_max:.3f}. An inflated prior therefore "
         "indicates control variants that under-represent the mechanism an assay measures, not an assay that measures "
         "only part of a gene's disease mechanisms."
     )
-    resp6 = (
-        "We agree that the prior estimated by ExCALIBR is not the conventional clinical anchor of 0.10. It is the "
-        "fraction of pathogenic variants among the population variants measured by an assay, estimated from that "
-        "population sample relative to the P/LP and B/LB controls. Our simulations (Supplementary Section X) show that "
-        "this is not pathogenic-like assay-score membership. In an assay measuring a mechanism that accounts for 25% "
-        "of pathogenic variants, only 6% of population variants scored abnormally, yet the estimated prior was "
-        f"{b1.o_m:.2f} with the true component distributions and {b1.f_m:.2f} with the ExCALIBR fit, for a true prior "
-        "of 0.25. The simulations also show when a prior is inflated: when P/LP controls "
-        "over-represent mechanisms that the assay does not measure (an estimate of "
-        f"{m75['A2 (M2 only)'].f_m:.2f} for a true 0.25), and when controls are too sparse to identify it. With 3 P/LP, "
-        "0 B/LB, 10 population and 6 synonymous variants (the counts cited for KCNH2_Kozek_Glazer_2020), estimates were biased upward by "
-        f"{kc_lo:.2f}–{kc_hi:.2f} at true priors of 0.05–0.25. The values cited by the reviewer come from the first "
-        "version of the manuscript. In the revised analysis of 87 datasets, the median prior is 0.196 (42, 25 and 11 "
-        "datasets at or above 0.2, 0.3 and 0.4), and the priors of TPK1_Weile_2017 and KCNH2_Kozek_Glazer_2020 are 0.352 "
-        "and 0.167. Finally, fixing the prior at 0.10 for every dataset gives the same median per-dataset accuracy "
-        "against ClinVar as the estimated priors (0.968 for both; Extended Data Fig. 4), so ExCALIBR's performance "
-        "does not depend on high priors."
+
+    M = read_macros()
+    dor_both = ed3_both_determinate_dor()
+    resp_det = (
+        "ExCALIBR's lower determinate rate does not come at the expense of correct calls. Of the "
+        f"{M['ResDetSubAuthOnlyN']} ClinVar P/LP and B/LB variant effect measurements classified only by the authors, "
+        f"author annotations had an accuracy of {M['ResDetSubAuthOnlyAcc']} (MCC {M['ResDetSubAuthOnlyMCC']}), "
+        f"mostly because P/LP variants were classified as functionally normal (sensitivity {M['ResDetSubAuthOnlySens']}); "
+        f"ExCALIBR left these indeterminate. Conversely, the {M['ResDetSubExcOnlyN']} measurements classified only by "
+        f"ExCALIBR had an accuracy of {M['ResDetSubExcOnlyAcc']} (MCC {M['ResDetSubExcOnlyMCC']}). We now report this "
+        "breakdown in Supplementary Table X."
     )
+    resp_dor = (
+        f"The diagnostic odds ratio (DOR) is {M['ResPerfDORExcalibr']} for ExCALIBR vs. {M['ResPerfDORAuthor']} for author "
+        "annotations (pathogenic vs. benign calls). When indeterminate calls are counted against each method, ExCALIBR "
+        f"remains ahead for both pathogenic (DOR {M['ResPerfDORPathExcalibr']} vs. {M['ResPerfDORPathAuthor']}) and "
+        f"benign ({M['ResPerfDORBenExcalibr']} vs. {M['ResPerfDORBenAuthor']}) evidence. Restricted to the variants where "
+        f"both methods made a determinate call, the DOR is {dor_both[0]} vs. {dor_both[1]}, and with each variant counted "
+        f"once across assays it is {M['ResDedupDORExcalibr']} vs. {M['ResDedupDORAuthor']}."
+    )
+    cg = COMMON_GNOMAD
+    resp_gnomad = (
+        "Moreover, ExCALIBR assigns these common variants almost exclusively benign evidence: of the "
+        f"{cg['n_calibrated']} that are calibrated, {cg['n_benign_only']} receive only benign evidence, "
+        f"{cg['n_indeterminate']} receive no evidence in any assay, and {cg['n_pathogenic']} (a synonymous KCNH2 variant, "
+        "p.Leu564=) receives pathogenic evidence in a single assay. The remaining variant is excluded by the authors' "
+        "quality flag."
+    )
+    n_boot, n_restarts = K["n_boot"], K["n_restarts"]
+    resp6 = (
+        "The priors for the four datasets in Figure 2 are 18.4%, 14.6%, 24.9% and 5.5% for BRCA1, G6PD, PTEN and "
+        "DDX3X, respectively. Values of this size are also supported by the few studies that functionally "
+        "characterized the variants observed in a population database. Clark et al. (2018, PMC6034809) assayed the "
+        "enzymatic activity of every NAGLU missense variant of unknown significance in ExAC. Of the 189 NAGLU missense "
+        "variants, 24 were known to be pathogenic, and 41 of the 164 assayed variants of unknown significance had "
+        "activity consistent with pathogenic alleles (≤15% of wild type), giving a pathogenic fraction of "
+        "(24 + 41)/189 = 34.4%. Similarly, Trinidad et al. (2023, Genome Biology 24:172) assayed all 230 ARSA "
+        "missense variants in gnomAD, among others, and found that 36% of the variants of unknown significance they "
+        "tested had activity in the pathogenic range. In autosomal recessive disease genes such as these, a "
+        "substantial fraction of population variants can therefore be pathogenic, and priors of 20%–35% are not "
+        "implausible. "
+        "As detailed in our response to comment 4, the prior estimated by ExCALIBR is the fraction of pathogenic "
+        "variants among the population variants measured by an assay, and our simulations show that it is not the "
+        "fraction of population variants with pathogenic-like (abnormal) scores (Supplementary Section X). We agree "
+        "that it is not the conventional clinical anchor of 0.10; it is a dataset-specific estimate from the population "
+        "sample relative to the P/LP and B/LB controls. The simulations also show when an estimated prior is too high: "
+        "when the P/LP controls over-represent mechanisms that the assay does not measure (an estimate of "
+        f"{m75['A2 (M2 only)'].f_m:.2f} for a true P(Y=1) of 0.25), and when the controls are too few to identify the "
+        "prior. With 3 P/LP, 0 B/LB, 10 population and 6 synonymous variants (the counts cited for "
+        f"KCNH2_Kozek_Glazer_2020), estimates were biased upward by {kc_lo:.2f}–{kc_hi:.2f} at true priors of "
+        "0.05–0.25. The values cited by the reviewer come from the first version of the manuscript. In the revised "
+        "analysis of 87 datasets, the median prior is 0.196 (42, 25 and 11 datasets at or above 0.2, 0.3 and 0.4), and "
+        "the priors of TPK1_Weile_2017 and KCNH2_Kozek_Glazer_2020 are 0.352 and 0.167. Moreover, the priors the "
+        "reviewer lists do not inflate pathogenic evidence in the Bayesian ACMG/AMP framework: the evidence "
+        f"thresholds are set by the constant c, which is smallest at a prior of {M['MethTavtigianCMinPrior']} and "
+        "increases above it, so priors above that value, including every one the reviewer cites (0.300–0.887), make "
+        "pathogenic evidence harder, not easier, to reach than a prior at the minimum (Methods). Finally, on the "
+        f"{M['NumACMGScalerDatasets']} datasets that acmgscaler could also calibrate, fixing the prior at 0.10 gave a "
+        f"median per-dataset accuracy of {M['ResCmpAccMedPriorFixed']}, compared with {M['ResCmpAccMedExcalibrAcmgSet']} "
+        "with estimated priors (Extended Data Fig. 4D–F), so ExCALIBR's accuracy does not depend on high priors."
+    )
+    pending = "" if n_restarts > 1 else (
+        "<div class='note'><p><b>Update pending.</b> The fitted-arm results on this page use 1 restart per "
+        "bootstrap. With one restart, most M1-only fits miss the small abnormal cluster and settle on a local optimum "
+        "that splits the normal peak, which is what makes the M1-only fit run high. With 20 restarts every fit finds "
+        "the cluster and the bias disappears (0.110 vs. 0.109 with the true components, true P(Y=1) = 0.10). A rerun "
+        "with 8 restarts is in progress. Do not paste response blocks 1–3 until this page is updated; blocks 4–6 are "
+        "final.</p></div>")
 
     css = """
 :root{--bg:#f6f7f9;--surface:#ffffff;--ink:#14171c;--muted:#565d68;--faint:#8a919c;--line:#dfe3e8;--grid:#eceff3;
@@ -444,7 +494,7 @@ ul{margin:0;padding-left:20px;display:grid;gap:4px;max-width:76ch}code{font-fami
 """
     legend = ("<div class='legend'>" + "".join(
         f"<span><span class='sw' style='background:var({CSS_VAR[a]})'></span>{SHORT[a]}: {LONG[a]}</span>" for a in ASSAYS)
-        + "<span>● true components</span><span>○ ExCALIBR fit</span><span>bars: 95% CI over 20 datasets</span>"
+        + "<span>● true components</span><span>○ ExCALIBR fit</span><span>bars: 95% CI of the mean</span>"
           "<span>dashed: true prior</span><span>faint line: large-sample expectation</span></div>")
 
     def resp_block(i, title, text):
@@ -464,10 +514,12 @@ ul{margin:0;padding-left:20px;display:grid;gap:4px;max-width:76ch}code{font-fami
 prior, so we can check what ExCALIBR estimates, with and without fitting, and what pushes the estimate up.</p>
 </header>
 
+{pending}
 <section class="key">
 <div class="card"><span class="eyebrow">Clean controls</span><b>All three assays recover the true prior</b>
-<p>True 0.25: estimates {b1.f_m:.2f} (M1 only), {b2.f_m:.2f} (M2 only), {b3.f_m:.2f} (both). No significant bias at any
-prior from 0.05 to 0.40. Measuring fewer mechanisms costs precision, not accuracy.</p></div>
+<p>True 0.25: estimates {b1.f_m:.2f} (M1 only), {b2.f_m:.2f} (M2 only), {b3.f_m:.2f} (both). With the true components there is
+no bias at any prior from 0.05 to 0.40 (largest error {o_bias_max:.3f}), and none with the fit (largest
+{max(f23_bias_max, fa1_max):.3f}). The fit runs high only for the minority-mechanism assay at weak separation.</p></div>
 <div class="card"><span class="eyebrow">What inflates it</span><b>P/LP from the wrong mechanism mix</b>
 <p>When P/LP over-represent the mechanism an assay does not measure, the prior rises to {m75['A2 (M2 only)'].f_m:.2f}.
 The assay measuring both mechanisms stays at {m75['A3 (M1+M2)'].f_m:.2f}.</p></div>
@@ -482,7 +534,7 @@ moves the prior only modestly, as theory predicts.</p></div>
 assays, so assays are compared on the same data. Right: each assay's class score distributions, and its prior
 estimates (rich controls, true prior 0.25) against the fraction of gnomAD variants that are pathogenic and score
 abnormally, which is what the reviewer suggests the prior measures.</p>
-<div class="card scroll">{diagram(base)}</div>
+<div class="card scroll">{diagram(base, n_o, n_f)}</div>
 </section>
 
 <section>
@@ -491,12 +543,13 @@ abnormally, which is what the reviewer suggests the prior measures.</p>
 <li><b>Two estimators.</b> <i>True components</i>: no fit; each sample's density uses the exact class distributions,
 with its class weights estimated from the data, and the prior comes from the production prior EM on the gnomAD sample
 (<code>estimate_prior_from_class_densities</code>, average of B/LB and synonymous as the benign reference, as in
-production). <i>ExCALIBR fit</i>: the production fit (<code>Fit.run</code>, 2 Gaussian components, 1 restart) and
-<code>get_fit_prior</code>, median over 10 bootstraps.</li>
+production). <i>ExCALIBR fit</i>: the production fit (<code>Fit.run</code>, 2 Gaussian components,
+{n_restarts} restarts per bootstrap with the best kept by held-out log-likelihood, as in production) and
+<code>get_fit_prior</code>, median over {n_boot} bootstraps.</li>
 <li><b>Settings.</b> Clean controls at true priors 0.05–0.40 with rich and sparse controls; benign variants in P/LP
 and pathogenic variants in B/LB at 5–20%; P/LP mechanism mix from 0% to 100% M1 with gnomAD fixed at 25%; separation
 Δ of 1.5, 2.5 and 4 SD; correlation ρ of 0, 0.3 and 0.6.</li>
-<li><b>Tests.</b> 20 replicate datasets per setting. Two-sided Wilcoxon signed-rank tests, Holm-corrected within each
+<li><b>Tests.</b> {n_o} replicate datasets per setting with the true components; the first {n_f} also get the ExCALIBR fit, so fit vs. true components is paired. Two-sided Wilcoxon signed-rank tests, Holm-corrected within each
 experiment: bias against the true prior; deviation from the large-sample expectation; fit against true components
 (paired); and between assays (paired, on the estimate and on its absolute error).</li>
 </ul>
@@ -506,9 +559,10 @@ experiment: bias against the true prior; deviation from the large-sample expecta
 <h2>Clean controls: estimate vs. true prior</h2>
 {legend}
 <div class="card charts">{charts_clean}</div>
-<p>With rich controls, no estimate differs from the truth ({n_rich_sig} of {len(bt)} tests significant). The M1-only
-assay is less precise than the others (significantly larger absolute error), and its fit runs slightly high at low
-priors. With TPK1-like controls the M1-only assay is unstable. With KCNH2_Kozek-like controls (3 P/LP, 0 B/LB) every assay
+<p>With rich controls, the true-component estimates are unbiased for every assay (largest mean error
+{o_bias_max:.3f}), and so is the fit (largest {max(f23_bias_max, fa1_max):.3f}; none significant). The M1-only
+assay is less
+precise than the others (significantly larger absolute error). With TPK1-like controls the M1-only assay is unstable. With KCNH2_Kozek-like controls (3 P/LP, 0 B/LB) every assay
 is biased upward at low priors. When the few P/LP variants contain none that score abnormally, the prior EM cannot move
 from its starting value of 0.5 ({100 * kc_at05:.0f}% of M1-only bootstraps in this regime).</p>
 </section>
@@ -517,7 +571,7 @@ from its starting value of 0.5 ({100 * kc_at05:.0f}% of M1-only bootstraps in th
 <h2>Biased controls: label noise and mechanism mix</h2>
 {legend}
 <div class="card charts">{charts_bias}</div>
-<p>Each estimate follows its large-sample expectation ({n_dev - n_dev_sig} of {n_dev} tests not significant). Label
+<p>With the true components, each estimate matches its large-sample expectation to within {o_dev_max:.3f}. Label
 noise moves the prior modestly: up to about 0.32 when 20% of P/LP are benign, and down to about 0.16–0.19 when 20% of B/LB are
 pathogenic. The mechanism mix of P/LP is what produces large errors, in opposite directions for the two single-mechanism
 assays. The assay measuring both mechanisms is unaffected. Where the P/LP contain no variant the assay can detect (0%
@@ -529,33 +583,38 @@ M1 for A1, 100% for A2), the prior is unidentifiable and the estimate stays at 0
 {legend}
 <div class="card charts">{charts_fit}</div>
 <p>For assays detecting most or all pathogenic variants, the fit matches the true-component estimate to within
-{fo23:.3f}. The M1-only fit drifts upward at low priors and weak separation ({sep25.f_m:.2f} vs. {sep25.o_m:.2f} with
-true components, true prior 0.10, Δ = 2.5). At Δ = 1.5 even the true-component estimate for that assay is imprecise
-and low ({sep15.o_m:.2f} for a true 0.25), so there the limit is the data, not the fit. Correlation between mechanisms introduces no bias and makes the M1-only estimate more precise, because M2
-variants then shift that assay too.</p>
+{fo23:.3f}. The M1-only fit runs high at weaker separation: at Δ = 2.5 it exceeds the true-component estimate by
+{ws_gap_lo:.2f}–{ws_gap_hi:.2f} ({sep25.f_m:.2f} vs. {sep25.o_m:.2f} at a true prior of 0.10, {sep25_25.f_m:.2f} vs.
+{sep25_25.o_m:.2f} at 0.25). With the true components, even Δ = 1.5 keeps every assay within {sep15_o_err:.3f} of the
+truth, so the excess comes from fitting a small abnormal cluster that overlaps the normal peak. Correlation between
+mechanisms removes it (within {rho6_gap_max:.3f} at ρ = 0.6), because M2 variants then shift that assay too.</p>
 </section>
 
 <section>
 <h2>Key numbers</h2>
-<p>Mean prior estimate [95% CI] over 20 simulated datasets.</p>
+<p>Mean prior estimate [95% CI of the mean]: {n_o} simulated datasets with the true components, {n_f} with the fit.</p>
 <div class="card">{results_table(t_rows)}</div>
 </section>
 
 <section>
 <h2>Response text</h2>
-<p>Paste-ready. Replace "Supplementary Section X" and "Supplementary Table X" with the references once placed. The
-first two blocks fill the gaps in the comment 4 draft. The third is for comment 6.</p>
+<p>Paste-ready for the response document. Replace "Supplementary Section X" and "Supplementary Table X" with the
+references once placed. Blocks 1–2 fill the gaps in the comment 4 draft and block 3 is for comment 6. Blocks 4–6 take
+their numbers from the manuscript build.</p>
 {resp_block(1, "Comment 4: theory and simulation (replaces “WE COULD WRITE…”)", resp4a)}
 {resp_block(2, "Comment 4: the two remaining concerns", resp4b)}
 {resp_block(3, "Comment 6: priors are too high", resp6)}
+{resp_block(4, "Lower determinate rate (ExCALIBR vs. author)", resp_det)}
+{resp_block(5, "DOR (continues “…DOR analyses probably best reflect the advances from our paper.”)", resp_dor)}
+{resp_block(6, "Common gnomAD variants (continues “…the influence of common variants is negligible.”)", resp_gnomad)}
 </section>
 
 <section>
-<h2>Open decision</h2>
+<h2>Known limitation</h2>
 <div class="note"><p>When the labelled P/LP sample contains no variant the assay can detect, the pathogenic and benign
 densities on gnomAD are identical. The production prior EM then returns its starting value of 0.5, which the discard
-rule (prior ≤ 0.001 or ≥ 0.999) does not catch. This drives the sparse-control inflation above. Two options: discard
-such bootstraps as unidentifiable, or start the EM at 0.1. Either changes the pipeline.</p></div>
+rule (prior ≤ 0.001 or ≥ 0.999) does not catch. This drives the sparse-control inflation above. The supplement
+describes it as a limitation; the pipeline is unchanged.</p></div>
 </section>
 
 <section>

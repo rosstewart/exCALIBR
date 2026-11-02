@@ -56,6 +56,42 @@ def _format_dataset_label(dataset_name: str) -> str:
     return f"\\textit{{{gene}}} ({label})"
 
 
+def latex_prior_simulation_table(rows) -> str:
+    r"""LaTeX table of the prior-estimation simulation (analysis/prior_simulation):
+    for each setting and assay, the large-sample expected prior and the mean
+    [95% CI] estimate with the true components and with the ExCALIBR fit.
+
+    `rows` is analysis.prior_simulation.summary.table_rows(summ): a list of
+    (setting_label, summary_row) in display order, three assays per setting.
+    The setting label is printed on its first row only.
+    """
+    short = {"A1 (M1 only)": "A1 (M1 only)", "A2 (M2 only)": "A2 (M2 only)", "A3 (M1+M2)": "A3 (M1 + M2)"}
+
+    def _ci(m, lo, hi):
+        return "--" if pd.isna(m) else f"{m:.3f} [{lo:.3f}, {hi:.3f}]"
+
+    lines = [
+        r"\begin{table}[!tb]", r"\centering",
+        r"\caption{Prior-estimation simulation.}",
+        r"\label{tab:prior_simulation}",
+        r"\begin{tabular}{llccc}", r"\toprule",
+        r"Setting & Assay & Expected & True components & \excalibr{} fit \\",
+        r"\midrule",
+    ]
+    prev = None
+    for label, r in rows:
+        if prev is not None and label != prev:
+            lines.append(r"\midrule")
+        cell = label if label != prev else ""
+        lines.append(f"{cell} & {short[r['assay']]} & {r['expected']:.3f} & "
+                     f"{_ci(r['o_m'], r['o_lo'], r['o_hi'])} & {_ci(r['f_m'], r['f_lo'], r['f_hi'])} \\\\")
+        prev = label
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    latex = "\n".join(lines)
+    print(latex)
+    return latex
+
+
 def latex_determinate_subset_table(rows: List[Tuple[str, str, pd.DataFrame]]) -> str:
     r"""LaTeX table of ExCALIBR vs. author performance on P/LP and B/LB
     variants split by which method made a determinate call.
@@ -627,7 +663,7 @@ def latex_splice_ablation_summary_table(summary_df: pd.DataFrame, baseline_condi
         r"Metrics are computed with respect to the original control samples.}",
         r"\label{tab:splice_ablation_summary}",
         r"\begin{tabular}{lccccccc}", r"\toprule",
-        r"Condition & Accuracy ($\Delta\%$) & Coverage ($\Delta\%$) & DOR ($\Delta\%$) & "
+        r"Condition & Accuracy ($\Delta\%$) & Determinate ($\Delta\%$) & DOR ($\Delta\%$) & "
         r"$\Delta$PLP\% & $\Delta$BLB\% & $\Delta$gnomAD\% & $\Delta$Synonymous\% \\",
         r"\midrule",
     ]
@@ -668,7 +704,7 @@ def latex_splice_ablation_fixed_population_table(
         r"Metrics are computed with respect to the original control samples.}",
         r"\label{tab:splice_ablation_fixed_population}",
         r"\begin{tabular}{lccc}", r"\toprule",
-        r"SpliceAI threshold & Accuracy ($\Delta\%$) & Coverage ($\Delta\%$) & DOR ($\Delta\%$) \\",
+        r"SpliceAI threshold & Accuracy ($\Delta\%$) & Determinate ($\Delta\%$) & DOR ($\Delta\%$) \\",
         r"\midrule",
     ]
 

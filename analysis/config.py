@@ -286,6 +286,14 @@ SKEW_LOCKED_BOOTSTRAP_RESULTS = _env(
     "/data/ross/assay_calibration/skew_locked_gmm/bootstrap_results.json.gz",
 )
 
+# Prior-estimation simulation (Reviewer 3 #4/#6; Supplementary Figure/Table,
+# section A11h): outputs of `python -m analysis.prior_simulation.test_priors`
+# (paired_replicates.csv, paired_tests.csv).
+PRIOR_SIMULATION_DIR = _env(
+    "EXCALIBR_PRIOR_SIMULATION_DIR",
+    "/data/ross/assay_calibration/prior_simulation",
+)
+
 # Pathomechanism-aware ExCALIBR rerun ("canonical" vs "pathomech_boundary"
 # comparison -- see Supplementary Section sec:pathomechanism_prior). Same
 # ExCALIBR-shaped output tree as OUTPUT_DIR/SKEW_LOCKED_OUTPUT_DIR, so it's

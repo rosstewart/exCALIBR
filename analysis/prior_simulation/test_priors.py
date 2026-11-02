@@ -3,7 +3,8 @@
 Uses the generative model, settings and estimators of simulate_priors.py, but
 with the replicate dataset as the unit of analysis:
 
-* 20 replicate datasets per setting. Within a replicate, the three assays
+* 500 replicate datasets per setting for the true-component estimator, the
+  first 50 of which also get the production fit (5 bootstraps x 8 restarts). Within a replicate, the three assays
   score the SAME simulated variants (one latent draw read out by A1, A2, A3),
   so assays are compared paired.
 * Per replicate and assay, one prior per estimator:
@@ -36,8 +37,11 @@ from analysis.prior_simulation.simulate_priors import (
     draw_classes, draw_latent, expected_prior, fit_priors, oracle_prior, readout,
 )
 
-N_REP = 20
-N_BOOT = 10
+N_REP_ORACLE = 500   # replicate datasets per setting, true-component estimator
+N_REP_FIT = 50       # of those, the first N_REP_FIT also get the production fit (paired)
+ORACLE_CHUNK = 50    # oracle-only replicates per task
+N_BOOT = 5        # bootstraps per fitted replicate
+N_RESTARTS = 8    # restarts per bootstrap (best by held-out log-likelihood, as in production)
 ASSAY_PAIRS = [("A1 (M1 only)", "A3 (M1+M2)"), ("A2 (M2 only)", "A3 (M1+M2)"), ("A1 (M1 only)", "A2 (M2 only)")]
 
 
@@ -66,7 +70,7 @@ def build_settings():
     return settings
 
 
-def replicate_task(setting, seed, rep):
+def replicate_task(setting, seed, rep, do_fit=True, n_boot=N_BOOT, n_restarts=N_RESTARTS):
     exp, regime, pi, params = setting
     rng = np.random.default_rng([seed, rep])
     n_p, n_b, n_g, n_s = REGIMES[regime]
@@ -81,16 +85,22 @@ def replicate_task(setting, seed, rep):
     for assay in ASSAYS:
         samples = [readout(e1, e2, assay) for e1, e2 in latent]
         orc = oracle_prior(samples, samples[G_IDX], assay, params["delta"], params["rho"])
-        boots = np.asarray(fit_priors(samples, range(N_BOOT)), dtype=float)
+        boots = np.asarray(fit_priors(samples, range(n_boot), num_fits=n_restarts) if do_fit else [], dtype=float)
         ok = boots[np.isfinite(boots)]
         out.append({
             "experiment": exp, "regime": regime, "true_prior": pi, **params, "rep": rep, "assay": assay,
             "oracle": orc,
             "fit": float(np.median(ok)) if len(ok) else np.nan,
             "fit_n_boot_ok": len(ok),
+            "fit_n_boot": n_boot if do_fit else 0,
+            "fit_n_restarts": n_restarts if do_fit else 0,
             "fit_frac_at_em_init": float(np.mean(np.abs(ok - 0.5) < 1e-3)) if len(ok) else np.nan,
         })
     return out
+
+
+def oracle_chunk(setting, seed, r0, r1):
+    return [row for r in range(r0, r1) for row in replicate_task(setting, seed, r, do_fit=False)]
 
 
 def wilcoxon(x):
@@ -169,22 +179,32 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--n-jobs", type=int, default=64)
+    ap.add_argument("--n-rep-oracle", type=int, default=N_REP_ORACLE)
+    ap.add_argument("--n-rep-fit", type=int, default=N_REP_FIT)
+    ap.add_argument("--n-boot", type=int, default=N_BOOT, help="bootstraps per fitted replicate")
+    ap.add_argument("--n-restarts", type=int, default=N_RESTARTS, help="restarts per bootstrap")
     args = ap.parse_args()
 
     settings = build_settings()
     seeds = np.random.SeedSequence(args.seed).generate_state(len(settings))
-    tasks = [delayed(replicate_task)(s, int(seed), r)
-             for s, seed in zip(settings, seeds) for r in range(N_REP)]
-    print(f"{len(settings)} settings x {N_REP} replicates = {len(tasks)} tasks", flush=True)
+    tasks = [delayed(replicate_task)(s, int(seed), r, True, args.n_boot, args.n_restarts)
+             for s, seed in zip(settings, seeds) for r in range(args.n_rep_fit)]
+    tasks += [delayed(oracle_chunk)(s, int(seed), r0, min(r0 + ORACLE_CHUNK, args.n_rep_oracle))
+              for s, seed in zip(settings, seeds)
+              for r0 in range(args.n_rep_fit, args.n_rep_oracle, ORACLE_CHUNK)]
+    print(f"{len(settings)} settings: {args.n_rep_fit} fitted + {args.n_rep_oracle - args.n_rep_fit} "
+          f"true-component-only replicates each; {len(tasks)} tasks on {args.n_jobs} workers", flush=True)
+    # Fit tasks first: they dominate the runtime.
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(tasks)
     reps = pd.DataFrame([row for res in results for row in res])
-    exp_cache = {}
-    for i, r in reps.iterrows():
-        k = (r.assay, r.true_prior, r.delta, r.rho, r.eps_p, r.delta_b, r.lab_m1_frac, REGIMES[r.regime][1] > 0)
-        if k not in exp_cache:
-            exp_cache[k] = expected_prior(r.assay, r.true_prior, r.delta, r.rho, r.eps_p, r.delta_b,
-                                          r.lab_m1_frac, has_benign=k[-1])
-        reps.loc[i, "expected_prior"] = exp_cache[k]
+    ek = ["assay", "regime", "true_prior", "delta", "rho", "eps_p", "delta_b", "lab_m1_frac"]
+    uniq = reps[ek].drop_duplicates().copy()
+    uniq["expected_prior"] = [
+        expected_prior(r.assay, r.true_prior, r.delta, r.rho, r.eps_p, r.delta_b, r.lab_m1_frac,
+                       has_benign=REGIMES[r.regime][1] > 0)
+        for r in uniq.itertuples()
+    ]
+    reps = reps.merge(uniq, on=ek, how="left")
     reps.to_csv(args.out_dir / "paired_replicates.csv", index=False, float_format="%.4f")
     stats = tests(reps)
     stats.to_csv(args.out_dir / "paired_tests.csv", index=False, float_format="%.4g")

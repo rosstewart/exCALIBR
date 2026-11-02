@@ -175,8 +175,9 @@ def expected_prior(assay, pi, delta, rho, eps_p, delta_b, lab_m1_frac, has_benig
 
 # ── production fit ───────────────────────────────────────────────────────────
 
-def fit_priors(samples, seeds):
-    """Production 2-component Gaussian fit, 1 restart, one prior per bootstrap seed."""
+def fit_priors(samples, seeds, num_fits=1):
+    """Production 2-component Gaussian fit, `num_fits` restarts per bootstrap (best by
+    held-out log-likelihood, as in production), one prior per bootstrap seed."""
     from src.assay_calibration.data_utils.dataset import BasicScoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -199,7 +200,7 @@ def fit_priors(samples, seeds):
         for b in seeds:
             try:
                 models, best, _ = fitter.run(
-                    [2], bootstrap=True, bootstrap_seed=int(b), num_fits=1, master_seed=0,
+                    [2], bootstrap=True, bootstrap_seed=int(b), num_fits=num_fits, master_seed=0,
                     check_monotonic=True, force_gaussian=True, core_limit=1, verbose=False,
                 )
                 m = models[best]

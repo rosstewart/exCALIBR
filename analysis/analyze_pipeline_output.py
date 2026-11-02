@@ -1176,8 +1176,7 @@ REG.check("clinvar-lower-determinate", _dm["coverage"] < _am["coverage"],
 # (`build_one_sided_determinate_matrices`). Author-only shows how accurate the
 # author calls are where ExCALIBR abstains; ExCALIBR-only shows the accuracy of
 # the calls ExCALIBR adds. Same scope as ED Table 3 (datasets with both an
-# ExCALIBR and an author matrix). Written to tables/ but not yet registered
-# with the manuscript (no REG.table).
+# ExCALIBR and an author matrix). Supplementary Table tab:author_determinate_subsets.
 
 # %%
 from analysis.manuscript_stats import latex_determinate_subset_table
@@ -1207,7 +1206,7 @@ if all(m is not None for m in det_subset_mats.values()):
         ("Neither", "", det_subset_mats["neither"]),
     ]
     _det_subset_latex = latex_determinate_subset_table(_det_rows)
-    save_latex_table(_det_subset_latex, FIGURE_SUBDIRS["tables"] / "author_determinate_subsets.tex")
+    REG.table("tab:author_determinate_subsets", _det_subset_latex)
 
     _n = {k: int(m.values.sum()) for k, m in det_subset_mats.items()}
     _met = {k: _ccm(det_subset_mats[k]) for k in ("excalibr_only", "author_only")}
@@ -2977,6 +2976,110 @@ if _splice_root.exists():
                       f"{sorted(_splice_stale)}, then run the generated jobs")
 else:
     REG.require(_splice_root, "SpliceAI-threshold ablation (Supp Table S7)")
+
+# %% [markdown]
+# ### A11h. Prior-estimation simulation -> Supplementary Figure (fig:prior_simulation) and Table (tab:prior_simulation)
+#
+# A simulated gene with two disease mechanisms and three assays measuring one
+# or both (Reviewer 3, comments 4 and 6): does the prior estimated from
+# gnomAD equal the population's pathogenic fraction when an assay measures
+# only part of a gene's disease mechanisms, and what inflates it (label
+# noise, P/LP mechanism mix, sparse controls, separation, correlated
+# mechanisms)? The replicates are computed outside the build
+# (`python -m analysis.prior_simulation.test_priors`, about 50 min on 120
+# cores); this section only summarizes them. Every number quoted in the
+# supplement text comes from analysis.prior_simulation.summary.key_numbers,
+# the same function the shareable report page uses.
+
+# %%
+_ps_dir = Path(config.PRIOR_SIMULATION_DIR)
+_ps_reps = _ps_dir / "paired_replicates.csv"
+if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
+    from analysis.prior_simulation import simulate_priors as _ps_sim, test_priors as _ps_test
+    from analysis.prior_simulation.figures import make_figure as _ps_make_figure
+    from analysis.prior_simulation.summary import key_numbers as _ps_key_numbers, load as _ps_load, \
+        table_rows as _ps_table_rows
+    from analysis.manuscript_stats import latex_prior_simulation_table
+
+    REG.require(_ps_reps, "prior-estimation simulation replicates (Supp Figure/Table)",
+                newer_than=[Path(_ps_sim.__file__), Path(_ps_test.__file__)],
+                regen="python -m analysis.prior_simulation.test_priors --n-jobs 120  # then rerun A11h")
+    _ps_r, _ps_t, _ps_summ = _ps_load(_ps_dir)
+    _psk = _ps_key_numbers(_ps_r, _ps_t, _ps_summ)
+
+    _ps_fig = _ps_make_figure(_ps_summ, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_prior_simulation.png")
+    print(f"  Saved: {_ps_fig}")
+    REG.figure("fig:prior_simulation", _ps_fig, inputs=[_ps_reps])
+    _ps_latex = latex_prior_simulation_table(_ps_table_rows(_ps_summ))
+    REG.table("tab:prior_simulation", _ps_latex, data_row_label_re=r"[^&]*& A[123] ", inputs=[_ps_reps])
+
+    # Design (method constants from the simulation code).
+    _ps_inp = dict(inputs=[_ps_reps])
+    _rich = _ps_sim.REGIMES["rich"]
+    REG.num("SuppPriorSimMOnePct", 100 * _ps_sim.POP_M1_FRAC, fmt=".0f", kind="method",
+            source="% of pathogenic population variants acting via M1")
+    REG.num("SuppPriorSimMTwoPct", 100 * (1 - _ps_sim.POP_M1_FRAC), fmt=".0f", kind="method",
+            source="% acting via M2")
+    for _nm, _v in zip(("NPLP", "NBLB", "NGnomad", "NSyn"), _rich):
+        REG.num(f"SuppPriorSim{_nm}", _v, kind="method", source=f"rich regime {_nm} count")
+    REG.num("SuppPriorSimShift", _ps_sim.BASE["delta"], fmt=".0f", kind="method", source="base abnormal shift (SD)")
+    REG.num("SuppPriorSimNTrue", _psk["n_o"], source="replicate datasets per setting, true components", **_ps_inp)
+    REG.num("SuppPriorSimNFit", _psk["n_f"], source="replicate datasets per setting, ExCALIBR fit", **_ps_inp)
+    REG.num("SuppPriorSimNBoot", _psk["n_boot"], source="bootstraps per fitted replicate", **_ps_inp)
+    REG.num("SuppPriorSimNRestarts", _psk["n_restarts"], source="restarts per bootstrap (best by held-out LL)",
+            **_ps_inp)
+    # Results.
+    _f3 = lambda name, v, src: REG.num(name, v, fmt=".3f", source=src, **_ps_inp)
+    _f2 = lambda name, v, src: REG.num(name, v, fmt=".2f", source=src, **_ps_inp)
+    _f3("SuppPriorSimTrueBiasMax", _psk["o_bias_max"], "rich clean: largest |mean bias|, true components")
+    _f3("SuppPriorSimFitBiasMaxMulti", _psk["f23_bias_max"], "rich clean: largest |mean bias|, fit, A2/A3")
+    _f3("SuppPriorSimFitBiasMaxMinority", _psk["fa1_max"], "rich clean: largest |mean bias|, fit, A1")
+    for _a, _tag, _b in zip(_ps_sim.ASSAYS, ("AOne", "ATwo", "AThree"), ("b1", "b2", "b3")):
+        _f2(f"SuppPriorSimFit{_tag}", _psk[_b]["f_m"], f"rich clean pi = 0.25: fit mean, {_a}")
+        _f2(f"SuppPriorSimTrue{_tag}", _psk[_b]["o_m"], f"rich clean pi = 0.25: true-component mean, {_a}")
+        _f2(f"SuppPriorSimMech{_tag}", _psk["m75"][_a]["f_m"], f"P/LP 75% M1: fit mean, {_a}")
+    REG.num("SuppPriorSimAbnPctAOne", 100 * 0.25 * _ps_sim.POP_M1_FRAC, fmt=".1f",
+            source="% of gnomAD pathogenic and abnormal-scoring in A1 at pi = 0.25", kind="method")
+    REG.num("SuppPriorSimAbnPctATwo", 100 * 0.25 * (1 - _ps_sim.POP_M1_FRAC), fmt=".1f",
+            source="% of gnomAD pathogenic and abnormal-scoring in A2 at pi = 0.25", kind="method")
+    _f2("SuppPriorSimNoisePLPLo", min(r.f_m for r in _psk["np20"].values()), "20% benign in P/LP: lowest fit mean")
+    _f2("SuppPriorSimNoisePLPHi", max(r.f_m for r in _psk["np20"].values()), "20% benign in P/LP: highest fit mean")
+    _f2("SuppPriorSimNoiseBLBLo", min(r.f_m for r in _psk["nb20"].values()), "20% pathogenic in B/LB: lowest fit mean")
+    _f2("SuppPriorSimNoiseBLBHi", max(r.f_m for r in _psk["nb20"].values()), "20% pathogenic in B/LB: highest fit mean")
+    _f3("SuppPriorSimDevMax", _psk["o_dev_max"], "noise/mechanism settings: largest |true-component - expectation|")
+    _f3("SuppPriorSimFitTrueGapMulti", _psk["fo23"], "largest |fit - true components|, A2/A3, rich settings")
+    _f2("SuppPriorSimSepTwoFiveFit", _psk["sep25"]["f_m"], "A1, pi = 0.10, Delta = 2.5: fit mean")
+    _f2("SuppPriorSimSepTwoFiveTrue", _psk["sep25"]["o_m"], "A1, pi = 0.10, Delta = 2.5: true-component mean")
+    _f2("SuppPriorSimSepTwoFiveFitQ", _psk["sep25_25"]["f_m"], "A1, pi = 0.25, Delta = 2.5: fit mean")
+    _f2("SuppPriorSimSepTwoFiveTrueQ", _psk["sep25_25"]["o_m"], "A1, pi = 0.25, Delta = 2.5: true-component mean")
+    _f2("SuppPriorSimWeakSepGapLo", _psk["ws_gap_lo"], "A1, Delta = 2.5: smallest fit - true components")
+    _f2("SuppPriorSimWeakSepGapHi", _psk["ws_gap_hi"], "A1, Delta = 2.5: largest fit - true components")
+    _f3("SuppPriorSimCorrGapMax", _psk["rho6_gap_max"], "A1, Delta = 2.5, rho = 0.6: largest |fit - true components|")
+    _f3("SuppPriorSimSepOneFiveErr", _psk["sep15_o_err"], "Delta = 1.5: largest |true-component - truth|")
+    _f2("SuppPriorSimSparseBiasLo", _psk["kc_lo"], "3/0/10/6 controls: smallest significant fit bias")
+    _f2("SuppPriorSimSparseBiasHi", _psk["kc_hi"], "3/0/10/6 controls: largest significant fit bias")
+    REG.num("SuppPriorSimSparseEMInitPct", 100 * _psk["kc_at05"], fmt=".0f",
+            source="3/0/10/6 controls, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
+
+    REG.check("prior-sim-true-unbiased", _psk["o_bias_max"] < 0.02 and _psk["o_bias_nsig"] == 0,
+              f"rich clean true-component |bias| max {_psk['o_bias_max']:.4f}, {_psk['o_bias_nsig']} significant",
+              "supplement.tex prior simulation (unbiased with true components)")
+    REG.check("prior-sim-fit-matches-multi", _psk["fo23"] < 0.02 and _psk["f23_bias_max"] < 0.02,
+              f"A2/A3 fit - true max {_psk['fo23']:.4f}; fit |bias| max {_psk['f23_bias_max']:.4f}",
+              "supplement.tex prior simulation (fit matches for assays detecting most pathogenic variants)")
+    REG.check("prior-sim-fit-unbiased-rich", _psk["n_rich_sig"] == 0 and max(_psk["fa1_max"], _psk["f23_bias_max"]) < 0.05,
+              f"rich clean: {_psk['n_rich_sig']} significant biases (both arms); fit |bias| max "
+              f"A1 {_psk['fa1_max']:.4f}, A2/A3 {_psk['f23_bias_max']:.4f}",
+              "supplement.tex prior simulation (fit unbiased for every assay with rich, well-separated controls)")
+    REG.check("prior-sim-fit-minority-weak-sep", _psk["ws_gap_lo"] > 0.03 and _psk["ws_all_sig"]
+              and _psk["rho6_gap_max"] < 0.02,
+              f"A1 fit - true at Delta = 2.5: {_psk['ws_gap_lo']:.3f}-{_psk['ws_gap_hi']:.3f}, all significant "
+              f"{_psk['ws_all_sig']}; rho = 0.6 gap {_psk['rho6_gap_max']:.4f}",
+              "supplement.tex prior simulation (fit runs high only for the minority assay at weak separation)")
+    REG.check("prior-sim-a3-immune", max(_psk["a3_mech_err"], _psk["a3_mech_err_o"]) < 0.02,
+              f"A3 under P/LP mechanism bias: max |estimate - 0.25| fit {_psk['a3_mech_err']:.4f}, "
+              f"true {_psk['a3_mech_err_o']:.4f}",
+              "supplement.tex prior simulation (assay measuring both mechanisms unaffected)")
 
 # %% [markdown]
 # ## A12. Supplementary Data 1-3

@@ -111,7 +111,9 @@ PREDICTOR_RAW_DATA_DIR = _env(
 # uv_sources.load_fgfr_uv_points (verified: reproduces the exact same
 # standard_points distribution as the calibration's own exported variants.csv
 # for all 3 assays, all 1462 FGFR ms variants bridged).
-FGFR_UV_CALIB_DIR = "/data/ross/assay_calibration/FGFR/uv_calib_logscores"
+# 1,000 bootstrap iterations x 100 fits per component count (FGFR_Tangermann/run_uv.sh); the earlier
+# 20-iteration calibration is /data/ross/assay_calibration/FGFR/uv_calib_logscores
+FGFR_UV_CALIB_DIR = "/data/ross/assay_calibration/FGFR/uv_1000b_103026/calibration"
 
 # Canonical n_c/benign_method per dataset for the exc_pp_clinvar2025_calib
 # source (same file the UV/analysis/ package uses to pick "the" calibration
