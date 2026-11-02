@@ -313,8 +313,17 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
     cap_hits: dict = defaultdict(int)            # (bs_seed, label, save_dir) → cap hit count
     remaining = dict(fits_per_bootstrap)
 
+    # Opt-in (EXCALIBR_SAVE_RESTART_LL=1): also keep every restart's held-out
+    # log-likelihood, written next to the best fits as
+    # bootstrap_<seed>_restart_val_ll.json, for restart-saturation studies.
+    save_all_ll = os.environ.get("EXCALIBR_SAVE_RESTART_LL") == "1"
+    all_ll: dict = defaultdict(list)             # (bs_seed, save_dir) -> [{label, fit_idx, val_ll}]
+
     def _finalize(bs_seed, label, save_dir, fit_idx, result):
         val_ll = (result.get("val_ll", -np.inf) if result else -np.inf)
+        if save_all_ll:
+            all_ll[(bs_seed, save_dir)].append(dict(label=label, fit_idx=fit_idx,
+                                                    val_ll=float(val_ll) if np.isfinite(val_ll) else None))
         sort_key = (val_ll, -(fit_idx if fit_idx is not None else 0))
         key = (bs_seed, label, save_dir)
         if sort_key > best.get(key, (-np.inf, -np.inf, None))[:2]:
@@ -329,6 +338,10 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu") -> None
         # ── Save as soon as all fits for this bootstrap are done ──
         if remaining[bs_key] == 0:
             save_path = Path(save_dir) / f"bootstrap_{bs_seed}_best_fits.pkl"
+            if save_all_ll:
+                import json as _json
+                (Path(save_dir) / f"bootstrap_{bs_seed}_restart_val_ll.json").write_text(
+                    _json.dumps(all_ll.pop(bs_key, [])))
             new_results = {}
             for (b, lbl, sd), (_, _, res) in best.items():
                 if b == bs_seed and sd == save_dir:
