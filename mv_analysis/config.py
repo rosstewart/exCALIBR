@@ -252,13 +252,13 @@ PAPER_STRENGTH_DIR = f"{PAPER_FIGURES_DIR}/strength"
 # PKNN_DIR/production_oob): per-dataset inputs and out-of-sample results.
 PKNN_DIR = _env("MV_PKNN_DIR", "/data/ross/assay_calibration/multivariate/pknn_101626")
 
-# The manuscript source tree (ExCALIBR_MV.tex / ExCALIBR_MV_supp.tex). The
+# The manuscript source tree (main_102826.tex / ExCALIBR_MV_supp.tex). The
 # paper notebook's "manuscript" section writes Figures/generated/macros.tex
 # here and copies every figure the .tex includes from PAPER_FIGURES_DIR into
 # Figures/generated/, mirroring analysis/analyze_pipeline_output.py's
 # MANUSCRIPT_FIGURE_DIR for the univariate paper.
 MANUSCRIPT_DIR = _env("MV_MANUSCRIPT_DIR", os.path.join(_ROOT, "ExCALIBR-MV_latex_092026"))
-MANUSCRIPT_MAIN_TEX = os.path.join(MANUSCRIPT_DIR, "ExCALIBR_MV.tex")
+MANUSCRIPT_MAIN_TEX = os.path.join(MANUSCRIPT_DIR, "main_102826.tex")  # the canonical main text
 MANUSCRIPT_SUPP_TEX = os.path.join(MANUSCRIPT_DIR, "ExCALIBR_MV_supp.tex")
 MANUSCRIPT_FIGURE_DIR = os.path.join(MANUSCRIPT_DIR, "Figures")
 MANUSCRIPT_GENERATED_DIR = os.path.join(MANUSCRIPT_FIGURE_DIR, "generated")

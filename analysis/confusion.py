@@ -154,6 +154,46 @@ def build_both_determinate_confusion_matrices(
     return excalibr_mat, author_mat
 
 
+def build_one_sided_determinate_matrices(
+    df_sub: pd.DataFrame, use_oob: bool = True, label: str = "",
+) -> dict:
+    """The complement of build_both_determinate_confusion_matrices: the
+    P/LP+B/LB variants where only one method (or neither) made a
+    determinate call, each scored with the method that did.
+
+    Returns {"excalibr_only": ExCALIBR matrix on variants with points != 0
+    and no Normal/Abnormal author call, "author_only": author matrix on
+    variants with points == 0 and a Normal/Abnormal author call,
+    "neither": ExCALIBR matrix (all IR) on the rest}. Same
+    [BLB,PLP] x [Normal,IR,Abnormal] layout and determinate rules as the
+    both-determinate builder, so the four subsets partition the controls
+    of the unrestricted ExCALIBR matrix. Values are None when the subset is
+    empty or `auth_label` is absent.
+    """
+    out = {"excalibr_only": None, "author_only": None, "neither": None}
+    if "auth_label" not in df_sub.columns:
+        return out
+
+    pts = _effective_points(df_sub, use_oob, label=label, context="one_sided_determinate")
+    exc_det = pts != 0
+    auth_det = df_sub["auth_label"].str.upper().isin({"NORMAL", "ABNORMAL"})
+
+    def _restrict(mask):
+        sub = df_sub[mask]
+        return sub if len(sub) else None
+
+    sub = _restrict(exc_det & ~auth_det)
+    if sub is not None:
+        out["excalibr_only"] = build_confusion_matrix(sub, use_oob=use_oob, label=label)
+    sub = _restrict(~exc_det & auth_det)
+    if sub is not None:
+        out["author_only"] = build_author_confusion_matrix(sub, use_oob=use_oob)
+    sub = _restrict(~exc_det & ~auth_det)
+    if sub is not None:
+        out["neither"] = build_confusion_matrix(sub, use_oob=use_oob, label=label)
+    return out
+
+
 def build_vus_coverage(
     df_sub: pd.DataFrame, use_oob: bool = True, label: str = "",
     points_col: Optional[str] = None,

@@ -16,7 +16,7 @@
 #
 # The paper-specific counterpart to `mv_analysis/mv_cockpit.py` (which stays
 # the flexible "load and analyze one dataset of choosing" tool) -- this
-# notebook runs *every* analysis `ExCALIBR-MV_latex_092026/ExCALIBR_MV.tex`
+# notebook runs *every* analysis `ExCALIBR-MV_latex_092026/main_102826.tex`
 # needs, from one fits directory (`mv_analysis.config.PAPER_FITS_DIR`), the
 # same role `analysis/analyze_pipeline_output.py` plays for the univariate
 # paper. Lives in `mv_analysis/`, not `analysis/`, so MV output never mixes
@@ -1396,6 +1396,11 @@ def _write_performance_tables(REG, tdir):
             REG.pct(f"ResPool{ptag}{tag}DetPct", m["determinate"], m["total"], source=f"{rel}: pooled {lab}")
             REG.num(f"ResPool{ptag}{tag}FP", int(rows["FP"].sum()), source=f"{rel}: pooled {lab} FP")
             REG.num(f"ResPool{ptag}{tag}FN", int(rows["FN"].sum()), source=f"{rel}: pooled {lab} FN")
+            # share of pathogenic calls on B/LB controls (1 - PPV), as a percentage
+            n_path = int(rows["TP"].sum() + rows["FP"].sum())
+            if n_path:
+                REG.pct(f"ResPool{ptag}{tag}FDRPct", int(rows["FP"].sum()), n_path,
+                        source=f"{rel}: pooled {lab}, B/LB among pathogenic calls")
         joint_rows = methods[0][2]
         REG.num(f"ResPool{ptag}Genes", len(joint_rows), source=f"{rel}: genes in the pooled table")
         REG.num(f"ResPool{ptag}Controls", pooled[panel][0][2]["total"], source=f"{rel}: pooled controls")
@@ -1537,6 +1542,21 @@ def _register_revision_macros(REG):
             r = r.iloc[0]
             REG.num(f"ResGeneFGFRMCC{tag}", float(r["mcc"]), fmt=".2f", source=f"functional table: FGFR {tag}")
             REG.pct(f"ResGeneFGFRDet{tag}", int(r["determinate"]), int(r["total"]), source=f"functional table: FGFR {tag}")
+    # the groups with the largest drop in determinate rate (joint vs independent), for the text
+    jm = j.merge(u, on=["gene", "cluster"], suffixes=("_mv", "_uv"))
+    jm["drop"] = jm["determinate_uv"] / jm["total_uv"] - jm["determinate_mv"] / jm["total_mv"]
+    for word, r in zip(("One", "Two", "Three"), jm.sort_values("drop", ascending=False).head(3).itertuples()):
+        name = _gene_display(r.gene) if "_gene_display" in globals() else str(r.gene)
+        group = "" if r.cluster == "gene" else " (group " + str(r.cluster).replace("cluster", "") + ")"
+        REG.text(f"ResDetDropGene{word}", f"\\textit{{{name}}}{group}", source="functional table: largest determinate-rate drop")
+        for tag in ("mv", "uv"):
+            T = tag.upper()
+            REG.pct(f"ResDetDropGene{word}Det{T}", int(getattr(r, f"determinate_{tag}")), int(getattr(r, f"total_{tag}")),
+                    source=f"functional table: {r.gene} {r.cluster} {T}")
+            REG.num(f"ResDetDropGene{word}Err{T}", int(getattr(r, f"FP_{tag}") + getattr(r, f"FN_{tag}")),
+                    source=f"functional table: {r.gene} {r.cluster} {T} errors")
+        REG.num(f"ResDetDropGene{word}NPLP", int(r.n_pathogenic_mv), source=f"functional table: {r.gene} P/LP controls")
+        REG.num(f"ResDetDropGene{word}NBLB", int(r.n_benign_mv), source=f"functional table: {r.gene} B/LB controls")
     dep = figs / "dependence"
     cr = dep / "conflict_resolution.csv"
     if REG.require(cr, "conflict resolution"):
@@ -1595,6 +1615,87 @@ def _pathogenic_factors():
                 out["__tau__"] = max(out.get("__tau__", 0.0), float(j["pathogenic_share"]))
     cache.write_text(json.dumps(out, indent=1))
     return out
+
+
+# study (as named in figure labels, make_performance_figures._study) -> bibliography key;
+# studies without one are cited through the harmonized collection they come from
+ASSAY_STUDY_CITE = {
+    "Adamovich 2022": "adamovich2022functional", "Findlay 2018": "findlay2018accurate",
+    "Matreyek 2018": "matreyek2018multiplex", "Mighell 2018": "mighell2018saturation",
+    "van Loggerenberg 2023": "van2023systematically", "Glazer 2020": "glazer2020deep",
+    "Jia 2021": "jia2021massively", "Popp 2025": "popp2024multiplex",
+    "Gebbia 2024": "gebbia2024missense", "McCarthy-Leo 2024": "McCarthyLeo2024CHEK2",
+    "Gersing 2023": "gersing2023comprehensive", "Gersing 2024": "gersing2024characterizing",
+    "Biar 2026": "biar2026integrated", "Tangermann 2026": "tangermann2026saturation",
+    "Kato 2003": "kato2003understanding", "Giacomelli 2018": "giacomelli2018mutational", "Funk 2025": "funk2025deep",
+    "Kotler 2018": "Kotler2018-uv", "Dearth 2007": "dearth2007inactive", "Shiraishi 2004": "shiraishi2004isolation",
+    "Kawaguchi 2005": "kawaguchi2005oligomerization",
+    "Boonen 2026": "boonen2026site", "Grønbæk-Thygesen 2024": "gronbaekthygesen2024deep", "Hu 2024": "hu2024functional",
+    "Huang 2025": "huang2025functional", "Jiang 2022": "jiang2022calibrated", "McDonnell 2024": "mcdonnell2024deep",
+    "Muhammad 2024": "muhammad2024highthroughput", "O'Neill 2024": "oneill2024multiplexed",
+    "Sahu 2023": "sahu2023saturation", "Sahu 2025": "sahu2025saturation", "Sun 2020": "sun2020proactive",
+    "Zheng 2022": "zheng2022proactive", "Tabet 2026": "tabet2026functional",
+}
+
+
+# readable names for readouts whose dataset name is a column code
+READOUT_LABELS = {
+    **{t + "nWT": "Transactivation, " + t.replace("h1433s", "14-3-3$\\sigma$") + " promoter"
+       for t in ("WAF1", "MDM2", "BAX", "h1433s", "AIP1", "GADD45", "NOXA", "P53R2")},
+    "Giac_WT_Nut": "Growth, p53 wild-type cells, nutlin-3", "Giac_NULL_Nut": "Growth, p53-null cells, nutlin-3",
+    "Giac_Etop": "Growth, p53-null cells, etoposide", "Funk_RFS": "Relative fitness", "Kotler_RFS": "Relative fitness",
+    "DN_score": "Dominant-negative activity", "log_TempSens": "Temperature sensitivity",
+    "KawOligo": "Oligomerization state", "Median activation": "Kinase activation",
+    "Median PemR": "Pemigatinib resistance", "Median FutR": "Futibatinib resistance", "PALB2_IGVF": "",
+    "ubquitous": "ubiquitous",
+}
+
+
+def _write_assay_table(REG, tdir):
+    """Every functional readout of the paper's joint models: gene, readout and
+    study (first author, year) with its citation; the same study names as the
+    per-gene performance figures (make_performance_figures._study)."""
+    import json
+    import re
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "figures" / "scripts"))
+    import make_performance_figures as MPF
+    from analysis.plot_common import display_name
+    rows, seen, uncited = [], set(), set()
+    for f in sorted((Path(config.PKNN_DIR) / "prep").glob("*.json")):
+        m = json.load(open(f))
+        if m["panel"] != "functional" or not config.paper_includes(m["key"]):
+            continue
+        gene = "FGFR1--4" if m["gene_set"] == "fgfr" else m["gene"]
+        dims = [str(x) for x in np.load(f.with_suffix(".npz"), allow_pickle=True)["dims"]]
+        if str(m["gene"]).upper() == "TP53":
+            from src.assay_calibration.multivariate_data.tp53 import SCORE_COLS
+            dims = list(SCORE_COLS)
+        for d in dims:
+            if (gene, d) in seen:
+                continue
+            seen.add((gene, d))
+            study = MPF._study(d)
+            name = display_name(d)
+            readout = re.sub(r"^[^_]+_.+?_\d{4}_?", "", name) if name not in MPF.STUDY_OF else name
+            readout = READOUT_LABELS.get(readout, readout)
+            readout = readout.replace("Median ", "").replace("_", " ") or "--"
+            key = ASSAY_STUDY_CITE.get(study)
+            if key is None:
+                uncited.add(study)
+            cite = f"~\\cite{{{key}}}" if key else "~\\cite{igvf_pp}$^\\ast$"
+            gtex = "\\textit{" + gene + "}"
+            stex = "IGVF Consortium" if study == "IGVF" else study.replace(" 20", " \\textit{et al.} 20")
+            rows.append((gene, gtex + " & " + readout + " & " + stex + cite + " \\\\"))
+    if not rows:
+        REG._fail_soft("missing-input", "P-KNN prep for the assay table")
+        return
+    rows.sort(key=lambda r: r[0].upper())
+    body = ("\\begin{tabular}{lll}\n\\toprule\nGene & Readout & Study \\\\\n\\midrule\n"
+            + "\n".join(r for _, r in rows) + "\n\\bottomrule\n\\end{tabular}\n")
+    (tdir / "mv_assays.tex").write_text(body)
+    REG.output(tdir / "mv_assays.tex", "A", "Extended Data table of every functional readout and its study")
+    if uncited:
+        print(f"  assay table: no bibliography entry for {sorted(uncited)} (cited through the harmonized collection)")
 
 
 def _write_gene_data_table(REG, tdir):
@@ -2238,8 +2339,9 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
                 scale = 1 if key == "som" else 100
                 REG.num(f"ResTPFiftyThreeVal{nm}Int", scale * m["intermediate"], fmt=".0f", source=f"{fv.name}: m_{key}")
                 REG.num(f"ResTPFiftyThreeVal{nm}IntVariants", m["int_variants"], source=f"{fv.name}: m_{key}")
-                REG.text(f"ResTPFiftyThreeVal{nm}PIntVsBen", _p(m["p_int_vs_benign_holm"]), source=f"{fv.name}: m_{key} Holm")
-                REG.text(f"ResTPFiftyThreeVal{nm}PIntVsRPV", _p(m["p_int_vs_rpv_holm"]), source=f"{fv.name}: m_{key} Holm")
+                for tag_, col_ in (("PIntVsBen", "p_int_vs_benign_holm"), ("PIntVsRPV", "p_int_vs_rpv_holm")):
+                    if np.isfinite(m[col_]):  # NaN where the intermediate class has no data for this measure
+                        REG.text(f"ResTPFiftyThreeVal{nm}{tag_}", _p(m[col_]), source=f"{fv.name}: m_{key} Holm")
                 if key == "som":
                     REG.num("ResTPFiftyThreeValSomIntBenFold", m["intermediate"] / m["benign"], fmt=".1f",
                             source=f"{fv.name}: m_som intermediate / benign-like")
@@ -2286,6 +2388,7 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
     tdir.mkdir(parents=True, exist_ok=True)
     _write_performance_tables(REG, tdir)
     _write_gene_data_table(REG, tdir)
+    _write_assay_table(REG, tdir)
     _register_strength_macros(REG)
     _register_revision_macros(REG)
     _register_readout_split_macros(REG)
@@ -2307,7 +2410,11 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
             from mv_analysis import baselines as B
             x = B.oob_gene_level()  # gene level (BRCA2's groups merged); undefined MCC is NaN
             x = x[(x["panel"] == panel) & x["method"].isin(methods)].assign(key=lambda f: f["gene"])
-            mcc = x.pivot_table(index="key", columns="method", values="mcc", aggfunc="first").dropna()
+            mcc = x.pivot_table(index="key", columns="method", values="mcc", aggfunc="first")
+            # methods with no results yet (the classifiers' cross-fitted calibration runs
+            # separately, hpc/submit_classifier_cal.sh) are left out rather than failing
+            methods = [mth for mth in methods if mth in mcc.columns]
+            mcc = mcc[methods].dropna()
             det = x.pivot_table(index="key", columns="method", values="det_rate", aggfunc="first").loc[mcc.index]
             first = True
             for mth in methods:
@@ -2317,14 +2424,18 @@ def run_manuscript(ret_counts=None, ret_ev=None, strict=False):
                 rows.append(f"{lead} & {names[mth]} & {mcc[mth].median():.2f} & {100 * det[mth].median():.0f} & {bw} \\\\")
                 first = False
             rows.append("\\midrule")
-            worse = {c: int((mcc["MV"] < mcc[c] - 1e-9).sum()) for c in classifiers}
+            present = [c for c in classifiers if c in mcc.columns]
+            if not present:
+                REG._fail_soft("classifier-results", f"{panel}: no classifier results collected yet")
+                continue
+            worse = {c: int((mcc["MV"] < mcc[c] - 1e-9).sum()) for c in present}
             top = max(worse, key=worse.get)
             REG.num(f"ResSup{ptag}Genes", len(mcc), source=f"{oob_f.name}: {panel} genes evaluable by every method")
             REG.num(f"ResSup{ptag}MaxWorse", worse[top], source=f"{oob_f.name}: {panel}, most genes a classifier beats joint")
             REG.text(f"ResSup{ptag}MaxWorseMethod", names[top].lower(), source=f"{oob_f.name}: {panel}, that classifier")
             REG.num(f"ResSup{ptag}MaxWorseMVBetter", int((mcc["MV"] > mcc[top] + 1e-9).sum()),
                     source=f"{oob_f.name}: {panel}, genes joint beats that classifier")
-            if not all(mcc[c].median() <= mcc["MV"].median() for c in classifiers):
+            if not all(mcc[c].median() <= mcc["MV"].median() for c in present):
                 REG._fail_soft("classifier-median", f"{panel}: a classifier's median MCC exceeds joint "
                                "calibration's; the text claiming otherwise must be revised")
         body = ("\\begin{tabular}{llrrrr}\n\\toprule\n"
@@ -2410,7 +2521,7 @@ def _tp53_best_config():
 # %% [markdown]
 # ## Section 10: manuscript-number summary
 #
-# Prints the values `ExCALIBR_MV.tex`'s `\Num*`/`\MCC*` macros currently
+# Prints the values `main_102826.tex`'s `\Num*`/`\MCC*` macros currently
 # hold as placeholders -- mirrors `analyze_pipeline_output.py`'s final
 # section's role (a single place to read off the numbers going into the
 # manuscript, not a LaTeX-writing step).

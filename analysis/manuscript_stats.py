@@ -56,6 +56,43 @@ def _format_dataset_label(dataset_name: str) -> str:
     return f"\\textit{{{gene}}} ({label})"
 
 
+def latex_determinate_subset_table(rows: List[Tuple[str, str, pd.DataFrame]]) -> str:
+    r"""LaTeX table of ExCALIBR vs. author performance on P/LP and B/LB
+    variants split by which method made a determinate call.
+
+    `rows` are `(subset_label, method_label, matrix)` tuples, `matrix` a
+    summed [BLB,PLP] x [Normal,IR,Abnormal] confusion matrix scored by that
+    method; method_label "" marks a count-only row (the "Neither" subset),
+    whose metric cells are dashes.
+    """
+    from src.assay_calibration.plot_utils.utils import compute_classification_metrics
+
+    lines = [
+        r"\begin{table}[!tb]",
+        r"\centering",
+        r"\caption{Out-of-bag \excalibr{} evidence and author functional annotations on P/LP and B/LB variants, "
+        r"split by which method made a determinate call. Each subset is scored with the method(s) that made a call.}",
+        r"\label{tab:author_determinate_subsets}",
+        r"\begin{tabular}{llrrrrrrr}",
+        r"\toprule",
+        r"Determinate call by & Scored & $n$ & P/LP & B/LB & Accuracy & Sensitivity & Specificity & MCC \\",
+        r"\midrule",
+    ]
+    for subset, method, mat in rows:
+        n_b, n_p = (int(x) for x in mat.sum(axis=1).loc[["BLB", "PLP"]])
+        if method:
+            m = compute_classification_metrics(mat)
+            vals = [_fmt3(m["accuracy"]), _fmt3(m["sensitivity"]), _fmt3(m["specificity"]), _fmt3(m["mcc"])]
+        else:
+            vals = ["--"] * 4
+        lines.append(f"{subset} & {method or '--'} & {_fmt_int(n_p + n_b)} & {_fmt_int(n_p)} & {_fmt_int(n_b)} & "
+                     + " & ".join(vals) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    latex = "\n".join(lines)
+    print(latex)
+    return latex
+
+
 def latex_performance_table_clinvar(groups: List[Tuple[str, Dict, Dict]]) -> str:
     """LaTeX table comparing ExCALIBR evidence vs. author annotations on
     P/LP and B/LB variants — one (ExCALIBR, Author) column pair per entry in

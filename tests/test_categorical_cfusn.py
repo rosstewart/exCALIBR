@@ -381,12 +381,14 @@ def test_spec_resolves_after_gating_drops_a_dim():
 def test_tp53_categorical_ingestion_and_collapse():
     from src.assay_calibration.multivariate_data import tp53
     from src.assay_calibration.multivariate_data import redundancy_collapse as rc
-    jit = tp53.build_tp53_multiscoreset()
-    jit2 = tp53.build_tp53_multiscoreset(kawoligo_mode="jitter")
-    assert np.array_equal(jit.scores, jit2.scores, equal_nan=True), "default mode must be unchanged"
+    assert tp53.DEFAULT_KAWOLIGO_MODE == "categorical"
+    jit = tp53.build_tp53_multiscoreset(kawoligo_mode="jitter")
     assert jit.categorical_dims == {}
 
     ms = tp53.build_tp53_multiscoreset(kawoligo_mode="categorical")
+    default = tp53.build_tp53_multiscoreset()
+    assert np.array_equal(default.scores, ms.scores, equal_nan=True), "default mode must be categorical"
+    assert default.categorical_dims == ms.categorical_dims
     assert ms.categorical_dims == {"KawOligo": ["Tetramer", "Dimer", "Monomer"]}
     k = list(ms.dataset_names).index("KawOligo")
     vals = ms.scores[:, k]

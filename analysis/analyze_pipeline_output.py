@@ -135,6 +135,7 @@ from analysis.confusion import (
     build_vus_coverage,
     build_author_vus_coverage,
     build_both_determinate_confusion_matrices,
+    build_one_sided_determinate_matrices,
     make_confusion_figure,
     make_single_confusion_figure,
     make_confusion_grid_figure,
@@ -379,6 +380,7 @@ vus_by_method = {m: [] for m in methods}
 auth_vus_by_method = {m: [] for m in methods}
 both_det_excalibr_by_method = {m: [] for m in methods}
 both_det_author_by_method = {m: [] for m in methods}
+one_sided_det_by_method = {m: [] for m in methods}
 
 for dataset in datasets:
     df_ds = df[df["dataset"] == dataset]
@@ -402,6 +404,10 @@ for dataset in datasets:
         )
         both_det_excalibr_by_method[method].append(both_det_excalibr)
         both_det_author_by_method[method].append(both_det_author)
+        one_sided_det_by_method[method].append(
+            build_one_sided_determinate_matrices(df_m, use_oob=use_oob, label=f"{dataset}/{method}")
+            if not df_m.empty else None
+        )
 
 primary_method = methods[0]
 auths = auth_by_method[primary_method]
@@ -1087,6 +1093,7 @@ if _clinvar_perf_groups:
     _clinvar_perf_latex = latex_performance_table_clinvar(_clinvar_perf_groups)
     save_latex_table(_clinvar_perf_latex, FIGURE_SUBDIRS["tables"] / "author_clinvar_performance.tex")
 
+
 # Same aggregate report + LaTeX table, gene-deduplicated -- reuses the
 # deduped_matrix_for_author/deduped_author_matrix matrices built in 3a1c.
 if deduped_matrix_for_author is not None and deduped_author_matrix is not None:
@@ -1160,6 +1167,72 @@ REG.check("clinvar-outperforms-all-metrics", all(_better.values()),
           f"ExCALIBR > author on: {_better}", "main.tex Results/accuracy")
 REG.check("clinvar-lower-determinate", _dm["coverage"] < _am["coverage"],
           f"determinate {_dm['coverage']:.3f} vs {_am['coverage']:.3f}", "main.tex Results/accuracy")
+
+# %% [markdown]
+# ### A5d. Determinate-call subsets (ExCALIBR only / author only / neither)
+#
+# Complements A5b: the ED Table 3 controls split by which method made a
+# determinate call, each subset scored with the method(s) that called it
+# (`build_one_sided_determinate_matrices`). Author-only shows how accurate the
+# author calls are where ExCALIBR abstains; ExCALIBR-only shows the accuracy of
+# the calls ExCALIBR adds. Same scope as ED Table 3 (datasets with both an
+# ExCALIBR and an author matrix). Written to tables/ but not yet registered
+# with the manuscript (no REG.table).
+
+# %%
+from analysis.manuscript_stats import latex_determinate_subset_table
+from src.assay_calibration.plot_utils.utils import compute_classification_metrics as _ccm
+
+
+def _sum_mats(mats):
+    mats = [m for m in mats if m is not None]
+    return sum(mats[1:], mats[0].copy()) if mats else None
+
+
+_ed3_idx = [i for i, (d, a) in enumerate(zip(conf_by_method[primary_method], auths))
+            if d is not None and a is not None]
+_one_sided = one_sided_det_by_method[primary_method]
+det_subset_mats = {
+    "both_excalibr": _sum_mats([both_det_excalibr[i] for i in _ed3_idx]),
+    "both_author": _sum_mats([both_det_author[i] for i in _ed3_idx]),
+    **{k: _sum_mats([_one_sided[i][k] for i in _ed3_idx if _one_sided[i] is not None])
+       for k in ("excalibr_only", "author_only", "neither")},
+}
+if all(m is not None for m in det_subset_mats.values()):
+    _det_rows = [
+        ("Both", "\\excalibr{}", det_subset_mats["both_excalibr"]),
+        ("Both", "Author", det_subset_mats["both_author"]),
+        ("\\excalibr{} only", "\\excalibr{}", det_subset_mats["excalibr_only"]),
+        ("Author only", "Author", det_subset_mats["author_only"]),
+        ("Neither", "", det_subset_mats["neither"]),
+    ]
+    _det_subset_latex = latex_determinate_subset_table(_det_rows)
+    save_latex_table(_det_subset_latex, FIGURE_SUBDIRS["tables"] / "author_determinate_subsets.tex")
+
+    _n = {k: int(m.values.sum()) for k, m in det_subset_mats.items()}
+    _met = {k: _ccm(det_subset_mats[k]) for k in ("excalibr_only", "author_only")}
+    # The four subsets partition the ED Table 3 controls, and each method's
+    # determinate total is "both" plus its own one-sided subset.
+    if danz_agg_metrics is not None:
+        _total = _n["both_excalibr"] + _n["excalibr_only"] + _n["author_only"] + _n["neither"]
+        REG.check("det-subsets-partition",
+                  _total == danz_agg_metrics["total"]
+                  and _n["both_excalibr"] + _n["excalibr_only"] == danz_agg_metrics["determinate"]
+                  and _n["both_author"] + _n["author_only"] == auth_agg_metrics["determinate"],
+                  f"subsets sum to {_total} vs ED Table 3 {danz_agg_metrics['total']}; "
+                  f"ExCALIBR det {_n['both_excalibr'] + _n['excalibr_only']} vs {danz_agg_metrics['determinate']}; "
+                  f"author det {_n['both_author'] + _n['author_only']} vs {auth_agg_metrics['determinate']}",
+                  "ED Table 3 / determinate-subset table")
+    for _k, _tag in (("excalibr_only", "ExcOnly"), ("author_only", "AuthOnly")):
+        _src = f"determinate-subset table: {_k.replace('_', ' ')} (scored by the method that called it)"
+        REG.num(f"ResDetSub{_tag}N", _n[_k], source=f"{_src}, P/LP+B/LB variants")
+        for _metric, _name in (("accuracy", "Acc"), ("sensitivity", "Sens"), ("specificity", "Spec"),
+                               ("ppv", "PPV"), ("mcc", "MCC")):
+            REG.num(f"ResDetSub{_tag}{_name}", _met[_k][_metric], fmt=".3f", source=f"{_src}, {_metric}")
+    REG.num("ResDetSubNeitherN", _n["neither"], source="determinate-subset table: neither method determinate")
+else:
+    print("  SKIP determinate-subset table: a subset has no variants in any author-annotated dataset")
+
 
 # %% [markdown]
 # ## A6. Figure 5 (gene accuracy, datasets reaching evidence, All of Us ORs) and Extended Data Figure 2
