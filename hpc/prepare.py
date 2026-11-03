@@ -1002,6 +1002,9 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             cluster_ms = copy.deepcopy(ms)
             from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
             select_dims(cluster_ms, dims)
+            if getattr(cluster_ms, "combined_population", None) == "intersection":
+                from src.assay_calibration.multivariate_data.combined import restrict_to_both_modalities
+                restrict_to_both_modalities(cluster_ms)
             cluster_label = _cluster_suffixed_label(dataset_label, cluster_idx)
             cluster_save_dir = save_dir if cluster_idx == 0 else f"{save_dir}_cluster{cluster_idx + 1}"
             cluster_extra_fields = dict(extra_cjob_fields or {})
@@ -1254,7 +1257,10 @@ def _build_gene_set_ms_map(gene_set, args):
                 # this default. Locking this explicitly means job generation
                 # doesn't silently change behavior if build_combined_
                 # multiscoreset's own default ever flips again.
-                require_both_modalities=False,
+                # --combined-population intersection fits on the evaluated
+                # population only (>=1 functional AND >=1 predictor score),
+                # which also drops the __predictor_dup label copies.
+                require_both_modalities=getattr(args, "combined_population", "union") == "intersection",
                 predictor_transform=getattr(args, "predictor_transform_value", None),
             )
             if ms is None:
@@ -2300,8 +2306,19 @@ def main():
                             "logit, rank_int (multivariate_data/predictors.py). Each value "
                             "becomes its own condition <output-dir>/ptx_<TRANSFORM>/, merged "
                             "into one job array. Functional readouts are untouched.")
+        p.add_argument("--combined-population", choices=["union", "intersection"], default="union",
+                       help="[combined] Fit population: 'union' (default; every variant with "
+                            "any score, plus the predictor-label copies of assayed variants) or "
+                            "'intersection' (only variants with >=1 functional AND >=1 "
+                            "predictor score, the population that is evaluated). Writes a "
+                            "combined_population.txt marker that mv_analysis/config.py reads "
+                            "so scoring rebuilds the same rows.")
 
     args = parser.parse_args()
+    if getattr(args, "combined_population", "union") != "union":
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "combined_population.txt"), "w") as f:
+            f.write(args.combined_population + "\n")
 
     # Sample one dataset slice to estimate per-worker memory more accurately
     _sample_slice = None

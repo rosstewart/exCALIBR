@@ -2087,6 +2087,13 @@ if skew_locked_conf_raw is not None:
 if pathomech_conf_raw_aligned is not None:
     _ablation_baseline_matrices["pathomechanism"] = pathomech_conf_raw_aligned
     _ablation_baseline_labels["pathomechanism"] = "Pathomechanism-aware prior"
+# Fixed-prior ExCALIBR is an ablation of prior estimation, so it is compared
+# with ExCALIBR here over all datasets. The 61-dataset acmgscaler group
+# (ED Fig. 4D-F, Supplementary Table S8) keeps it only for the like-for-like
+# comparison with acmgscaler, which also uses a prior of 0.1.
+if manual_prior_conf_raw is not None:
+    _ablation_baseline_matrices["excalibr_prior_0.1"] = manual_prior_conf_raw
+    _ablation_baseline_labels["excalibr_prior_0.1"] = f"ExCALIBR (prior={FIXED_PRIOR})"
 _gmm_display = {"plp_blb": "GMM (P/LP+B/LB)", "all_plp_blb": "GMM (all P/LP+B/LB)"}
 for _variant, _conf in gmm_conf_raw_by_variant.items():
     if _variant in ("plp_blb", "all_plp_blb"):
@@ -2099,6 +2106,7 @@ if len(_ablation_baseline_matrices) > 1:
         _agg, _ablation_baseline_labels, _own, len(datasets), _n_matched,
         caption=r"Performance comparison of out-of-bag \excalibr-calibrated evidence vs. the "
                 r"skew-locked calibration, the pathomechanism-aware prior/likelihood-ratio variant, "
+                r"\excalibr with a fixed prior of 0.1, "
                 r"and two simple two-component GMM calibration baselines (prior=0.1), differing only "
                 r"in which variants are pooled as benign controls.",
         label="tab:ablation_baseline_performance",
@@ -2215,6 +2223,7 @@ if acmgscaler_conf_raw is not None and manual_prior_conf_raw is not None:
 if "ExCALIBR vs. GMM / Skew-locked / Pathomechanism" in _panel_groups:
     _abl = _panel_groups["ExCALIBR vs. GMM / Skew-locked / Pathomechanism"]
     _register_medians(_abl, {k: t for k, t in (("excalibr", "Excalibr"), ("skew_locked", "SkewLocked"),
+                                                ("excalibr_prior_0.1", "PriorFixedAll"),
                                                 ("gmm_plp_blb", "Gmm"), ("gmm_all_plp_blb", "GmmAll"))
                              if k in _abl}, "ResCmpAblationNumMatched")
 for _p, _what in ((config.ACMGSCALER_OUTPUT_DIR, "acmgscaler outputs (run_acmgscaler_all.py)"),
@@ -2237,6 +2246,50 @@ REG.require(config.PATHOMECHANISM_OUTPUT_DIR, "pathomechanism-aware ExCALIBR rer
             expect_datasets=set(datasets), found_datasets=set(datasets) - set(_pathomech_stale),
             regen="python run_igvf_batch.py ... --pathomechanism-prior --oob --splits-file "
                   f"{config.SPLITS_FILE} --datasets {' '.join(sorted(_pathomech_stale))}")
+# Estimated vs. fixed (0.1) prior, variant by variant (response to Reviewer 3, comment 6): among controls with
+# evidence under both runs, does any change direction; and in datasets with high estimated priors, does the
+# estimated prior give more strong pathogenic evidence to VUS, or more benign evidence to P/LP, than 0.1?
+if manual_prior_conf_raw is not None:
+    from analysis.plot_common import effective_points as _eff_pts
+    _keys = ["dataset", "variant_id", "sample"]
+    _vp = []
+    for _d, _tag in ((df[df["method"] == primary_method], "e"), (mp_df, "f")):
+        _d = _d[_keys + ["is_vus"]].assign(**{f"pts_{_tag}": _eff_pts(_d, use_oob=True, label=f"prior01/{_tag}",
+                                                                      context="all")})
+        _d["cls"] = np.where(_sample_matches(_d, "Pathogenic/Likely Pathogenic"), "P",
+                             np.where(_sample_matches(_d, "Benign/Likely Benign"), "B", ""))
+        _vp.append(_d)
+    _vp = _vp[0].merge(_vp[1][_keys + ["pts_f"]], on=_keys, how="inner")
+    _ctl = _vp[_vp["cls"] != ""]
+    _both = _ctl[(_ctl["pts_e"] != 0) & (_ctl["pts_f"] != 0)]
+    _flip = int((np.sign(_both["pts_e"]) != np.sign(_both["pts_f"])).sum())
+    REG.num("ResPriorFixedNumBothDet", len(_both), fmt=",d",
+            source="P/LP+B/LB variants with evidence under both the estimated and the 0.1 prior")
+    REG.num("ResPriorFixedNumFlipped", _flip, source="of these, evidence direction differs between the two priors")
+    _acc_both = lambda c: (((_both.cls == "P") & (_both[c] > 0)) | ((_both.cls == "B") & (_both[c] < 0))).mean()
+    REG.num("ResPriorFixedAccBothDet", float(_acc_both("pts_e")), fmt=".3f",
+            source="accuracy on those variants (identical under both priors when none flips)")
+    _cov = compute_per_dataset_metrics_multi({"excalibr": conf_by_method[primary_method],
+                                              "excalibr_prior_0.1": manual_prior_conf_raw}, datasets)
+    for _m, _tag in (("excalibr", "Est"), ("excalibr_prior_0.1", "Fixed")):
+        _c = _cov[f"{_m}_coverage"].to_numpy(dtype=float)
+        REG.num(f"ResPriorDetMed{_tag}", 100 * float(np.median(_c[np.isfinite(_c)])), fmt=".1f",
+                source=f"median per-dataset determinate rate of controls, all datasets: {_m}")
+    _hi_thr = 0.25  # the prior at which Tavtigian's c is smallest (MethTavtigianCMinPrior)
+    _hi = {d for d in datasets if float(_resolved_cals[d]["prior"]) > _hi_thr}
+    _vh = _vp[_vp["dataset"].isin(_hi)]
+    _vus_h = _vh[_vh["is_vus"] == True]  # noqa: E712
+    _plp_h = _vh[_vh["cls"] == "P"]
+    REG.num("ResPriorHighNumDatasets", len(_hi), source=f"datasets with estimated prior > {_hi_thr}")
+    for _c, _tag in (("pts_e", "Est"), ("pts_f", "Fixed")):
+        REG.num(f"ResPriorHighVusStrong{_tag}", 100 * float((_vus_h[_c] >= 4).mean()), fmt=".1f",
+                source=f"% VUS with >= +4 points (strong or stronger), datasets with prior > {_hi_thr}: {_c}")
+        REG.num(f"ResPriorHighPlpBenign{_tag}", int((_plp_h[_c] < 0).sum()),
+                source=f"P/LP variants with benign evidence, datasets with prior > {_hi_thr}: {_c}")
+    REG.check("prior-fixed-no-direction-flip", _flip == 0,
+              f"{_flip} of {len(_both)} controls with evidence under both priors change direction",
+              "Response to R3 comment 6 ('never assigned evidence in opposite directions')")
+
 if manual_prior_conf_raw is not None:
     REG.require(config.MANUAL_PRIOR_OUTPUT_DIR, "fixed-prior rerun dataset coverage", expect_datasets=set(datasets),
                 found_datasets={d for d, m in zip(datasets, manual_prior_conf_raw) if m is not None})
@@ -3048,16 +3101,44 @@ if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
     _f2("SuppPriorSimNoiseBLBHi", max(r.f_m for r in _psk["nb20"].values()), "20% pathogenic in B/LB: highest fit mean")
     _f3("SuppPriorSimDevMax", _psk["o_dev_max"], "noise/mechanism settings: largest |true-component - expectation|")
     _f3("SuppPriorSimFitTrueGapMulti", _psk["fo23"], "largest |fit - true components|, A2/A3, rich settings")
-    _f2("SuppPriorSimSepTwoFiveFit", _psk["sep25"]["f_m"], "A1, pi = 0.10, Delta = 2.5: fit mean")
-    _f2("SuppPriorSimSepTwoFiveTrue", _psk["sep25"]["o_m"], "A1, pi = 0.10, Delta = 2.5: true-component mean")
-    _f2("SuppPriorSimSepTwoFiveFitQ", _psk["sep25_25"]["f_m"], "A1, pi = 0.25, Delta = 2.5: fit mean")
-    _f2("SuppPriorSimSepTwoFiveTrueQ", _psk["sep25_25"]["o_m"], "A1, pi = 0.25, Delta = 2.5: true-component mean")
-    _f2("SuppPriorSimWeakSepGapLo", _psk["ws_gap_lo"], "A1, Delta = 2.5: smallest fit - true components")
-    _f2("SuppPriorSimWeakSepGapHi", _psk["ws_gap_hi"], "A1, Delta = 2.5: largest fit - true components")
+    # Fit minus true components on the same datasets, M1-only assay, separation series (mean pathogenic effect
+    # -4 / -2.5 / -1.5) at the base true prior 0.25, and the low-prior repeat at 0.10.
+    _gs = _psk["gap_sep"]
+    for _d, _tag in ((4.0, "Four"), (2.5, "TwoFive"), (1.5, "OneFive")):
+        _f2(f"SuppPriorSimGapSep{_tag}", _gs[(0.25, _d)][0], f"A1, pi = 0.25, Delta = {_d}: fit - true components")
+        _f2(f"SuppPriorSimGapSep{_tag}Low", _gs[(0.1, _d)][0], f"A1, pi = 0.10, Delta = {_d}: fit - true components")
+    _f3("SuppPriorSimGapSepMulti", _psk["fo23_sep25"], "A2/A3, pi = 0.25, all Delta: largest |fit - true components|")
     _f3("SuppPriorSimCorrGapMax", _psk["rho6_gap_max"], "A1, Delta = 2.5, rho = 0.6: largest |fit - true components|")
     _f3("SuppPriorSimSepOneFiveErr", _psk["sep15_o_err"], "Delta = 1.5: largest |true-component - truth|")
     _f2("SuppPriorSimSparseBiasLo", _psk["kc_lo"], "3/0/10/6 controls: smallest significant fit bias")
     _f2("SuppPriorSimSparseBiasHi", _psk["kc_hi"], "3/0/10/6 controls: largest significant fit bias")
+    def _ps_range(lo, hi, fmt=".2f"):
+        lo, hi = format(lo, fmt), format(hi, fmt)
+        return lo if lo == hi else f"{lo}--{hi}"
+    REG.text("SuppPriorSimNoisePLPRange", _ps_range(min(r.f_m for r in _psk["np20"].values()),
+                                                    max(r.f_m for r in _psk["np20"].values())),
+             source="20% benign in P/LP: fit means across assays (range, or one value if equal)", **_ps_inp)
+    REG.text("SuppPriorSimNoiseBLBRange", _ps_range(min(r.f_m for r in _psk["nb20"].values()),
+                                                    max(r.f_m for r in _psk["nb20"].values())),
+             source="20% pathogenic in B/LB: fit means across assays (range, or one value if equal)", **_ps_inp)
+    # Identifiability: spread of the true-component estimate vs. separation; unidentifiable cell.
+    _f3("SuppPriorSimSDAOne", _psk["sd_base"][_ps_sim.ASSAYS[0]], "rich clean pi = 0.25: SD of true-component estimate, A1")
+    _f3("SuppPriorSimSDAThree", _psk["sd_base"][_ps_sim.ASSAYS[2]], "rich clean pi = 0.25: SD of true-component estimate, A3")
+    _f3("SuppPriorSimSDSepAOne", _psk["sd_sep15"][_ps_sim.ASSAYS[0]], "Delta = 1.5, pi = 0.25: SD of true-component estimate, A1")
+    _f3("SuppPriorSimSDSepAThree", _psk["sd_sep15"][_ps_sim.ASSAYS[2]], "Delta = 1.5, pi = 0.25: SD of true-component estimate, A3")
+    _f2("SuppPriorSimUnidMean", _psk["unid_a1"]["o_m"], "P/LP 0% M1, A1: true-component mean (unidentifiable)")
+    REG.num("SuppPriorSimUnidEMInitPct", 100 * _psk["unid_a1"]["at05"], fmt=".0f",
+            source="P/LP 0% M1, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
+    REG.check("prior-sim-unidentifiable-stays-at-start", abs(_psk["unid_a1"]["o_m"] - 0.5) < 0.03
+              and _psk["unid_a1"]["at05"] > 0.25,
+              f"P/LP 0% M1, A1: mean {_psk['unid_a1']['o_m']:.3f}, {100 * _psk['unid_a1']['at05']:.0f}% at 0.5",
+              "supplement.tex prior simulation (unidentifiable prior stays at EM start)")
+    REG.check("prior-sim-precision-tracks-separation",
+              _psk["sd_base"][_ps_sim.ASSAYS[0]] > 2 * _psk["sd_base"][_ps_sim.ASSAYS[2]]
+              and all(_psk["sd_sep15"][a] > _psk["sd_base"][a] for a in _ps_sim.ASSAYS),
+              f"SD A1 {_psk['sd_base'][_ps_sim.ASSAYS[0]]:.3f} vs A3 {_psk['sd_base'][_ps_sim.ASSAYS[2]]:.3f}; "
+              f"Delta 1.5: {[round(v, 3) for v in _psk['sd_sep15'].values()]}",
+              "supplement.tex prior simulation (less separation -> less precise, not biased)")
     REG.num("SuppPriorSimSparseEMInitPct", 100 * _psk["kc_at05"], fmt=".0f",
             source="3/0/10/6 controls, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
 
@@ -3071,15 +3152,177 @@ if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
               f"rich clean: {_psk['n_rich_sig']} significant biases (both arms); fit |bias| max "
               f"A1 {_psk['fa1_max']:.4f}, A2/A3 {_psk['f23_bias_max']:.4f}",
               "supplement.tex prior simulation (fit unbiased for every assay with rich, well-separated controls)")
-    REG.check("prior-sim-fit-minority-weak-sep", _psk["ws_gap_lo"] > 0.03 and _psk["ws_all_sig"]
-              and _psk["rho6_gap_max"] < 0.02,
-              f"A1 fit - true at Delta = 2.5: {_psk['ws_gap_lo']:.3f}-{_psk['ws_gap_hi']:.3f}, all significant "
-              f"{_psk['ws_all_sig']}; rho = 0.6 gap {_psk['rho6_gap_max']:.4f}",
-              "supplement.tex prior simulation (fit runs high only for the minority assay at weak separation)")
+    REG.check("prior-sim-fit-minority-weak-sep",
+              _gs[(0.25, 2.5)][0] > 0.03 and _gs[(0.25, 2.5)][1] < 0.05
+              and _gs[(0.25, 4.0)][1] >= 0.05 and _gs[(0.25, 1.5)][1] >= 0.05
+              and min(_gs[(0.1, 2.5)][0], _gs[(0.1, 1.5)][0]) > 0.05
+              and max(_gs[(0.1, 2.5)][1], _gs[(0.1, 1.5)][1]) < 0.05
+              and _psk["fo23_sep25"] < 0.02 and _psk["rho6_gap_max"] < 0.02,
+              f"A1 fit - true at pi 0.25 (Delta 4/2.5/1.5): "
+              + ", ".join(f"{_gs[(0.25, d)][0]:+.3f} (p {_gs[(0.25, d)][1]:.3g})" for d in (4.0, 2.5, 1.5))
+              + "; pi 0.10: " + ", ".join(f"{_gs[(0.1, d)][0]:+.3f} (p {_gs[(0.1, d)][1]:.3g})" for d in (4.0, 2.5, 1.5))
+              + f"; A2/A3 max {_psk['fo23_sep25']:.4f}; rho 0.6 gap {_psk['rho6_gap_max']:.4f}",
+              "supplement.tex prior simulation (fit excess for the M1-only assay: significant only at -2.5 at 0.25; "
+              "larger at 0.10)")
     REG.check("prior-sim-a3-immune", max(_psk["a3_mech_err"], _psk["a3_mech_err_o"]) < 0.02,
               f"A3 under P/LP mechanism bias: max |estimate - 0.25| fit {_psk['a3_mech_err']:.4f}, "
               f"true {_psk['a3_mech_err_o']:.4f}",
               "supplement.tex prior simulation (assay measuring both mechanisms unaffected)")
+
+    # Closed forms (Supplementary Section "Prior estimation: theory and simulations"): large-sample estimate under
+    # biased controls (Proposition 3) vs. the simulated large-sample expectation, and the asymptotic SD
+    # (Proposition 2) vs. the simulated SD with rich controls.
+    _pred_dev = []
+    for _r in _ps_summ[_ps_summ.experiment.isin(["2_noise_plp", "2_noise_blb", "3_mech_bias"])
+                       & (_ps_summ.regime == "rich")].itertuples():
+        _pp = _ps_sim.predicted_prior(_r.experiment, _r.assay, _r.true_prior, _r.eps_p, _r.delta_b, _r.lab_m1_frac)
+        if np.isfinite(_pp) and np.isfinite(_r.expected):
+            _pred_dev.append(abs(_pp - _r.expected))
+    _f3("SuppPriorSimPredMaxDev", max(_pred_dev), "largest |closed-form - simulated large-sample expectation|, "
+        "label noise and mechanism-mix settings")
+    REG.check("prior-sim-closed-form-matches", max(_pred_dev) < 0.01,
+              f"closed form vs expected_prior: max |diff| {max(_pred_dev):.4f} over {len(_pred_dev)} settings",
+              "supplement.tex prior theory (Proposition 3 closed forms)")
+    for _a, _tag in ((_ps_sim.ASSAYS[0], "AOne"), (_ps_sim.ASSAYS[2], "AThree")):
+        _f3(f"SuppPriorSimPredSD{_tag}", _ps_sim.predicted_sd(_a, 0.25, _rich[2], _rich[0]),
+            f"asymptotic SD (Proposition 2), rich controls, pi = 0.25, {_a}")
+
+# Sample size: one control sample at a time reduced from the rich counts (test_priors.py --design sample_size).
+_ss_reps_path = Path(config.PRIOR_SIMULATION_DIR) / "sample_size_replicates.csv"
+if "_ps_sim" in globals() and not config.warn_if_missing(str(_ss_reps_path), "prior-simulation sample-size replicates"):
+    from analysis.prior_simulation.summary import sample_size_summary as _ss_summary
+    from analysis.prior_simulation.figures import make_sample_size_figure as _ss_make_figure
+    REG.require(_ss_reps_path, "prior-simulation sample-size replicates (Supp Figure)",
+                newer_than=[Path(_ps_sim.__file__), Path(_ps_test.__file__)],
+                regen="python -m analysis.prior_simulation.test_priors --design sample_size --n-jobs 120")
+    _ss_r = pd.read_csv(_ss_reps_path, low_memory=False)
+    _ss = _ss_summary(_ss_r)
+    _ss_fig = _ss_make_figure(_ss, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_prior_sample_size.png")
+    REG.figure("fig:prior_sample_size", _ss_fig, inputs=[_ss_reps_path])
+    _ss_inp = dict(inputs=[_ss_reps_path])
+    _A1, _A2, _A3 = _ps_sim.ASSAYS
+
+    def _ssr(sample, size, assay, arm):
+        return _ss[(_ss["sample"] == sample) & (_ss["size"] == size) & (_ss.assay == assay) & (_ss.arm == arm)].iloc[0]
+    _mins = {s: int(_ss[_ss["sample"] == s]["size"].min()) for s in ("P/LP", "B/LB", "gnomAD", "synonymous")}
+    _g = _mins["gnomAD"]
+    for _s, _tag in (("P/LP", "PLP"), ("B/LB", "BLB"), ("gnomAD", "Gnomad"), ("synonymous", "Syn")):
+        REG.num(f"SuppPriorSSMin{_tag}", _mins[_s], kind="method", source=f"smallest {_s} sample size simulated")
+    _f3s = lambda name, v, src: REG.num(name, v, fmt=".3f", source=src, **_ss_inp)
+    for _a, _tag in ((_A1, "AOne"), (_A3, "AThree")):
+        _f3s(f"SuppPriorSSSDBase{_tag}", _ssr("gnomAD", 500, _a, "oracle_raw").sd, f"SD, rich controls, {_a}")
+        _f3s(f"SuppPriorSSSDGnomad{_tag}", _ssr("gnomAD", _g, _a, "oracle_raw").sd, f"SD, gnomAD = {_g}, {_a}")
+        _f3s(f"SuppPriorSSSDGnomadPred{_tag}", _ps_sim.predicted_sd(_a, 0.25, _g, _rich[0]),
+             f"asymptotic SD (Proposition 2), gnomAD = {_g}, {_a}")
+        _f3s(f"SuppPriorSSRawBiasGnomad{_tag}", _ssr("gnomAD", _g, _a, "oracle_raw").bias,
+             f"bias before the discard rule, gnomAD = {_g}, {_a}")
+    _gr = _ssr("gnomAD", _g, _A1, "oracle_raw")
+    _f3s("SuppPriorSSRawBiasGnomadAOneLo", _gr.bias_lo, "95% CI lower bound of that bias, A1")
+    _f3s("SuppPriorSSRawBiasGnomadAOneHi", _gr.bias_hi, "95% CI upper bound of that bias, A1")
+    _gk, _gf = _ssr("gnomAD", _g, _A1, "oracle"), _ssr("gnomAD", _g, _A1, "fit")
+    REG.num("SuppPriorSSDiscardPct", 100 * _gk.discard, fmt=".0f", source=f"gnomAD = {_g}, A1: % discarded",
+            **_ss_inp)
+    _gz = _ss_r[(_ss_r.regime == f"gnomAD = {_g}") & (_ss_r.assay == _A1) & _ss_r.oracle.isna()]
+    REG.num("SuppPriorSSZeroPct", 100 * float((_gz.oracle_raw <= 0.001).mean()), fmt=".0f",
+            source=f"gnomAD = {_g}, A1: % of discarded estimates at zero", **_ss_inp)
+    REG.num("SuppPriorSSNoMOnePct", 100 * (1 - 0.25 * _ps_sim.POP_M1_FRAC) ** _g, fmt=".0f", kind="method",
+            source=f"% of gnomAD samples of {_g} with no M1 variant at pi = 0.25")
+    _f3s("SuppPriorSSKeptBias", _gk.bias, f"gnomAD = {_g}, A1: bias after the discard rule, true components")
+    _f3s("SuppPriorSSFitBias", _gf.bias, f"gnomAD = {_g}, A1: bias of the fit (after the discard rule)")
+    REG.num("SuppPriorSSFitDiscardPct", 100 * _gf.discard, fmt=".0f",
+            source=f"gnomAD = {_g}, A1: % of fitted bootstraps discarded", **_ss_inp)
+    for _n, _tag in ((20, "Twenty"), (10, "Ten")):
+        _f3s(f"SuppPriorSSPLPBias{_tag}", _ssr("P/LP", _n, _A1, "oracle_raw").bias,
+             f"P/LP = {_n}, A1: bias before the discard rule")
+        _f3s(f"SuppPriorSSPLPPred{_tag}", _ps_sim.predicted_plp_bias(_A1, 0.25, _n),
+             f"P/LP = {_n}, A1: delta-method bias")
+    _plp_a3 = max(abs(_ssr("P/LP", _n, _A3, "oracle_raw").bias) for _n in (50, 20, 10, 5))
+    _f3s("SuppPriorSSPLPAThreeMax", _plp_a3, "P/LP reduced, A3: largest |bias|")
+    _oth = _ss[_ss["sample"].isin(["B/LB", "synonymous"]) & ~_ss.is_base & (_ss.arm == "oracle_raw")]
+    _f3s("SuppPriorSSOtherBiasMax", float(_oth.bias.abs().max()), "B/LB or synonymous reduced: largest |bias|")
+    _f3s("SuppPriorSSOtherSDMax", float(_oth.sd.max()), "B/LB or synonymous reduced: largest SD")
+    _plp_lo = min(_ssr("P/LP", _n, _A1, "oracle_raw").bias_lo for _n in (20, 10))
+    REG.check("prior-sim-ss-gnomad-raw-unbiased", _gr.bias_lo < 0.02 and _gr.bias_hi > -0.02 and abs(_gr.bias) < 0.03,
+              f"gnomAD = {_g}, A1 raw bias {_gr.bias:+.3f} [{_gr.bias_lo:+.3f}, {_gr.bias_hi:+.3f}]",
+              "supplement.tex prior simulation (small population sample: variance, not bias)")
+    REG.check("prior-sim-ss-plp-bias-positive", _plp_lo > 0 and _plp_a3 < 0.02,
+              f"P/LP 20/10, A1 raw bias CI lower bound min {_plp_lo:+.3f}; A3 max |bias| {_plp_a3:.3f}",
+              "supplement.tex prior simulation (small P/LP sample biases the minority-mechanism assay upward)")
+    REG.check("prior-sim-ss-others-negligible", float(_oth.bias.abs().max()) < 0.02,
+              f"B/LB/synonymous reduced: max |bias| {float(_oth.bias.abs().max()):.4f}",
+              "supplement.tex prior simulation (B/LB and synonymous sample sizes hardly matter)")
+
+# Boundary estimates: discard (production) vs. keep / clip / fallbacks, and the EM starting value, applied to the
+# same raw bootstrap priors (test_priors.py --design policy).
+_pol_path = Path(config.PRIOR_SIMULATION_DIR) / "policy_replicates.csv"
+if "_ps_sim" in globals() and not config.warn_if_missing(str(_pol_path), "prior-simulation boundary-rule replicates"):
+    from analysis.prior_simulation.summary import policy_summary as _pol_summary, \
+        start_value_summary as _start_summary
+    REG.require(_pol_path, "prior-simulation boundary-rule replicates (Supp text)",
+                newer_than=[Path(_ps_sim.__file__), Path(_ps_test.__file__)],
+                regen="python -m analysis.prior_simulation.test_priors --design policy --n-boot 10 --n-jobs 100")
+    _pol_r = pd.read_csv(_pol_path, low_memory=False)
+    _pol = _pol_summary(_pol_r)
+    _pol_inp = dict(inputs=[_pol_path])
+    _pk = ["experiment", "regime", "true_prior", "assay", "arm"]
+    _pm = _pol.pivot_table(index=_pk, columns="policy", values="mean")
+    _clip_dev = float(max((_pm.P1 - _pm.P2a).abs().max(), (_pm.P2a - _pm.P2b).abs().max()))
+    REG.num("SuppPriorRuleClipMaxDiff", _clip_dev, fmt=".4f", source="largest |difference| in the dataset prior "
+            "between keeping, clipping to [0.001, 0.999] and clipping to [0.0001, 0.9999]", **_pol_inp)
+    REG.check("prior-sim-rule-clip-bound-irrelevant", _clip_dev < 0.002, f"max |keep/clip differences| {_clip_dev:.4f}",
+              "supplement.tex prior simulation (clip bounds do not change the median prior)")
+    _pr = _pol.pivot_table(index=_pk, columns="policy", values="rmse")
+    _pr_fit = _pr.xs("fit", level="arm")
+    _pr_fit = _pr_fit[(_pr_fit.P0 - _pr_fit.P2a).abs() > 0.005]
+    REG.num("SuppPriorRuleNDiffer", len(_pr_fit), source="fitted settings where discard and clip RMSE differ "
+            "by > 0.005", **_pol_inp)
+    REG.num("SuppPriorRuleClipWins", int((_pr_fit.P2a < _pr_fit.P0).sum()),
+            source="of these, settings where clipping has the lower RMSE", **_pol_inp)
+
+    def _polr(exp, reg, tp, assay, policy, arm="fit"):
+        return _pol[(_pol.experiment == exp) & (_pol.regime == reg) & np.isclose(_pol.true_prior, tp)
+                    & (_pol.assay == assay) & (_pol.policy == policy) & (_pol.arm == arm)].iloc[0]
+    _pg = f"gnomAD = {int(_pol_r[_pol_r.regime.str.startswith('gnomAD')].regime.str.split(' = ').str[1].astype(int).min())}"
+    _p0, _p2 = (_polr("6_sample_size", _pg, 0.25, _ps_sim.ASSAYS[0], p) for p in ("P0", "P2a"))
+    REG.num("SuppPriorRuleGnomadBiasDiscard", _p0.bias, fmt=".3f", source=f"{_pg}, A1, fit: bias, discard", **_pol_inp)
+    REG.num("SuppPriorRuleGnomadBiasClip", _p2.bias, fmt=".3f", source=f"{_pg}, A1, fit: bias, clip", **_pol_inp)
+    REG.num("SuppPriorRuleGnomadNonePct", 100 * _p0.nan_frac, fmt=".0f",
+            source=f"{_pg}, A1, fit: % of datasets with no prior under discarding", **_pol_inp)
+    _fb = _polr("1_clean", "KCNH2_Kozek-like", 0.40, _ps_sim.ASSAYS[0], "P4")
+    REG.num("SuppPriorRuleFallbackBiasHigh", _fb.bias, fmt=".3f",
+            source="KCNH2-like, true prior 0.40, A1, fit: bias of the 0.1 fallback", **_pol_inp)
+    _kept = {d: _resolved_cals[d].get("pct_bootstraps_kept") for d in datasets}
+    _kept = {d: float(v) for d, v in _kept.items() if v is not None}
+    REG.num("SuppPriorRuleNDatasetsLossTen", sum(v < 0.9 for v in _kept.values()),
+            source="datasets losing > 10% of bootstrap fits to the prior discard rule")
+    REG.num("SuppPriorRuleNDatasetsAllKept", sum(v >= 1 for v in _kept.values()),
+            source="datasets keeping every bootstrap fit")
+    # EM starting value 0.1 vs 0.5 (production), under the current discard rule.
+    _sv = _start_summary(_pol_r)
+    if _sv is not None:
+        def _svr(reg, tp, assay, start, arm="oracle"):
+            return _sv[(_sv.regime == reg) & np.isclose(_sv.true_prior, tp) & (_sv.assay == assay)
+                       & np.isclose(_sv.start, start) & (_sv.arm == arm)].iloc[0]
+        _A1 = _ps_sim.ASSAYS[0]
+        REG.num("SuppPriorStartAtStartPct", 100 * max(_svr("KCNH2_Kozek-like", tp, _A1, 0.5).at_start
+                                                      for tp in (0.05, 0.10, 0.25, 0.40)), fmt=".0f",
+                source="KCNH2-like, A1: largest % of true-component estimates at the EM start", **_pol_inp)
+        for _tp, _tag in ((0.05, "Five"), (0.25, "TwentyFive"), (0.40, "Forty")):
+            for _st, _st_tag in ((0.5, "Half"), (0.1, "Tenth")):
+                REG.num(f"SuppPriorStartBias{_tag}{_st_tag}", _svr("KCNH2_Kozek-like", _tp, _A1, _st).bias,
+                        fmt=".3f", source=f"KCNH2-like, true prior {_tp}, A1, true components: bias, EM start {_st}",
+                        **_pol_inp)
+                REG.num(f"SuppPriorStartFitBias{_tag}{_st_tag}", _svr("KCNH2_Kozek-like", _tp, _A1, _st, "fit").bias,
+                        fmt=".3f", source=f"KCNH2-like, true prior {_tp}, A1, ExCALIBR fit: bias, EM start {_st}",
+                        **_pol_inp)
+        _rich_sv = _sv[_sv.regime == "rich"].pivot_table(index=["true_prior", "assay", "arm"], columns="start",
+                                                          values="mean")
+        _rich_dev = float((_rich_sv[0.5] - _rich_sv[0.1]).abs().max())
+        REG.num("SuppPriorStartRichMaxDiff", _rich_dev, fmt=".3f",
+                source="rich controls: largest |mean estimate, start 0.5 - start 0.1|", **_pol_inp)
+        REG.check("prior-sim-start-rich-invariant", _rich_dev < 0.001,  # text: "by less than 0.001"
+                  f"rich controls: max |start 0.5 - start 0.1| {_rich_dev:.4f}",
+                  "supplement.tex prior theory (unique maximizer: start value irrelevant when identified)")
 
 # %% [markdown]
 # ## A12. Supplementary Data 1-3

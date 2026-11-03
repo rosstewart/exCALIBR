@@ -205,6 +205,23 @@ if "MV_PREDICTOR_TRANSFORM" not in os.environ and os.path.exists(_PTX_MARKER):
     with open(_PTX_MARKER) as _f:
         os.environ["MV_PREDICTOR_TRANSFORM"] = _f.read().strip()
 
+# A run whose combined models were fit on the intersection population
+# (hpc/prepare.py --combined-population intersection) carries a
+# combined_population.txt marker; combined multiscoresets must then be rebuilt
+# on the same rows, or the stored fits' row shapes would not match.
+# $MV_COMBINED_POPULATION (union|intersection) wins.
+COMBINED_POPULATION = os.environ.get("MV_COMBINED_POPULATION", "")
+if not COMBINED_POPULATION:
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        _m = os.path.join(_d, "combined_population.txt")
+        if os.path.exists(_m):
+            with open(_m) as _f:
+                COMBINED_POPULATION = _f.read().strip()
+            break
+COMBINED_POPULATION = COMBINED_POPULATION or "union"
+if COMBINED_POPULATION not in ("union", "intersection"):
+    raise ValueError(f"MV_COMBINED_POPULATION must be union or intersection, not {COMBINED_POPULATION!r}")
+
 # Run-specific figure output, NOT the paper repo's Figures/mv/ -- matches
 # the tp53_pca10_run/figures precedent; copying into the paper repo is a
 # separate, deliberate step the user does themselves.
@@ -407,6 +424,19 @@ def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
 
 def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0,
                               results_json: str = None, rebuild=None, min_overlap_rows: int = 30):
+    """See _restrict_ms_to_stored_fit. For a combined ms built on the
+    intersection population (COMBINED_POPULATION), the rows are restricted
+    again on the selected dimensions, exactly as hpc/prepare.py did per
+    cluster, so stored out-of-bag masks index the same rows."""
+    ms = _restrict_ms_to_stored_fit(ms, gene, gene_set, cluster_idx, results_json, rebuild, min_overlap_rows)
+    if gene_set == "combined" and getattr(ms, "combined_population", None) == "intersection":
+        from src.assay_calibration.multivariate_data.combined import restrict_to_both_modalities
+        restrict_to_both_modalities(ms)
+    return ms
+
+
+def _restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0,
+                               results_json: str = None, rebuild=None, min_overlap_rows: int = 30):
     """Restrict an already-built MultiScoreset to the dimensions the stored fit
     for `gene`/`cluster_idx` was trained on (see build_ms_for_gene_cluster).
     `rebuild`: zero-argument callable that rebuilds the same data, called
@@ -675,7 +705,7 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
                 # (which would mismatch the stored fit's variant/weight-row
                 # shape, same issue seen for TP53/BRCA2's role-count
                 # mismatch warnings this session).
-                require_both_modalities=False)
+                require_both_modalities=COMBINED_POPULATION == "intersection")
             if ms is None:
                 print(f"  [{gene}] could not build combined ms, skipping")
                 continue

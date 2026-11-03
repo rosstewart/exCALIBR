@@ -127,7 +127,10 @@ def fit_sample_counts(dataset: str) -> Dict[str, int]:
     pcfg = PipelineConfig(dataset_csv=str(cfg.DATASET_TSV), dataset_name=dataset, output_dir="/tmp",
                           clinvar_release="2018" if "_clinvar_2018" in dataset else "2025")
     scoreset = load_dataset_from_df(df_ds, pcfg)
-    counts = dict(zip([s[1] for s in scoreset.samples], (int(c) for c in scoreset.sample_counts)))
+    # Pair names with counts positionally over ALL samples: `scoreset.samples` yields only non-empty samples, so
+    # zipping it with `sample_counts` (all samples) misaligns the counts whenever an empty sample precedes a
+    # non-empty one (e.g. no B/LB: the population count was reported as B/LB's 0).
+    counts = dict(zip(scoreset.sample_names, (int(c) for c in scoreset.sample_counts)))
     return {f"{k}_fit": counts.get(v, counts.get("gnomAD", 0) if k == "n_gnomad" else 0) for k, v in _SAMPLES.items()}
 
 

@@ -670,7 +670,7 @@ def _get_benign_reference_weights(weights, benign_method, benign_idx, synonymous
 def estimate_prior_from_class_densities(
     f1, f2, mode,
     max_em_steps=10000, tolerance=1e-6,
-    no_signal_prior=0.1, floor_low=0.01, discard_high=0.99,
+    no_signal_prior=0.1, floor_low=0.01, discard_high=0.99, initial_prior=0.5,
 ):
     """Numeric core of prior estimation, shared by get_fit_prior (below) and
     the multivariate analysis harness (src/assay_calibration/multivariate_analysis/mv_calibration.py), so both
@@ -713,7 +713,10 @@ def estimate_prior_from_class_densities(
     treatment for the negative_unlabeled branch.
     """
     if mode == 'standard':
-        prior_estimate = 0.5
+        # EM starting value; the estimate stays here when the likelihood is flat
+        # (pathogenic and benign densities equal at every population point).
+        # Only the prior simulation (analysis/prior_simulation) changes it.
+        prior_estimate = initial_prior
         converged = False
         em_steps = 0
         while not converged and em_steps < max_em_steps:

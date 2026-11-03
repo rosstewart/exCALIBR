@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 import numpy as np
 
-from analysis.prior_simulation.simulate_priors import ASSAYS, CLASSES, DEFAULT_OUT_DIR, POP_M1_FRAC, class_density
+from analysis.prior_simulation.simulate_priors import (ASSAYS, CLASSES, DEFAULT_OUT_DIR, POP_M1_FRAC, REGIMES,
+                                                       class_density)
 from analysis.prior_simulation.summary import load, sel
 
 # Categorical slots 1-3 of the validated default palette, in fixed order.
@@ -66,37 +67,56 @@ def _points(ax, df, xcol, span, expected=True):
             ax.plot(s[xcol].to_numpy() + base, s["expected"].to_numpy(), color=c, lw=1.0, alpha=0.45, zorder=2)
 
 
+PATH_C = "#a8434f"  # pathogenic (any mechanism) in the sample cartoons
+
+
+def _clouds(ax, kappa=4.0, rho=0.0, n=90, seed=3):
+    """Latent effects (e1, e2): benign at (0, 0), pathogenic via M1 at (-kappa, -rho kappa), via M2 at
+    (-rho kappa, -kappa); unit variance, correlation rho."""
+    rng = np.random.default_rng(seed)
+    cov = [[1, rho], [rho, 1]]
+    for mu, col, k in (((0, 0), BENIGN, n), ((-kappa, -rho * kappa), COLORS[ASSAYS[0]], n // 3),
+                       ((-rho * kappa, -kappa), COLORS[ASSAYS[1]], n)):
+        e = rng.multivariate_normal(mu, cov, k)
+        ax.scatter(e[:, 0], e[:, 1], s=1.6, color=col, alpha=0.7, lw=0)
+    ax.set_xlim(-7.5, 3)
+    ax.set_ylim(-7.5, 3)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
+    ax.set_xlabel("e1", labelpad=1, fontsize=6)
+    ax.set_ylabel("e2", labelpad=1, fontsize=6)
+
+
 def _schematic(ax, base):
-    """Panel a: data generation -> assays -> estimates."""
+    """Panel a: latent effects -> three assays -> estimates."""
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-
-    def box(x, y, w, h, title, lines, step=0.062):
-        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.004,rounding_size=0.012",
-                                    fc=BOX, ec=GRID, lw=0.8))
-        ax.text(x + 0.01, y + h - 0.025, title, fontsize=7.2, fontweight="bold", color=INK, va="top")
-        for i, ln in enumerate(lines):
-            ax.text(x + 0.01, y + h - 0.1 - step * i, ln, fontsize=6.1, color=MUTED, va="top")
 
     def arrow(p, q):
         ax.add_patch(FancyArrowPatch(p, q, arrowstyle="-|>", mutation_scale=7, color=MUTED, lw=0.8,
                                      connectionstyle="arc3,rad=0"))
 
-    box(0.0, 0.62, 0.225, 0.38, "Variants in the gene", [
-        "benign: probability P(Y=0)", "pathogenic: probability P(Y=1)",
-        "   via M1: 25% of pathogenic", "   via M2: 75% of pathogenic", "true P(Y=1) = 0.25 (varied)"])
-    box(0.0, 0.08, 0.225, 0.5, "Samples", [
-        "P/LP: pathogenic (100)", "   + mislabels, mechanism mix",
-        "B/LB: benign (100)", "   + pathogenic mislabels",
-        "gnomAD: pathogenic w.p. P(Y=1) (500)", "synonymous: benign (200)", "sparse: 8/1/50/20, 3/0/10/6"])
-    box(0.255, 0.2, 0.2, 0.62, "Latent effect (e1, e2)", [
-        "e ~ N(μ, Σ),  Σ = [[1, ρ], [ρ, 1]]", "benign:  μ = (0, 0)", "via M1:  μ = (−Δ, −ρΔ)",
-        "via M2:  μ = (−ρΔ, −Δ)", "Δ = 4 SD (1.5, 2.5)", "ρ = 0 (0.3, 0.6)", "each variant is read",
-        "by all three assays"])
-    arrow((0.225, 0.5), (0.255, 0.5))
+    # Latent effects of every variant, and the mechanism split of pathogenic variants.
+    c_ax = ax.inset_axes([0.03, 0.2, 0.3, 0.72], transform=ax.transAxes)
+    _clouds(c_ax)
+    c_ax.set_title("Latent effects of each variant", fontsize=6.8, color=INK, loc="left", pad=2, fontweight="bold")
+    c_ax.text(0.2, 0.6, "benign", fontsize=5.8, color=BENIGN, transform=c_ax.transData, ha="left")
+    c_ax.text(-4, 1.7, "via M1", fontsize=5.8, color=COLORS[ASSAYS[0]], ha="center")
+    c_ax.text(1.1, -4, "via M2", fontsize=5.8, color=COLORS[ASSAYS[1]], ha="left", va="center")
+    b_ax = ax.inset_axes([0.03, 0.04, 0.3, 0.07], transform=ax.transAxes)
+    b_ax.barh([0], [POP_M1_FRAC], color=COLORS[ASSAYS[0]], height=1)
+    b_ax.barh([0], [1 - POP_M1_FRAC], left=POP_M1_FRAC, color=COLORS[ASSAYS[1]], height=1)
+    b_ax.text(POP_M1_FRAC / 2, 0, f"M1 {100 * POP_M1_FRAC:.0f}%", color="white", fontsize=5.8, ha="center",
+              va="center")
+    b_ax.text(POP_M1_FRAC + (1 - POP_M1_FRAC) / 2, 0, f"M2 {100 * (1 - POP_M1_FRAC):.0f}%", color="white",
+              fontsize=5.8, ha="center", va="center")
+    b_ax.set_xlim(0, 1)
+    b_ax.axis("off")
+    b_ax.set_title("pathogenic variants", fontsize=6, color=MUTED, loc="left", pad=1.5)
 
-    x0, w, h, gap = 0.49, 0.51, 0.3, 0.035
+    x0, w, h, gap = 0.42, 0.58, 0.29, 0.03
     xs = np.linspace(-8, 3.5, 300)
     for i, assay in enumerate(ASSAYS):
         y = 1 - (i + 1) * h - i * gap
@@ -105,10 +125,9 @@ def _schematic(ax, base):
         score = {ASSAYS[0]: "score = e1", ASSAYS[1]: "score = e2", ASSAYS[2]: "score = min(e1, e2)"}[assay]
         ax.text(x0 + 0.01, y + h - 0.022, f"{SHORT[assay]}: reads {LONG[assay]}", fontsize=6.8,
                 fontweight="bold", color=COLORS[assay], va="top")
-        ax.text(x0 + 0.17, y + h - 0.022, f"({score})", fontsize=6.1, color=MUTED, va="top")
-        arrow((0.455, 0.5), (x0, y + h / 2))
-        # Class densities.
-        d_ax = ax.inset_axes([x0 + 0.012, y + 0.06, 0.2, h - 0.15], transform=ax.transAxes)
+        ax.text(x0 + 0.19, y + h - 0.022, f"({score})", fontsize=6.1, color=MUTED, va="top")
+        arrow((0.355, 0.56), (x0, y + h / 2))
+        d_ax = ax.inset_axes([x0 + 0.012, y + 0.06, 0.23, h - 0.15], transform=ax.transAxes)
         for c, style, col in (("B", "-", BENIGN), ("M1", "--", COLORS[ASSAYS[0]]), ("M2", ":", COLORS[ASSAYS[1]])):
             d_ax.plot(xs, class_density(xs, c, assay, 4.0, 0.0), ls=style, color=col, lw=1.1)
         d_ax.set_yticks([])
@@ -117,8 +136,7 @@ def _schematic(ax, base):
         d_ax.spines["left"].set_visible(False)
         d_ax.set_xlim(-8, 3.5)
         d_ax.set_ylim(0, 0.45)
-        # Estimate strip.
-        s_ax = ax.inset_axes([x0 + 0.26, y + 0.075, 0.235, h - 0.19], transform=ax.transAxes)
+        s_ax = ax.inset_axes([x0 + 0.3, y + 0.075, 0.265, h - 0.19], transform=ax.transAxes)
         r = base[base.assay == assay].iloc[0]
         c = COLORS[assay]
         s_ax.axvline(0.25, color=MUTED, ls="--", lw=0.8)
@@ -133,63 +151,150 @@ def _schematic(ax, base):
         s_ax.set_xticks([0, 0.1, 0.2, 0.3, 0.4, 0.5])
         s_ax.tick_params(labelsize=6)
         s_ax.set_title("estimated prior (true 0.25)", fontsize=6, color=MUTED, loc="left", pad=1.5)
-    # Legend for panel a.
     handles = [
         plt.Line2D([], [], color=BENIGN, lw=1.1, label="benign"),
         plt.Line2D([], [], color=COLORS[ASSAYS[0]], ls="--", lw=1.1, label="pathogenic via M1"),
         plt.Line2D([], [], color=COLORS[ASSAYS[1]], ls=":", lw=1.1, label="pathogenic via M2"),
         plt.Line2D([], [], marker="D", mfc="white", mec=INK, ls="", ms=4,
-                   label="fraction of gnomAD pathogenic and scoring abnormal"),
+                   label="fraction of population pathogenic and scoring abnormal"),
     ]
-    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.0, 0.035), ncol=4, frameon=False, fontsize=6.2,
+    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.42, 0.0), ncol=2, frameon=False, fontsize=5.9,
               handlelength=2.2, columnspacing=1.2)
 
 
+# Sample cartoons above panels b-j: what each experiment changes.
+_SAMPLES = ("P/LP", "B/LB", "population", "synonymous")
+
+
+def _bar(ax, y, parts, label, note=""):
+    """One horizontal sample bar of unit length split into (fraction, color, hatch) parts."""
+    left = 0.0
+    for frac, col, hatch in parts:
+        ax.barh([y], [frac], left=left, color=col, height=0.62, hatch=hatch, edgecolor="white", lw=0.4)
+        left += frac
+    ax.text(-0.03, y, label, ha="right", va="center", fontsize=5.8, color=MUTED)
+    if note:
+        ax.text(1.03, y, note, ha="left", va="center", fontsize=5.6, color=MUTED)
+
+
+def _cartoon_axes(ax):
+    ax.set_xlim(-0.42, 1.55)
+    ax.axis("off")
+
+
+def _cartoon_sizes(ax, counts):
+    """Bars proportional to log10(n + 1) on a common scale (500 = full), one per sample, coloured by class."""
+    _cartoon_axes(ax)
+    full = np.log10(501)
+    comp = {"P/LP": [(1, PATH_C, "")], "B/LB": [(1, BENIGN, "")],
+            "population": [(0.25, PATH_C, ""), (0.75, BENIGN, "")], "synonymous": [(1, BENIGN, "")]}
+    for k, (name, n) in enumerate(zip(_SAMPLES, counts)):
+        L = np.log10(n + 1) / full
+        _bar(ax, 3 - k, [(f * L, c, h) for f, c, h in comp[name]], name, str(n))
+    ax.set_ylim(-0.6, 3.6)
+
+
+def _cartoon_noise(ax, which):
+    _cartoon_axes(ax)
+    if which == "plp":
+        _bar(ax, 1, [(0.8, PATH_C, ""), (0.2, BENIGN, "////")], "P/LP", "benign: 0–20%")
+        _bar(ax, 0, [(1, BENIGN, "")], "B/LB")
+    else:
+        _bar(ax, 1, [(1, PATH_C, "")], "P/LP")
+        _bar(ax, 0, [(0.8, BENIGN, ""), (0.2, PATH_C, "////")], "B/LB", "pathogenic: 0–20%")
+    ax.set_ylim(-0.6, 1.6)
+
+
+def _cartoon_mech(ax):
+    _cartoon_axes(ax)
+    m1, m2 = COLORS[ASSAYS[0]], COLORS[ASSAYS[1]]
+    _bar(ax, 1, [(0.75, m1, "////"), (0.25, m2, "")], "P/LP", "M1: 0–100%")
+    _bar(ax, 0, [(POP_M1_FRAC, m1, ""), (1 - POP_M1_FRAC, m2, "")], "population\npathogenic", "M1: 25%")
+    ax.set_ylim(-0.6, 1.6)
+
+
+def _cartoon_shift(ax):
+    xs = np.linspace(-6, 3, 200)
+    g = lambda m: np.exp(-0.5 * (xs - m) ** 2)
+    ax.plot(xs, g(0), color=BENIGN, lw=1.0)
+    for k, a in ((1.5, 1.0), (2.5, 0.6), (4.0, 0.35)):
+        ax.plot(xs, g(-k), color=PATH_C, lw=1.0, alpha=a)
+    ax.annotate("", xy=(-4, 1.12), xytext=(0, 1.12), arrowprops=dict(arrowstyle="<->", color=MUTED, lw=0.7))
+    ax.text(-2, 1.2, "κ = 1.5, 2.5, 4", fontsize=5.8, color=MUTED, ha="center", va="bottom")
+    ax.set_xlim(-8.5, 5)
+    ax.set_ylim(0, 1.6)
+    ax.axis("off")
+
+
+def _cartoon_corr(ax, kappa):
+    ax.axis("off")
+    for k, rho in enumerate((0.0, 0.6)):
+        sub = ax.inset_axes([0.08 + 0.33 * k, 0.2, 0.28, 0.85])
+        _clouds(sub, kappa=kappa, rho=rho, n=70)
+        sub.set_xlabel("")
+        sub.set_ylabel("")
+        for s in sub.spines.values():
+            s.set_color(GRID)
+        sub.text(0.5, -0.04, f"ρ = {rho:g}", transform=sub.transAxes, fontsize=5.8, color=MUTED, ha="center",
+                 va="top")
+    ax.text(0.76, 0.45, "e1 and e2\ncorrelated", transform=ax.transAxes, fontsize=5.6, color=MUTED, va="center")
+
+
 def make_figure(summ, out_path):
-    fig = plt.figure(figsize=(7.2, 10.0))
-    gs = fig.add_gridspec(4, 3, height_ratios=[1.55, 1, 1, 1], hspace=0.62, wspace=0.34,
-                          left=0.08, right=0.985, top=0.975, bottom=0.075)
-    ax_a = fig.add_subplot(gs[0, :])
+    fig = plt.figure(figsize=(7.2, 11.2))
+    outer = fig.add_gridspec(4, 1, height_ratios=[1.3, 1.35, 1.35, 1.35], hspace=0.42,
+                             left=0.08, right=0.985, top=0.975, bottom=0.075)
+    ax_a = fig.add_subplot(outer[0])
     _schematic(ax_a, sel(summ, experiment="1_clean", regime="rich", true_prior=0.25))
     _panel_letter(ax_a, "a", x=-0.05, y=0.98)
 
-    grid = [fig.add_subplot(gs[r, c]) for r in (1, 2, 3) for c in range(3)]
-    clean = [("rich", "Rich controls (100/100/500/200)"), ("TPK1-like", "TPK1-like controls (8/1/50/20)"),
-             ("KCNH2_Kozek-like", "KCNH2-like controls (3/0/10/6)")]
-    for ax, (reg, title) in zip(grid[:3], clean):
+    grid, carts = [], []
+    for r in (1, 2, 3):
+        inner = outer[r].subgridspec(2, 3, height_ratios=[0.32, 1], hspace=0.12, wspace=0.34)
+        carts += [fig.add_subplot(inner[0, c]) for c in range(3)]
+        grid += [fig.add_subplot(inner[1, c]) for c in range(3)]
+    clean = [("rich", "Rich controls"), ("TPK1-like", "Sparse controls"), ("KCNH2_Kozek-like", "Very sparse controls")]
+    for ax, cax, (reg, title) in zip(grid[:3], carts[:3], clean):
         df = sel(summ, experiment="1_clean", regime=reg)
         ax.plot([0, 0.45], [0, 0.45], color=MUTED, ls="--", lw=0.8, zorder=1)
         _points(ax, df, "true_prior", 0.45, expected=False)
         ax.set_xlim(0, 0.45)
         ax.set_xticks([0, 0.1, 0.2, 0.3, 0.4])
-        _style(ax, title, "True prior", (0, 0.6))
+        _style(ax, "", "True prior", (0, 0.6))
+        _cartoon_sizes(cax, REGIMES[reg])
+        cax.set_title(title, loc="left", color=INK, pad=2, fontsize=7.5)
     for assay in ASSAYS:
         grid[0].plot([0, 0.45], [0, 0.45 * DETECTED[assay]], color=COLORS[assay], ls=":", lw=0.9, zorder=1)
     grid[0].text(0.01, 0.56, "dotted: fraction pathogenic\nand scoring abnormal", fontsize=5.8, color=MUTED, va="top")
 
     specs = [
         (grid[3], "2_noise_plp", "eps_p", "Benign variants labelled P/LP", "Fraction of P/LP that are benign",
-         (0.03, 0.22), (0.1, 0.45), [0.05, 0.1, 0.15, 0.2], {}),
+         (0.03, 0.22), (0.1, 0.45), [0.05, 0.1, 0.15, 0.2], {}, lambda c: _cartoon_noise(c, "plp")),
         (grid[4], "2_noise_blb", "delta_b", "Pathogenic variants labelled B/LB", "Fraction of B/LB that are pathogenic",
-         (0.03, 0.22), (0.1, 0.45), [0.05, 0.1, 0.15, 0.2], {}),
-        (grid[5], "3_mech_bias", "lab_m1_frac", "P/LP mechanism mix", "Fraction of P/LP via M1 (gnomAD: 0.25)",
-         (-0.07, 1.07), (0, 0.85), [0, 0.25, 0.5, 0.75, 1], {}),
-        (grid[6], "4_separation", "delta", "Separation (true prior 0.25)", "Abnormal shift Δ (SD)",
-         (1.2, 4.3), (0.1, 0.45), [1.5, 2.5, 4], {"true_prior": 0.25}),
-        (grid[7], "5_correlation", "rho", "Correlated mechanisms, Δ = 4", "Correlation ρ",
-         (-0.08, 0.68), (0.1, 0.45), [0, 0.3, 0.6], {"true_prior": 0.25, "delta": 4.0}),
-        (grid[8], "5_correlation", "rho", "Correlated mechanisms, Δ = 2.5", "Correlation ρ",
-         (-0.08, 0.68), (0.1, 0.45), [0, 0.3, 0.6], {"true_prior": 0.25, "delta": 2.5}),
+         (0.03, 0.22), (0.1, 0.45), [0.05, 0.1, 0.15, 0.2], {}, lambda c: _cartoon_noise(c, "blb")),
+        (grid[5], "3_mech_bias", "lab_m1_frac", "P/LP mechanism mix", "Fraction of P/LP via M1 (population: 0.25)",
+         (-0.07, 1.07), (0, 0.85), [0, 0.25, 0.5, 0.75, 1], {}, _cartoon_mech),
+        (grid[6], "4_separation", "delta", "Separation", "Abnormal shift κ (SD)",
+         (1.2, 4.3), (0.1, 0.45), [1.5, 2.5, 4], {"true_prior": 0.25}, _cartoon_shift),
+        (grid[7], "5_correlation", "rho", "Correlated mechanisms, κ = 4", "Correlation ρ",
+         (-0.08, 0.68), (0.1, 0.45), [0, 0.3, 0.6], {"true_prior": 0.25, "delta": 4.0},
+         lambda c: _cartoon_corr(c, 4.0)),
+        (grid[8], "5_correlation", "rho", "Correlated mechanisms, κ = 2.5", "Correlation ρ",
+         (-0.08, 0.68), (0.1, 0.45), [0, 0.3, 0.6], {"true_prior": 0.25, "delta": 2.5},
+         lambda c: _cartoon_corr(c, 2.5)),
     ]
-    for ax, exp, xcol, title, xlabel, xlim, ylim, xticks, extra in specs:
+    for (ax, exp, xcol, title, xlabel, xlim, ylim, xticks, extra, cart), cax in zip(specs, carts[3:]):
         df = sel(summ, experiment=exp, **extra)
         ax.axhline(0.25, color=MUTED, ls="--", lw=0.8, zorder=1)
         _points(ax, df, xcol, xlim[1] - xlim[0], expected=exp in ("2_noise_plp", "2_noise_blb", "3_mech_bias"))
         ax.set_xlim(*xlim)
         ax.set_xticks(xticks)
-        _style(ax, title, xlabel, ylim)
-    for ax, letter in zip(grid, "bcdefghij"):
-        _panel_letter(ax, letter)
+        _style(ax, "", xlabel, ylim)
+        cart(cax)
+        cax.set_title(title, loc="left", color=INK, pad=2, fontsize=7.5)
+    for cax, letter in zip(carts, "bcdefghij"):
+        cax.text(-0.02, 1.02, letter, transform=cax.transAxes, fontsize=9, fontweight="bold", color=INK,
+                 va="bottom", ha="right")
 
     handles = [plt.Line2D([], [], marker="o", ls="", color=COLORS[a], mec="white", ms=5,
                           label=f"{SHORT[a]}: {LONG[a]}") for a in ASSAYS]
@@ -198,9 +303,73 @@ def make_figure(summ, out_path):
         plt.Line2D([], [], marker="o", ls="", color=MUTED, mfc="white", ms=4.5, label="ExCALIBR fit"),
         plt.Line2D([], [], color=MUTED, alpha=0.45, lw=1.0, label="large-sample expectation"),
         plt.Line2D([], [], color=MUTED, ls="--", lw=0.8, label="true prior"),
+        plt.Rectangle((0, 0), 1, 1, color=PATH_C, label="pathogenic (sample cartoons)"),
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=7, frameon=False, fontsize=6.3, columnspacing=1.0,
-               handletextpad=0.4, bbox_to_anchor=(0.5, 0.005))
+    fig.legend(handles=handles, loc="lower center", ncol=4, frameon=False, fontsize=6.3, columnspacing=1.0,
+               handletextpad=0.4, bbox_to_anchor=(0.5, 0.003))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300)
+    fig.savefig(out_path.with_suffix(".pdf"))
+    plt.close(fig)
+    return out_path
+
+
+def make_sample_size_figure(ss, out_path):
+    """Supplementary figure: bias (a-d) and SD (e-h) of the true-component prior estimate as one control sample at a
+    time is reduced (true prior 0.25; others at 100/100/500/200). Filled: all estimates (before the discard rule);
+    open: estimates kept by the discard rule (prior <= 0.001 or >= 0.999 dropped). Lines: closed-form predictions
+    (delta-method P/LP bias; asymptotic SD, Proposition 2)."""
+    from analysis.prior_simulation.simulate_priors import predicted_plp_bias, predicted_sd
+    from analysis.prior_simulation.summary import BASE_COUNTS, SAMPLES
+    fig, axes = plt.subplots(2, 4, figsize=(7.2, 4.4), gridspec_kw=dict(hspace=0.55, wspace=0.38))
+    fig.subplots_adjust(left=0.075, right=0.99, top=0.93, bottom=0.17)
+    for j, sample in enumerate(SAMPLES):
+        g = ss[ss["sample"] == sample]
+        sizes = sorted(g["size"].unique(), reverse=True)
+        pos = {n: k for k, n in enumerate(sizes)}
+        for row, (col, lo, hi, ylabel, ylim) in enumerate((("bias", "bias_lo", "bias_hi", "Bias (estimate − 0.25)",
+                                                            (-0.1, 0.32)),
+                                                           ("sd", "sd_lo", "sd_hi", "SD of the estimate", (0, 0.32)))):
+            ax = axes[row, j]
+            if row == 0:
+                ax.axhline(0, color=MUTED, ls="--", lw=0.8, zorder=1)
+            for i, assay in enumerate(ASSAYS):
+                c = COLORS[assay]
+                for arm, filled, dx in (("oracle_raw", True, -0.07), ("oracle", False, 0.07)):
+                    if row == 1 and arm == "oracle":
+                        continue
+                    r = g[(g.assay == assay) & (g.arm == arm)].sort_values("size", ascending=False)
+                    x = np.array([pos[n] for n in r["size"]]) + (i - 1) * 0.16 + (dx if row == 0 else 0)
+                    m = r[col].to_numpy()
+                    err = np.vstack([m - r[lo].to_numpy(), r[hi].to_numpy() - m])
+                    ax.errorbar(x, m, yerr=err, fmt="o", ms=3.2, lw=1.0, capsize=0, color=c, zorder=3,
+                                mfc=c if filled else "white", mec=c, mew=0.9)
+                xs = np.arange(len(sizes)) + (i - 1) * 0.16
+                counts = [{**BASE_COUNTS, sample: n} for n in sizes]
+                if row == 0 and sample == "P/LP":
+                    # delta-method approximation: drawn only where >= 2.5 P/LP are expected to act through the
+                    # measured mechanism(s)
+                    ok = [k["P/LP"] * DETECTED[assay] >= 2.5 for k in counts]
+                    ax.plot(xs[ok], [predicted_plp_bias(assay, 0.25, k["P/LP"]) for k, o in zip(counts, ok) if o],
+                            color=c, lw=1.0, alpha=0.45, zorder=2)
+                if row == 1 and sample in ("P/LP", "gnomAD"):
+                    ax.plot(xs, [predicted_sd(assay, 0.25, k["gnomAD"], k["P/LP"]) for k in counts], color=c,
+                            lw=1.0, alpha=0.45, zorder=2)
+            ax.set_xticks(range(len(sizes)))
+            ax.set_xticklabels([str(int(n)) for n in sizes])
+            ax.set_xlim(-0.5, len(sizes) - 0.5)
+            _style(ax, f"{sample} reduced" if row == 0 else "", f"{sample} variants", ylim, ylabel=ylabel)
+            _panel_letter(ax, "abcdefgh"[row * 4 + j], x=-0.3, y=1.04)
+    handles = [plt.Line2D([], [], marker="o", ls="", color=COLORS[a], mec="white", ms=5,
+                          label=f"{SHORT[a]}: {LONG[a]}") for a in ASSAYS]
+    handles += [
+        plt.Line2D([], [], marker="o", ls="", color=MUTED, ms=4.5, label="all estimates"),
+        plt.Line2D([], [], marker="o", ls="", color=MUTED, mfc="white", ms=4.5, label="after discard rule"),
+        plt.Line2D([], [], color=MUTED, alpha=0.45, lw=1.0, label="closed-form prediction"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=6, frameon=False, fontsize=6.3, columnspacing=1.0,
+               handletextpad=0.4, bbox_to_anchor=(0.5, 0.0))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300)

@@ -250,6 +250,23 @@ def select_variants(ms, mask: np.ndarray) -> None:
     ms.sample_counts = ms._sample_assignments.sum(axis=0)
 
 
+def restrict_to_both_modalities(ms) -> None:
+    """Restrict a combined MultiScoreset IN PLACE to rows observed in >=1
+    predictor AND >=1 functional dimension of its CURRENT dimensions, and mark
+    it (ms.combined_population = "intersection"). Applied after build and
+    again after each per-cluster select_dims: a variant whose functional score
+    lies only in another cluster is predictor-only within this one."""
+    pred_names = set(PREDICTOR_DATASET_NAMES.values())
+    names = list(ms.dataset_names)
+    P = [i for i, n in enumerate(names) if n in pred_names]
+    F = [i for i, n in enumerate(names) if n not in pred_names]
+    observed = ~np.isnan(np.asarray(ms.scores, dtype=float))
+    keep = observed[:, P].any(axis=1) & observed[:, F].any(axis=1)
+    if not keep.all():
+        select_variants(ms, keep)
+    ms.combined_population = "intersection"
+
+
 def combined_calibration_clusters(observations, dataset_names, min_overlap_rows=30):
     """Disjoint fit clusters for a combined (predictor + functional) dataset:
     the functional readouts' own clusters (Fit._select_all_calibration_clusters
@@ -354,10 +371,6 @@ def build_combined_multiscoreset(
         combined.categorical_dims = cats
 
     if require_both_modalities:
-        n_predictor_dims = len(predictor_scoresets)
-        observed = ~combined.missing
-        has_predictor = observed[:, :n_predictor_dims].any(axis=1)
-        has_functional = observed[:, n_predictor_dims:].any(axis=1)
-        select_variants(combined, has_predictor & has_functional)
+        restrict_to_both_modalities(combined)
 
     return combined

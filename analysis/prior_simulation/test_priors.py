@@ -25,6 +25,7 @@ Run:
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,7 @@ import scipy.stats as sps
 from joblib import Parallel, delayed
 
 from analysis.prior_simulation.simulate_priors import (
-    ASSAYS, BASE, DEFAULT_OUT_DIR, G_IDX, POP_M1_FRAC, REGIMES,
+    ASSAYS, BASE, DEFAULT_OUT_DIR, EM_STARTS, G_IDX, POP_M1_FRAC, REGIMES,
     draw_classes, draw_latent, expected_prior, fit_priors, oracle_prior, readout,
 )
 
@@ -70,10 +71,58 @@ def build_settings():
     return settings
 
 
-def replicate_task(setting, seed, rep, do_fit=True, n_boot=N_BOOT, n_restarts=N_RESTARTS):
+# One-at-a-time downsampling of the standard (rich) controls, at the base setting (true prior 0.25):
+# which sample's size drives the error of the prior estimate, and is it bias or variance?
+SAMPLE_SIZE_PRIOR = 0.25
+SAMPLE_SIZE_GRID = {
+    "P/LP": (50, 20, 10, 5),
+    "B/LB": (50, 20, 10, 5, 0),
+    "gnomAD": (200, 100, 50, 20, 10),
+    "synonymous": (50, 20, 10, 5),
+}
+SAMPLE_ORDER = ("P/LP", "B/LB", "gnomAD", "synonymous")
+
+
+def _sample_size_regimes():
+    """{regime name: (n_P/LP, n_B/LB, n_gnomAD, n_syn)}: the base, then each sample reduced alone."""
+    base = REGIMES["rich"]
+    out = {"base": base}
+    for i, sample in enumerate(SAMPLE_ORDER):
+        for n in SAMPLE_SIZE_GRID[sample]:
+            counts = list(base)
+            counts[i] = n
+            out[f"{sample} = {n}"] = tuple(counts)
+    return out
+
+
+SAMPLE_SIZE_REGIMES = _sample_size_regimes()
+
+
+def regime_counts(regime):
+    return REGIMES[regime] if regime in REGIMES else SAMPLE_SIZE_REGIMES[regime]
+
+
+def build_sample_size_settings():
+    return [("6_sample_size", regime, SAMPLE_SIZE_PRIOR, dict(BASE)) for regime in SAMPLE_SIZE_REGIMES]
+
+
+def build_policy_settings():
+    """Clean controls at every regime and prior, plus the sample-size grid: settings for testing alternatives to
+    discarding boundary priors (raw per-bootstrap priors are recorded; policies are applied afterwards)."""
+    clean = [s for s in build_settings() if s[0] == "1_clean"]
+    return clean + build_sample_size_settings()
+
+
+N_BOOT_POLICY = 20  # bootstraps per fitted replicate in the policy design (a real bootstrap distribution)
+
+
+def replicate_task(setting, seed, rep, do_fit=True, n_boot=N_BOOT, n_restarts=N_RESTARTS, density_dir=None):
+    """One simulated dataset, all three assays. With `density_dir`, also saves each bootstrap fit's pathogenic and
+    benign densities at the gnomAD scores (and the true-component ones), so prior rules can be rerun without
+    refitting."""
     exp, regime, pi, params = setting
     rng = np.random.default_rng([seed, rep])
-    n_p, n_b, n_g, n_s = REGIMES[regime]
+    n_p, n_b, n_g, n_s = regime_counts(regime)
     labs = [
         draw_classes(rng, n_p, 1 - params["eps_p"], params["lab_m1_frac"]),
         draw_classes(rng, n_b, params["delta_b"], POP_M1_FRAC),
@@ -81,21 +130,41 @@ def replicate_task(setting, seed, rep, do_fit=True, n_boot=N_BOOT, n_restarts=N_
         draw_classes(rng, n_s, 0.0, POP_M1_FRAC),
     ]
     latent = [draw_latent(rng, lab, params["delta"], params["rho"]) for lab in labs]
-    out = []
-    for assay in ASSAYS:
+    out, saved = [], {}
+    for ai, assay in enumerate(ASSAYS):
         samples = [readout(e1, e2, assay) for e1, e2 in latent]
-        orc = oracle_prior(samples, samples[G_IDX], assay, params["delta"], params["rho"])
-        boots = np.asarray(fit_priors(samples, range(n_boot), num_fits=n_restarts) if do_fit else [], dtype=float)
+        orc_s = {s0: oracle_prior(samples, samples[G_IDX], assay, params["delta"], params["rho"], discard=False,
+                                  initial_prior=s0) for s0 in EM_STARTS}
+        orc_raw = orc_s[0.5]
+        orc = orc_raw if 0.001 < orc_raw < 0.999 else np.nan  # discard rule, as in production
+        boots, raw_s, dens = (fit_priors(samples, range(n_boot), num_fits=n_restarts, return_raw=True)
+                              if do_fit else ([], {s0: [] for s0 in EM_STARTS}, []))
+        boots, boots_raw = np.asarray(boots, dtype=float), np.asarray(raw_s[0.5], dtype=float)
+        if density_dir is not None and do_fit:
+            for k, fd in enumerate(dens):
+                if fd is not None:
+                    saved[f"a{ai}_b{k}_fp"], saved[f"a{ai}_b{k}_fb"] = (x.astype(np.float32) for x in fd)
         ok = boots[np.isfinite(boots)]
         out.append({
             "experiment": exp, "regime": regime, "true_prior": pi, **params, "rep": rep, "assay": assay,
             "oracle": orc,
+            "oracle_raw": orc_raw,
+            "n_plp_m1": int((labs[0] == "M1").sum()), "n_plp_m2": int((labs[0] == "M2").sum()),
+            "n_gnomad_path": int((labs[2] != "B").sum()),
             "fit": float(np.median(ok)) if len(ok) else np.nan,
             "fit_n_boot_ok": len(ok),
             "fit_n_boot": n_boot if do_fit else 0,
             "fit_n_restarts": n_restarts if do_fit else 0,
             "fit_frac_at_em_init": float(np.mean(np.abs(ok - 0.5) < 1e-3)) if len(ok) else np.nan,
+            "fit_boot_raw": ";".join(f"{v:.6g}" for v in boots_raw) if do_fit else "",
+            "oracle_raw_start01": orc_s[0.1],
+            "fit_boot_raw_start01": ";".join(f"{v:.6g}" for v in raw_s[0.1]) if do_fit else "",
         })
+    if saved:
+        density_dir = Path(density_dir)
+        density_dir.mkdir(parents=True, exist_ok=True)
+        tag = re.sub(r"[^\w.=-]+", "_", f"{exp}__{regime}__{pi}__{seed}__{rep}")
+        np.savez_compressed(density_dir / f"{tag}.npz", **saved)
     return out
 
 
@@ -183,11 +252,22 @@ def main():
     ap.add_argument("--n-rep-fit", type=int, default=N_REP_FIT)
     ap.add_argument("--n-boot", type=int, default=N_BOOT, help="bootstraps per fitted replicate")
     ap.add_argument("--n-restarts", type=int, default=N_RESTARTS, help="restarts per bootstrap")
+    ap.add_argument("--design", choices=("main", "sample_size", "policy"), default="main",
+                    help="main grid (paired_*.csv), one-at-a-time sample downsampling (sample_size_*.csv), or the "
+                         "boundary-prior policy test (policy_*.csv; raw per-bootstrap priors, 20 bootstraps)")
     args = ap.parse_args()
 
-    settings = build_settings()
+    settings = {"main": build_settings, "sample_size": build_sample_size_settings,
+                "policy": build_policy_settings}[args.design]()
+    prefix = {"main": "paired", "sample_size": "sample_size", "policy": "policy"}[args.design]
+    args.seed += {"main": 0, "sample_size": 1000, "policy": 2000}[args.design]  # own seed stream per design
+    if args.design == "policy" and args.n_boot == N_BOOT:
+        args.n_boot = N_BOOT_POLICY
     seeds = np.random.SeedSequence(args.seed).generate_state(len(settings))
-    tasks = [delayed(replicate_task)(s, int(seed), r, True, args.n_boot, args.n_restarts)
+    # The policy design keeps each bootstrap fit's gnomAD-point densities, so prior rules (start value, discard or
+    # clip, fallbacks) can be rerun later without refitting.
+    density_dir = args.out_dir / f"{prefix}_densities" if args.design == "policy" else None
+    tasks = [delayed(replicate_task)(s, int(seed), r, True, args.n_boot, args.n_restarts, density_dir)
              for s, seed in zip(settings, seeds) for r in range(args.n_rep_fit)]
     tasks += [delayed(oracle_chunk)(s, int(seed), r0, min(r0 + ORACLE_CHUNK, args.n_rep_oracle))
               for s, seed in zip(settings, seeds)
@@ -201,14 +281,14 @@ def main():
     uniq = reps[ek].drop_duplicates().copy()
     uniq["expected_prior"] = [
         expected_prior(r.assay, r.true_prior, r.delta, r.rho, r.eps_p, r.delta_b, r.lab_m1_frac,
-                       has_benign=REGIMES[r.regime][1] > 0)
+                       has_benign=regime_counts(r.regime)[1] > 0)
         for r in uniq.itertuples()
     ]
     reps = reps.merge(uniq, on=ek, how="left")
-    reps.to_csv(args.out_dir / "paired_replicates.csv", index=False, float_format="%.4f")
+    reps.to_csv(args.out_dir / f"{prefix}_replicates.csv", index=False, float_format="%.4f")
     stats = tests(reps)
-    stats.to_csv(args.out_dir / "paired_tests.csv", index=False, float_format="%.4g")
-    print(f"wrote {args.out_dir / 'paired_replicates.csv'} and paired_tests.csv ({len(stats)} tests)")
+    stats.to_csv(args.out_dir / f"{prefix}_tests.csv", index=False, float_format="%.4g")
+    print(f"wrote {args.out_dir / f'{prefix}_replicates.csv'} and {prefix}_tests.csv ({len(stats)} tests)")
 
 
 if __name__ == "__main__":

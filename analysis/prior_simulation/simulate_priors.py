@@ -141,13 +141,17 @@ def class_weights(dens, tol=1e-10, max_iter=10_000):
     return w
 
 
-def prior_em(f_p, f_b):
-    """Production prior EM plus get_fit_prior's discard rule (standard mode)."""
-    p = estimate_prior_from_class_densities(f_p, f_b, mode="standard")
-    return np.nan if (p <= 0.001 or p >= 0.999) else p
+EM_STARTS = (0.5, 0.1)  # production starts the prior EM at 0.5; 0.1 is tested as an alternative
 
 
-def oracle_prior(samples, gnomad, assay, delta, rho, weights=None):
+def prior_em(f_p, f_b, discard=True, initial_prior=0.5):
+    """Production prior EM plus get_fit_prior's discard rule (standard mode); `discard=False` returns the raw EM
+    estimate, so the effect of the rule itself can be measured. `initial_prior` is the EM starting value."""
+    p = estimate_prior_from_class_densities(f_p, f_b, mode="standard", initial_prior=initial_prior)
+    return np.nan if discard and (p <= 0.001 or p >= 0.999) else p
+
+
+def oracle_prior(samples, gnomad, assay, delta, rho, weights=None, discard=True, initial_prior=0.5):
     """Weights from `samples` (or given); prior EM on the full gnomAD sample."""
     if weights is None:
         weights = []
@@ -156,7 +160,7 @@ def oracle_prior(samples, gnomad, assay, delta, rho, weights=None):
             weights.append(class_weights(d))
     dg = np.vstack([class_density(gnomad, c, assay, delta, rho) for c in CLASSES])
     w_b = weights[S_IDX] if len(samples[B_IDX]) == 0 else (weights[B_IDX] + weights[S_IDX]) / 2
-    return prior_em(weights[P_IDX] @ dg, w_b @ dg)
+    return prior_em(weights[P_IDX] @ dg, w_b @ dg, discard=discard, initial_prior=initial_prior)
 
 
 def expected_prior(assay, pi, delta, rho, eps_p, delta_b, lab_m1_frac, has_benign=True, seed=12345):
@@ -175,9 +179,36 @@ def expected_prior(assay, pi, delta, rho, eps_p, delta_b, lab_m1_frac, has_benig
 
 # ── production fit ───────────────────────────────────────────────────────────
 
-def fit_priors(samples, seeds, num_fits=1):
+def fit_gnomad_densities(model, scores, sample_assignments, benign_method, pathogenic_idx, benign_idx, gnomad_idx,
+                         synonymous_idx):
+    """The fitted pathogenic and benign-reference densities at the gnomAD scores, built exactly as get_fit_prior
+    builds them in standard mode (default path: no LR-filtered pathogenic mask, no pathomechanism correction)."""
+    from src.assay_calibration.fit_utils.cfusn import density_utils
+    from src.assay_calibration.fit_utils.point_ranges import _get_benign_reference_weights
+    if benign_idx is None:
+        benign_idx = synonymous_idx
+    if benign_method == "synonymous":
+        benign_idx = synonymous_idx
+    params, weights = model["component_params"], model["weights"]
+    population = scores[sample_assignments[:, gnomad_idx]]
+    f_p = density_utils.joint_densities(population, params, weights[pathogenic_idx]).sum(axis=0)
+    w_b = _get_benign_reference_weights(weights, benign_method, benign_idx, synonymous_idx)
+    f_b = density_utils.joint_densities(population, params, w_b).sum(axis=0)
+    return f_p, f_b
+
+
+def raw_fit_prior(*args, initial_prior=0.5):
+    """The prior get_fit_prior computes in standard mode, BEFORE its discard rule (prior <= 0.001 or >= 0.999 -> NaN),
+    from the same densities and EM, so alternative rules can be tested without touching production code."""
+    return prior_em(*fit_gnomad_densities(*args), discard=False, initial_prior=initial_prior)
+
+
+def fit_priors(samples, seeds, num_fits=1, return_raw=False):
     """Production 2-component Gaussian fit, `num_fits` restarts per bootstrap (best by
-    held-out log-likelihood, as in production), one prior per bootstrap seed."""
+    held-out log-likelihood, as in production), one prior per bootstrap seed. With `return_raw`, returns
+    (priors, raw_priors, densities): raw_priors[start] are the estimates before the discard rule with the EM started
+    at each value in EM_STARTS, and densities[k] = (f_p, f_b) at the gnomAD scores (None if the fit failed), so any
+    other prior rule can be applied later without refitting."""
     from src.assay_calibration.data_utils.dataset import BasicScoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -196,7 +227,7 @@ def fit_priors(samples, seeds, num_fits=1):
         else:
             idx = dict(benign_idx=None, gnomad_idx=G_IDX - 1, synonymous_idx=S_IDX - 1)
             benign_method = "synonymous"
-        out = []
+        out, raw, dens = [], {s0: [] for s0 in EM_STARTS}, []
         for b in seeds:
             try:
                 models, best, _ = fitter.run(
@@ -207,9 +238,18 @@ def fit_priors(samples, seeds, num_fits=1):
                 p, _ = get_fit_prior({"fit": m}, ss.scores, benign_method, pathogenic_idx=P_IDX,
                                      sample_assignments=ss.sample_assignments, **idx)
             except Exception:
-                p = np.nan
+                m, p = None, np.nan
+            fd = None
+            if return_raw and m is not None:
+                try:
+                    fd = fit_gnomad_densities(m, ss.scores, ss.sample_assignments, benign_method, P_IDX, **idx)
+                except Exception:
+                    fd = None
+            for s0 in EM_STARTS:
+                raw[s0].append(np.nan if fd is None else prior_em(*fd, discard=False, initial_prior=s0))
             out.append(p)
-    return out
+            dens.append(fd)
+    return (out, raw, dens) if return_raw else out
 
 
 # ── tasks ────────────────────────────────────────────────────────────────────
@@ -374,3 +414,65 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ── closed-form theory (Supplementary Section "Prior estimation: theory and simulations") ─────────────────────
+
+# Fraction of pathogenic population variants each assay detects (rho = 0): M1-only reads M1, M2-only reads M2, the
+# combined assay reads both. Pathogenic variants acting through an unmeasured mechanism score like benign variants.
+DETECTED = {"A1 (M1 only)": POP_M1_FRAC, "A2 (M2 only)": 1 - POP_M1_FRAC, "A3 (M1+M2)": 1.0}
+
+
+def predicted_prior(experiment, assay, pi, eps_p=0.0, delta_b=0.0, lab_m1_frac=POP_M1_FRAC):
+    """Large-sample limit of the estimate from the mixture identity (rho = 0; benign reference = average of B/LB and
+    synonymous). Solving p_G = a p_SP + (1 - a) p_ref for a, with each labeled density a mixture of the true class
+    densities:
+      benign variants among P/LP (eps):       a = pi / (1 - eps)
+      pathogenic variants among B/LB (delta): a = (pi - delta/2) / (1 - delta/2)
+      P/LP mechanism mix m (fraction via M1): a = pi * w_pop / w_lab for a single-mechanism assay (w = fraction of
+                                              pathogenic variants it detects), and pi for the combined assay, whose
+                                              score distribution is the same for M1 and M2 variants.
+    NaN where the prior is not identified (w_lab = 0); values are clipped to [0, 1]."""
+    if experiment == "2_noise_plp":
+        a = pi / (1 - eps_p)
+    elif experiment == "2_noise_blb":
+        a = (pi - delta_b / 2) / (1 - delta_b / 2)
+    elif experiment == "3_mech_bias":
+        if assay == "A3 (M1+M2)":
+            a = pi
+        else:
+            w_pop = DETECTED[assay]
+            w_lab = lab_m1_frac if assay == "A1 (M1 only)" else 1 - lab_m1_frac
+            if w_lab == 0:
+                return np.nan
+            a = pi * w_pop / w_lab
+    else:
+        a = pi
+    return float(min(max(a, 0.0), 1.0))
+
+
+def fisher_information(assay, pi, delta=4.0, rho=0.0):
+    """I(pi) = integral of (p_P - p_B)^2 / p_G: the information per population variant about the prior when the
+    class densities are known. p_P is the population mix of M1 and M2 pathogenic densities."""
+    from scipy.integrate import quad
+    d = lambda x, c: class_density(np.atleast_1d(x), c, assay, delta, rho)[0]
+    p_p = lambda x: POP_M1_FRAC * d(x, "M1") + (1 - POP_M1_FRAC) * d(x, "M2")
+    p_g = lambda x: pi * p_p(x) + (1 - pi) * d(x, "B")
+    lo, hi = -delta - 10, 8
+    return quad(lambda x: (p_p(x) - d(x, "B")) ** 2 / p_g(x), lo, hi, limit=400)[0]
+
+
+def predicted_sd(assay, pi, n_gnomad, n_plp, delta=4.0, rho=0.0):
+    """Asymptotic SD of the estimate: a population term 1/(n_G I) plus, for an assay detecting a fraction w of
+    pathogenic variants, the delta-method term pi^2 (1 - w) / (n_P w) from estimating w from the P/LP sample."""
+    w = DETECTED[assay]
+    var = 1 / (n_gnomad * fisher_information(assay, pi, delta, rho)) + pi ** 2 * (1 - w) / (n_plp * w)
+    return float(np.sqrt(var))
+
+
+def predicted_plp_bias(assay, pi, n_plp):
+    """Second-order (delta-method) bias from a small P/LP sample: the estimate behaves as pi * w / w_hat with
+    w_hat ~ Binomial(n_P, w) / n_P, and E[1/w_hat] ~ (1/w)(1 + (1 - w)/(n_P w)), so bias ~ pi (1 - w) / (n_P w).
+    An approximation, accurate when n_P w is not small."""
+    w = DETECTED[assay]
+    return float(pi * (1 - w) / (n_plp * w))
