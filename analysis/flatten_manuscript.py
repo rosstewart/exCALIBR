@@ -22,7 +22,7 @@ def read_macros(macros_tex: Path) -> Dict[str, str]:
             re.match(r"\\newcommand\{\\([A-Za-z]+)\}\{(.*)\}\s*$", line)
         if m:
             value = m.group(2)
-            hl = re.fullmatch(r"\\textcolor\{red\}\{(.*)\}", value)
+            hl = re.fullmatch(r"\\textcolor(?:\[[^\]]*\])?\{[^}]*\}\{(.*)\}", value)  # any HIGHLIGHT_COLOR
             out[m.group(1)] = hl.group(1) if hl else value
     return out
 

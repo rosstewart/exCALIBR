@@ -39,6 +39,18 @@ import matplotlib.patches as mpatches
 from adjustText import adjust_text  # pip install adjustText
 
 
+
+def _defined_priors(summary):
+    """Per-fit priors for display, without fits whose prior is undefined
+    (summary['prior_degenerate'], set only with
+    PipelineConfig.exclude_degenerate_prior_fits) -- the same fits the
+    pipeline leaves out of the median prior."""
+    priors = np.atleast_1d(np.asarray(summary['priors'], dtype=float))
+    degen = summary.get('prior_degenerate') if hasattr(summary, 'get') else None
+    if degen is not None and len(degen) == len(priors) and not np.all(degen):
+        priors = priors[~np.asarray(degen, dtype=bool)]
+    return priors
+
 def _display_dataset(name) -> str:
     """Figure-label dataset name: the internal "_clinvar_2018" suffix is dropped."""
     name = str(name)
@@ -187,7 +199,7 @@ def plot_scoreset_compare_point_assignments(dataset, scoresets, summary, scorese
             tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(
                 summary[(config, n_c)]['prior'], point_values,
             )
-            priors = np.percentile(np.array(summary[(config, n_c)]['priors']),[5,50,95])
+            priors = np.percentile(_defined_priors(summary[(config, n_c)]),[5,50,95])
 
             ax_lr.set_title(f"{st} LR+ {config}\nprior: {priors[1]:.3f} ({priors[0]:.3f}-{priors[2]:.3f}), C: {summary[(config, n_c)]['C']}", fontsize=10)
             add_thresholds(tauP, tauB, ax_lr)
@@ -443,7 +455,7 @@ def plot_summary(scoreset: Scoreset, fits: List[Dict], summary:Dict, score_range
         ax.plot(score_range,llr_curves[i],color=c,label=labels[i])
     point_values = sorted(list(set([abs(int(k)) for k in summary['point_ranges'].keys()])))
     tauP,tauB,_ = list(map(np.log, thresholds_from_prior(summary['prior'],point_values)) )
-    priors = np.percentile(np.array(summary['priors']),[5,50,95])
+    priors = np.percentile(_defined_priors(summary),[5,50,95])
     ax.set_title(f"{_display_dataset(dataset)} ({n_c}, median:{use_median_prior},em:{not use_2c_equation}): prior: {priors[1]:.3f} ({priors[0]:.3f}-{priors[2]:.3f}), C: {C}")
     add_thresholds(tauP, tauB, ax)
     ax.set_xlabel("Score")
@@ -585,7 +597,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(
         indv_summary['prior'], point_values_all,
     )
-    priors = np.percentile(np.array(indv_summary['priors']),[pathogenic_percentile,50,benign_percentile])
+    priors = np.percentile(_defined_priors(indv_summary),[pathogenic_percentile,50,benign_percentile])
     
     # Identify which point values have insufficient evidence (empty ranges)
     point_ranges_dict = {int(k): v for k, v in indv_summary['point_ranges'].items()}

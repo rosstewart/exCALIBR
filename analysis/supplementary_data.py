@@ -1,6 +1,9 @@
 """
 Supplementary Data 1-3 for the Nature Genetics manuscript, built from
 pipeline output (Supplementary Data 4, All of Us, is a collaborator file).
+Supplementary Data 5-6 (Human Domainome 1, Reviewer 3) reuse build_sd1 and
+extended_data_appendix.build_appendix_pdf on the Domainome calibrations
+(analysis/domainome/build_domainome_supplementary_data.py).
 
 - SD1 `SD1_dataset_summaries.csv`: one row per calibrated dataset, same
   columns/order as `ExCALIBR_latex_src/old_supp_data_1_dataset_summaries.csv`.
@@ -53,10 +56,10 @@ def _fmt_ranges(ranges) -> str:
     return ";".join(f"{_fmt_bound(lo)} {_fmt_bound(hi)}" for lo, hi in (ranges or []))
 
 
-def _resolved_calibration(dataset: str, tree, model_selections, dataset_configs) -> Dict:
+def _resolved_calibration(dataset: str, tree, model_selections, dataset_configs, output_dir=None) -> Dict:
     from analysis.discovery import resolve_component
     comp = resolve_component(dataset, list(tree[dataset].keys()), model_selections, dataset_configs)
-    path = next(iter(sorted((Path(cfg.OUTPUT_DIR) / dataset).glob(f"{dataset}_{comp}_calibration.json"))), None)
+    path = next(iter(sorted((Path(output_dir or cfg.OUTPUT_DIR) / dataset).glob(f"{dataset}_{comp}_calibration.json"))), None)
     if path is None:
         raise FileNotFoundError(f"{dataset}: no calibration json for component {comp}")
     with open(path) as f:
@@ -114,17 +117,19 @@ def _heldout_yang_cell(row: Optional[pd.Series], sample: str, n_fit: int, min_n:
     return f"{med:.3f} ({lo:.3f}-{hi:.3f})"
 
 
-def fit_sample_counts(dataset: str) -> Dict[str, int]:
+def fit_sample_counts(dataset: str, dataset_tsv=None) -> Dict[str, int]:
     """Sample sizes as the pipeline constructs them for fitting (Scoreset from
-    load_dataset_from_df with the run's PipelineConfig)."""
+    load_dataset_from_df with the run's PipelineConfig). `dataset_tsv`
+    defaults to cfg.DATASET_TSV (another resource, e.g. Domainome, otherwise)."""
     from src.assay_calibration.pipeline.config import PipelineConfig
     from src.assay_calibration.pipeline.utils import load_dataset_from_df
     from analysis.discovery import load_master_df
 
-    df_full = load_master_df(str(cfg.DATASET_TSV))
+    dataset_tsv = str(dataset_tsv or cfg.DATASET_TSV)
+    df_full = load_master_df(dataset_tsv)
     df_ds = df_full[df_full["Dataset"] == dataset.replace("_clinvar_2018", "")].copy()
     df_ds["Dataset"] = dataset
-    pcfg = PipelineConfig(dataset_csv=str(cfg.DATASET_TSV), dataset_name=dataset, output_dir="/tmp",
+    pcfg = PipelineConfig(dataset_csv=dataset_tsv, dataset_name=dataset, output_dir="/tmp",
                           clinvar_release="2018" if "_clinvar_2018" in dataset else "2025")
     scoreset = load_dataset_from_df(df_ds, pcfg)
     # Pair names with counts positionally over ALL samples: `scoreset.samples` yields only non-empty samples, so
@@ -137,8 +142,11 @@ def fit_sample_counts(dataset: str) -> Dict[str, int]:
 def build_sd1(datasets: List[str], tree, model_selections, dataset_configs, df_variants: pd.DataFrame,
               df_all_groups: Optional[pd.DataFrame] = None, yang_df: Optional[pd.DataFrame] = None,
               curated_csv: Optional[str] = None, yang_heldout_df: Optional[pd.DataFrame] = None,
+              output_dir=None, dataset_tsv=None,
               ) -> (pd.DataFrame, List[str]):
-    """SD1 rows for `datasets`. Returns (table, problems)."""
+    """SD1 rows for `datasets`. Returns (table, problems). `output_dir` and
+    `dataset_tsv` default to cfg.OUTPUT_DIR / cfg.DATASET_TSV; SD5 (Domainome)
+    passes its own."""
     from analysis.plot_common import sample_matches
 
     problems = []
@@ -172,12 +180,12 @@ def build_sd1(datasets: List[str], tree, model_selections, dataset_configs, df_v
         auth = sub["auth_label"].astype(str) if "auth_label" in sub else pd.Series(dtype=str)
         row["author_assignments_provided"] = bool(auth.str.upper().isin(["NORMAL", "ABNORMAL"]).any())
         try:
-            row.update(fit_sample_counts(ds))
+            row.update(fit_sample_counts(ds, dataset_tsv=dataset_tsv))
         except Exception as e:  # noqa: BLE001 -- reported, not hidden
             problems.append(f"{ds}: fit sample counts failed ({e})")
             row.update({f"{k}_fit": "" for k in _SAMPLES})
 
-        cal = _resolved_calibration(ds, tree, model_selections, dataset_configs)
+        cal = _resolved_calibration(ds, tree, model_selections, dataset_configs, output_dir=output_dir)
         pr = cal.get("point_ranges", {})
         for i in [*range(-8, 0), *range(1, 9)]:
             row[f"range_{i}"] = _fmt_ranges(pr.get(str(i), []))

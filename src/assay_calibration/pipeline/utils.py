@@ -138,7 +138,12 @@ def save_results(
             import numpy as _np
             llr = _np.asarray(calibration['log_lr_plus'])
             pct = _np.nanpercentile(llr, [5, 50, 95], axis=0)
-            priors_arr = _np.asarray(calibration.get('priors', calibration['prior']))
+            priors_arr = _np.atleast_1d(_np.asarray(calibration.get('priors', calibration['prior']), dtype=float))
+            # Undefined (EM-start) priors are left out when
+            # exclude_degenerate_prior_fits flagged them (all-False otherwise).
+            degen = calibration.get('prior_degenerate')
+            if degen is not None and len(degen) == len(priors_arr) and not _np.all(degen):
+                priors_arr = priors_arr[~_np.asarray(degen, dtype=bool)]
             priors_pct = _np.nanpercentile(priors_arr, [5, 50, 95]).tolist()
             lr_data = {
                 'dataset': config.dataset_name,
@@ -229,6 +234,8 @@ def load_dataset_from_df(df, config):
             min_clinvar_star=config.min_clinvar_star,
             population_type=config.population_type,
             synonymous_exclusive=getattr(config, "synonymous_exclusive", False),
+            missense_controls_only=getattr(config, "missense_controls_only", False),
+            extra_sample=getattr(config, "extra_sample", None),
             spliceai_threshold=getattr(config, "spliceai_threshold", 0.2),
             vep_splice_filter=getattr(config, "vep_splice_filter", True),
         )

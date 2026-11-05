@@ -687,7 +687,7 @@ def build(out_dir):
 
     pticks = [0, 0.1, 0.2, 0.3, 0.4, 0.5]
     charts_clean = "".join(panel(
-        {"rich": "Rich controls (100 / 100 / 500 / 200)", "TPK1-like": "TPK1-like (8 / 1 / 50 / 20)",
+        {"rich": "Rich samples (100 / 100 / 500 / 200)", "TPK1-like": "TPK1-like (8 / 1 / 50 / 20)",
          "KCNH2_Kozek-like": "KCNH2_Kozek-like (3 / 0 / 10 / 6)"}[reg],
         "True prior", (0, 0.45), (0, 0.6), [0, 0.1, 0.2, 0.3, 0.4], [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
         series_for(df, "true_prior", lambda r: f"true prior {r.true_prior:.2f}"), identity=True)

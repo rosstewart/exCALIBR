@@ -180,6 +180,7 @@ def run_single_dataset(
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=getattr(args, "filter_pathogenic_sample_by_lr", False),
+        exclude_degenerate_prior_fits=getattr(args, "exclude_degenerate_prior_fits", False),
         pathomechanism_method=getattr(args, "pathomechanism_method", None),
         pathomechanism_boundary_joint_prior=getattr(
             args, "pathomechanism_boundary_joint_prior", "product"
@@ -202,6 +203,9 @@ def run_single_dataset(
             "acmg_bayes_floor_at_neutral", getattr(args, "acmg_bayes_floor_at_neutral", False)
         ),
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         seed=getattr(args, "seed", None),
         spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
         vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
@@ -523,6 +527,9 @@ def _run_one_combo(
         point_values=[1, 2, 3, 4, 5, 6, 7, 8],
         n_jobs=n_bootstrap_jobs,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         acmg_mapping_method=getattr(args, "acmg_mapping_method", "tavtigian"),
         acmg_bayes_targets=getattr(args, "acmg_bayes_targets", None),
         acmg_bayes_floor_at_neutral=getattr(args, "acmg_bayes_floor_at_neutral", False),
@@ -530,6 +537,7 @@ def _run_one_combo(
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
+        exclude_degenerate_prior_fits=getattr(args, "exclude_degenerate_prior_fits", False),
         pathomechanism_method=pathomechanism_method,
         pathomechanism_boundary_joint_prior=getattr(
             args, "pathomechanism_boundary_joint_prior", "product"
@@ -583,6 +591,9 @@ def _detect_benign_sample_availability(dataset_df: pd.DataFrame, dataset_name: s
         min_clinvar_star=args.min_clinvar_star,
         population_type=args.population_type,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
         vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
     )
@@ -864,6 +875,9 @@ def generate_all_configs_viz(
         point_values=[1, 2, 3, 4, 5, 6, 7, 8],
         n_jobs=1,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         seed=getattr(args, "seed", None),
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
@@ -1174,6 +1188,16 @@ def main():
                        help="Skip datasets whose calibration JSON output already exists "
                             "(useful for resuming a failed run)")
 
+    parser.add_argument("--force-benign-reference", action="store_true",
+                       help="Use only B/LB as the benign reference for lr+ and the prior, overriding each "
+                            "dataset's benign_method; datasets without B/LB go to PU mode (no synonymous fallback).")
+    parser.add_argument("--missense-controls-only", action="store_true",
+                       help="Load Scoreset with missense_controls_only=True (P/LP and B/LB restricted to "
+                            "missense). Must match the hpc/prepare.py run that produced --precomputed-fits.")
+    parser.add_argument("--extra-sample", dest="extra_sample", default=None,
+                       choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
+                       help="5th sample used in fitting but not in lr+/prior (e.g. 'ptv'). Must match "
+                            "the hpc/prepare.py run that produced --precomputed-fits.")
     parser.add_argument("--synonymous-exclusive", action="store_true",
                        help="Load Scoreset with synonymous_exclusive=True: synonymous variants "
                             "are assigned only to the synonymous sample, not also to P/LP or B/LB. "
@@ -1234,6 +1258,13 @@ def main():
                             "the two, e.g. to sweep --pathogenic-percentile while always keeping "
                             "the benign-direction bound at the 95th percentile. Global, batch-wide "
                             "-- not settable per-dataset via --dataset-configs.")
+    parser.add_argument("--exclude-degenerate-prior-fits", action="store_true", default=False,
+                       help="Leave bootstrap fits whose standard-mode prior EM never left its 0.5 "
+                            "start (pathogenic and benign-reference densities coincide, so the "
+                            "prior is undefined) out of the median prior, prior percentiles and "
+                            "OOB median prior; they are still used for every LR+ percentile. "
+                            "Off by default (published calibrations do not use it). Global, "
+                            "batch-wide.")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
     # experimentation only -- mutually exclusive with --pathomechanism-prior below.
     # Parses with default=None; resolve_prior_mode reconciles it after parsing.

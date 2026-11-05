@@ -64,7 +64,7 @@ PRECOMPUTED_FITS = _env(
 #                            include (copied from exploratory_figures/ at the end
 #                            of each run), plus generated/ (macros.tex, tables)
 #   tables/                  LaTeX table files and IGVF data-release CSVs
-#   supplementary_data/      Supplementary Data 1-3
+#   supplementary_data/      Supplementary Data 1-6 (5-6: Human Domainome 1)
 #   submission/              flattened .tex (no personal macros) for Nature Genetics
 #   pillar_project_figures/  IGVF Pillar Project outputs (other paper)
 FIGURE_DIR = _env("EXCALIBR_FIGURE_DIR", str(Path(OUTPUT_DIR) / "exploratory_figures"))
@@ -432,6 +432,8 @@ CURATED_DATASET_METADATA_CSV = _env(
 # Review aid: render every generated number that differs from the
 # pre-automation manuscript (or is new) in red. Turn off once reviewed.
 HIGHLIGHT_CHANGED_NUMBERS = _env("EXCALIBR_HIGHLIGHT_CHANGED_NUMBERS", "1") == "1"
+# xcolor name or model spec for those numbers, e.g. "red", "blue", "[HTML]{1F6FB2}".
+HIGHLIGHT_COLOR = _env("EXCALIBR_HIGHLIGHT_COLOR", "red")
 
 # Explicit, reasoned exemptions from the manuscript build's staleness checks:
 # {input path: reason}. Every waiver is copied into build_report.md.

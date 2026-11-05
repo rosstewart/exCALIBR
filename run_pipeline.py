@@ -247,6 +247,11 @@ Examples:
     parser.add_argument("--no-pathomechanism-prior",
                        dest="pathomechanism_prior_enabled", action="store_false", default=None,
                        help=argparse.SUPPRESS)
+    parser.add_argument("--exclude-degenerate-prior-fits", action="store_true", default=False,
+                        help="Leave bootstrap fits whose standard-mode prior EM never left its 0.5 "
+                             "start (prior undefined) out of the median prior, prior percentiles "
+                             "and OOB median prior; still used for every LR+ percentile. Off by "
+                             "default (published calibrations do not use it).")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
     # experimentation only -- mutually exclusive with --pathomechanism-prior above.
     # Parses with default=None; resolve_prior_mode reconciles it after parsing.
@@ -413,6 +418,7 @@ Examples:
         pathogenic_percentile=args.pathogenic_percentile,
         benign_percentile=args.benign_percentile,
         filter_pathogenic_sample_by_lr=args.filter_pathogenic_sample_by_lr,
+        exclude_degenerate_prior_fits=args.exclude_degenerate_prior_fits,
         pathomechanism_method=args.pathomechanism_method,
         pathomechanism_boundary_joint_prior=args.pathomechanism_boundary_joint_prior,
         acmg_mapping_method=(args.acmg_mapping_method

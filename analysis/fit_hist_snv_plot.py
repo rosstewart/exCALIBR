@@ -33,6 +33,16 @@ TITLE_SPACER = 0.10
 # src/assay_calibration/plot_utils/style.py (imported above).
 
 
+def _bin_kw(hist_data, bin_width):
+    """histplot bin arguments: binwidth=bin_width, unless the scores have zero
+    range (e.g. a single B/LB variant), where binwidth gives 0 bins and numpy
+    raises -- then one bin of width bin_width centred on the value."""
+    hist_data = np.asarray(hist_data)
+    if hist_data.size and np.ptp(hist_data) == 0:
+        return dict(bins=[hist_data[0] - bin_width / 2, hist_data[0] + bin_width / 2])
+    return dict(binwidth=bin_width)
+
+
 def plot_figure_panel_a(scoreset_2018, indv_summary, fits, score_range, flipped, n_samples,
                         layout='horizontal', minimal=False, figsize=None):
     """
@@ -99,7 +109,7 @@ def plot_figure_panel_a(scoreset_2018, indv_summary, fits, score_range, flipped,
             hist_data = scoreset_2018.scores[sample_mask]
             n_count = sample_mask.sum()
             
-            sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax,
+            sns.histplot(hist_data, **_bin_kw(hist_data, bin_width), stat='density', ax=ax,
                        alpha=0.5 if sample_num != 0 else 0.7, color=color)
             
             density_sample = sample_density(score_range, fits, sample_idx)
@@ -162,7 +172,7 @@ def plot_figure_panel_a(scoreset_2018, indv_summary, fits, score_range, flipped,
             n_count = sample_mask.sum()
             
             # Plot histogram
-            sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax,
+            sns.histplot(hist_data, **_bin_kw(hist_data, bin_width), stat='density', ax=ax,
                        alpha=0.5 if sample_num != 0 else 0.7, color=color)
 
             ax.set_xlim(x_min, x_max)
@@ -285,13 +295,13 @@ def plot_figure_panel_b(scoreset, indv_summary, score_range, flipped,
                 hist_data = all_scores
                 display_name = 'All SNVs'
                 n_count = len(all_scores)
-                sns.histplot(hist_data, binwidth=bin_width, stat='count', ax=ax_twin,
+                sns.histplot(hist_data, **_bin_kw(hist_data, bin_width), stat='count', ax=ax_twin,
                            alpha=alpha, color=color)
             else:
                 hist_data = scoreset.scores[sample_mask]
                 display_name = SAMPLE_NAMES[sample_num]
                 n_count = sample_mask.sum()
-                sns.histplot(hist_data, binwidth=bin_width, stat='count', ax=ax_hist,
+                sns.histplot(hist_data, **_bin_kw(hist_data, bin_width), stat='count', ax=ax_hist,
                            alpha=alpha, color=color)
             
             face_rgba = to_rgba(color, alpha)
@@ -331,7 +341,7 @@ def plot_figure_panel_b(scoreset, indv_summary, score_range, flipped,
                 display_name = SAMPLE_NAMES[sample_num]
                 n_count = sample_mask.sum()
             
-            sns.histplot(hist_data, binwidth=bin_width, stat='density', ax=ax_hist,
+            sns.histplot(hist_data, **_bin_kw(hist_data, bin_width), stat='density', ax=ax_hist,
                        alpha=alpha, color=color)
             
             face_rgba = to_rgba(color, alpha)
@@ -500,6 +510,11 @@ def plot_figure_panel_b(scoreset, indv_summary, score_range, flipped,
             handlelength=0.8,
             borderpad=0.7
         )
+    elif not final_handles:
+        # No evidence ranges at all (uncalibratable): no legend entries, and
+        # ncol=0 would make matplotlib raise.
+        ax_legend.text(0.5, 0.5, 'No evidence assigned', ha='center', va='center',
+                       fontsize=FONTSIZE_LEGEND, transform=ax_legend.transAxes)
     else:
         # Single row for 14 or fewer items
         ncol = len(final_handles)

@@ -102,6 +102,20 @@ class PipelineConfig:
     # opt-in alternative pathogenic-sample-cleaning strategy.
     filter_pathogenic_sample_by_lr: bool = False
 
+    # Opt-in (default off: the published calibrations do not use it). In
+    # standard (P/LP + benign-reference) mode, get_fit_prior's EM starts at
+    # 0.5; a bootstrap fit whose pathogenic and benign-reference densities
+    # coincide on the population sample makes every posterior 0.5, so the EM
+    # returns its start value. That prior is undefined (the population
+    # likelihood is flat in the prior), not 0.5. When enabled, such fits
+    # (|prior - 0.5| < DEGENERATE_PRIOR_TOL) are left out of the median
+    # prior, the prior percentiles and each variant's OOB median prior, but
+    # are KEPT for every LR+ percentile (their LR+ = 1 is a genuine
+    # no-separation draw). Not applied in unmixing (PU/NU) mode or with
+    # pathomechanism_method. Falls back to all kept fits (and flags
+    # prior_unstable) if every kept fit is degenerate.
+    exclude_degenerate_prior_fits: bool = False
+
     # EXPERIMENTAL, opt-in alternative to filter_pathogenic_sample_by_lr's
     # ad-hoc row filter, for any dataset with a pathogenic-labeled sample.
     # Decomposes the pathogenic-labeled sample's score density as
@@ -291,6 +305,13 @@ class PipelineConfig:
     clinvar_release: str = "2026"
     min_clinvar_star: int = 1
     synonymous_exclusive: bool = False
+    # Sample-composition knobs, forwarded to Scoreset by load_dataset_from_df; must
+    # match the values hpc/prepare.py used when the bootstrap fits were generated.
+    missense_controls_only: bool = False
+    extra_sample: Optional[str] = None
+    # Use only the B/LB sample as the benign reference (lr+ and prior), overriding
+    # benign_method; datasets without B/LB fall back to PU mode, never synonymous.
+    force_benign_reference: bool = False
 
     # Splice-filter ablation knobs, forwarded to Scoreset.splicing_filter via
     # load_dataset_from_df -- same two knobs hpc/prepare.py already exposes

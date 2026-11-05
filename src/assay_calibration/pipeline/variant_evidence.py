@@ -885,9 +885,14 @@ def _process_variant_oob(
     benign_center: Optional[float] = None,
     benign_island_reference_scores: Optional[np.ndarray] = None,
     benign_island_min_frac: float = 0.0,
+    prior_degenerate: Optional[np.ndarray] = None,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
+
+    prior_degenerate (aligned with priors): fits whose prior is undefined
+    (PipelineConfig.exclude_degenerate_prior_fits) are left out of this
+    variant's OOB median prior but kept for its OOB LR+.
 
     This matches _process_single_variant_oob_full in point_ranges.py:
     1. Subset to OOB bootstraps
@@ -915,16 +920,21 @@ def _process_variant_oob(
     oob_priors = priors[oob_indices]
     oob_fp = log_fp[oob_indices]
     oob_fb = log_fb[oob_indices]
+    oob_degen = (np.asarray(prior_degenerate, dtype=bool)[oob_indices] if prior_degenerate is not None
+                 else np.zeros(len(oob_indices), dtype=bool))
 
     # Filter invalid priors
     valid = ~np.isnan(oob_priors) & (oob_priors > 0) & (oob_priors < 1)
     n_valid = int(valid.sum())
     oob_priors, oob_fp, oob_fb = oob_priors[valid], oob_fp[valid], oob_fb[valid]
+    oob_degen = oob_degen[valid]
 
     if len(oob_priors) < min_samples:
         return variant_idx, {"_fail": f"too_few_valid_priors ({n_valid}<{min_samples})"}
 
-    prior = float(np.nanmedian(oob_priors))
+    # Undefined priors (if flagged) are left out of the median only; all
+    # valid fits still enter the OOB LR+ below.
+    prior = float(np.nanmedian(oob_priors[~oob_degen] if (~oob_degen).any() else oob_priors))
     if prior <= 0 or prior >= 1:
         return variant_idx, {"_fail": f"invalid_median_prior ({prior})"}
 
@@ -1022,6 +1032,11 @@ def _compute_oob_evidence(
         benign_island_reference_scores = np.asarray(benign_island_reference_scores, dtype=float)
     benign_island_min_frac = calibration.get("benign_island_min_frac", 0.0) or 0.0
     valid_seeds = np.asarray(calibration["valid_bootstrap_seeds"])
+    prior_degenerate = calibration.get("prior_degenerate", None)
+    if prior_degenerate is not None:
+        prior_degenerate = np.asarray(prior_degenerate, dtype=bool)
+        if len(prior_degenerate) != len(priors):
+            prior_degenerate = None
 
     oob_map = _build_oob_mapping(scoreset, dataset_splits, valid_seeds)
     log(f"  OOB mapping built: {len(oob_map)} variants have OOB data")
@@ -1045,6 +1060,7 @@ def _compute_oob_evidence(
             benign_center=benign_center,
             benign_island_reference_scores=benign_island_reference_scores,
             benign_island_min_frac=benign_island_min_frac,
+            prior_degenerate=prior_degenerate,
         )
         for vidx, oob_idx in oob_map.items()
     )

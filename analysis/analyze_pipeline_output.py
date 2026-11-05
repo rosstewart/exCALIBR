@@ -3391,6 +3391,63 @@ if not _sd4_problems:
 REG.static("Figures_preautomation/ross_figs/fig1_cartoon.png", "Fig. 1 conceptual illustration; hand-made, maintained on Overleaf")
 
 # %% [markdown]
+# ## A12b. Supplementary Data 5-6: Human Domainome 1 (Reviewer 3)
+#
+# The seven Domainome abundance datasets (Beltran et al. 2025) for MECP2, CRX,
+# TP63, FHL1 (LIM2, LIM3) and SATB2 (CUT1, CUT2), calibrated with the selected
+# configurations in dataset_configs_domainome.json (ClinVar 2025, --oob).
+# SD5 has SD1's columns, SD6 SD2's layout (every scored variant, abundance
+# axis); both alphabetical. Built by
+# analysis/domainome/build_domainome_supplementary_data.py; skipped when the
+# Domainome outputs are not on this machine.
+
+# %%
+from analysis.domainome import build_domainome_supplementary_data as dom_sd
+
+_dom_out = dom_sd.BASE / "exc_domainome_clinvar2025_selected"
+_dom_kw = dict(output_dir=str(_dom_out), dataset_tsv=str(dom_sd.BASE / "excalibr_domainome.integrated.tsv.gz"),
+               precomputed_fits=str(dom_sd.BASE / "jobs_domainome_clinvar2025_2c3c_1000b" / "bootstrap_results.json.gz"),
+               dataset_configs_path=str(dom_sd.BASE / "dataset_configs_domainome.json"))
+if not _dom_out.exists():
+    print(f"  SD5-6 skipped: no Domainome calibrations at {_dom_out}")
+else:
+    sd5_df, _sd5_problems = dom_sd.build_sd5(
+        **_dom_kw, splits_file=str(dom_sd.BASE / "domainome_clinvar2025_dataset_splits.pkl"),
+        cache_dir=str(dom_sd.BASE / "yang_distance_cache"))
+    sd5_df.to_csv(SUPP_DATA_DIR / dom_sd.SD5_NAME, index=False)
+    print(f"  SD5: {len(sd5_df)} rows -> {SUPP_DATA_DIR / dom_sd.SD5_NAME}")
+    for _p in _sd5_problems:
+        REG.check("sd5", False, _p, "Supplementary Data 5")
+    if not _sd5_problems:
+        REG.check("sd5", True, "no problems", "Supplementary Data 5")
+    REG.check("sd5-rows", len(sd5_df) == 7, f"SD5 has {len(sd5_df)} rows (7 Domainome datasets)",
+              "Supplementary Data 5")
+    REG.check("sd5-no-internal-suffix", not sd5_df.astype(str).apply(
+        lambda c: c.str.contains("_clinvar_2018")).any().any(), "no internal suffix in SD5", "Supplementary Data 5")
+
+    dom_sd.build_sd6(SUPP_DATA_DIR / dom_sd.SD6_NAME, n_jobs=7, **_dom_kw)
+    REG.figure("supp_data_6", SUPP_DATA_DIR / dom_sd.SD6_NAME, inputs=[_dom_kw["precomputed_fits"]])
+
+    # Numbers for the Domainome sentence (Discussion) and the R3.22 response.
+    _rng = lambda r: str(r).strip() not in ("", "nan")  # noqa: E731
+    _path_cols = [f"range_{i}" for i in range(1, 9)]
+    _ben_cols = [f"range_{i}" for i in range(-8, 0)]
+    _has_path = sd5_df[_path_cols].apply(lambda r: any(_rng(v) for v in r), axis=1)
+    _has_ben = sd5_df[_ben_cols].apply(lambda r: any(_rng(v) for v in r), axis=1)
+    _max_path = sd5_df[_path_cols].apply(lambda r: max([i + 1 for i, v in enumerate(r) if _rng(v)], default=0), axis=1)
+    _dom_src = "Supplementary Data 5 (Human Domainome 1)"
+    REG.num("NumDomainomeDatasets", len(sd5_df), source=_dom_src, words=True)
+    REG.num("NumDomainomeGenes", sd5_df["gene"].nunique(), source=_dom_src, words=True)
+    REG.num("NumDomainomeDatasetsPathEvidence", int(_has_path.sum()), source=_dom_src + ": any pathogenic range",
+            words=True)
+    REG.num("NumDomainomeDatasetsBenEvidence", int(_has_ben.sum()), source=_dom_src + ": any benign range",
+            words=True)
+    REG.num("NumDomainomeDatasetsMaxPathEight", int((_max_path == 8).sum()), source=_dom_src + ": reach +8",
+            words=True)
+    REG.num("NumDomainomeDatasetsNoBLB", int((pd.to_numeric(sd5_df["n_blb_fit"]) == 0).sum()),
+            source=_dom_src + ": no B/LB controls in fitting", words=True)
+
+# %% [markdown]
 # ## A13. Zenodo data record: bootstrap fits and splits (Data availability)
 #
 # Writes config.ZENODO_DATA_DIR with the regular and skew-locked bootstrap
@@ -4094,7 +4151,7 @@ _old_values = _json.loads(OLD_VALUES_JSON.read_text()) if OLD_VALUES_JSON.exists
 # so it holds exactly the manuscript's files.
 REG.export_figures(FIGURE_DIR, MANUSCRIPT_FIGURE_DIR)
 REG.write(MANUSCRIPT_FIGURE_DIR, nature_checks=nature_genetics_checks(MAIN_TEX, SUPP_TEX), old_values=_old_values,
-          highlight_changed=config.HIGHLIGHT_CHANGED_NUMBERS)
+          highlight_changed=config.HIGHLIGHT_CHANGED_NUMBERS, highlight_color=config.HIGHLIGHT_COLOR)
 _flat_problems = flatten_manuscript([MAIN_TEX, SUPP_TEX], REG.out_dir / "macros.tex", MANUSCRIPT_FIGURE_DIR,
                                     SUBMISSION_DIR)
 if _flat_problems and REG.strict:

@@ -137,7 +137,7 @@ def cmd_configs(args):
     print(f"{len(sel)} datasets; differ from manual: n_c {int(sel.n_c_differs.sum())}, "
           f"benign_method {int(sel.benign_method_differs.sum())}, overrides {int(sel.overrides_differ.sum())}, "
           f"any {len(changed)}")
-    print(pd.crosstab(sel["manual_n_c"], sel["auto_n_c"], rmargins=True))
+    print(pd.crosstab(sel["manual_n_c"], sel["auto_n_c"], margins=True))
     print(f"wrote {CFG['manual']}, {CFG['auto']}, {SELECTION_CSV}, {CHANGED_JSON}")
 
 

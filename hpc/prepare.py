@@ -362,7 +362,8 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type,
                               force_gaussian=False, default_release="2026",
                               master_seed=DEFAULT_MASTER_SEED,
-                              spliceai_threshold=0.2, vep_splice_filter=True):
+                              spliceai_threshold=0.2, vep_splice_filter=True,
+                              missense_controls_only=False, extra_sample=None):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -382,6 +383,10 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                    spliceai_threshold=spliceai_threshold, vep_splice_filter=vep_splice_filter)
         if population_type:
             kw["population_type"] = population_type
+        if missense_controls_only:
+            kw["missense_controls_only"] = True
+        if extra_sample:
+            kw["extra_sample"] = extra_sample
         ds = Scoreset(df_ds, **kw)
     except (ValueError, KeyError) as e:
         print(f"  {dataset_name} skipping: {e}")
@@ -567,12 +572,22 @@ def run_default(args):
             master_seed=args.seed,
             spliceai_threshold=spliceai_threshold,
             vep_splice_filter=vep_splice_filter,
+            missense_controls_only=getattr(args, "missense_controls_only", False),
+            extra_sample=getattr(args, "extra_sample", None),
         )
         for ds in datasets
     )
 
     all_jobs = [j for r in results if r for j in r]
-    total_jobs, num_arrays = _save_manifest(output_dir, all_jobs, args.target_array_size, N_BOOTSTRAPS)
+    sample_settings = {
+        "population_type": args.population_type,
+        "missense_controls_only": bool(getattr(args, "missense_controls_only", False)),
+        "extra_sample": getattr(args, "extra_sample", None),
+        "n_bootstraps": N_BOOTSTRAPS,
+        "clinvar_default_release": default_release,
+    }
+    total_jobs, num_arrays = _save_manifest(output_dir, all_jobs, args.target_array_size, N_BOOTSTRAPS,
+                                            extra_index_fields={"sample_settings": sample_settings})
     _print_next_steps(output_dir, total_jobs, num_arrays)
 
 
@@ -1947,6 +1962,19 @@ def main():
         p.add_argument("--config-file", default=None,
                        help="Dataset config JSON (default: dataset_configs_jan_2026.json)")
         p.add_argument("--population-type", default=None)
+        p.add_argument("--missense-controls-only", action="store_true",
+                       help="Restrict the P/LP and B/LB samples to missense variants "
+                            "(population/synonymous/extra samples unaffected; combine with "
+                            "--population-type gnomAD_missense_nsSNV for a missense-only "
+                            "population sample). Must match at calibration.")
+        p.add_argument("--extra-sample", dest="extra_sample", default=None,
+                       choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
+                       help="Add a 5th sample fit with its own weights over the shared "
+                            "components but never used in lr+ or prior estimation -- e.g. "
+                            "'ptv' (stop-gained of any length + frameshift). Must match at "
+                            "calibration.")
+        p.add_argument("--regularization-type", dest="extra_sample", default=None,
+                       help=argparse.SUPPRESS)  # deprecated name of --extra-sample
         p.add_argument("--components", nargs="+", type=int, default=None,
                        help="Override component counts (default: per-config)")
         p.add_argument("--force-gaussian", action="store_true",
@@ -2024,7 +2052,7 @@ def main():
                       help="Score columns to iterate over")
     p_mv.add_argument("--dataset-col", default="gene_symbol")
     p_mv.add_argument("--population-type", default=None)
-    p_mv.add_argument("--regularization-type", default=None)
+    p_mv.add_argument("--extra-sample", "--regularization-type", dest="regularization_type", default=None)
     p_mv.add_argument("--components", nargs="+", type=int, default=None)
     p_mv.add_argument("--splice-measure",
                       type=lambda x: x.lower() in ("yes", "true", "1"),
@@ -2074,8 +2102,8 @@ def main():
     p_multi.add_argument("--max-dimensions", type=int, default=None,
                          help="Skip genes with more datasets than this")
     p_multi.add_argument("--population-type", default=None)
-    p_multi.add_argument("--regularization-type", default=None,
-                         choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv"],
+    p_multi.add_argument("--extra-sample", "--regularization-type", dest="regularization_type", default=None,
+                         choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
                          help="Adds a 5th sample role retaining variants regardless of "
                               "clinical label -- 'all_assayed' (every assayed variant; "
                               "used by this session's staged-init experiments) or one of "

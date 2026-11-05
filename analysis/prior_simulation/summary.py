@@ -142,7 +142,7 @@ TABLE_SETTINGS = (
        ("75\\% of P/LP via M1", dict(experiment="3_mech_bias", lab_m1_frac=0.75)),
        ("$\\kappa = 1.5$ SD", dict(experiment="4_separation", true_prior=0.25, delta=1.5)),
        ("$\\rho = 0.6$, $\\kappa = 2.5$", dict(experiment="5_correlation", true_prior=0.25, delta=2.5, rho=0.6))]
-    + [(f"3/0/10/6 controls, $P(Y=1) = {p:.2f}$", dict(experiment="1_clean", regime="KCNH2_Kozek-like", true_prior=p))
+    + [(f"3/0/10/6 samples, $P(Y=1) = {p:.2f}$", dict(experiment="1_clean", regime="KCNH2_Kozek-like", true_prior=p))
        for p in (0.10, 0.25)]
 )
 

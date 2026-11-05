@@ -870,6 +870,10 @@ class Scoreset:
                 for row in rows
             )
         self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
+        # Restrict the P/LP and B/LB samples to missense variants (population,
+        # synonymous and extra samples are unaffected; use population_type to
+        # restrict the population sample). Default off = production behaviour.
+        self.missense_controls_only = kwargs.get("missense_controls_only", False)
         self.score_avg = kwargs.get("score_avg",True)
 
         # for discordance and downsampling analyses
@@ -1020,16 +1024,16 @@ class Scoreset:
         
         """
         self.has_synomyous = any([variant.is_synonymous for variant in self.variants])
-        self.parse_regularization_type(**kwargs)
-        self.NSamples = 5 if self.regularization_type is not None else 4
+        self.parse_extra_sample(**kwargs)
+        self.NSamples = 5 if self.extra_sample is not None else 4
         self.sample_names = [
             "Pathogenic/Likely Pathogenic",
             "Benign/Likely Benign",
             "population",
             "Synonymous",
         ]
-        if self.regularization_type is not None:
-            self.sample_names.append(self.regularization_type)
+        if self.extra_sample is not None:
+            self.sample_names.append(self.extra_sample)
         variants_by_id = self.get_variants_by_id()
         self.n_variants = len(variants_by_id)
         self._sample_assignments = np.zeros(
@@ -1054,7 +1058,8 @@ class Scoreset:
         self.parse_population_type(**kwargs)
         group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
         is_pop = self.is_population_member  # avoid repeated self-lookup in tight loop
-        is_reg = self.is_regularization_member if self.regularization_type is not None else None
+        is_reg = self.is_extra_sample_member if self.extra_sample is not None else None
+        _mis_gate = getattr(self, "missense_controls_only", False)
 
         # Determine variant-matching strategy once for the whole scoreset.
         # Use .all() so a strategy is only chosen when it covers every variant.
@@ -1160,9 +1165,9 @@ class Scoreset:
                     continue
             if any(is_pop(v) for v in variants):
                 self._sample_assignments[idx, 2] = True
-            if any(v.is_pathogenic for v in variants):
+            if any(v.is_pathogenic and (v.is_missense or not _mis_gate) for v in variants):
                 self._sample_assignments[idx, 0] = True
-            if any(v.is_benign for v in variants):
+            if any(v.is_benign and (v.is_missense or not _mis_gate) for v in variants):
                 self._sample_assignments[idx, 1] = True
             if is_reg is not None and any(is_reg(v) for v in variants):
                 self._sample_assignments[idx, 4] = True
@@ -1272,25 +1277,46 @@ class Scoreset:
     
     
 
-    def parse_regularization_type(self, **kwargs):
-        regularization_type = kwargs.get("regularization_type", None)
-        valid = {None, 'all_missense_snv', 'all_assayed', 'all_snv', 'all_nsSNV'}
-        if regularization_type not in valid:
+    EXTRA_SAMPLE_TYPES = {None, 'all_missense_snv', 'all_assayed', 'all_snv', 'all_nsSNV', 'ptv'}
+
+    def parse_extra_sample(self, **kwargs):
+        """Optional fifth sample (raw column 4): fit with its own mixture weights over the
+        shared components, but given no role in lr+ or prior estimation (pipeline/visualize.py
+        assigns roles by sample name). `regularization_type` is the deprecated name of
+        `extra_sample` and is still accepted (MV tooling and saved job manifests use it)."""
+        extra = kwargs.get("extra_sample", None)
+        legacy = kwargs.get("regularization_type", None)
+        if extra is not None and legacy is not None and extra != legacy:
+            raise ValueError(f"extra_sample={extra!r} conflicts with regularization_type={legacy!r}")
+        extra = extra if extra is not None else legacy
+        if extra not in self.EXTRA_SAMPLE_TYPES:
             raise ValueError(
-                f"Invalid regularization_type {regularization_type!r}; must be one of {valid}"
+                f"Invalid extra_sample {extra!r}; must be one of {self.EXTRA_SAMPLE_TYPES}"
             )
-        self.regularization_type = regularization_type
+        self.extra_sample = extra
+        self.regularization_type = extra  # deprecated alias, kept for existing callers/pickles
+
+    def parse_regularization_type(self, **kwargs):
+        """Deprecated alias of parse_extra_sample."""
+        return self.parse_extra_sample(**kwargs)
+
+    def is_extra_sample_member(self, variant) -> bool:
+        kind = self.extra_sample
+        if kind == 'all_assayed':
+            return True
+        if kind == 'all_snv':
+            return variant.is_snv
+        if kind == 'all_nsSNV':
+            return variant.is_nsSNV
+        if kind == 'all_missense_snv':
+            return variant.is_missense and variant.is_snv
+        if kind == 'ptv':
+            return getattr(variant, "is_ptv", False)
+        return False
 
     def is_regularization_member(self, variant) -> bool:
-        if self.regularization_type == 'all_assayed':
-            return True
-        if self.regularization_type == 'all_snv':
-            return variant.is_snv
-        if self.regularization_type == 'all_nsSNV':
-            return variant.is_nsSNV
-        if self.regularization_type == 'all_missense_snv':
-            return variant.is_missense and variant.is_snv
-        return False
+        """Deprecated alias of is_extra_sample_member."""
+        return self.is_extra_sample_member(variant)
 
     def parse_population_type(self,**kwargs):
         population_type = kwargs.get("population_type",'gnomAD')
@@ -1539,6 +1565,8 @@ class Variant:
         cons_str = cons if isinstance(cons, str) else ""
         self.is_synonymous = (cons_str.lower() == "synonymous") or (cons_str == "synonymous_variant")
         self.is_missense = (cons_str == 'missense_variant') or (cons_str.lower() == 'missense')
+        # protein-truncating: stop-gain of any length (SNV or MNV) or frameshift
+        self.is_ptv = cons_str.lower() in {"stop_gained", "frameshift_variant", "nonsense", "frameshift"}
         self.is_snv = len(str(self.ref_allele)) == 1 and len(str(self.alt_allele)) == 1 and str(self.ref_allele) != str(self.alt_allele)
 
     def parse_clinvar_sig(self):

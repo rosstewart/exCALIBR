@@ -253,7 +253,7 @@ def make_figure(summ, out_path):
         inner = outer[r].subgridspec(2, 3, height_ratios=[0.32, 1], hspace=0.12, wspace=0.34)
         carts += [fig.add_subplot(inner[0, c]) for c in range(3)]
         grid += [fig.add_subplot(inner[1, c]) for c in range(3)]
-    clean = [("rich", "Rich controls"), ("TPK1-like", "Sparse controls"), ("KCNH2_Kozek-like", "Very sparse controls")]
+    clean = [("rich", "Rich samples"), ("TPK1-like", "Sparse samples"), ("KCNH2_Kozek-like", "Very sparse samples")]
     for ax, cax, (reg, title) in zip(grid[:3], carts[:3], clean):
         df = sel(summ, experiment="1_clean", regime=reg)
         ax.plot([0, 0.45], [0, 0.45], color=MUTED, ls="--", lw=0.8, zorder=1)

@@ -54,6 +54,11 @@ from ..plot_utils.utils import (
 from .config import PipelineConfig
 from .utils import load_dataset_from_df
 
+# |prior - 0.5| below this marks a standard-mode prior EM that never left its
+# 0.5 start (get_fit_prior's EM tolerance is 1e-6): see
+# PipelineConfig.exclude_degenerate_prior_fits.
+DEGENERATE_PRIOR_TOL = 1e-6
+
 _precomputed_fits_cache: Dict[str, Dict] = {}
 
 
@@ -256,7 +261,12 @@ def process_component_fits(
         raise ValueError("Must have at least pathogenic OR (benign/synonymous)")
     
     # Adjust benign_method based on available samples
-    if synonymous_idx is None and (config.benign_method == 'avg' or config.benign_method == 'synonymous'):
+    force_benign = getattr(config, "force_benign_reference", False)
+    if force_benign:
+        # Benign reference = B/LB only, whatever the dataset config says; with no B/LB the
+        # dataset goes to PU mode (synonymous is still fit but never used as reference).
+        config.benign_method = 'benign'
+    elif synonymous_idx is None and (config.benign_method == 'avg' or config.benign_method == 'synonymous'):
         logger.warning(f"  No synonymous sample, setting benign_method from {config.benign_method} to benign")
         config.benign_method = 'benign'
     elif benign_idx is None and (config.benign_method == 'avg' or config.benign_method == 'benign'):
@@ -291,6 +301,10 @@ def process_component_fits(
                 synonymous_idx = None
             elif name == "benign":
                 benign_idx = None
+
+    if force_benign and synonymous_idx is not None:
+        logger.info("  force_benign_reference: synonymous sample fit but not used as benign reference")
+        synonymous_idx = None
 
     # Re-check benign_method after validation
     if synonymous_idx is None and config.benign_method == 'avg':
@@ -395,6 +409,7 @@ def process_component_fits(
         prior = config.manual_prior
         prior_pathogenic = config.manual_prior
         fit_priors = np.full(len(fits), prior)
+        prior_degenerate = np.zeros(len(fits), dtype=bool)
         fit_priors_pathogenic = fit_priors
         fit_mechanism_match_fracs = np.full(len(fits), np.nan)
         valid_bootstrap_seeds = bootstrap_seeds  # no filtering
@@ -577,7 +592,24 @@ def process_component_fits(
         # Compute prior(s). 'prior' (P(Y=1), benign-direction) is unchanged in
         # meaning/name for backward compatibility; 'prior_pathogenic' (P(Y=1,M=1)) is
         # new, only meaningful when mechanism_flag.
-        prior = np.nanmedian(fit_priors)
+        # Opt-in (PipelineConfig.exclude_degenerate_prior_fits): fits whose
+        # standard-mode prior EM never left its 0.5 start carry no information
+        # about the prior; leave them out of the median prior (kept for LR+).
+        if (getattr(config, "exclude_degenerate_prior_fits", False) and used_get_fit_prior
+                and not unmixing_mode and not mechanism_flag):
+            prior_degenerate = np.abs(fit_priors - 0.5) < DEGENERATE_PRIOR_TOL
+            n_degenerate = int(prior_degenerate.sum())
+            logger.info(f"  exclude_degenerate_prior_fits: {n_degenerate}/{len(fit_priors)} kept fits "
+                        f"have an undefined (EM-start) prior; excluded from the median prior, kept for LR+")
+            if n_degenerate == len(fit_priors):
+                logger.warning("  exclude_degenerate_prior_fits: every kept fit is degenerate; "
+                               "using all kept fits for the prior")
+                prior_degenerate = np.zeros(len(fit_priors), dtype=bool)
+                prior_unstable = True
+        else:
+            prior_degenerate = np.zeros(len(fit_priors), dtype=bool)
+
+        prior = np.nanmedian(fit_priors[~prior_degenerate])
         prior_pathogenic = np.nanmedian(fit_priors_pathogenic) if mechanism_flag else np.nan
         logger.info(f"  Prior (benign-direction, P(Y=1)): {prior:.6f}")
         if mechanism_flag:
@@ -1181,6 +1213,9 @@ def process_component_fits(
         'PLP_frac_pathomechanism_measured_unstable': bool(mechanism_match_frac_unstable),
         'PLP_frac_pathomechanism_measured_per_fit': fit_mechanism_match_fracs,
         'priors': fit_priors,
+        # Per kept fit: prior excluded from the median/percentiles/OOB median
+        # as undefined (only ever True with exclude_degenerate_prior_fits).
+        'prior_degenerate': prior_degenerate,
         'priors_pathogenic': fit_priors_pathogenic if mechanism_flag else None,
         'pct_bootstraps_kept': pct_bootstraps_kept,
         'pct_pathogenic_rows_kept': pct_pathogenic_rows_kept,
