@@ -1691,41 +1691,6 @@ def get_bootstrap_score_ranges_dual(fitIdx, fit, log_fD, log_fN_benign, log_fP_r
             ranges_p, ranges_b, C_p, C_b, log_fN_pathogenic_local)
 
 
-def remove_insufficient_bootstrap_converage_points(point_ranges, percent_no_evidence, point_values):
-
-    # P/LP
-    for point in point_values:
-        if percent_no_evidence[point] > 0.05 and len(point_ranges[point]) > 0:
-            if point > 1 : # extend range below
-                i = 1
-                while point-i != 0:
-                    if len(point_ranges[point-i]) > 0:
-                        new_range = np.vstack([point_ranges[point-i], point_ranges[point]])[
-                                                np.vstack([point_ranges[point-i], point_ranges[point]])[:, 0].argsort()]
-                        point_ranges[point-i] = new_range
-                        break
-                    i += 1
-                
-            point_ranges[point] = [] # remove strength
-
-    # B/LB
-    for point_p in point_values:
-        point = -point_p 
-        if percent_no_evidence[point] > 0.05 and len(point_ranges[point]) > 0:
-            if point < -1 : # extend range below
-                i = 1
-                while point+i != 0:
-                    if len(point_ranges[point+i]) > 0:
-                        new_range = np.vstack([point_ranges[point+i], point_ranges[point]])[
-                                                np.vstack([point_ranges[point+i], point_ranges[point]])[:, 0].argsort()]
-                        point_ranges[point+i] = new_range
-                        break
-                    i += 1
-                
-            point_ranges[point] = [] # remove strength
-
-
-
 def check_thresholds_reached(lrPlus, tau, point_values, pathogenicOrBenign):
     
     if pathogenicOrBenign == "benign":

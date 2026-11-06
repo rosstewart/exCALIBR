@@ -1198,14 +1198,19 @@ det_subset_mats = {
        for k in ("excalibr_only", "author_only", "neither")},
 }
 if all(m is not None for m in det_subset_mats.values()):
-    _det_rows = [
-        ("Both", "\\excalibr{}", det_subset_mats["both_excalibr"]),
-        ("Both", "Author", det_subset_mats["both_author"]),
-        ("\\excalibr{} only", "\\excalibr{}", det_subset_mats["excalibr_only"]),
-        ("Author only", "Author", det_subset_mats["author_only"]),
-        ("Neither", "", det_subset_mats["neither"]),
+    # Same layout as ED Table tab:author_performance; only the subsets that table does not show (one method
+    # determinate). The abstaining method's matrix is all indeterminate (same variants), so its determinate
+    # count reads 0 and its metrics print as dashes. The "neither" count is quoted in the caption.
+    def _all_ir(m):
+        z = m.copy() * 0
+        z["IR"] = m.sum(axis=1)
+        return z
+
+    _det_groups = [
+        ("ExCALIBR only", det_subset_mats["excalibr_only"], _all_ir(det_subset_mats["excalibr_only"])),
+        ("Author only", _all_ir(det_subset_mats["author_only"]), det_subset_mats["author_only"]),
     ]
-    _det_subset_latex = latex_determinate_subset_table(_det_rows)
+    _det_subset_latex = latex_determinate_subset_table(_det_groups)
     REG.table("tab:author_determinate_subsets", _det_subset_latex)
 
     _n = {k: int(m.values.sum()) for k, m in det_subset_mats.items()}

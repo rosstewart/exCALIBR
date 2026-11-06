@@ -358,12 +358,78 @@ def _components_from_config(config_file: str | None, new_to_old: dict, complemen
     return lookup
 
 
+def _parse_plp_subsample_n(v):
+    if v is None or v == "missense":
+        return v
+    return int(v)
+
+
+def _expected_onehot_counts(sample_assignments):
+    """Expected per-sample row counts after makeOneHot (each multi-label row goes
+    to one of its m samples uniformly at random): sum over members of 1/m."""
+    sa = np.asarray(sample_assignments, dtype=float)
+    m = sa.sum(axis=1, keepdims=True)
+    return (sa / np.maximum(m, 1.0)).sum(axis=0)
+
+
+def _composition_sample_weights(df_ds, kw, ds, plp_weight, extra_sample_pull, dataset_name):
+    """sample_proportions (+ anchor_weight_scale) for the control-composition
+    experiments, or {} (unweighted, production behaviour).
+
+    plp_weight="all_plp": the P/LP sample's total M-step pull is set to that of the
+    unrestricted all-variant-type P/LP sample (so a missense-only or subsampled
+    P/LP sample keeps the same leverage on the shared components).
+    extra_sample_pull="plp_all" / "plp": the extra (e.g. PTV) sample's total pull is
+    set to that of the all-type P/LP sample / the P/LP sample as used.
+    Totals are expected counts after the per-bootstrap one-hot assignment; every
+    other sample keeps its own expected count, so its per-row weight stays ~1.
+    """
+    if plp_weight in (None, "none") and extra_sample_pull in (None, "full"):
+        return {}
+    from src.assay_calibration.data_utils.dataset import Scoreset
+    names = [n for n, c in zip(ds.sample_names, ds.sample_counts) if c > 0]
+    props = _expected_onehot_counts(ds.sample_assignments)
+    plp = "Pathogenic/Likely Pathogenic"
+    ref_kw = {k: v for k, v in kw.items()
+              if k not in ("missense_plp_only", "plp_subsample_n", "plp_subsample_seed",
+                           "missense_controls_only")}
+    ref = Scoreset(df_ds, **ref_kw)
+    ref_names = [n for n, c in zip(ref.sample_names, ref.sample_counts) if c > 0]
+    n_all = _expected_onehot_counts(ref.sample_assignments)[ref_names.index(plp)] if plp in ref_names else None
+    if plp_weight == "all_plp" and plp in names and n_all is not None:
+        props[names.index(plp)] = n_all
+    extra = [i for i, n in enumerate(names) if n not in
+             (plp, "Benign/Likely Benign", "gnomAD", "population", "Synonymous")]
+    if extra and extra_sample_pull == "plp_ptv" and plp in ref_names:
+        # pull of the PTV P/LP rows in the unrestricted P/LP sample (P/LP rows that are
+        # also members of the extra PTV sample), so PTVs carry the leverage the
+        # nonsense/frameshift P/LP had in the all-type fit, in their own sample
+        rn = ref_names
+        ext = [i for i, n in enumerate(rn) if n not in
+               (plp, "Benign/Likely Benign", "gnomAD", "population", "Synonymous")]
+        rsa = np.asarray(ref.sample_assignments, bool)
+        target = float((rsa[:, rn.index(plp)] & rsa[:, ext].any(axis=1)).sum()) if ext else None
+        if target:
+            for i in extra:
+                props[i] = target
+    if extra and extra_sample_pull in ("plp_all", "plp"):
+        target = n_all if extra_sample_pull == "plp_all" else (props[names.index(plp)] if plp in names else None)
+        if target is not None:
+            for i in extra:
+                props[i] = target
+    print(f"  {dataset_name}: sample_proportions "
+          + ", ".join(f"{n}={p:.1f}" for n, p in zip(names, props)))
+    return {"sample_proportions": props.tolist(), "anchor_weight_scale": True}
+
+
 def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type,
                               force_gaussian=False, default_release="2026",
                               master_seed=DEFAULT_MASTER_SEED,
                               spliceai_threshold=0.2, vep_splice_filter=True,
-                              missense_controls_only=False, extra_sample=None):
+                              missense_controls_only=False, extra_sample=None,
+                              missense_plp_only=False, plp_subsample_n=None, plp_subsample_seed=0,
+                              plp_weight="none", extra_sample_pull="full"):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -387,6 +453,11 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
             kw["missense_controls_only"] = True
         if extra_sample:
             kw["extra_sample"] = extra_sample
+        if missense_plp_only:
+            kw["missense_plp_only"] = True
+        if plp_subsample_n is not None:
+            kw["plp_subsample_n"] = plp_subsample_n
+            kw["plp_subsample_seed"] = plp_subsample_seed
         ds = Scoreset(df_ds, **kw)
     except (ValueError, KeyError) as e:
         print(f"  {dataset_name} skipping: {e}")
@@ -395,6 +466,8 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
     if sum(1 for _ in ds.samples) < 2:
         print(f"  {dataset_name} skipping: insufficient samples")
         return None
+
+    weight_kw = _composition_sample_weights(df_ds, kw, ds, plp_weight, extra_sample_pull, dataset_name)
 
     fitter = Fit(ds)
     all_jobs = []
@@ -405,7 +478,7 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
             jobs = fitter.generate_fit_jobs(
                 component_range=[nc], bootstrap_seed=bs, master_seed=master_seed,
                 check_monotonic=True, num_fits=NUM_FITS,
-                force_gaussian=force_gaussian)
+                force_gaussian=force_gaussian, **weight_kw)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
             if ref_jobs is None:
                 ref_jobs = jobs
@@ -533,6 +606,10 @@ def run_default(args):
     else:
         _comp_for = lambda name: [2, 3]  # noqa: E731
         print("Components: [2, 3] for all datasets (no --config-file or --components given)")
+    if getattr(args, "components_plus_one", False):
+        _base_comp_for = _comp_for
+        _comp_for = lambda name: sorted({c + 1 for c in (_base_comp_for(name) or [])})  # noqa: E731
+        print("Components: +1 on every dataset's selection (--components-plus-one)")
 
     datasets = df.Dataset.unique()
     dataset_filter = _resolve_dataset_filter(args, df)
@@ -574,6 +651,11 @@ def run_default(args):
             vep_splice_filter=vep_splice_filter,
             missense_controls_only=getattr(args, "missense_controls_only", False),
             extra_sample=getattr(args, "extra_sample", None),
+            missense_plp_only=getattr(args, "missense_plp_only", False),
+            plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+            plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
+            plp_weight=getattr(args, "plp_weight", "none"),
+            extra_sample_pull=getattr(args, "extra_sample_pull", "full"),
         )
         for ds in datasets
     )
@@ -583,6 +665,11 @@ def run_default(args):
         "population_type": args.population_type,
         "missense_controls_only": bool(getattr(args, "missense_controls_only", False)),
         "extra_sample": getattr(args, "extra_sample", None),
+        "missense_plp_only": bool(getattr(args, "missense_plp_only", False)),
+        "plp_subsample_n": getattr(args, "plp_subsample_n", None),
+        "plp_subsample_seed": getattr(args, "plp_subsample_seed", 0),
+        "plp_weight": getattr(args, "plp_weight", "none"),
+        "extra_sample_pull": getattr(args, "extra_sample_pull", "full"),
         "n_bootstraps": N_BOOTSTRAPS,
         "clinvar_default_release": default_release,
     }
@@ -1967,6 +2054,22 @@ def main():
                             "(population/synonymous/extra samples unaffected; combine with "
                             "--population-type gnomAD_missense_nsSNV for a missense-only "
                             "population sample). Must match at calibration.")
+        p.add_argument("--missense-plp-only", action="store_true",
+                       help="Restrict only the P/LP sample to missense (B/LB, population, synonymous "
+                            "unchanged). Must match at calibration.")
+        p.add_argument("--plp-subsample-n", default=None,
+                       help="Keep the P/LP label on a random subset of this many P/LP rows ('missense' = "
+                            "the dataset's missense P/LP count): matched-count control. Must match at calibration.")
+        p.add_argument("--plp-subsample-seed", type=int, default=0)
+        p.add_argument("--plp-weight", choices=["none", "all_plp"], default="none",
+                       help="'all_plp': upweight the (restricted) P/LP sample so its total M-step pull "
+                            "equals the unrestricted all-type P/LP sample's (sample_proportions). Fit-only.")
+        p.add_argument("--extra-sample-pull", choices=["full", "plp_all", "plp", "plp_ptv"], default="full",
+                       help="Total M-step pull of the extra sample: its own size (full), the all-type "
+                            "P/LP sample's, the P/LP sample's as used, or the number of P/LP variants that "
+                            "are PTVs (plp_ptv). Fit-only.")
+        p.add_argument("--components-plus-one", action="store_true",
+                       help="Fit one more component than each dataset's selected n_c (e.g. 3c -> 4c).")
         p.add_argument("--extra-sample", dest="extra_sample", default=None,
                        choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
                        help="Add a 5th sample fit with its own weights over the shared "

@@ -22,7 +22,6 @@ from ..fit_utils.point_ranges import (
     compute_lr_filtered_pathogenic_mask,
     get_bootstrap_score_ranges,
     get_bootstrap_score_ranges_dual,
-    remove_insufficient_bootstrap_converage_points,
     check_thresholds_reached,
     extend_points_to_xlims,
     compute_single_fit_log_densities,
@@ -49,6 +48,7 @@ _mpl.use('Agg')
 import matplotlib.pyplot as plt
 from ..plot_utils.utils import (
     plot_scoreset_best_config, sample_density, add_thresholds, log_thresholds_with_ylim_pad,
+    sample_display_name, sample_hist_style, reference_config_label,
 )
 
 from .config import PipelineConfig
@@ -186,7 +186,9 @@ def generate_visualizations(
                     indv_summary=calibration,
                     fits=fits,
                     score_range=np.asarray(calibration['score_range']),
-                    config=f"({config.benign_method})",
+                    config=reference_config_label(
+                        config.benign_method, scoreset,
+                        getattr(config, "force_benign_reference", False)),
                     n_c=component_key,
                     n_samples=len([s for s in scoreset.samples]),
                     relax=False,
@@ -1004,8 +1006,6 @@ def process_component_fits(
                     else:
                         point_ranges[point_value] = [[threshold, upper_lim]]
     
-    # Check for insufficient bootstrap coverage
-    percent_no_evidence = {point: 0.0 for point in config.point_values + list(-1 * np.array(config.point_values))}
 
     # Auto-detect bidirectional assays (e.g. LoF/GoF in one assay) per
     # bootstrap fit, and force postprocess_point_ranges=False (custom
@@ -1379,7 +1379,6 @@ def plot_all_configs_comparison(
     n_cols = n_samples + 2          # sample columns + LR+ + confusion
     n_rows_per_nc = 1 + len(BENIGN_METHODS)   # density + one row per benign_method
     n_rows = len(n_components) * n_rows_per_nc
-    hist_colors = ["#CA7682", "#1D7AAB", "#A0A0A0", "#6BAA75"]
 
     height_ratios = []
     for _ in n_components:
@@ -1440,8 +1439,9 @@ def plot_all_configs_comparison(
                 fd_w = 2 * iqr * n ** (-1 / 3) if iqr > 0 else 0
                 w = scores_s.max() - scores_s.min()
                 bins = max(min(100, int(w / fd_w)) if fd_w > 0 else 50, 10)
+                _hc, _ = sample_hist_style(scoreset.sample_names[s_raw], s_raw)
                 sns.histplot(scores_s, bins=bins, stat="density", ax=ax_fit,
-                             alpha=0.5, color=hist_colors[s_raw % len(hist_colors)])
+                             alpha=0.5, color=_hc)
                 density = sample_density(score_range_ref, fits, s_col)
                 for c in range(density.shape[1]):
                     d = np.nanpercentile(density[:, c, :], [pathogenic_percentile, 50, benign_percentile], axis=0)
@@ -1451,7 +1451,7 @@ def plot_all_configs_comparison(
                 d_pct = np.nanpercentile(d_tot, [pathogenic_percentile, 50, benign_percentile], axis=0)
                 ax_fit.plot(score_range_ref, d_pct[1], color="black", alpha=0.5)
                 ax_fit.fill_between(score_range_ref, d_pct[0], d_pct[2], color="gray", alpha=0.2)
-                ax_fit.set_title(f"{n_c_str}: {scoreset.sample_names[s_raw]}\n(n={n:,d})", fontsize=8)
+                ax_fit.set_title(f"{n_c_str}: {sample_display_name(scoreset.sample_names[s_raw])}\n(n={n:,d})", fontsize=8)
                 ax_fit.legend(fontsize=6)
                 ax_fit.grid(linewidth=0.5, alpha=0.3)
                 ax_fit.set_xlabel("Score", fontsize=7)

@@ -308,6 +308,11 @@ class PipelineConfig:
     # Sample-composition knobs, forwarded to Scoreset by load_dataset_from_df; must
     # match the values hpc/prepare.py used when the bootstrap fits were generated.
     missense_controls_only: bool = False
+    # P/LP-only missense restriction, and the matched-count random P/LP subset
+    # control (plp_subsample_n: int or "missense"); see Scoreset.
+    missense_plp_only: bool = False
+    plp_subsample_n: Optional[object] = None
+    plp_subsample_seed: int = 0
     extra_sample: Optional[str] = None
     # Use only the B/LB sample as the benign reference (lr+ and prior), overriding
     # benign_method; datasets without B/LB fall back to PU mode, never synonymous.

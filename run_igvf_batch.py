@@ -204,6 +204,9 @@ def run_single_dataset(
         ),
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
         extra_sample=getattr(args, "extra_sample", None),
         force_benign_reference=getattr(args, "force_benign_reference", False),
         seed=getattr(args, "seed", None),
@@ -258,11 +261,14 @@ def run_single_dataset(
                     child_pid = os.fork()
                     if child_pid == 0:
                         try:
-                            from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config
+                            from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config, reference_config_label
                             fig = plot_scoreset_best_config(
                                 dataset=dataset_name, scoreset=scoreset, indv_summary=indv_summary,
                                 fits=fits, score_range=np.asarray(indv_summary["score_range"]),
-                                config=f"({benign_method})", n_c=comp_key, n_samples=n_samples,
+                                config=reference_config_label(
+                                    benign_method, scoreset,
+                                    getattr(config, "force_benign_reference", False)),
+                                n_c=n_c, n_samples=n_samples,
                                 relax=False, flipped=indv_summary.get("scoreset_flipped", False),
                                 pathogenic_percentile=config.pathogenic_percentile,
                                 benign_percentile=config.benign_percentile,
@@ -479,6 +485,13 @@ def _load_calibration_from_disk(calib_path: Path, lr_path: Path):
     }
 
 
+def _parse_plp_subsample_n(v):
+    """None, 'missense', or an int (CLI gives strings)."""
+    if v is None or v == "missense":
+        return v
+    return int(v)
+
+
 def _run_one_combo(
     n_c_str: str,
     benign_method: str,
@@ -528,6 +541,9 @@ def _run_one_combo(
         n_jobs=n_bootstrap_jobs,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
         extra_sample=getattr(args, "extra_sample", None),
         force_benign_reference=getattr(args, "force_benign_reference", False),
         acmg_mapping_method=getattr(args, "acmg_mapping_method", "tavtigian"),
@@ -592,6 +608,9 @@ def _detect_benign_sample_availability(dataset_df: pd.DataFrame, dataset_name: s
         population_type=args.population_type,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
         extra_sample=getattr(args, "extra_sample", None),
         force_benign_reference=getattr(args, "force_benign_reference", False),
         spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
@@ -876,6 +895,9 @@ def generate_all_configs_viz(
         n_jobs=1,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
         missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
         extra_sample=getattr(args, "extra_sample", None),
         force_benign_reference=getattr(args, "force_benign_reference", False),
         seed=getattr(args, "seed", None),
@@ -964,14 +986,16 @@ def generate_all_configs_viz(
         child_pid = os.fork()
         if child_pid == 0:
             try:
-                from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config
+                from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config, reference_config_label
                 fig = plot_scoreset_best_config(
                     dataset=dataset_name,
                     scoreset=scoreset,
                     indv_summary=calib,
                     fits=fits_by_nc[n_c_str],
                     score_range=np.asarray(calib["score_range"]),
-                    config=f"({benign_method})",
+                    config=reference_config_label(
+                        benign_method, scoreset,
+                        getattr(config_load, "force_benign_reference", False)),
                     n_c=comp_key,
                     n_samples=scoreset.n_samples,
                     relax=False,
@@ -1194,6 +1218,14 @@ def main():
     parser.add_argument("--missense-controls-only", action="store_true",
                        help="Load Scoreset with missense_controls_only=True (P/LP and B/LB restricted to "
                             "missense). Must match the hpc/prepare.py run that produced --precomputed-fits.")
+    parser.add_argument("--missense-plp-only", action="store_true",
+                       help="Restrict only the P/LP sample to missense (B/LB, population, synonymous unchanged). "
+                            "Must match the hpc/prepare.py run that produced --precomputed-fits.")
+    parser.add_argument("--plp-subsample-n", default=None,
+                       help="Keep the P/LP label on a random subset of this many P/LP rows ('missense' = the "
+                            "dataset's number of missense P/LP). Must match the hpc/prepare.py run.")
+    parser.add_argument("--plp-subsample-seed", type=int, default=0,
+                       help="Seed for --plp-subsample-n.")
     parser.add_argument("--extra-sample", dest="extra_sample", default=None,
                        choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
                        help="5th sample used in fitting but not in lr+/prior (e.g. 'ptv'). Must match "

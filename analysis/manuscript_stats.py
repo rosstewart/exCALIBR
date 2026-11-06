@@ -26,6 +26,8 @@ def _fmt3(x) -> str:
 
 
 def _fmt1(x) -> str:
+    if x is None or (isinstance(x, float) and (x != x or x in (float("inf"), float("-inf")))):
+        return "--"
     return f"{x:.1f}"
 
 
@@ -92,41 +94,29 @@ def latex_prior_simulation_table(rows) -> str:
     return latex
 
 
-def latex_determinate_subset_table(rows: List[Tuple[str, str, pd.DataFrame]]) -> str:
-    r"""LaTeX table of ExCALIBR vs. author performance on P/LP and B/LB
-    variants split by which method made a determinate call.
+def latex_determinate_subset_table(groups: List[Tuple[str, pd.DataFrame, pd.DataFrame]]) -> str:
+    r"""LaTeX table of ExCALIBR vs. author performance on the P/LP and B/LB variants
+    that only one method called determinate, in the same layout as Extended
+    Data Table tab:author_performance (metric rows; one ExCALIBR/Author column
+    pair per subset). The both-determinate subset is omitted because it is
+    already in that table.
 
-    `rows` are `(subset_label, method_label, matrix)` tuples, `matrix` a
-    summed [BLB,PLP] x [Normal,IR,Abnormal] confusion matrix scored by that
-    method; method_label "" marks a count-only row (the "Neither" subset),
-    whose metric cells are dashes.
+    `groups` are `(subset_label, excalibr_matrix, author_matrix)` tuples of
+    summed [BLB,PLP] x [Normal,IR,Abnormal] confusion matrices on the same
+    variants. Metrics of a method with no determinate call in a subset are
+    undefined and print as dashes.
     """
     from src.assay_calibration.plot_utils.utils import compute_classification_metrics
 
-    lines = [
-        r"\begin{table}[!tb]",
-        r"\centering",
-        r"\caption{Out-of-bag \excalibr{} evidence and author functional annotations on P/LP and B/LB variants, "
-        r"split by which method made a determinate call. Each subset is scored with the method(s) that made a call.}",
-        r"\label{tab:author_determinate_subsets}",
-        r"\begin{tabular}{llrrrrrrr}",
-        r"\toprule",
-        r"Determinate call by & Scored & $n$ & P/LP & B/LB & Accuracy & Sensitivity & Specificity & MCC \\",
-        r"\midrule",
-    ]
-    for subset, method, mat in rows:
-        n_b, n_p = (int(x) for x in mat.sum(axis=1).loc[["BLB", "PLP"]])
-        if method:
-            m = compute_classification_metrics(mat)
-            vals = [_fmt3(m["accuracy"]), _fmt3(m["sensitivity"]), _fmt3(m["specificity"]), _fmt3(m["mcc"])]
-        else:
-            vals = ["--"] * 4
-        lines.append(f"{subset} & {method or '--'} & {_fmt_int(n_p + n_b)} & {_fmt_int(n_p)} & {_fmt_int(n_b)} & "
-                     + " & ".join(vals) + r" \\")
-    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
-    latex = "\n".join(lines)
-    print(latex)
-    return latex
+    def _metrics(mat):
+        m = dict(compute_classification_metrics(mat))
+        if m["determinate"] == 0:
+            for k in ("accuracy", "sensitivity", "specificity", "mcc", "ppv", "fdr", "lr_plus_standard",
+                      "lr_plus_pathogenic", "lr_plus_benign", "dor_standard", "dor_pathogenic", "dor_benign"):
+                m[k] = None
+        return m
+
+    return latex_performance_table_clinvar([(label, _metrics(exc), _metrics(auth)) for label, exc, auth in groups])
 
 
 def latex_performance_table_clinvar(groups: List[Tuple[str, Dict, Dict]]) -> str:

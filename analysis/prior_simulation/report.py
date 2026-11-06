@@ -693,10 +693,10 @@ def build(out_dir):
         series_for(df, "true_prior", lambda r: f"true prior {r.true_prior:.2f}"), identity=True)
         for reg, df in clean.items())
     charts_bias = "".join([
-        panel("Benign variants labelled P/LP", "Fraction of P/LP that are benign", (0.03, 0.22), (0.1, 0.45),
+        panel("Benign variants labeled P/LP", "Fraction of P/LP that are benign", (0.03, 0.22), (0.1, 0.45),
               [0.05, 0.1, 0.15, 0.2], [0.1, 0.2, 0.3, 0.4], series_for(noise_p, "eps_p", lambda r: f"ε = {r.eps_p:.2f}"),
               ref=0.25, expected=expected_for(noise_p, "eps_p")),
-        panel("Pathogenic variants labelled B/LB", "Fraction of B/LB that are pathogenic", (0.03, 0.22), (0.1, 0.45),
+        panel("Pathogenic variants labeled B/LB", "Fraction of B/LB that are pathogenic", (0.03, 0.22), (0.1, 0.45),
               [0.05, 0.1, 0.15, 0.2], [0.1, 0.2, 0.3, 0.4],
               series_for(noise_b, "delta_b", lambda r: f"δ = {r.delta_b:.2f}"), ref=0.25,
               expected=expected_for(noise_b, "delta_b")),
@@ -783,7 +783,7 @@ def build(out_dir):
         "−2.5 and −1.5, significantly so only at −2.5. Because a fixed excess matters more for a small prior, we "
         f"repeated these settings at a true prior of 0.10, where the M1-only excess was {gs[(0.1, 2.5)][0]:.2f} at "
         f"−2.5 and {gs[(0.1, 1.5)][0]:.2f} at −1.5 ({gs[(0.1, 4.0)][0]:.2f} at −4). "
-        "Second, the argument assumes that the control variants are sampled without bias. Mislabelled controls shift "
+        "Second, the argument assumes that the control variants are sampled without bias. Mislabeled controls shift "
         f"the prior modestly: from a true 0.25 to "
         f"{rng(min(r.f_m for r in np20.values()), max(r.f_m for r in np20.values()))} when 20% of P/LP variants are "
         f"benign, and to {rng(min(r.f_m for r in nb20.values()), max(r.f_m for r in nb20.values()))} when 20% of B/LB "
@@ -1155,7 +1155,7 @@ Blocks 4–8 take their numbers from the manuscript build.</p>
 
 <section>
 <h2>Known limitation</h2>
-<div class="note"><p>When the labelled P/LP sample contains no variant the assay can detect, the pathogenic and benign
+<div class="note"><p>When the labeled P/LP sample contains no variant the assay can detect, the pathogenic and benign
 densities on gnomAD are identical. The production prior EM then returns its starting value of 0.5, which the discard
 rule (prior ≤ 0.001 or ≥ 0.999) does not catch. This drives the sparse-control inflation above. The supplement
 describes it as a limitation; the pipeline is unchanged.</p></div>

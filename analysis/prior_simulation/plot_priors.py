@@ -89,9 +89,9 @@ def main():
            experiment="1_clean", regime="TPK1-like")
     _panel(ax[2], df, "c  Clean labels, KCNH2_Kozek-like (3/0/10/6)", "true_prior", "True prior",
            experiment="1_clean", regime="KCNH2_Kozek-like")
-    _panel(ax[3], df, "d  Benign variants labelled P/LP", "eps_p", "Fraction of P/LP that are benign",
+    _panel(ax[3], df, "d  Benign variants labeled P/LP", "eps_p", "Fraction of P/LP that are benign",
            experiment="2_noise_plp")
-    _panel(ax[4], df, "e  Pathogenic variants labelled B/LB", "delta_b",
+    _panel(ax[4], df, "e  Pathogenic variants labeled B/LB", "delta_b",
            "Fraction of B/LB that are pathogenic", experiment="2_noise_blb")
     _panel(ax[5], df, "f  Mechanism-biased P/LP (gnomAD: 25% M1)", "lab_m1_frac",
            "Fraction of P/LP acting via M1", experiment="3_mech_bias")

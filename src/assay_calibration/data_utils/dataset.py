@@ -874,6 +874,14 @@ class Scoreset:
         # synonymous and extra samples are unaffected; use population_type to
         # restrict the population sample). Default off = production behaviour.
         self.missense_controls_only = kwargs.get("missense_controls_only", False)
+        # Restrict only the P/LP sample to missense (B/LB, population, synonymous
+        # and extra samples unchanged). Default off.
+        self.missense_plp_only = kwargs.get("missense_plp_only", False)
+        # Keep the P/LP label on a random subset of plp_subsample_n P/LP rows only
+        # (other memberships kept); a matched-count control for missense_plp_only.
+        # Default None = off.
+        self.plp_subsample_n = kwargs.get("plp_subsample_n", None)
+        self.plp_subsample_seed = kwargs.get("plp_subsample_seed", 0)
         self.score_avg = kwargs.get("score_avg",True)
 
         # for discordance and downsampling analyses
@@ -1040,6 +1048,7 @@ class Scoreset:
             (self.n_variants, self.NSamples), dtype=bool
         )
         self._scores = np.zeros(self.n_variants)
+        self._plp_is_missense = np.zeros(self.n_variants, dtype=bool)
         self._auth_labels = np.empty(self.n_variants, dtype='U50')
         self._raw_func_classes = np.empty(self.n_variants, dtype=object)
         _fcc_cols = sorted(
@@ -1060,6 +1069,7 @@ class Scoreset:
         is_pop = self.is_population_member  # avoid repeated self-lookup in tight loop
         is_reg = self.is_extra_sample_member if self.extra_sample is not None else None
         _mis_gate = getattr(self, "missense_controls_only", False)
+        _plp_mis_gate = _mis_gate or getattr(self, "missense_plp_only", False)
 
         # Determine variant-matching strategy once for the whole scoreset.
         # Use .all() so a strategy is only chosen when it covers every variant.
@@ -1165,7 +1175,8 @@ class Scoreset:
                     continue
             if any(is_pop(v) for v in variants):
                 self._sample_assignments[idx, 2] = True
-            if any(v.is_pathogenic and (v.is_missense or not _mis_gate) for v in variants):
+            self._plp_is_missense[idx] = any(v.is_pathogenic and v.is_missense for v in variants)
+            if any(v.is_pathogenic and (v.is_missense or not _plp_mis_gate) for v in variants):
                 self._sample_assignments[idx, 0] = True
             if any(v.is_benign and (v.is_missense or not _mis_gate) for v in variants):
                 self._sample_assignments[idx, 1] = True
@@ -1179,6 +1190,17 @@ class Scoreset:
         # pipeline/visualize.py instead of the sample-filtered range.
         self.global_score_min = float(np.nanmin(self._scores))
         self.global_score_max = float(np.nanmax(self._scores))
+
+        if self.plp_subsample_n is not None:
+            _plp_rows = np.flatnonzero(self._sample_assignments[:, 0])
+            # "missense": match the number of missense P/LP rows in this dataset
+            _n = (int((self._sample_assignments[:, 0] & self._plp_is_missense).sum())
+                  if self.plp_subsample_n == "missense" else int(self.plp_subsample_n))
+            if len(_plp_rows) > _n:
+                _rng = np.random.default_rng(int(self.plp_subsample_seed))
+                _keep = _rng.choice(_plp_rows, size=_n, replace=False)
+                _drop = np.setdiff1d(_plp_rows, _keep)
+                self._sample_assignments[_drop, 0] = False
 
         keep_mask = self._sample_assignments.any(axis=1)
         self._keep_mask = keep_mask

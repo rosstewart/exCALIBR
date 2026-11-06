@@ -248,6 +248,57 @@ def plot_scoreset_compare_point_assignments(dataset, scoresets, summary, scorese
     return fig
 
 
+# Display label / histogram style per Scoreset sample name. Raw names are the
+# Scoreset.sample_names entries; a 5th "extra" sample is named by its
+# extra_sample type (data_utils/dataset.py EXTRA_SAMPLE_TYPES).
+SAMPLE_DISPLAY_NAMES = {
+    "population": "gnomAD",
+    "ptv": "PTV (nonsense + frameshift)",
+    "all_missense_snv": "All missense SNVs",
+    "all_assayed": "All assayed variants",
+    "all_snv": "All SNVs",
+    "all_nsSNV": "All nonsynonymous SNVs",
+}
+SAMPLE_HIST_STYLE = {
+    "Pathogenic/Likely Pathogenic": ("#CA7682", 0.6),
+    "Benign/Likely Benign": ("#1D7AAB", 0.6),
+    "gnomAD": ("#A0A0A0", 0.3),
+    "population": ("#A0A0A0", 0.3),
+    "Synonymous": ("#6BAA75", 0.5),
+}
+EXTRA_SAMPLE_HIST_STYLE = ("#B07AA1", 0.5)
+
+
+def reference_config_label(benign_method, scoreset, force_benign_reference=False):
+    """Title label "(<benign_method>)" for plot_scoreset_best_config. Under
+    force_benign_reference a dataset with no B/LB has no benign reference at all
+    (PU mode) -- the title heuristic there would otherwise relabel it as
+    "(synonymous)" whenever a synonymous sample exists."""
+    counts = getattr(scoreset, "sample_counts", None)
+    if force_benign_reference and counts is not None and len(counts) > 1 and counts[1] == 0:
+        return "(PU)"
+    return f"({benign_method})"
+
+
+def sample_display_name(name):
+    return SAMPLE_DISPLAY_NAMES.get(name, name)
+
+
+_INDEX_HIST_STYLE = [("#CA7682", 0.6), ("#1D7AAB", 0.6), ("#A0A0A0", 0.3), ("#6BAA75", 0.5)]
+
+
+def sample_hist_style(name, index=None):
+    """(color, alpha) for a sample's histogram. Known names map to the
+    standard P/LP, B/LB, gnomAD, synonymous styles; an unknown name falls back
+    to the historical by-column style for columns 0-3 (e.g. BasicScoreset
+    names), and anything beyond (the extra sample) gets its own style."""
+    if name in SAMPLE_HIST_STYLE:
+        return SAMPLE_HIST_STYLE[name]
+    if name not in SAMPLE_DISPLAY_NAMES and index is not None and 0 <= index < 4:
+        return _INDEX_HIST_STYLE[index]
+    return EXTRA_SAMPLE_HIST_STYLE
+
+
 def sample_density(x, fits, sampleNum):
     x = np.asarray(x)
     _density = np.stack([density_utils.joint_densities(x, _fit['fit']['component_params'],_fit['fit']['weights'][sampleNum])
@@ -531,20 +582,11 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         bins = min(100, int(score_range_width / fd_width)) if fd_width > 0 else 50
         bins = max(bins, 10)
 
-        # Plot based on sample number (which category)
-        if sample_num == 0:  # P/LP
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.6, color='#CA7682')
-        elif sample_num == 1:  # B/LB
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.6, color='#1D7AAB')
-        elif sample_num == 2:  # gnomAD
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.3, color='#A0A0A0')
-        elif sample_num == 3:  # Synonymous
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.5, color='#6BAA75')
-    
+        # Style by sample name, so a 5th (extra) sample also gets a histogram.
+        hist_color, hist_alpha = sample_hist_style(scoreset.sample_names[sample_num], sample_num)
+        sns.histplot(sample_scores, bins=bins,
+                     stat='density', ax=ax_fit, alpha=hist_alpha, color=hist_color)
+
         max_hist_density = max([patch.get_height() for patch in ax_fit.patches]) if ax_fit.patches else 1.0
         
         density = sample_density(score_range, fits, sample_num-num_skipped)
@@ -558,7 +600,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         d_perc = np.percentile(d, [pathogenic_percentile,50,benign_percentile], axis=0)
         ax_fit.plot(score_range, d_perc[1], color='black', alpha=.5)
         ax_fit.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
-        ax_fit.set_title(f"{n_c}{relax_code}: {scoreset.sample_names[sample_num].replace('population','gnomAD')}\n(n={scoreset.sample_assignments[:,sample_num-num_skipped].sum():,d})")
+        ax_fit.set_title(f"{n_c}{relax_code}: {sample_display_name(scoreset.sample_names[sample_num])}\n(n={scoreset.sample_assignments[:,sample_num-num_skipped].sum():,d})")
         ax_fit.set_xlabel("Score")
         ax_fit.set_ylabel("Density")
         ax_fit.set_ylim([0, max_hist_density * 1.1])
@@ -685,8 +727,13 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
 
         # Check pathogenic-direction (lower-bound) percentile: find max and its position
         lr_5th = llr_curves[0]
-        max_5th_idx = np.nanargmax(lr_5th)
-        max_5th = lr_5th[max_5th_idx]
+        # An all-NaN curve (e.g. too few samples for any finite LR+) gets no
+        # threshold annotations rather than crashing the whole figure.
+        if np.all(np.isnan(lr_5th)):
+            max_5th_idx, max_5th = 0, -np.inf
+        else:
+            max_5th_idx = np.nanargmax(lr_5th)
+            max_5th = lr_5th[max_5th_idx]
         exceeds_pathogenic = any(max_5th > tau for tau in tauP)
         
         # Check if insufficient evidence causes cutoff
@@ -738,8 +785,11 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         
         # Check 95th percentile: find min and its position
         lr_95th = llr_curves[2]
-        min_95th_idx = np.nanargmin(lr_95th)
-        min_95th = lr_95th[min_95th_idx]
+        if np.all(np.isnan(lr_95th)):
+            min_95th_idx, min_95th = 0, np.inf
+        else:
+            min_95th_idx = np.nanargmin(lr_95th)
+            min_95th = lr_95th[min_95th_idx]
         exceeds_benign = any(min_95th < tau for tau in tauB)
         
         # Check if insufficient evidence causes cutoff
@@ -895,7 +945,8 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
                              linewidth=2)
             
         
-        ax_lr.set_title(f"Log LR+\nprior: {priors[1]:.3f}, C: {indv_summary['C']}", fontsize=11)
+        _c_txt = f", C: {indv_summary['C']}" if indv_summary.get('C') is not None else ""
+        ax_lr.set_title(f"Log LR+\nprior: {priors[1]:.3f}{_c_txt}", fontsize=11)
         add_thresholds(tauP, tauB, ax_lr)
         ax_lr.set_xlabel("Score")
         ax_lr.set_ylabel("Log LR+")

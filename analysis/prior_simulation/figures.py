@@ -15,11 +15,11 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+from matplotlib.patches import FancyArrowPatch
 import numpy as np
 
 from analysis.prior_simulation.simulate_priors import (ASSAYS, CLASSES, DEFAULT_OUT_DIR, POP_M1_FRAC, REGIMES,
-                                                       class_density)
+                                                       class_density, predicted_prior)
 from analysis.prior_simulation.summary import load, sel
 
 # Categorical slots 1-3 of the validated default palette, in fixed order.
@@ -37,6 +37,11 @@ plt.rcParams.update({
 })
 
 
+def _letter(i):
+    """Panel label: capital letter in parentheses, e.g. (A)."""
+    return f"({'ABCDEFGHIJ'[i]})"
+
+
 def _panel_letter(ax, letter, x=-0.18, y=1.08):
     ax.text(x, y, letter, transform=ax.transAxes, fontsize=9, fontweight="bold", color=INK, va="bottom")
 
@@ -50,7 +55,9 @@ def _style(ax, title, xlabel, ylim, ylabel="Estimated prior"):
     ax.set_axisbelow(True)
 
 
-def _points(ax, df, xcol, span, expected=True):
+def _points(ax, df, xcol, span, experiment=None):
+    """Mean and 95% CI per assay; with `experiment`, also the closed-form large-sample prediction of
+    Proposition 3 (`predicted_prior`) as a line."""
     for i, assay in enumerate(ASSAYS):
         s = df[df.assay == assay].sort_values(xcol)
         if s.empty:
@@ -63,14 +70,16 @@ def _points(ax, df, xcol, span, expected=True):
             err = np.vstack([m - s[f"{p}_lo"].to_numpy(), s[f"{p}_hi"].to_numpy() - m])
             ax.errorbar(x, m, yerr=err, fmt="o", ms=3.6, lw=1.1, capsize=0, color=c, zorder=3,
                         mfc=c if arm == "oracle" else "white", mec=c, mew=1.0)
-        if expected:
-            ax.plot(s[xcol].to_numpy() + base, s["expected"].to_numpy(), color=c, lw=1.0, alpha=0.45, zorder=2)
+        if experiment is not None:
+            pred = np.array([predicted_prior(experiment, assay, r.true_prior, eps_p=r.eps_p, delta_b=r.delta_b,
+                                             lab_m1_frac=r.lab_m1_frac) for r in s.itertuples()])
+            ax.plot(s[xcol].to_numpy() + base, pred, color=c, lw=1.0, alpha=0.45, zorder=2)
 
 
 PATH_C = "#a8434f"  # pathogenic (any mechanism) in the sample cartoons
 
 
-def _clouds(ax, kappa=4.0, rho=0.0, n=90, seed=3):
+def _clouds(ax, kappa=4.0, rho=0.0, n=90, seed=3, lim=(-7.5, 3)):
     """Latent effects (e1, e2): benign at (0, 0), pathogenic via M1 at (-kappa, -rho kappa), via M2 at
     (-rho kappa, -kappa); unit variance, correlation rho."""
     rng = np.random.default_rng(seed)
@@ -79,8 +88,8 @@ def _clouds(ax, kappa=4.0, rho=0.0, n=90, seed=3):
                        ((-rho * kappa, -kappa), COLORS[ASSAYS[1]], n)):
         e = rng.multivariate_normal(mu, cov, k)
         ax.scatter(e[:, 0], e[:, 1], s=1.6, color=col, alpha=0.7, lw=0)
-    ax.set_xlim(-7.5, 3)
-    ax.set_ylim(-7.5, 3)
+    ax.set_xlim(*lim)
+    ax.set_ylim(*lim)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal")
@@ -98,35 +107,41 @@ def _schematic(ax, base):
         ax.add_patch(FancyArrowPatch(p, q, arrowstyle="-|>", mutation_scale=7, color=MUTED, lw=0.8,
                                      connectionstyle="arc3,rad=0"))
 
-    # Latent effects of every variant, and the mechanism split of pathogenic variants.
-    c_ax = ax.inset_axes([0.03, 0.2, 0.3, 0.72], transform=ax.transAxes)
-    _clouds(c_ax)
-    c_ax.set_title("Latent effects of each variant", fontsize=6.8, color=INK, loc="left", pad=2, fontweight="bold")
-    c_ax.text(0.2, 0.6, "benign", fontsize=5.8, color=BENIGN, transform=c_ax.transData, ha="left")
-    c_ax.text(-4, 1.7, "via M1", fontsize=5.8, color=COLORS[ASSAYS[0]], ha="center")
-    c_ax.text(1.1, -4, "via M2", fontsize=5.8, color=COLORS[ASSAYS[1]], ha="left", va="center")
-    b_ax = ax.inset_axes([0.03, 0.04, 0.3, 0.07], transform=ax.transAxes)
+    # Latent values of every variant (square panel), and the mechanism split of pathogenic variants below it.
+    fw, fh = ax.figure.get_size_inches()
+    pos = ax.get_position()
+    aspect = (pos.height * fh) / (pos.width * fw)  # axes-fraction width of a square of unit axes-fraction height
+    hc = 0.66
+    wc = hc * aspect
+    xc = 0.1
+    c_ax = ax.inset_axes([xc, 0.25, wc, hc], transform=ax.transAxes)
+    _clouds(c_ax, lim=(-7.5, 5))
+    c_ax.set_title("Latent values of each variant", fontsize=6.8, color=INK, loc="center", pad=3, fontweight="bold")
+    c_ax.text(2.9, 0.0, "benign", fontsize=5.8, color=BENIGN, ha="left", va="center")
+    c_ax.text(-4, 2.6, "via M1", fontsize=5.8, color=COLORS[ASSAYS[0]], ha="center", va="bottom")
+    c_ax.text(2.9, -4, "via M2", fontsize=5.8, color=COLORS[ASSAYS[1]], ha="left", va="center")
+    b_ax = ax.inset_axes([xc, 0.03, wc, 0.07], transform=ax.transAxes)
     b_ax.barh([0], [POP_M1_FRAC], color=COLORS[ASSAYS[0]], height=1)
     b_ax.barh([0], [1 - POP_M1_FRAC], left=POP_M1_FRAC, color=COLORS[ASSAYS[1]], height=1)
-    b_ax.text(POP_M1_FRAC / 2, 0, f"M1 {100 * POP_M1_FRAC:.0f}%", color="white", fontsize=5.8, ha="center",
+    b_ax.text(POP_M1_FRAC / 2, 0, f"{100 * POP_M1_FRAC:.0f}%", color="white", fontsize=5.6, ha="center",
               va="center")
-    b_ax.text(POP_M1_FRAC + (1 - POP_M1_FRAC) / 2, 0, f"M2 {100 * (1 - POP_M1_FRAC):.0f}%", color="white",
-              fontsize=5.8, ha="center", va="center")
+    b_ax.text(POP_M1_FRAC + (1 - POP_M1_FRAC) / 2, 0, f"{100 * (1 - POP_M1_FRAC):.0f}%", color="white",
+              fontsize=5.6, ha="center", va="center")
+    b_ax.text(-0.04, 0, "pathogenic:\nM1 / M2", fontsize=5.8, color=MUTED, ha="right", va="center",
+              transform=b_ax.transData)
     b_ax.set_xlim(0, 1)
     b_ax.axis("off")
-    b_ax.set_title("pathogenic variants", fontsize=6, color=MUTED, loc="left", pad=1.5)
+    x_arrow = xc + wc + 0.03
 
     x0, w, h, gap = 0.42, 0.58, 0.29, 0.03
     xs = np.linspace(-8, 3.5, 300)
     for i, assay in enumerate(ASSAYS):
         y = 1 - (i + 1) * h - i * gap
-        ax.add_patch(FancyBboxPatch((x0, y), w, h, boxstyle="round,pad=0.004,rounding_size=0.012",
-                                    fc="white", ec=GRID, lw=0.8))
         score = {ASSAYS[0]: "score = e1", ASSAYS[1]: "score = e2", ASSAYS[2]: "score = min(e1, e2)"}[assay]
         ax.text(x0 + 0.01, y + h - 0.022, f"{SHORT[assay]}: reads {LONG[assay]}", fontsize=6.8,
                 fontweight="bold", color=COLORS[assay], va="top")
         ax.text(x0 + 0.19, y + h - 0.022, f"({score})", fontsize=6.1, color=MUTED, va="top")
-        arrow((0.355, 0.56), (x0, y + h / 2))
+        arrow((x_arrow, 0.58), (x0 - 0.01, y + h / 2))
         d_ax = ax.inset_axes([x0 + 0.012, y + 0.06, 0.23, h - 0.15], transform=ax.transAxes)
         for c, style, col in (("B", "-", BENIGN), ("M1", "--", COLORS[ASSAYS[0]]), ("M2", ":", COLORS[ASSAYS[1]])):
             d_ax.plot(xs, class_density(xs, c, assay, 4.0, 0.0), ls=style, color=col, lw=1.1)
@@ -136,7 +151,7 @@ def _schematic(ax, base):
         d_ax.spines["left"].set_visible(False)
         d_ax.set_xlim(-8, 3.5)
         d_ax.set_ylim(0, 0.45)
-        s_ax = ax.inset_axes([x0 + 0.3, y + 0.075, 0.265, h - 0.19], transform=ax.transAxes)
+        s_ax = ax.inset_axes([x0 + 0.3, y + 0.105, 0.265, h - 0.2], transform=ax.transAxes)
         r = base[base.assay == assay].iloc[0]
         c = COLORS[assay]
         s_ax.axvline(0.25, color=MUTED, ls="--", lw=0.8)
@@ -150,7 +165,7 @@ def _schematic(ax, base):
         s_ax.spines["left"].set_visible(False)
         s_ax.set_xticks([0, 0.1, 0.2, 0.3, 0.4, 0.5])
         s_ax.tick_params(labelsize=6)
-        s_ax.set_title("estimated prior (true 0.25)", fontsize=6, color=MUTED, loc="left", pad=1.5)
+        s_ax.set_title("estimated prior (true 0.25)", fontsize=6, color=MUTED, loc="right", pad=1.5)
     handles = [
         plt.Line2D([], [], color=BENIGN, lw=1.1, label="benign"),
         plt.Line2D([], [], color=COLORS[ASSAYS[0]], ls="--", lw=1.1, label="pathogenic via M1"),
@@ -229,7 +244,7 @@ def _cartoon_shift(ax):
 def _cartoon_corr(ax, kappa):
     ax.axis("off")
     for k, rho in enumerate((0.0, 0.6)):
-        sub = ax.inset_axes([0.08 + 0.33 * k, 0.2, 0.28, 0.85])
+        sub = ax.inset_axes([0.2 + 0.33 * k, 0.2, 0.28, 0.85])
         _clouds(sub, kappa=kappa, rho=rho, n=70)
         sub.set_xlabel("")
         sub.set_ylabel("")
@@ -237,27 +252,26 @@ def _cartoon_corr(ax, kappa):
             s.set_color(GRID)
         sub.text(0.5, -0.04, f"ρ = {rho:g}", transform=sub.transAxes, fontsize=5.8, color=MUTED, ha="center",
                  va="top")
-    ax.text(0.76, 0.45, "e1 and e2\ncorrelated", transform=ax.transAxes, fontsize=5.6, color=MUTED, va="center")
 
 
 def make_figure(summ, out_path):
-    fig = plt.figure(figsize=(7.2, 11.2))
-    outer = fig.add_gridspec(4, 1, height_ratios=[1.3, 1.35, 1.35, 1.35], hspace=0.42,
-                             left=0.08, right=0.985, top=0.975, bottom=0.075)
+    fig = plt.figure(figsize=(7.2, 8.4))
+    outer = fig.add_gridspec(4, 1, height_ratios=[1.25, 1.3, 1.3, 1.3], hspace=0.40,
+                             left=0.08, right=0.985, top=0.975, bottom=0.085)
     ax_a = fig.add_subplot(outer[0])
     _schematic(ax_a, sel(summ, experiment="1_clean", regime="rich", true_prior=0.25))
-    _panel_letter(ax_a, "a", x=-0.05, y=0.98)
+    _panel_letter(ax_a, _letter(0), x=-0.05, y=0.98)
 
     grid, carts = [], []
     for r in (1, 2, 3):
-        inner = outer[r].subgridspec(2, 3, height_ratios=[0.32, 1], hspace=0.12, wspace=0.34)
+        inner = outer[r].subgridspec(2, 3, height_ratios=[0.36, 1], hspace=0.14, wspace=0.34)
         carts += [fig.add_subplot(inner[0, c]) for c in range(3)]
         grid += [fig.add_subplot(inner[1, c]) for c in range(3)]
     clean = [("rich", "Rich samples"), ("TPK1-like", "Sparse samples"), ("KCNH2_Kozek-like", "Very sparse samples")]
     for ax, cax, (reg, title) in zip(grid[:3], carts[:3], clean):
         df = sel(summ, experiment="1_clean", regime=reg)
         ax.plot([0, 0.45], [0, 0.45], color=MUTED, ls="--", lw=0.8, zorder=1)
-        _points(ax, df, "true_prior", 0.45, expected=False)
+        _points(ax, df, "true_prior", 0.45)
         ax.set_xlim(0, 0.45)
         ax.set_xticks([0, 0.1, 0.2, 0.3, 0.4])
         _style(ax, "", "True prior", (0, 0.6))
@@ -268,9 +282,9 @@ def make_figure(summ, out_path):
     grid[0].text(0.01, 0.56, "dotted: fraction pathogenic\nand scoring abnormal", fontsize=5.8, color=MUTED, va="top")
 
     specs = [
-        (grid[3], "2_noise_plp", "eps_p", "Benign variants labelled P/LP", "Fraction of P/LP that are benign",
+        (grid[3], "2_noise_plp", "eps_p", "Benign variants labeled P/LP", "Fraction of P/LP that are benign",
          (0.03, 0.22), (0.1, 0.45), [0.05, 0.1, 0.15, 0.2], {}, lambda c: _cartoon_noise(c, "plp")),
-        (grid[4], "2_noise_blb", "delta_b", "Pathogenic variants labelled B/LB", "Fraction of B/LB that are pathogenic",
+        (grid[4], "2_noise_blb", "delta_b", "Pathogenic variants labeled B/LB", "Fraction of B/LB that are pathogenic",
          (0.03, 0.22), (0.1, 0.45), [0.05, 0.1, 0.15, 0.2], {}, lambda c: _cartoon_noise(c, "blb")),
         (grid[5], "3_mech_bias", "lab_m1_frac", "P/LP mechanism mix", "Fraction of P/LP via M1 (population: 0.25)",
          (-0.07, 1.07), (0, 0.85), [0, 0.25, 0.5, 0.75, 1], {}, _cartoon_mech),
@@ -286,14 +300,15 @@ def make_figure(summ, out_path):
     for (ax, exp, xcol, title, xlabel, xlim, ylim, xticks, extra, cart), cax in zip(specs, carts[3:]):
         df = sel(summ, experiment=exp, **extra)
         ax.axhline(0.25, color=MUTED, ls="--", lw=0.8, zorder=1)
-        _points(ax, df, xcol, xlim[1] - xlim[0], expected=exp in ("2_noise_plp", "2_noise_blb", "3_mech_bias"))
+        _points(ax, df, xcol, xlim[1] - xlim[0],
+                experiment=exp if exp in ("2_noise_plp", "2_noise_blb", "3_mech_bias") else None)
         ax.set_xlim(*xlim)
         ax.set_xticks(xticks)
         _style(ax, "", xlabel, ylim)
         cart(cax)
         cax.set_title(title, loc="left", color=INK, pad=2, fontsize=7.5)
-    for cax, letter in zip(carts, "bcdefghij"):
-        cax.text(-0.02, 1.02, letter, transform=cax.transAxes, fontsize=9, fontweight="bold", color=INK,
+    for k, cax in enumerate(carts):
+        cax.text(-0.02, 1.02, _letter(k + 1), transform=cax.transAxes, fontsize=9, fontweight="bold", color=INK,
                  va="bottom", ha="right")
 
     handles = [plt.Line2D([], [], marker="o", ls="", color=COLORS[a], mec="white", ms=5,
@@ -301,7 +316,7 @@ def make_figure(summ, out_path):
     handles += [
         plt.Line2D([], [], marker="o", ls="", color=MUTED, ms=4.5, label="true components"),
         plt.Line2D([], [], marker="o", ls="", color=MUTED, mfc="white", ms=4.5, label="ExCALIBR fit"),
-        plt.Line2D([], [], color=MUTED, alpha=0.45, lw=1.0, label="large-sample expectation"),
+        plt.Line2D([], [], color=MUTED, alpha=0.45, lw=1.0, label="closed-form prediction (Proposition 3)"),
         plt.Line2D([], [], color=MUTED, ls="--", lw=0.8, label="true prior"),
         plt.Rectangle((0, 0), 1, 1, color=PATH_C, label="pathogenic (sample cartoons)"),
     ]
@@ -359,8 +374,9 @@ def make_sample_size_figure(ss, out_path):
             ax.set_xticks(range(len(sizes)))
             ax.set_xticklabels([str(int(n)) for n in sizes])
             ax.set_xlim(-0.5, len(sizes) - 0.5)
-            _style(ax, f"{sample} reduced" if row == 0 else "", f"{sample} variants", ylim, ylabel=ylabel)
-            _panel_letter(ax, "abcdefgh"[row * 4 + j], x=-0.3, y=1.04)
+            name = "population" if sample == "gnomAD" else sample
+            _style(ax, f"{name} reduced" if row == 0 else "", f"{name} variants", ylim, ylabel=ylabel)
+            _panel_letter(ax, _letter(row * 4 + j), x=-0.3, y=1.04)
     handles = [plt.Line2D([], [], marker="o", ls="", color=COLORS[a], mec="white", ms=5,
                           label=f"{SHORT[a]}: {LONG[a]}") for a in ASSAYS]
     handles += [
