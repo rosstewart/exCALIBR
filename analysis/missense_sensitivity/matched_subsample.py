@@ -49,7 +49,7 @@ def training_rows(sa, scores, seed):
     return orig[tr], onehot
 
 
-def _calibrate(ds, df_ds, fits, seeds, n_c, benign_method, overrides, release, tmp):
+def _calibrate(ds, df_ds, fits, seeds, n_c, benign_method, overrides, release, tmp, keep_dir=None):
     import run_igvf_batch as rib
     args = Namespace(dataset="", min_clinvar_star=1, population_type="gnomAD", manual_prior=None)
     out = Path(tempfile.mkdtemp(dir=tmp))
@@ -59,6 +59,11 @@ def _calibrate(ds, df_ds, fits, seeds, n_c, benign_method, overrides, release, t
             liberal_monotonicity=overrides.get("liberal_monotonicity", True),
             postprocess_point_ranges=overrides.get("postprocess_point_ranges", True))
         cal = json.load(open(next(out.glob("*_calibration.json"))))
+        if keep_dir is not None:  # keep the calibration, LR curves and variant table for per-dataset figures
+            Path(keep_dir).mkdir(parents=True, exist_ok=True)
+            for f in list(out.glob("*_calibration.json")) + list(out.glob("*_lr_values.json.gz")) \
+                    + list(out.glob("*_variants.csv")):
+                shutil.copy2(f, Path(keep_dir) / f.name)
     finally:
         shutil.rmtree(out, ignore_errors=True)
     return cal
@@ -78,7 +83,7 @@ def _score(cal, scores_plp, scores_vus):
                 vus_mean_path=float(np.clip(v, 0, None).mean()) if len(v) else np.nan)
 
 
-def _dataset_task(ds, df_ds, fits_ds, cfg_entry, n_subsets, tmp):
+def _dataset_task(ds, df_ds, fits_ds, cfg_entry, n_subsets, tmp, keep_root=None):
     import run_igvf_batch as rib
     from analysis.missense_sensitivity.compare_runs import _missense_map
     from analysis.missense_sensitivity.reweight_plp_missense import _em_weights
@@ -134,7 +139,8 @@ def _dataset_task(ds, df_ds, fits_ds, cfg_entry, n_subsets, tmp):
                     scores[rp], rec["fit"]["component_params"], rec["fit"]["weights"][pc]).tolist()
             new_fits.append(rec)
         try:
-            cal = _calibrate(ds, df_ds, new_fits, seeds, n_c, benign_method, overrides, release, tmp)
+            cal = _calibrate(ds, df_ds, new_fits, seeds, n_c, benign_method, overrides, release, tmp,
+                             keep_dir=(Path(keep_root) / ds / arm) if keep_root else None)
             row = _score(cal, sc_plp, sc_vus)
         except Exception as e:  # keep the batch going
             row = dict(error=repr(e)[:200])
@@ -150,6 +156,8 @@ def main():
     ap.add_argument("--datasets", nargs="*", default=None)
     ap.add_argument("--config", default="src/igvf_configs/dataset_configs_aug_2026.json")
     ap.add_argument("--out", default=str(ROOT / "analysis_v3" / "e1_matched_subsample.csv"))
+    ap.add_argument("--keep-root", default=None,
+                    help="keep each arm's calibration outputs under <keep-root>/<dataset>/<arm>/")
     ap.add_argument("--tmp", default="/tmp/claude-9996/-home-rcstewart-exCALIBR/"
                     "32036f78-48fd-4171-a682-ba397e58233c/scratchpad/e1_tmp")
     args = ap.parse_args()
@@ -177,13 +185,15 @@ def main():
         f = parts / f"{ds}.csv"
         if f.exists():
             return
-        rows = _dataset_task(ds, slices[ds], fits[ds], _cfg_for(ds), args.n_subsets, args.tmp)
+        rows = _dataset_task(ds, slices[ds], fits[ds], _cfg_for(ds), args.n_subsets, args.tmp, args.keep_root)
         pd.DataFrame(rows).to_csv(f, index=False)
 
     todo = [ds for ds in datasets if _cfg_for(ds) is not None and not (parts / f"{ds}.csv").exists()]
     print(f"{len(todo)} datasets to run ({len(datasets) - len(todo)} already done)")
     Parallel(n_jobs=args.n_jobs, verbose=5)(delayed(_run)(ds) for ds in todo)
-    df = pd.concat([pd.read_csv(f) for f in sorted(parts.glob("*.csv"))], ignore_index=True)
+    # datasets without P/LP write an empty part file
+    df = pd.concat([pd.read_csv(f) for f in sorted(parts.glob("*.csv")) if f.stat().st_size > 2], ignore_index=True)
+    df = df[df.arm != "skip"]
     df.to_csv(args.out, index=False)
 
     # missense arm vs random-subset distribution, per dataset

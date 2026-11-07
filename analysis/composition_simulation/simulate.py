@@ -45,7 +45,7 @@ import pandas as pd
 import scipy.stats as sps
 
 warnings.filterwarnings("ignore")
-OUT = Path("/data/ross/assay_calibration/composition_simulation")
+OUT = Path("/data/ross/assay_calibration/missense_only_calibrations/composition_simulation")
 NAMES = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD", "Synonymous", "ptv"]
 POINTS = [1, 2, 3, 4, 5, 6, 7, 8]
 

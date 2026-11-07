@@ -2,8 +2,8 @@
 
 Make a task file (one JSON list of keyword dicts for the module's run_cell):
     python -m analysis.composition_simulation.tasks make <out_dir> [--reps 10] [--reps-e6 30] [--B 50] [--R 4]
-Run a slice of it (each array index runs --per-index tasks with as many workers):
-    python -m analysis.composition_simulation.tasks run <out_dir> --index 0 --per-index 4
+Run a slice of it (each array index runs --per-index tasks with as many workers; the SLURM script uses 16):
+    python -m analysis.composition_simulation.tasks run <out_dir> --index 0 --per-index 16
 Collect finished tasks:
     python -m analysis.composition_simulation.tasks collect <out_dir>
 
@@ -88,12 +88,12 @@ def main():
     m.add_argument("--reps", type=int, default=10)
     m.add_argument("--reps-e6", type=int, default=30)
     m.add_argument("--B", type=int, default=50)
-    m.add_argument("--R", type=int, default=4)
+    m.add_argument("--R", type=int, default=16)
     m.add_argument("--which", nargs="+", default=["e3", "e6"])
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("--index", type=int, required=True)
-    r.add_argument("--per-index", type=int, default=4)
+    r.add_argument("--per-index", type=int, default=16)
     r.add_argument("--workers", type=int, default=0)
     c = sub.add_parser("collect")
     c.add_argument("out_dir")

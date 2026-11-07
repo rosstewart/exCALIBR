@@ -21,7 +21,7 @@ OUT="$(realpath "${1:?Usage: $0 <out_dir>}")"
 TASKS="$OUT/tasks.json"
 [ -f "$TASKS" ] || { echo "Error: $TASKS not found (run analysis.composition_simulation.tasks make)"; exit 1; }
 
-TASKS_PER_INDEX="${TASKS_PER_INDEX:-4}"
+TASKS_PER_INDEX="${TASKS_PER_INDEX:-16}"
 N_TASKS=$(python3 -c "import json; print(len(json.load(open('$TASKS'))))")
 MAX_IDX=$(( (N_TASKS + TASKS_PER_INDEX - 1) / TASKS_PER_INDEX - 1 ))
 mkdir -p "$OUT/logs"
@@ -29,10 +29,10 @@ mkdir -p "$OUT/logs"
 ACCOUNT="${SLURM_ACCOUNT:-predrag}"
 JOB_NAME="${SLURM_JOB_NAME:-excalibr_composition_sim}"
 TIME="${SLURM_TIME:-23:59:00}"
-MEM="${SLURM_MEM:-8G}"
+MEM="${SLURM_MEM:-16G}"
 CPUS="${SLURM_CPUS:-$TASKS_PER_INDEX}"
 PARTITION="${SLURM_PARTITION:-short}"
-MAX_CONCURRENT="${MAX_CONCURRENT:-200}"
+MAX_CONCURRENT="${MAX_CONCURRENT:-50}"
 PYTHON="${PYTHON:-/home/stewart.ro/.conda/envs/pillar_project/bin/python}"
 
 JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
@@ -51,8 +51,8 @@ JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 TQDM_DISABLE=1
 export PYTHONPATH=${REPO}
 cd ${REPO}
-${PYTHON} -m analysis.composition_simulation.tasks run ${OUT} --index \${SLURM_ARRAY_TASK_ID} \\
-    --per-index ${TASKS_PER_INDEX} --workers ${TASKS_PER_INDEX}
+# keep on one line: a backslash continuation here becomes a stray argument
+${PYTHON} -m analysis.composition_simulation.tasks run ${OUT} --index \${SLURM_ARRAY_TASK_ID} --per-index ${TASKS_PER_INDEX} --workers ${TASKS_PER_INDEX}
 SBATCH_SCRIPT
 )
 

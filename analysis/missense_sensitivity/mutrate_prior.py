@@ -47,7 +47,7 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 ROOT = Path("/data/ross/assay_calibration/missense_only_calibrations")
-MUT_TABLE = Path("/data/ross/assay_calibration/reference/mutation_rate_methylation_bins.txt.bgz")
+MUT_TABLE = Path("/data/ross/assay_calibration/missense_only_calibrations/reference/mutation_rate_methylation_bins.txt.bgz")
 HG38 = Path("/data/dbs/reference_genome/hg38.fa.gz")
 WINDOWS = ROOT / "analysis_v3" / "e8_hg38_windows.pkl"
 PLP, BLB, SYN = "Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "Synonymous"

@@ -42,7 +42,7 @@ import scipy.stats as sps
 from analysis.composition_simulation.simulate import calibrate, truth_points, POINTS
 
 warnings.filterwarnings("ignore")
-OUT = Path("/data/ross/assay_calibration/composition_simulation")
+OUT = Path("/data/ross/assay_calibration/missense_only_calibrations/composition_simulation")
 NAMES = ["Pathogenic/Likely Pathogenic", "Benign/Likely Benign", "gnomAD", "Synonymous"]
 
 SETTINGS = {
