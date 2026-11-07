@@ -170,10 +170,20 @@ def main():
     def _cfg_for(ds):
         return cfg.get(ds) or cfg.get(ds.replace("_clinvar_2018", ""))
 
-    res = Parallel(n_jobs=args.n_jobs, verbose=5)(
-        delayed(_dataset_task)(ds, slices[ds], fits[ds], _cfg_for(ds), args.n_subsets, args.tmp)
-        for ds in datasets if _cfg_for(ds) is not None)
-    df = pd.DataFrame([r for rs in res for r in rs])
+    parts = Path(args.out.replace(".csv", "_parts"))
+    parts.mkdir(parents=True, exist_ok=True)
+
+    def _run(ds):
+        f = parts / f"{ds}.csv"
+        if f.exists():
+            return
+        rows = _dataset_task(ds, slices[ds], fits[ds], _cfg_for(ds), args.n_subsets, args.tmp)
+        pd.DataFrame(rows).to_csv(f, index=False)
+
+    todo = [ds for ds in datasets if _cfg_for(ds) is not None and not (parts / f"{ds}.csv").exists()]
+    print(f"{len(todo)} datasets to run ({len(datasets) - len(todo)} already done)")
+    Parallel(n_jobs=args.n_jobs, verbose=5)(delayed(_run)(ds) for ds in todo)
+    df = pd.concat([pd.read_csv(f) for f in sorted(parts.glob("*.csv"))], ignore_index=True)
     df.to_csv(args.out, index=False)
 
     # missense arm vs random-subset distribution, per dataset

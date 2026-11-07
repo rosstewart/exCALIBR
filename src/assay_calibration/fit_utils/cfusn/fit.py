@@ -71,6 +71,18 @@ def compute_sample_weights(sample_indicators, **kwargs):
     Returns None when nothing requests any reweighting (byte-for-byte the
     original no-op behavior).
     """
+    # Explicit per-row weights (EXPERIMENTAL, default absent): used as given for
+    # the component (theta) M-step. The mixing-weight (W) step is an unweighted
+    # mean within each sample regardless (update_steps.get_sample_weights_and_ll),
+    # so rows duplicated once per sample with weight 1/m implement "full membership
+    # for W, each variant counted once for theta". Rows must align with the fit's
+    # observations (bootstrap=False, rows already resampled by the caller).
+    obs_w = kwargs.get("observation_weights", None)
+    if obs_w is not None:
+        obs_w = np.asarray(obs_w, dtype=float)
+        if obs_w.shape[0] != sample_indicators.shape[0]:
+            raise ValueError(f"observation_weights length {obs_w.shape[0]} != rows {sample_indicators.shape[0]}")
+        return obs_w
     proportions = kwargs.get("sample_proportions", None)
     transform = kwargs.get("sample_weight_transform", None)
     beta = float(kwargs.get("sample_balance_beta", 0.0))
