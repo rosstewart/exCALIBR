@@ -55,6 +55,10 @@ def _run_one(out_dir, t):
     mod = importlib.import_module(f"analysis.composition_simulation.{t['module']}")
     kw = {k: v for k, v in t.items() if k != "module"}
     rows = mod.run_cell(**kw)
+    errs = [r.get("error") for r in rows if isinstance(r.get("error"), str)]
+    if rows and len(errs) == len(rows):  # every arm failed: write nothing, so a resubmission reruns the task
+        print(f"FAILED {_task_id(t)}: {errs[0]}")
+        return
     tmp = f.with_suffix(".tmp")
     pd.DataFrame(rows).to_csv(tmp, index=False)
     tmp.rename(f)
