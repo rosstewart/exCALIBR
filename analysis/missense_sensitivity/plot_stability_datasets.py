@@ -40,10 +40,12 @@ ARM_STYLE = {  # colour, linewidth, linestyle, label
     "mis_refit": ("#6250d6", 1.9, "--", "missense-only refit"),
     "sub_rw": ("#2a78d6", 0.9, "-", "random subsets, re-weighted"),
     "sub_refit": ("#1baf7a", 1.3, ":", "random subsets, refit"),
+    "cell_all": ("#008300", 2.0, (0, (6, 2)), "all P/LP, membership-cell fit"),
     "cell_mis": ("#e87ba4", 2.2, "-.", "missense, membership-cell fit"),
     "cell_mis_3c": ("#a50f5f", 1.6, (0, (1, 1)), "missense, membership-cell fit (3c)"),
 }
 CELLS = Path(__import__("os").environ.get("CELLS_DIR", "/data/ross/assay_calibration/missense_only_calibrations/cells/light_c1"))
+CELL_SRC = "light, 20 bootstraps" if "light" in str(CELLS) else "HPC medium, 100 bootstraps"
 
 PRIORITY = {
     "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": "composition, n large: missense P/LP give more evidence than all P/LP",
@@ -87,6 +89,7 @@ def load_arms(ds, kc=None):
                                                     key=lambda p: int(p.name.split("_")[1]))],
             "sub_refit": [_load_cal(SENS / f"medium_plpsub_s{i}" / ds) for i in range(3)]}
     if kc:  # membership-cell fits (light C1 run), at the config K and, for 2c datasets, at 3c too
+        arms["cell_all"] = [_load_cal(CELLS / f"calib_cell_all_{kc}" / ds)]
         arms["cell_mis"] = [_load_cal(CELLS / f"calib_cell_mis_{kc}" / ds)]
         if kc == "2c":
             arms["cell_mis_3c"] = [_load_cal(CELLS / "calib_cell_mis_3c" / ds)]
@@ -173,7 +176,7 @@ def _rule_text(arms, sc_mis, n_plp, n_mis):
         f"  all P/LP        {ma:5.2f}",
         f"  missense rw     {mm:5.2f}   subsets rw    {srw[0]:.2f}-{srw[1]:.2f}",
         f"  missense refit  {mr:5.2f}   subsets refit {sref[0]:.2f}-{sref[1]:.2f}",
-        f"  missense cell   {mc:5.2f}   (light fit: 20 bootstraps)", "",
+        f"  missense cell   {mc:5.2f}   ({CELL_SRC})", "",
         "highest pathogenic level",
         f"  all {la:.0f}   missense rw {lm:.0f}   refit {lr_:.0f}   cell {lc:.0f}",
         f"  subsets rw {lrw[0]:.0f}-{lrw[1]:.0f} ({nchg}/{len(st.get('sub_rw', []))} change it)",
@@ -200,13 +203,15 @@ def _cell_model(ds, df_ds, kc):
     for f in raw:
         cf.update(json.load(_gz.open(f)))
     cells = Cells.load(npz)
-    try:
-        comp, layout, _ = compose_arm(cells, cf, df_ds, "cell_mis")
-    except ValueError:
-        comp, layout = {}, []
-    raw_recs = [v[kc] for v in cf.values() if v and kc in v]
-    mis_recs = [v[kc] for v in comp.values() if kc in v]
-    return dict(cells=cells, raw=raw_recs, mis=mis_recs, layout=layout)
+    out = dict(cells=cells, raw=[v[kc] for v in cf.values() if v and kc in v])
+    for arm, key in (("cell_mis", "mis"), ("cell_all", "all")):
+        try:
+            comp, layout, _ = compose_arm(cells, cf, df_ds, arm)
+        except ValueError:
+            comp, layout = {}, []
+        out[key] = [v[kc] for v in comp.values() if kc in v]
+        out["layout" if key == "mis" else "layout_all"] = layout
+    return out
 
 
 def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, out_dir):
@@ -234,6 +239,9 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
     cols = []
     for j, n in enumerate(names):
         cols.append(("sample", sample_display_name(n), sa[:, j].astype(bool), j, A["all"], n))
+        if n == PLP and CM is not None and CM["all"] and PLP in CM["layout_all"]:
+            cols.append(("cell_all", f"P/LP all, cell fit ({kc}, {CELL_SRC})", A["is_plp"],
+                         CM["layout_all"].index(PLP), CM["all"], PLP))
         if n == PLP:
             if A["mis_rw"]:
                 cols.append(("mis_rw", "P/LP missense, re-weighted", A["mis_mask"], j, A["mis_rw"], PLP))
@@ -242,7 +250,7 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
             if A["sub_rw"] or sub_refit_recs:
                 cols.append(("subsets", "P/LP random subsets (missense n)", A["is_plp"], j, None, PLP))
             if CM is not None and CM["mis"] and PLP in CM["layout"]:
-                cols.append(("cell_mis", f"P/LP missense, cell fit ({kc}, light)", A["mis_mask"],
+                cols.append(("cell_mis", f"P/LP missense, cell fit ({kc}, {CELL_SRC})", A["mis_mask"],
                              CM["layout"].index(PLP), CM["mis"], PLP))
             if CM is not None and CM["raw"]:
                 cols.append(("cells", f"P/LP cells, cell fit ({kc})", A["is_plp"], None, CM["raw"], PLP))
@@ -285,8 +293,13 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
             for ci, row in t.iterrows():
                 if not row["mask"][0]:
                     continue
+                col_k = pal[k % len(pal)]
+                xc = CM["cells"].scores[CM["cells"].cell_of_row == ci]
+                if len(xc) > 1:  # the cell's own data, as a step histogram (density) in its colour
+                    a.hist(xc, bins=max(5, min(30, len(xc) // 2)), density=True, histtype="step", color=col_k,
+                           lw=1.0, alpha=0.9)
                 d = np.nansum(sample_density(sr, recs, ci), axis=1)
-                a.plot(sr, np.nanmedian(d, axis=0), color=pal[k % len(pal)], lw=1.6 if row.n >= 5 else 0.9,
+                a.plot(sr, np.nanmedian(d, axis=0), color=col_k, lw=1.8 if row.n >= 5 else 1.0,
                        ls="-" if row.n >= 5 else "--", label=f"{row['name']} (n={row.n})")
                 k += 1
             a.legend(fontsize=6, loc="upper left")
@@ -310,7 +323,7 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
         a.set_xlim(xlim)
 
     aP, aB, aS, aT = (fig.add_subplot(g1[0, i]) for i in range(4))
-    order = ["all", "sub_rw", "sub_refit", "mis_refit", "mis_rw", "cell_mis", "cell_mis_3c"]
+    order = ["all", "sub_rw", "sub_refit", "cell_all", "mis_refit", "mis_rw", "cell_mis", "cell_mis_3c"]
     ref = np.asarray(arms["all"][0]["lr"]["log_lr_plus_p5"], float)
 
     def same_as_all(c):
@@ -324,7 +337,7 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
         for arm in order:
             col, lw, ls, lab = ARM_STYLE[arm]
             for i, c in enumerate(arms.get(arm, [])):
-                tag = " - matches all P/LP" if arm in ("mis_rw", "mis_refit", "cell_mis", "cell_mis_3c") and same_as_all(c) else ""
+                tag = " - matches all P/LP" if arm in ("mis_rw", "mis_refit", "cell_all", "cell_mis", "cell_mis_3c") and same_as_all(c) else ""
                 ax_.plot(np.asarray(c["lr"]["score_range"]), c["lr"][f"log_lr_plus_{q}"], color=col, lw=lw, ls=ls,
                          alpha=0.45 if arm == "all" else (0.8 if lw < 1.5 else 1),
                          label=(lab + tag) if i == 0 else None, zorder=1 if arm == "all" else (3 if lw > 1.5 else 2))
@@ -342,7 +355,8 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
         ax_.set_xlabel("Score"); ax_.set_ylabel("log LR+ (natural log)")
     aP.legend(fontsize=7.5, loc="best")
     rows_, labs = [], []
-    for arm, lab in (("all", "all P/LP"), ("mis_rw", "missense, re-weighted"), ("mis_refit", "missense, refit"),
+    for arm, lab in (("all", "all P/LP"), ("cell_all", "all P/LP, cell fit"), ("mis_rw", "missense, re-weighted"),
+                     ("mis_refit", "missense, refit"),
                      ("cell_mis", "missense, cell fit"), ("cell_mis_3c", "missense, cell fit (3c)")):
         if arms.get(arm):
             rows_.append(_points(arms[arm][0]["cal"], sr)); labs.append(lab)
@@ -373,6 +387,54 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
                  f"capped at 0.5); first 100 bootstraps", fontsize=13, x=0.04, ha="left", y=0.995)
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     fn = out / f"{_display_dataset(ds)}_stability.png"
+    fig.savefig(fn, dpi=110)
+    plt.close(fig)
+    if CM is not None and CM["raw"]:
+        draw_cells(ds, CM, kc, xlim, out)
+    return str(fn)
+
+
+def draw_cells(ds, CM, kc, xlim, out):
+    """One panel per cell: the cell's scores (histogram) and its fitted mixture under the shared components
+    (components dashed at the median, total median with 5-95% band over bootstraps)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from src.assay_calibration.plot_utils.utils import sample_density, _display_dataset
+    cells, recs = CM["cells"], CM["raw"]
+    t = cells.table.reset_index(drop=True)
+    order = t.sort_values(["n"], ascending=False).index.tolist()
+    sr = np.linspace(xlim[0], xlim[1], 600)
+    nc = 6
+    nr = int(np.ceil(len(order) / nc))
+    fig, axes = plt.subplots(nr, nc, figsize=(3.4 * nc, 2.6 * nr + 0.8), squeeze=False)
+    for a in axes.flat:
+        a.axis("off")
+    for k, ci in enumerate(order):
+        a = axes.flat[k]; a.axis("on")
+        x = cells.scores[cells.cell_of_row == ci]
+        if len(x) > 1:
+            q1, q3 = np.percentile(x, [25, 75]); fd = 2 * (q3 - q1) * len(x) ** (-1 / 3)
+            bins = max(5, min(60, int((x.max() - x.min()) / fd)) if fd > 0 else 15)
+        else:
+            bins = 5
+        sns.histplot(x, bins=bins, stat="density", ax=a, color="#9a9a9a", alpha=0.5)
+        hmax = max([p.get_height() for p in a.patches]) if a.patches else 1.0
+        dens = sample_density(sr, recs, ci)
+        for c in range(dens.shape[1]):
+            a.plot(sr, np.nanpercentile(dens[:, c, :], 50, axis=0), color=f"C{c}", ls="--", lw=0.9)
+        tot = np.nansum(dens, axis=1)
+        p5, p50, p95 = np.percentile(tot, [5, 50, 95], axis=0)
+        a.plot(sr, p50, color="black", lw=1.3); a.fill_between(sr, p5, p95, color="gray", alpha=0.3)
+        w = np.median([np.asarray(r["fit"]["weights"][ci]) for r in recs], axis=0)
+        a.set_title(f"{t.loc[ci, 'name']}\nn={int(t.loc[ci, 'n'])}  w=" + "/".join(f"{v:.2f}" for v in w), fontsize=7.5)
+        a.set_xlim(xlim); a.set_ylim(0, max(hmax, np.nanmax(p95) if np.isfinite(np.nanmax(p95)) else 1) * 1.1)
+        a.tick_params(labelsize=6.5); a.set_xlabel(""); a.set_ylabel("")
+    fig.suptitle(f"{_display_dataset(ds)} - membership cells ({kc}, {CELL_SRC}): each cell's scores and fitted mixture "
+                 f"(shared components; w = median mixing weights)", fontsize=11, x=0.01, ha="left")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fn = Path(out) / f"{_display_dataset(ds)}_cells.png"
     fig.savefig(fn, dpi=110)
     plt.close(fig)
     return str(fn)

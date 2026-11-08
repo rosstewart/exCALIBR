@@ -36,14 +36,18 @@ ARMS = {
     # Synonymous sample's composed weights, so splice-disrupting synonymous variants do not shape the benign
     # reference (memo D7). Calibration flags are cell_mis's.
     "cell_mis_nosplsyn": dict(missense_plp_only=True, population_type="gnomAD_missense_nsSNV"),
+    # all-P/LP evidence without splice-risk synonymous in the benign reference (calibration flags as cell_all)
+    "cell_all_nosplsyn": dict(),
 }
 ARM_CLI = {
     "cell_all": [],
     "cell_mis": ["--missense-plp-only", "--population-type", "gnomAD_missense_nsSNV"],
     "cell_mis_nosplsyn": ["--missense-plp-only", "--population-type", "gnomAD_missense_nsSNV"],
+    "cell_all_nosplsyn": [],
 }
 # per arm: {calibration sample name: predicate on cell name -> drop that cell from the sample's composition}
-ARM_EXCLUDE = {"cell_mis_nosplsyn": {"Synonymous": lambda cell: cell.endswith(SAI_TAG)}}
+ARM_EXCLUDE = {"cell_mis_nosplsyn": {"Synonymous": lambda cell: cell.endswith(SAI_TAG)},
+               "cell_all_nosplsyn": {"Synonymous": lambda cell: cell.endswith(SAI_TAG)}}
 SAI_COLS = ["spliceAI_DS_AG", "spliceAI_DS_AL", "spliceAI_DS_DG", "spliceAI_DS_DL"]
 
 

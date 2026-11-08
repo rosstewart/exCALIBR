@@ -18,7 +18,7 @@ from pathlib import Path
 import pandas as pd
 
 ROLE = {"P": "Pathogenic/Likely Pathogenic", "B": "Benign/Likely Benign", "G": "population", "S": "Synonymous"}
-STD_CAL = {"cell_all": "medium_baseline_popall", "cell_mis": "medium_plpmis"}
+STD_CAL = {"cell_all": "medium_baseline_popall", "cell_mis": "medium_plpmis", "cell_mis_nosplsyn": "medium_plpmis", "cell_all_nosplsyn": "medium_baseline_popall"}
 SENS = Path("/data/ross/assay_calibration/missense_only_calibrations/sens_popmis_lp")
 
 
