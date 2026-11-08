@@ -1400,7 +1400,8 @@ def thresholds_from_prior(prior, point_values,
         "tavtigian" (default): legacy C*-based thresholds via
             get_tavtigian_constant.  lrP = C^(pv/len(pv)).
         "lp_anchored": sensitivity-analysis option; C chosen so 6 points give a
-            0.90 posterior at the prior (capped at prior 0.5), lrP = C^(pv/8).
+            0.90 posterior at the prior (capped at prior 0.5), lrP = C^(pv/8);
+            benign thresholds fixed at Tavtigian's C = 350, lrB = 350^(-pv/8).
         "piecewise": prior-adaptive Bayesian thresholds with exact posteriors
             at the four ACMG boundary points (T = 10, 6, -1, -7).  See
             assay_calibration.fit_utils.bayesian_thresholds.
@@ -1418,14 +1419,16 @@ def thresholds_from_prior(prior, point_values,
         lrP = C ** (pv / len(pv))
         lrB = 1 / lrP
         return lrP, lrB, C
-    elif acmg_mapping_method == "lp_anchored":
+    elif acmg_mapping_method in ("lp_anchored", "lp_anchored_b044"):
         # sensitivity analyses only: LP posterior held at 0.90 up to prior 0.5,
         # capped above; benign symmetric (see evidence_thresholds.lp_anchored_constant)
-        from .evidence_thresholds import lp_anchored_constant
+        from .evidence_thresholds import lp_anchored_constant, lp_anchored_benign_constant
         C = lp_anchored_constant(prior)
         pv = np.array(point_values)
         lrP = C ** (pv / 8)
-        lrB = 1 / lrP
+        # benign thresholds do not depend on the prior: C = 350 (prior 0.1) for
+        # lp_anchored, C anchored at prior 0.044 for lp_anchored_b044
+        lrB = 1 / (lp_anchored_benign_constant(acmg_mapping_method) ** (pv / 8))
         return lrP, lrB, C
     elif acmg_mapping_method == "piecewise":
         from .bayesian_thresholds import piecewise_tier_thresholds

@@ -36,7 +36,10 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from adjustText import adjust_text  # pip install adjustText
+try:  # optional: only the labelled-scatter helper below uses it (and re-imports it there)
+    from adjustText import adjust_text  # pip install adjustText
+except ImportError:  # e.g. cluster envs without it; calibration and fitting do not need it
+    adjust_text = None
 
 
 
@@ -499,9 +502,16 @@ def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2, acmg_mapping
     lrP, lrB, C = thresholds_from_prior(prior, point_values, acmg_mapping_method=method)
     tauP, tauB, log_c = np.log(lrP), np.log(lrB), np.log(C)
     # tavtigian: lrP = C^(pv/len(pv)); lp_anchored: lrP = C^(pv/8)
-    step = log_c / (8 if method == "lp_anchored" else len(point_values))
+    _lp = method in ("lp_anchored", "lp_anchored_b044")
+    step = log_c / (8 if _lp else len(point_values))
+    # lp_anchored*: benign tiers use a fixed, prior-independent C, so their step differs from the pathogenic one
+    if _lp:
+        from ..fit_utils.evidence_thresholds import lp_anchored_benign_constant
+        step_b = np.log(lp_anchored_benign_constant(method)) / 8
+    else:
+        step_b = step
     ylim_top = tauP[-1] + pad_points * step
-    ylim_bottom = tauB[-1] - pad_points * step
+    ylim_bottom = tauB[-1] - pad_points * step_b
     return tauP, tauB, ylim_top, ylim_bottom
 
 

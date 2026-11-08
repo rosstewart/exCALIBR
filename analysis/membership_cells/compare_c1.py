@@ -25,7 +25,7 @@ import pandas as pd
 
 ROOT = Path("/data/ross/assay_calibration/missense_only_calibrations")
 S = ROOT / "sens_popmis_lp"
-C = ROOT / "cells" / "light_c1"
+C = Path(__import__("os").environ.get("CELLS_DIR", str(ROOT / "cells" / "light_c1")))
 
 
 def _pts(d, ds):

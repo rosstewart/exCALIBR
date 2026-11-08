@@ -108,6 +108,23 @@ def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
     return int(fine_vals[np.argmin(fine_fails)])
 
 
+# Tavtigian et al. 2018 O_PVSt (prior 0.1); lp_anchored uses it for the benign thresholds
+TAVTIGIAN_C = 350.0
+
+
+# lp_anchored variants -> benign constant. "lp_anchored" keeps Tavtigian's fixed C = 350
+# (prior 0.1); "lp_anchored_b044" anchors the benign side the same way as the pathogenic side
+# but at prior 0.044: C = lp_anchored_constant(0.044) ~= 1135 (Tavtigian's own C(0.044) = 1124).
+LP_ANCHORED_BENIGN_PRIOR = {"lp_anchored": 0.1, "lp_anchored_b044": 0.044}
+
+
+def lp_anchored_benign_constant(method: str) -> float:
+    """Prior-independent benign constant for an lp_anchored variant (sensitivity analyses only)."""
+    if method == "lp_anchored":
+        return TAVTIGIAN_C
+    return lp_anchored_constant(LP_ANCHORED_BENIGN_PRIOR[method])
+
+
 def lp_anchored_constant(prior: float, lp_posterior: float = 0.90, prior_cap: float = 0.5,
                          lp_points: int = 6, vs_points: int = 8) -> float:
     """Sensitivity-analysis alternative to get_tavtigian_constant (NOT production).
@@ -117,7 +134,7 @@ def lp_anchored_constant(prior: float, lp_posterior: float = 0.90, prior_cap: fl
         C^(lp_points/vs_points) * prior_odds = LP odds  ->  C = (LP odds / prior odds)^(vs_points/lp_points).
     Priors above prior_cap (0.5) use the prior_cap value, so a higher prior never
     makes points harder to reach. At prior 0.1 this gives C = 81^(4/3) = 350.4,
-    Tavtigian's 2018 constant. Benign thresholds stay symmetric (lrB = 1/lrP).
+    Tavtigian's 2018 constant. Benign thresholds use TAVTIGIAN_C = 350 regardless of the prior.
     """
     q = min(float(prior), prior_cap)
     q = max(q, 1e-12)

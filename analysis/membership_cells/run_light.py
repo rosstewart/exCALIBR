@@ -61,6 +61,8 @@ def compose_all(out, slices):
         merged.setdefault((ds, kc), {}).update(json.load(gzip.open(f)))
     files, report = {}, []
     for (ds, kc), cf in sorted(merged.items()):
+        if ds not in slices:  # compose only the requested datasets (incremental use)
+            continue
         cells = Cells.load(out / "cells" / f"{ds}.npz")
         n_ok = sum(1 for v in cf.values() if v and "error" not in v)
         for arm in ARMS:
@@ -91,6 +93,9 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--config", default="src/igvf_configs/dataset_configs_aug_2026.json")
     ap.add_argument("--compose-only", action="store_true")
+    ap.add_argument("--reverse", action="store_true",
+                    help="run tasks in reverse order (a second runner sharing the same output; done blocks are skipped)")
+    ap.add_argument("--no-compose", action="store_true", help="fit only (leave composing to the main runner)")
     args = ap.parse_args()
     from joblib import Parallel, delayed
     from analysis import config as _cfg
@@ -113,12 +118,16 @@ def main():
                 for s0 in range(0, args.B, args.block):
                     tasks.append((ds, K, list(range(s0, min(s0 + args.block, args.B)))))
         Parallel(n_jobs=min(args.n_jobs, len(dss)))(delayed(build)(ds, slices[ds], args.scale, out) for ds in dss)
+        if args.reverse:
+            tasks = tasks[::-1]
         print(f"{len(tasks)} tasks")
         res = Parallel(n_jobs=args.n_jobs, verbose=5)(
             delayed(task)(ds, K, seeds, args.R, out) for ds, K, seeds in tasks)
         for r in res:
             if r.startswith("FAILED"):
                 print(r)
+    if args.no_compose:
+        return
     rep = compose_all(out, slices)
     print(rep.groupby(["arm", "status"]).size().to_string())
     print(rep[rep.status != "ok"].to_string(index=False))

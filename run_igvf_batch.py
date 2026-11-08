@@ -1390,7 +1390,7 @@ def main():
                        help="Write a config template JSON (all datasets with n_c/benign_method=null) "
                             "and exit. Preserves override fields from --dataset-configs if provided.")
     parser.add_argument("--acmg-mapping-method",
-                       choices=["tavtigian", "acmg_bayes", "lp_anchored", "all"],
+                       choices=["tavtigian", "acmg_bayes", "lp_anchored", "lp_anchored_b044", "all"],
                        default="tavtigian",
                        help="ACMG-mapping method (default: tavtigian). "
                             "'acmg_bayes' = prior-adaptive posterior-based classification, "
@@ -1400,8 +1400,14 @@ def main():
                             "options); 'all' runs tavtigian and acmg_bayes and writes "
                             "per-method output files for comparison. 'lp_anchored' (sensitivity "
                             "analyses only, not production): 6 points give exactly a 0.90 "
-                            "posterior at the dataset prior, priors above 0.5 treated as 0.5, "
-                            "benign thresholds symmetric.")
+                            "posterior at the dataset prior, priors above 0.5 treated as 0.5; "
+                            "benign thresholds fixed at Tavtigian's C = 350 (prior-independent). "
+                            "'lp_anchored_b044' (sensitivity only): same, but benign "
+                            "thresholds anchored at prior 0.044 (C ~= 1135).")
+    parser.add_argument("--no-output-suffix", action="store_true",
+                       help="With a single --acmg-mapping-method, write production file names "
+                            "(no _<method> suffix; the suffix is also appended to the Dataset "
+                            "name, which changes name-keyed lookups). Use a separate --output-dir.")
     parser.add_argument("--acmg-bayes-targets", type=json.loads, default=None,
                        help="Override acmg_bayes target posteriors as a JSON object, "
                             "e.g. '{\"LB\": 0.01, \"B\": 0.001}'. Any key not given falls "
@@ -1705,7 +1711,8 @@ def main():
     acmg_mapping_methods = (["tavtigian", "acmg_bayes"]
                              if args.acmg_mapping_method == "all"
                              else [args.acmg_mapping_method])
-    suffix = (lambda m: "" if (len(acmg_mapping_methods) == 1 and m == "tavtigian")
+    suffix = (lambda m: "" if (len(acmg_mapping_methods) == 1
+                               and (m == "tavtigian" or args.no_output_suffix))
               else f"_{m}")
 
     print(f"\nProcessing {len(datasets_to_process)} datasets × "

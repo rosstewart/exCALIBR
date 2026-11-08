@@ -43,7 +43,7 @@ ARM_STYLE = {  # colour, linewidth, linestyle, label
     "cell_mis": ("#e87ba4", 2.2, "-.", "missense, membership-cell fit"),
     "cell_mis_3c": ("#a50f5f", 1.6, (0, (1, 1)), "missense, membership-cell fit (3c)"),
 }
-CELLS = Path("/data/ross/assay_calibration/missense_only_calibrations/cells/light_c1")
+CELLS = Path(__import__("os").environ.get("CELLS_DIR", "/data/ross/assay_calibration/missense_only_calibrations/cells/light_c1"))
 
 PRIORITY = {
     "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": "composition, n large: missense P/LP give more evidence than all P/LP",
@@ -162,18 +162,20 @@ def _rule_text(arms, sc_mis, n_plp, n_mis):
     lrw, lref = rng("sub_rw", "max_path"), rng("sub_refit", "max_path")
     nchg = sum(s["max_path"] != la for s in st.get("sub_rw", []))
     pa, pm, pr = (one(k, "prior") for k in ("all", "mis_rw", "mis_refit"))
+    mc, lc, pc = one("cell_mis", "plp_mean_path"), one("cell_mis", "max_path"), one("cell_mis", "prior")
     yn = lambda b: "FLAG" if b else "-"
     out_rw = bool((mm < srw[0] - 1e-9) or (mm > srw[1] + 1e-9))
     return "\n".join([
         f"P/LP: {n_plp} all, {n_mis} missense", "",
         "prior",
-        f"  all {pa:.3f}   missense rw {pm:.3f}   refit {pr:.3f}", "",
+        f"  all {pa:.3f}   missense rw {pm:.3f}   refit {pr:.3f}   cell {pc:.3f}", "",
         "mean pathogenic points per missense P/LP",
         f"  all P/LP        {ma:5.2f}",
         f"  missense rw     {mm:5.2f}   subsets rw    {srw[0]:.2f}-{srw[1]:.2f}",
-        f"  missense refit  {mr:5.2f}   subsets refit {sref[0]:.2f}-{sref[1]:.2f}", "",
+        f"  missense refit  {mr:5.2f}   subsets refit {sref[0]:.2f}-{sref[1]:.2f}",
+        f"  missense cell   {mc:5.2f}   (light fit: 20 bootstraps)", "",
         "highest pathogenic level",
-        f"  all {la:.0f}   missense rw {lm:.0f}   refit {lr_:.0f}",
+        f"  all {la:.0f}   missense rw {lm:.0f}   refit {lr_:.0f}   cell {lc:.0f}",
         f"  subsets rw {lrw[0]:.0f}-{lrw[1]:.0f} ({nchg}/{len(st.get('sub_rw', []))} change it)",
         f"  subsets refit {lref[0]:.0f}-{lref[1]:.0f}", "",
         "candidate rules (re-weighting)",
@@ -183,6 +185,28 @@ def _rule_text(arms, sc_mis, n_plp, n_mis):
         f"  missense moves mean >= 0.5 {yn(abs(mm - ma) >= 0.5)}",
         f"  missense outside subsets   {yn(out_rw)}",
     ])
+
+
+def _cell_model(ds, df_ds, kc):
+    """Cell-fit records for (ds, K) from CELLS/raw + CELLS/cells: raw per-cell records, the Cells table, and the
+    composed cell_mis records in that arm's calibration layout. None if the cell fit is not there."""
+    import gzip as _gz
+    from analysis.membership_cells.cells import Cells, compose_arm
+    raw = sorted((CELLS / "raw").glob(f"{ds}__{kc}__*.json.gz"))
+    npz = CELLS / "cells" / f"{ds}.npz"
+    if not raw or not npz.exists():
+        return None
+    cf = {}
+    for f in raw:
+        cf.update(json.load(_gz.open(f)))
+    cells = Cells.load(npz)
+    try:
+        comp, layout, _ = compose_arm(cells, cf, df_ds, "cell_mis")
+    except ValueError:
+        comp, layout = {}, []
+    raw_recs = [v[kc] for v in cf.values() if v and kc in v]
+    mis_recs = [v[kc] for v in comp.values() if kc in v]
+    return dict(cells=cells, raw=raw_recs, mis=mis_recs, layout=layout)
 
 
 def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, out_dir):
@@ -205,6 +229,8 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
     refit_recs = _recs(fits_mis_refit, n_c)
     sub_refit_recs = [r for r in (_recs(f, n_c) for f in fits_sub_refit) if r]
 
+    kc = n_c if n_c in ("2c", "3c") else "3c"
+    CM = _cell_model(ds, df_ds, kc)
     cols = []
     for j, n in enumerate(names):
         cols.append(("sample", sample_display_name(n), sa[:, j].astype(bool), j, A["all"], n))
@@ -215,6 +241,11 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
                 cols.append(("mis_refit", "P/LP missense, refit", A["mis_mask"], j, refit_recs, PLP))
             if A["sub_rw"] or sub_refit_recs:
                 cols.append(("subsets", "P/LP random subsets (missense n)", A["is_plp"], j, None, PLP))
+            if CM is not None and CM["mis"] and PLP in CM["layout"]:
+                cols.append(("cell_mis", f"P/LP missense, cell fit ({kc}, light)", A["mis_mask"],
+                             CM["layout"].index(PLP), CM["mis"], PLP))
+            if CM is not None and CM["raw"]:
+                cols.append(("cells", f"P/LP cells, cell fit ({kc})", A["is_plp"], None, CM["raw"], PLP))
     ncol = len(cols)
     fig = plt.figure(figsize=(max(4.2 * ncol, 28), 13.5))
     gs = fig.add_gridspec(2, 1, height_ratios=[1, 1.2], hspace=0.3, left=0.04, right=0.99, top=0.9, bottom=0.06)
@@ -225,7 +256,7 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
         a = fig.add_subplot(g0[0, k])
         x = scores[mask]
         col, alpha = sample_hist_style(style_name, widx)
-        if kind in ("mis_rw", "mis_refit"):
+        if kind in ("mis_rw", "mis_refit", "cell_mis"):
             col, alpha = "#8C3B4A", 0.55
         if len(x) > 1:
             q1, q3 = np.percentile(x, [25, 75]); fd = 2 * (q3 - q1) * len(x) ** (-1 / 3)
@@ -246,6 +277,19 @@ def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, o
             a.plot([], [], color=ARM_STYLE["sub_rw"][0], lw=0.9, label=f"{len(A['sub_rw'])} subsets, re-weighted")
             a.plot([], [], color=ARM_STYLE["sub_refit"][0], lw=1.4, ls=":", label=f"{len(sub_refit_recs)} subsets, refit")
             a.legend(fontsize=6.5)
+        elif kind == "cells":
+            # each P/LP cell's own fitted density (median over bootstraps), shared components
+            t = CM["cells"].table
+            pal = ["#eb6834", "#2a78d6", "#1baf7a", "#6250d6", "#eda100", "#e87ba4", "#008300", "#e34948"]
+            k = 0
+            for ci, row in t.iterrows():
+                if not row["mask"][0]:
+                    continue
+                d = np.nansum(sample_density(sr, recs, ci), axis=1)
+                a.plot(sr, np.nanmedian(d, axis=0), color=pal[k % len(pal)], lw=1.6 if row.n >= 5 else 0.9,
+                       ls="-" if row.n >= 5 else "--", label=f"{row['name']} (n={row.n})")
+                k += 1
+            a.legend(fontsize=6, loc="upper left")
         elif kind == "mis_refit" and n_mis == 0:
             a.text(0.5, 0.5, "no missense P/LP:\nmissense-only calibration\nruns in NU mode", ha="center",
                    va="center", transform=a.transAxes, fontsize=10)

@@ -284,7 +284,7 @@ class PipelineConfig:
     #                  paths (single-item vs point-tier display).
     # "all" is handled at the orchestration layer (run_pipeline / run_igvf_batch)
     # by running the calibration step once per ACMG-mapping method.
-    acmg_mapping_method: Literal["tavtigian", "acmg_bayes", "lp_anchored"] = "tavtigian"
+    acmg_mapping_method: Literal["tavtigian", "acmg_bayes", "lp_anchored", "lp_anchored_b044"] = "tavtigian"
 
     # Optional override of the acmg_bayes target posteriors, e.g.
     # {"LB": 0.01, "B": 0.001} for stricter benign-direction targets. Any key

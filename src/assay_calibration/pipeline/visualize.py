@@ -679,7 +679,8 @@ def process_component_fits(
     # drawn threshold lines follow the mapping actually used for point_ranges
     from ..plot_utils import utils as _plot_utils
     _plot_utils.THRESHOLD_MAPPING_METHOD = (acmg_mapping_method
-                                            if acmg_mapping_method in ("tavtigian", "lp_anchored") else "tavtigian")
+                                            if acmg_mapping_method in ("tavtigian", "lp_anchored", "lp_anchored_b044")
+                                            else "tavtigian")
 
     log_lr_pathogenic = None  # set below only when mechanism_flag; stays None otherwise
     C_pathogenic = np.array([np.nan, np.nan])
