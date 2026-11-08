@@ -474,7 +474,13 @@ def plot_initial_vs_final_skew_grid(records, output_path=None, n_cols=4):
     return fig
 
 
-def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2):
+# Mapping used to DRAW tier thresholds on LR+ panels. The pipeline sets it from
+# config.acmg_mapping_method (pipeline/visualize.py) so the dashed lines match the
+# thresholds point_ranges were computed with; "tavtigian" unless changed.
+THRESHOLD_MAPPING_METHOD = "tavtigian"
+
+
+def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2, acmg_mapping_method=None):
     """log(lrP)/log(lrB) tier thresholds for `point_values`, plus a y-axis
     padding value extrapolated `pad_points` tiers beyond the highest one.
 
@@ -489,9 +495,11 @@ def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2):
     using the real per-tier step (log(C) / len(point_values)), which keeps
     the drawn thresholds identical to the ones point_ranges was computed with.
     """
-    lrP, lrB, C = thresholds_from_prior(prior, point_values)
+    method = acmg_mapping_method or THRESHOLD_MAPPING_METHOD
+    lrP, lrB, C = thresholds_from_prior(prior, point_values, acmg_mapping_method=method)
     tauP, tauB, log_c = np.log(lrP), np.log(lrB), np.log(C)
-    step = log_c / len(point_values)
+    # tavtigian: lrP = C^(pv/len(pv)); lp_anchored: lrP = C^(pv/8)
+    step = log_c / (8 if method == "lp_anchored" else len(point_values))
     ylim_top = tauP[-1] + pad_points * step
     ylim_bottom = tauB[-1] - pad_points * step
     return tauP, tauB, ylim_top, ylim_bottom

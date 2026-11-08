@@ -1399,6 +1399,8 @@ def thresholds_from_prior(prior, point_values,
     acmg_mapping_method : str
         "tavtigian" (default): legacy C*-based thresholds via
             get_tavtigian_constant.  lrP = C^(pv/len(pv)).
+        "lp_anchored": sensitivity-analysis option; C chosen so 6 points give a
+            0.90 posterior at the prior (capped at prior 0.5), lrP = C^(pv/8).
         "piecewise": prior-adaptive Bayesian thresholds with exact posteriors
             at the four ACMG boundary points (T = 10, 6, -1, -7).  See
             assay_calibration.fit_utils.bayesian_thresholds.
@@ -1414,6 +1416,15 @@ def thresholds_from_prior(prior, point_values,
         C = get_tavtigian_constant(prior, **kwargs)
         pv = np.array(point_values)
         lrP = C ** (pv / len(pv))
+        lrB = 1 / lrP
+        return lrP, lrB, C
+    elif acmg_mapping_method == "lp_anchored":
+        # sensitivity analyses only: LP posterior held at 0.90 up to prior 0.5,
+        # capped above; benign symmetric (see evidence_thresholds.lp_anchored_constant)
+        from .evidence_thresholds import lp_anchored_constant
+        C = lp_anchored_constant(prior)
+        pv = np.array(point_values)
+        lrP = C ** (pv / 8)
         lrB = 1 / lrP
         return lrP, lrB, C
     elif acmg_mapping_method == "piecewise":
@@ -1434,7 +1445,7 @@ def thresholds_from_prior(prior, point_values,
     else:
         raise ValueError(
             f"Unknown acmg_mapping_method {acmg_mapping_method!r}; "
-            f"expected 'tavtigian', 'piecewise', or 'strict_additive'"
+            f"expected 'tavtigian', 'lp_anchored', 'piecewise', or 'strict_additive'"
         )
 
 

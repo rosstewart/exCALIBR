@@ -1,211 +1,372 @@
-"""E7 per-dataset figures: the calibrations behind each stability-rule call, for a priority list of datasets.
+"""E7 per-dataset figures: all-P/LP evidence vs missense evidence (post-fit re-weighting and missense-only
+refit), each judged against random all-P/LP subsets of the missense size (re-weighted and refit).
 
-For each dataset, one figure with
-  A  pathogenic evidence: log10 lr+ (5th bootstrap percentile, the conservative pathogenic curve) vs score
-  B  evidence points vs score (the calibrated point thresholds; benign points negative)
-  C  where the P/LP sit: missense vs non-missense P/LP scores (strip), so composition differences are visible
-  D  the numbers each rule uses, and each rule's call
-Arms: all P/LP (black), missense P/LP (orange), the random all-P/LP subsets of the missense size (thin blue).
-Rows: E1 (baseline fits, P/LP weights re-estimated, components fixed); with --refit and the medium calibrations
-present, a second row from full refits (baseline first 100 bootstraps / plpmis / plpsub seeds 0-2).
+Arms (first 100 baseline bootstraps, which share bootstrap composition with the 100-bootstrap refits; point
+mapping lp_anchored everywhere):
+  all P/LP            production fits                                        prior: gnomAD, all types
+  missense, reweight  baseline components, P/LP weights from missense P/LP   prior: gnomAD missense
+  missense, refit     refit with missense-only P/LP (plpmis)                 prior: gnomAD missense
+  subsets, reweight   baseline components, P/LP weights from 10 random all-P/LP subsets of the missense size
+  subsets, refit      3 refits with random all-P/LP subsets of the missense size (plpsub)
+  (subset arms use the gnomAD missense prior: they are the count-matched null for the missense arms)
 
-Usage:  python -m analysis.missense_sensitivity.plot_stability_datasets [--refit] [--datasets ...]
+Layout
+  Row 0  sample histograms + fitted mixtures; a P/LP column per arm (missense columns show missense P/LP;
+         the subset column shows all P/LP with each subset's fitted P/LP density as a thin line)
+  Row 1  A  pathogenic evidence: log LR+ 5th percentile (natural log), every arm
+         B  benign evidence: log LR+ 95th percentile, every arm
+         C  evidence strip: one band per arm / subset, coloured by the points assigned along the score axis
+         D  numbers and each rule's call (in-bag points of the dataset's missense P/LP)
+
+Usage:  python -m analysis.missense_sensitivity.plot_stability_datasets [--datasets ...]
 """
 from __future__ import annotations
 
 import argparse
 import gzip
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
+warnings.filterwarnings("ignore")
 ROOT = Path("/data/ross/assay_calibration/missense_only_calibrations")
-KEEP = ROOT / "analysis_v3" / "e1_priority_calibrations"
-OUTDIR = ROOT / "figs_stability_rules" / "per_dataset"
+SENS = ROOT / "sens_popmis_lp"
 PLP = "Pathogenic/Likely Pathogenic"
-INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
-C_SUB, C_MIS = "#2a78d6", "#eb6834"
+ARM_STYLE = {  # colour, linewidth, linestyle, label
+    "all": ("#0b0b0b", 5.0, "-", "all P/LP (prior: gnomAD all)"),   # wide underlay: visible as an outline
+    "mis_rw": ("#eb6834", 1.9, "-", "missense, re-weighted"),
+    "mis_refit": ("#6250d6", 1.9, "--", "missense-only refit"),
+    "sub_rw": ("#2a78d6", 0.9, "-", "random subsets, re-weighted"),
+    "sub_refit": ("#1baf7a", 1.3, ":", "random subsets, refit"),
+    "cell_mis": ("#e87ba4", 2.2, "-.", "missense, membership-cell fit"),
+    "cell_mis_3c": ("#a50f5f", 1.6, (0, (1, 1)), "missense, membership-cell fit (3c)"),
+}
+CELLS = Path("/data/ross/assay_calibration/missense_only_calibrations/cells/light_c1")
 
-# priority list: why each dataset is worth looking at
 PRIORITY = {
-    "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": "composition, n large: missense P/LP give MORE evidence than all P/LP",
-    "GCK_Gersing_2024_abundance": "composition by mean points only (-0.33); highest level unchanged",
-    "PTEN_Matreyek_2018_clinvar_2018": "n-based rule says composition; missense sits at the edge of the subset range (count?)",
-    "CHEK2_McCarthy-Leo_2024": "n = 7 (count-limited by n), yet random subsets are stable and missense moves a level",
-    "BRCA2_IGVF": "n = 2: subsets unstable AND missense outside their range",
-    "KCNE1_Muhammad_2024_trafficking_WT_background_DN": "n = 3: subsets span 0-8 points; missense 0 vs all P/LP 8",
-    "KCNH2_Kozek_Glazer_2020": "n = 2 but every subset gives the same calls: n rule over-flags",
-    "BRCA2_Sahu_2023_exon13_SGE": "n = 3, stable under subsets: n rule over-flags",
-    "TSC2_IGVF": "n = 61 yet 1 of 10 subsets drops the top level: threshold at a level boundary",
+    "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": "composition, n large: missense P/LP give more evidence than all P/LP",
+    "GCK_Gersing_2024_abundance": "composition by mean points only; highest level unchanged",
+    "PTEN_Matreyek_2018_clinvar_2018": "missense at the edge of the subset range",
+    "CHEK2_McCarthy-Leo_2024": "n = 7 (count-limited by n), yet subsets stable and missense moves a level",
+    "BRCA2_IGVF": "n = 2: subsets unstable and missense outside their range",
+    "KCNE1_Muhammad_2024_trafficking_WT_background_DN": "n = 3: subsets span 0-8 points",
+    "KCNH2_Kozek_Glazer_2020": "n = 2 but every subset gives the same calls (n rule over-flags)",
+    "BRCA2_Sahu_2023_exon13_SGE": "n = 3, stable under subsets (n rule over-flags)",
+    "TSC2_IGVF": "n = 61 yet 1 of 10 subsets drops the top level",
     "BAP1_Waters_2024": "n = 11, just above the floor, unstable under subsets",
     "RAD51C_Olvera-León_2024": "n = 8: missense at the top of a wide subset range",
-    "PALB2_IGVF": "n = 3: wide subset spread (0-4.7 mean points)",
-    "LDLR_Tabet_2025_uptake": "control: n = 358, all arms agree",
-    # no missense P/LP: the missense-only calibration runs in NU mode (refit row only)
-    "XRCC2_IGVF": "all 6 P/LP non-missense: missense-only calibration becomes NU",
-    "PALB2_Boonen_2026_SGE": "all 4 P/LP non-missense: missense-only calibration becomes NU",
+    "PALB2_IGVF": "n = 3: wide subset spread",
+    "LDLR_Tabet_2025_uptake": "control: n = 358",
+    "TP53_Boettcher_2019_clinvar_2018": "composition: missense P/LP turn benign evidence on for 69% of missense variants",
+    "GCK_Gersing_2023_complementation": "missense-only refit collapses pathogenic evidence (top level 5 -> 1); re-weighting and subset refits do not",
+    "SGCB_Li_2023": "n = 8: re-weighting deepens benign evidence (mean -1 -> -4) beyond the subsets",
+    "DDX3X_Radford_2023": "re-weighting weakens benign evidence (mean -1.9 -> -1.0) beyond the subsets",
+    "TP53_Giacomelli_2018_combined_score_clinvar_2018": "re-weighting deepens benign evidence and lowers the top level 8 -> 7",
+    "BRCA1_Adamovich_2022_HDR_clinvar_2018": "n = 16: 41% of missense move >= 2 points under re-weighting",
+    "FKRP_Ma_2024": "re-weighting raises the top level 7 -> 8",
+    "XRCC2_IGVF": "all 6 P/LP non-missense: missense-only refit is NU",
+    "PALB2_Boonen_2026_SGE": "all 4 P/LP non-missense: missense-only refit is NU",
 }
 
 
-def _load_arm(d):
-    d = Path(d)
-    try:
-        cal = json.load(open(next(d.glob("*_calibration.json"))))
-        lr = json.load(gzip.open(next(d.glob("*_lr_values.json.gz"))))
-    except StopIteration:
+def _load_cal(d):
+    c = sorted(Path(d).glob("*_calibration.json"))
+    if not c:
         return None
-    return cal, lr
+    return dict(cal=json.load(open(c[0])),
+                lr=json.load(gzip.open(str(c[0]).replace("_calibration.json", "_lr_values.json.gz"), "rt")))
 
 
-def _points_curve(cal, x):
-    from src.assay_calibration.fit_utils.fit import assign_points
-    pr = {int(k): v for k, v in (cal.get("point_ranges") or {}).items()}
-    return assign_points(np.asarray(x, float), pr)
+def load_arms(ds, kc=None):
+    arms = {"all": [_load_cal(SENS / "medium_baseline_popall" / ds)],
+            "mis_rw": [_load_cal(SENS / "e1_priority_calibrations" / ds / "missense")],
+            "mis_refit": [_load_cal(SENS / "medium_plpmis" / ds)],
+            "sub_rw": [_load_cal(d) for d in sorted((SENS / "e1_priority_calibrations" / ds).glob("subset_*"),
+                                                    key=lambda p: int(p.name.split("_")[1]))],
+            "sub_refit": [_load_cal(SENS / f"medium_plpsub_s{i}" / ds) for i in range(3)]}
+    if kc:  # membership-cell fits (light C1 run), at the config K and, for 2c datasets, at 3c too
+        arms["cell_mis"] = [_load_cal(CELLS / f"calib_cell_mis_{kc}" / ds)]
+        if kc == "2c":
+            arms["cell_mis_3c"] = [_load_cal(CELLS / "calib_cell_mis_3c" / ds)]
+    return {k: [c for c in v if c] for k, v in arms.items()}
 
 
-def _plp_scores(ds):
-    """Missense and non-missense P/LP scores, from the baseline variants table."""
-    from analysis import config as _cfg
-    from analysis.discovery import load_master_df, _filter_dataset_df
+def _recs(fits_ds, n_c):
+    return [fits_ds[k][n_c] for k in sorted(fits_ds, key=int) if fits_ds[k].get(n_c)] if fits_ds else []
+
+
+def _reweighted(ds, df_ds, fits_ds, n_c, n_subsets=10):
+    """E1 arms re-created (same training rows, same rng as matched_subsample)."""
     from analysis.missense_sensitivity.compare_runs import _missense_map
-    dv = pd.read_csv(next((ROOT / "calib_baseline" / ds).glob(f"{ds}_*_variants.csv")))
-    df = _filter_dataset_df(load_master_df(_cfg.DATASET_TSV), ds, _cfg.DATASET_TSV)
-    mis = set(_missense_map(ds, df).query("is_missense").variant_id)
-    p = dv[dv["sample"].fillna("").str.contains(PLP, regex=False)]
-    return p[p.variant_id.isin(mis)].score.values, p[~p.variant_id.isin(mis)].score.values
+    from analysis.missense_sensitivity.matched_subsample import training_rows
+    from analysis.missense_sensitivity.reweight_plp_missense import _em_weights
+    from src.assay_calibration.pipeline.config import PipelineConfig
+    from src.assay_calibration.pipeline.utils import load_dataset_from_df
+    release = "2018" if ds.endswith("_clinvar_2018") else "2025"
+    ss = load_dataset_from_df(df_ds, PipelineConfig(dataset_csv="", dataset_name=ds, output_dir="/tmp",
+                                                    clinvar_release=release))
+    names = [n for n, c in zip(ss.sample_names, ss.sample_counts) if c > 0]
+    pc = names.index(PLP)
+    sa, scores = np.asarray(ss.sample_assignments), np.asarray(ss.scores)
+    mis = _missense_map(ds, df_ds)["is_missense"].values
+    is_plp = sa[:, pc].astype(bool)
+    n_mis = int((is_plp & mis).sum())
+    seeds = [k for k in sorted(fits_ds, key=int) if fits_ds[k].get(n_c)]
+    recs = [fits_ds[k][n_c] for k in seeds]
+    out = dict(names=names, pc=pc, sa=sa, scores=scores, is_plp=is_plp, mis_mask=is_plp & mis, all=recs,
+               mis_rw=[], sub_rw=[])
+    if n_mis == 0:
+        return out
+    rows_per_seed = [training_rows(sa, scores, int(b)) for b in seeds]
+    rng = np.random.default_rng(12345)
+    plp_rows = np.flatnonzero(is_plp)
+    members = [("mis_rw", is_plp & mis)]
+    for _ in range(n_subsets):
+        m = np.zeros(len(scores), bool)
+        m[rng.choice(plp_rows, size=n_mis, replace=False)] = True
+        members.append(("sub_rw", m))
+    for arm, member in members:
+        new = []
+        for rec, (rows, onehot) in zip(recs, rows_per_seed):
+            rec = json.loads(json.dumps(rec))
+            rp = rows[onehot[rows, pc] & member[rows]]
+            if len(rp):
+                rec["fit"]["weights"][pc] = _em_weights(scores[rp], rec["fit"]["component_params"],
+                                                        rec["fit"]["weights"][pc]).tolist()
+            new.append(rec)
+        if arm == "mis_rw":
+            out["mis_rw"] = new
+        else:
+            out["sub_rw"].append(new)
+    return out
 
 
-def _row(axs, arms, x_plp_m, x_plp_o, label):
-    """arms: dict name -> (cal, lr) with names 'all', 'missense', 'subset_*'."""
-    lo = min(np.min(a[1]["score_range"]) for a in arms.values())
-    hi = max(np.max(a[1]["score_range"]) for a in arms.values())
-    x = np.linspace(lo, hi, 600)
-    for name, (cal, lr) in sorted(arms.items(), key=lambda kv: (kv[0] != "subset", kv[0])):
-        sr = np.asarray(lr["score_range"], float)
-        y = np.asarray(lr["log_lr_plus_p5"], float) / np.log(10)
-        sub = name.startswith("subset")
-        kw = dict(color=C_SUB, lw=0.8, alpha=0.55, zorder=2) if sub else \
-            dict(color=C_MIS if name == "missense" else INK, lw=2, zorder=4 if name == "missense" else 3)
-        axs[0].plot(sr, y, **kw)
-        axs[1].step(x, _points_curve(cal, x), where="mid", **kw)
-    axs[0].axhline(0, color=INK2, lw=0.8)
-    axs[1].axhline(0, color=INK2, lw=0.8)
-    axs[0].set_ylabel(f"{label}\nlog10 lr+ (5th pct)", fontsize=8)
-    axs[1].set_ylabel("points", fontsize=8)
-    rng = np.random.default_rng(0)
-    axs[2].scatter(x_plp_m, rng.uniform(0.6, 1.4, len(x_plp_m)), s=10, color=C_MIS, alpha=0.8, label="missense P/LP")
-    axs[2].scatter(x_plp_o, rng.uniform(-0.4, 0.4, len(x_plp_o)), s=10, color=INK2, alpha=0.6, label="other P/LP")
-    axs[2].set_yticks([0, 1])
-    axs[2].set_yticklabels([f"other\n(n={len(x_plp_o)})", f"missense\n(n={len(x_plp_m)})"], fontsize=7.5)
-    axs[2].set_ylim(-0.8, 1.8)
-    for a in axs[:3]:
-        a.set_xlim(lo, hi)
-        a.grid(color=GRID, lw=0.6)
-        a.set_axisbelow(True)
-        a.tick_params(labelsize=7.5)
-        for s in ("top", "right"):
-            a.spines[s].set_visible(False)
+def _points(cal, x):
+    from src.assay_calibration.fit_utils.fit import assign_points
+    return assign_points(np.asarray(x, float), {int(k): v for k, v in (cal.get("point_ranges") or {}).items()})
 
 
-def _rule_text(r):
+def _rule_text(arms, sc_mis, n_plp, n_mis):
+    from analysis.missense_sensitivity.matched_subsample import _score
+    st = {k: [_score(c["cal"], sc_mis, []) for c in v] for k, v in arms.items()}
+    one = lambda k, key: st[k][0][key] if st.get(k) else np.nan
+
+    def rng(k, key):
+        v = [s[key] for s in st.get(k, [])]
+        return (min(v), max(v)) if v else (np.nan, np.nan)
+    ma, mm, mr = (one(k, "plp_mean_path") for k in ("all", "mis_rw", "mis_refit"))
+    la, lm, lr_ = (one(k, "max_path") for k in ("all", "mis_rw", "mis_refit"))
+    srw, sref = rng("sub_rw", "plp_mean_path"), rng("sub_refit", "plp_mean_path")
+    lrw, lref = rng("sub_rw", "max_path"), rng("sub_refit", "max_path")
+    nchg = sum(s["max_path"] != la for s in st.get("sub_rw", []))
+    pa, pm, pr = (one(k, "prior") for k in ("all", "mis_rw", "mis_refit"))
     yn = lambda b: "FLAG" if b else "-"
-    if r.n_mis == 0:
-        return (f"P/LP: {int(r.n_plp)} all, 0 missense\n\nmissense-only calibration has no P/LP:\n"
-                "NU mode, so its 'pathogenic' evidence means\nfunctionally abnormal, not pathogenic.\n\n"
-                "No re-weighting or random subsets possible.\nCount rules: n < 5 FLAG, n < 10 FLAG\n\n"
-                f"proposed: {r.proposed}")
-    lines = [
-        f"P/LP: {int(r.n_plp)} all, {int(r.n_mis)} missense",
-        "",
-        "mean points per missense P/LP",
-        f"  all {r.mean_all:.2f}  missense {r.mean_mis:.2f}",
-        f"  subsets {r.mean_lo:.2f}-{r.mean_hi:.2f} (median {r.mean_sub:.2f})",
+    out_rw = bool((mm < srw[0] - 1e-9) or (mm > srw[1] + 1e-9))
+    return "\n".join([
+        f"P/LP: {n_plp} all, {n_mis} missense", "",
+        "prior",
+        f"  all {pa:.3f}   missense rw {pm:.3f}   refit {pr:.3f}", "",
+        "mean pathogenic points per missense P/LP",
+        f"  all P/LP        {ma:5.2f}",
+        f"  missense rw     {mm:5.2f}   subsets rw    {srw[0]:.2f}-{srw[1]:.2f}",
+        f"  missense refit  {mr:5.2f}   subsets refit {sref[0]:.2f}-{sref[1]:.2f}", "",
         "highest pathogenic level",
-        f"  all {r.lev_all:.0f}  missense {r.lev_mis:.0f}  subsets {r.lev_lo:.0f}-{r.lev_hi:.0f}",
-        f"  subsets that change it: {int(r.lev_n_changed)}/{int(r.n_sub)}",
-        "",
-        "candidate rules",
-        f"  n < 5                     {yn(r.n_mis < 5)}",
-        f"  n < 10                    {yn(r.n_mis < 10)}",
-        f"  missense moves level >= 1 {yn(abs(r.lev_mis - r.lev_all) >= 1)}",
-        f"  missense moves mean >= 0.5 {yn(abs(r.mean_mis - r.mean_all) >= 0.5)}",
-        "",
-        "reference outcomes (random subsets)",
-        f"  count-unstable            {yn(r.count_unstable)}",
-        f"  composition               {yn(r.composition)}",
-        "",
-        f"proposed (n-based): {r.proposed}",
-        f"empirical (subsets): {r.empirical}",
-    ]
-    return "\n".join(lines)
+        f"  all {la:.0f}   missense rw {lm:.0f}   refit {lr_:.0f}",
+        f"  subsets rw {lrw[0]:.0f}-{lrw[1]:.0f} ({nchg}/{len(st.get('sub_rw', []))} change it)",
+        f"  subsets refit {lref[0]:.0f}-{lref[1]:.0f}", "",
+        "candidate rules (re-weighting)",
+        f"  n < 5                      {yn(n_mis < 5)}",
+        f"  n < 10                     {yn(n_mis < 10)}",
+        f"  missense moves level >= 1  {yn(abs(lm - la) >= 1)}",
+        f"  missense moves mean >= 0.5 {yn(abs(mm - ma) >= 0.5)}",
+        f"  missense outside subsets   {yn(out_rw)}",
+    ])
 
 
-def draw_dataset(ds, r, why, refit):
+def draw(ds, df_ds, fits_base, fits_mis_refit, fits_sub_refit, cfg_entry, why, out_dir):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from analysis.missense_sensitivity.plot_stability_rules import display_name
-    e1 = {a.name: _load_arm(a) for a in sorted((KEEP / ds).glob("*")) if a.is_dir()}
-    e1 = {k: v for k, v in e1.items() if v}
-    rows = [("E1 re-weighting", e1)] if e1 else []
-    if refit:
-        rf = {"all": _load_arm(ROOT / "calib_medium_baseline" / ds), "missense": _load_arm(ROOT / "calib_medium_plpmis" / ds)}
-        for i in range(3):
-            rf[f"subset_{i}"] = _load_arm(ROOT / f"calib_medium_plpsub_s{i}" / ds)
-        rf = {k: v for k, v in rf.items() if v}
-        if "all" in rf and "missense" in rf:
-            rows.append(("full refit" + (" (missense = NU)" if r.n_mis == 0 else ""), rf))
-    if not rows:
+    import seaborn as sns
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    import run_igvf_batch as rib
+    from src.assay_calibration.plot_utils.utils import (sample_density, sample_display_name, sample_hist_style,
+                                                        _display_dataset, log_thresholds_with_ylim_pad)
+    n_c, _, _ = rib.parse_dataset_config(cfg_entry)
+    arms = load_arms(ds, n_c if n_c in ("2c", "3c") else "3c")
+    if not arms["all"]:
         return None
-    xm, xo = _plp_scores(ds)
-    fig = plt.figure(figsize=(16, 3.3 * len(rows) + 1.0))
-    gs = fig.add_gridspec(len(rows), 4, width_ratios=[2.4, 2.4, 1.8, 2.0], wspace=0.32, hspace=0.35,
-                          left=0.06, right=0.99, top=1 - 0.8 / (3.3 * len(rows) + 1.0), bottom=0.12 / len(rows))
-    for i, (lab, arms) in enumerate(rows):
-        axs = [fig.add_subplot(gs[i, j]) for j in range(3)]
-        _row(axs, arms, xm, xo, lab)
-        if i == 0:
-            axs[0].set_title("A  pathogenic evidence curve", fontsize=9, loc="left")
-            axs[1].set_title("B  calibrated points", fontsize=9, loc="left")
-            axs[2].set_title("C  P/LP scores by variant type", fontsize=9, loc="left")
-        if i == len(rows) - 1:
-            for a in axs:
-                a.set_xlabel("assay score", fontsize=8)
-    ta = fig.add_subplot(gs[:, 3])
-    ta.axis("off")
-    ta.text(0, 1, _rule_text(r), va="top", ha="left", family="monospace", fontsize=7.6, transform=ta.transAxes)
-    from matplotlib.lines import Line2D
-    h = [Line2D([], [], color=INK, lw=2), Line2D([], [], color=C_MIS, lw=2), Line2D([], [], color=C_SUB, lw=0.8)]
-    fig.legend(h, ["all P/LP", "missense P/LP", "random all-P/LP subsets, missense size"], loc="upper right",
-               ncol=3, frameon=False, fontsize=8, bbox_to_anchor=(0.99, 1.0))
-    fig.suptitle(f"{display_name(ds)}  -  {why}", x=0.06, ha="left", fontsize=10.5, y=1 - 0.15 / fig.get_figheight())
-    OUTDIR.mkdir(parents=True, exist_ok=True)
-    out = OUTDIR / f"{display_name(ds)}.png"
-    fig.savefig(out, dpi=140)
+    A = _reweighted(ds, df_ds, fits_base, n_c)
+    names, sa, scores = A["names"], A["sa"], A["scores"]
+    sr = np.asarray(arms["all"][0]["lr"]["score_range"])
+    n_mis, n_plp = int(A["mis_mask"].sum()), int(A["is_plp"].sum())
+    refit_recs = _recs(fits_mis_refit, n_c)
+    sub_refit_recs = [r for r in (_recs(f, n_c) for f in fits_sub_refit) if r]
+
+    cols = []
+    for j, n in enumerate(names):
+        cols.append(("sample", sample_display_name(n), sa[:, j].astype(bool), j, A["all"], n))
+        if n == PLP:
+            if A["mis_rw"]:
+                cols.append(("mis_rw", "P/LP missense, re-weighted", A["mis_mask"], j, A["mis_rw"], PLP))
+            if refit_recs or n_mis == 0:
+                cols.append(("mis_refit", "P/LP missense, refit", A["mis_mask"], j, refit_recs, PLP))
+            if A["sub_rw"] or sub_refit_recs:
+                cols.append(("subsets", "P/LP random subsets (missense n)", A["is_plp"], j, None, PLP))
+    ncol = len(cols)
+    fig = plt.figure(figsize=(max(4.2 * ncol, 28), 13.5))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 1.2], hspace=0.3, left=0.04, right=0.99, top=0.9, bottom=0.06)
+    g0 = gs[0].subgridspec(1, ncol, wspace=0.28)
+    g1 = gs[1].subgridspec(1, 4, width_ratios=[1.25, 1.25, 1.4, 0.95], wspace=0.24)
+    xlim = None
+    for k, (kind, title, mask, widx, recs, style_name) in enumerate(cols):
+        a = fig.add_subplot(g0[0, k])
+        x = scores[mask]
+        col, alpha = sample_hist_style(style_name, widx)
+        if kind in ("mis_rw", "mis_refit"):
+            col, alpha = "#8C3B4A", 0.55
+        if len(x) > 1:
+            q1, q3 = np.percentile(x, [25, 75]); fd = 2 * (q3 - q1) * len(x) ** (-1 / 3)
+            bins = max(10, min(100, int((x.max() - x.min()) / fd)) if fd > 0 else 30)
+            sns.histplot(x, bins=bins, stat="density", ax=a, alpha=alpha, color=col)
+        elif len(x):
+            sns.histplot(x, bins=5, stat="density", ax=a, alpha=alpha, color=col)
+        hmax = max([p.get_height() for p in a.patches]) if a.patches else 1.0
+        if kind == "subsets":
+            for recs_s in A["sub_rw"]:
+                d = np.nansum(sample_density(sr, recs_s, widx), axis=1)
+                a.plot(sr, np.nanmedian(d, axis=0), color=ARM_STYLE["sub_rw"][0], lw=0.9, alpha=0.7)
+            for recs_s in sub_refit_recs:
+                d = np.nansum(sample_density(sr, recs_s, 0), axis=1)
+                a.plot(sr, np.nanmedian(d, axis=0), color=ARM_STYLE["sub_refit"][0], lw=1.4, ls=":")
+            d = np.nansum(sample_density(sr, A["all"], widx), axis=1)
+            a.plot(sr, np.nanmedian(d, axis=0), color="black", lw=1.8, label="all P/LP fit")
+            a.plot([], [], color=ARM_STYLE["sub_rw"][0], lw=0.9, label=f"{len(A['sub_rw'])} subsets, re-weighted")
+            a.plot([], [], color=ARM_STYLE["sub_refit"][0], lw=1.4, ls=":", label=f"{len(sub_refit_recs)} subsets, refit")
+            a.legend(fontsize=6.5)
+        elif kind == "mis_refit" and n_mis == 0:
+            a.text(0.5, 0.5, "no missense P/LP:\nmissense-only calibration\nruns in NU mode", ha="center",
+                   va="center", transform=a.transAxes, fontsize=10)
+        elif recs:
+            w_idx = 0 if kind == "mis_refit" else widx
+            dens = sample_density(sr, recs, w_idx)
+            for c in range(dens.shape[1]):
+                a.plot(sr, np.nanpercentile(dens[:, c, :], 50, axis=0), color=f"C{c}", ls="--", lw=1, label=f"Comp {c + 1}")
+            tot = np.nansum(dens, axis=1)
+            p5, p50, p95 = np.percentile(tot, [5, 50, 95], axis=0)
+            a.plot(sr, p50, color=ARM_STYLE[kind][0] if kind in ARM_STYLE else "black", lw=1.6)
+            a.fill_between(sr, p5, p95, color="gray", alpha=0.3)
+            a.legend(fontsize=6.5)
+        a.set_title(f"{n_c}: {title}\n(n={int(mask.sum()):,d})", fontsize=9.5)
+        a.set_ylim([0, hmax * 1.1]); a.tick_params(labelsize=8); a.grid(lw=0.5, alpha=0.3)
+        if xlim is None:
+            xlim = a.get_xlim()
+        a.set_xlim(xlim)
+
+    aP, aB, aS, aT = (fig.add_subplot(g1[0, i]) for i in range(4))
+    order = ["all", "sub_rw", "sub_refit", "mis_refit", "mis_rw", "cell_mis", "cell_mis_3c"]
+    ref = np.asarray(arms["all"][0]["lr"]["log_lr_plus_p5"], float)
+
+    def same_as_all(c):
+        cur = np.interp(sr, np.asarray(c["lr"]["score_range"]), np.asarray(c["lr"]["log_lr_plus_p5"], float))
+        ok = np.isfinite(ref) & np.isfinite(cur)
+        # within the plotted range, the curves differ by < 0.05 (median) -> say so in the legend
+        return bool(ok.any() and np.nanmedian(np.abs(ref[ok] - cur[ok])) < 0.05)
+    pv = list(range(1, 9))
+    for ax_, q, ttl in ((aP, "p5", "A  pathogenic evidence: log LR+, 5th percentile"),
+                        (aB, "p95", "B  benign evidence: log LR+, 95th percentile")):
+        for arm in order:
+            col, lw, ls, lab = ARM_STYLE[arm]
+            for i, c in enumerate(arms.get(arm, [])):
+                tag = " - matches all P/LP" if arm in ("mis_rw", "mis_refit", "cell_mis", "cell_mis_3c") and same_as_all(c) else ""
+                ax_.plot(np.asarray(c["lr"]["score_range"]), c["lr"][f"log_lr_plus_{q}"], color=col, lw=lw, ls=ls,
+                         alpha=0.45 if arm == "all" else (0.8 if lw < 1.5 else 1),
+                         label=(lab + tag) if i == 0 else None, zorder=1 if arm == "all" else (3 if lw > 1.5 else 2))
+        for arm, ls in (("all", "--"), ("mis_rw", ":")):
+            if arms.get(arm):
+                tauP, tauB, _, _ = log_thresholds_with_ylim_pad(arms[arm][0]["cal"]["prior"], pv,
+                                                                acmg_mapping_method="lp_anchored")
+                for t in (tauP if q == "p5" else tauB):
+                    ax_.axhline(t, color=ARM_STYLE[arm][0], ls=ls, lw=0.7, alpha=0.35)
+        _, _, top, bot = log_thresholds_with_ylim_pad(arms["all"][0]["cal"]["prior"], pv,
+                                                      acmg_mapping_method="lp_anchored")
+        ax_.set_ylim(bot, top); ax_.set_xlim(xlim); ax_.grid(lw=0.5, alpha=0.3)
+        ax_.axhline(0, color="#52514e", lw=0.8)
+        ax_.set_title(ttl + "\nthresholds: all P/LP dashed, missense re-weighted dotted", fontsize=9.5, loc="left")
+        ax_.set_xlabel("Score"); ax_.set_ylabel("log LR+ (natural log)")
+    aP.legend(fontsize=7.5, loc="best")
+    rows_, labs = [], []
+    for arm, lab in (("all", "all P/LP"), ("mis_rw", "missense, re-weighted"), ("mis_refit", "missense, refit"),
+                     ("cell_mis", "missense, cell fit"), ("cell_mis_3c", "missense, cell fit (3c)")):
+        if arms.get(arm):
+            rows_.append(_points(arms[arm][0]["cal"], sr)); labs.append(lab)
+    n_top = len(rows_)
+    for i, c in enumerate(arms.get("sub_rw", [])):
+        rows_.append(_points(c["cal"], sr)); labs.append(f"subset {i + 1}, re-weighted")
+    n_mid = len(rows_)
+    for i, c in enumerate(arms.get("sub_refit", [])):
+        rows_.append(_points(c["cal"], sr)); labs.append(f"subset {i + 1}, refit")
+    cmap = ListedColormap(["#08306b", "#08519c", "#2171b5", "#4292c6", "#6baed6", "#9ecae1", "#c6dbef", "#deebf7",
+                           "#f4f4f4",
+                           "#fee0d2", "#fcbba1", "#fc9272", "#fb6a4a", "#ef3b2c", "#cb181d", "#a50f15", "#67000d"])
+    norm = BoundaryNorm(np.arange(-8.5, 9.5, 1), cmap.N)
+    im = aS.imshow(np.vstack(rows_), aspect="auto", cmap=cmap, norm=norm, interpolation="nearest",
+                   extent=[sr[0], sr[-1], len(rows_) - 0.5, -0.5])
+    aS.set_yticks(range(len(labs))); aS.set_yticklabels(labs, fontsize=7.5)
+    for y in (n_top - 0.5, n_mid - 0.5):
+        if 0 < y < len(rows_) - 1:
+            aS.axhline(y, color="white", lw=4)
+    aS.set_xlim(xlim); aS.set_xlabel("Score")
+    aS.set_title("C  evidence strip: points along the score axis", fontsize=9.5, loc="left")
+    cb = fig.colorbar(im, ax=aS, ticks=range(-8, 9, 2), fraction=0.04, pad=0.02)
+    cb.set_label("points", fontsize=8); cb.ax.tick_params(labelsize=7)
+    aT.axis("off")
+    aT.text(0, 1, "D\n" + _rule_text(arms, scores[A["mis_mask"]], n_plp, n_mis), va="top", ha="left",
+            family="monospace", fontsize=8.5, transform=aT.transAxes)
+    fig.suptitle(f"{_display_dataset(ds)} - {why}\npoint mapping LP-anchored (6 points = 0.90 posterior, prior "
+                 f"capped at 0.5); first 100 bootstraps", fontsize=13, x=0.04, ha="left", y=0.995)
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    fn = out / f"{_display_dataset(ds)}_stability.png"
+    fig.savefig(fn, dpi=110)
     plt.close(fig)
-    return out
+    return str(fn)
+
+
+def _safe(*a):
+    try:
+        return draw(*a)
+    except Exception as e:
+        import traceback
+        return f"FAILED {a[0]}: {e!r}\n{traceback.format_exc()}"
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--refit", action="store_true")
+    ap.add_argument("--out", default=str(ROOT / "figs_stability_rules" / "per_dataset"))
     ap.add_argument("--datasets", nargs="*", default=None)
+    ap.add_argument("--n-jobs", type=int, default=8)
+    ap.add_argument("--config", default="src/igvf_configs/dataset_configs_aug_2026.json")
     args = ap.parse_args()
-    from analysis.missense_sensitivity.plot_stability_rules import e1_table, classify
-    t = e1_table().set_index("dataset", drop=False)
-    for c in ["mean_all", "mean_mis", "mean_lo", "mean_hi", "mean_sub", "lev_all", "lev_mis", "lev_lo", "lev_hi"]:
-        t[c] = t[c].astype(float)
-    rules, prop = classify(t)
-    t["count_unstable"], t["composition"], t["proposed"] = rules["count-unstable*"], rules["composition*"], prop
-    t["empirical"] = np.select([t.count_unstable & t.composition, t.count_unstable, t.composition],
-                               ["count-unstable + composition", "count-unstable", "composition"], "stable")
-    for ds in args.datasets or PRIORITY:
-        if not (KEEP / ds).exists() and not args.refit:
-            print("no kept calibrations:", ds)
-            continue
-        print(draw_dataset(ds, t.loc[ds], PRIORITY.get(ds, ""), args.refit))
+    from joblib import Parallel, delayed
+    from analysis import config as _cfg
+    from analysis.discovery import load_master_df, _filter_dataset_df
+    cfg = json.load(open(args.config))
+    todo = list(args.datasets or PRIORITY)
+    fb = json.load(gzip.open(ROOT / "explorer_jobs_pp_large_baseline" / "bootstrap_results_first100.json.gz"))
+    fm = json.load(gzip.open(ROOT / "explorer_jobs_pp_medium_plpmis" / "bootstrap_results.json.gz"))
+    fs = [json.load(gzip.open(ROOT / f"explorer_jobs_pp_medium_plpsub_s{i}" / "bootstrap_results.json.gz"))
+          for i in range(3)]
+    df_full = load_master_df(_cfg.DATASET_TSV)
+    slices = {ds: _filter_dataset_df(df_full, ds, _cfg.DATASET_TSV) for ds in todo}
+    del df_full
+    res = Parallel(n_jobs=args.n_jobs)(
+        delayed(_safe)(ds, slices[ds], fb[ds], fm.get(ds), [f.get(ds) for f in fs],
+                       cfg.get(ds) or cfg.get(ds.replace("_clinvar_2018", "")), PRIORITY.get(ds, ""), args.out)
+        for ds in todo)
+    for x in res:
+        print(x if x else "skipped (missing calibrations)")
 
 
 if __name__ == "__main__":

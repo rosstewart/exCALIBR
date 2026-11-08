@@ -45,8 +45,12 @@ def display_name(ds):
         return ds.replace("_clinvar_2018", "")
 
 
-def e1_table():
-    parts = sorted((ROOT / "analysis_v3" / "e1_matched_subsample_parts").glob("*.csv"))
+# E1 under the corrected settings (gnomAD missense prior, lp_anchored mapping, first 100 bootstraps)
+E1_PARTS = ROOT / "sens_popmis_lp" / "e1_full" / "e1_matched_subsample_parts"
+
+
+def e1_table(parts_dir=None):
+    parts = sorted(Path(parts_dir or E1_PARTS).glob("*.csv"))
     d = pd.concat([pd.read_csv(f) for f in parts if f.stat().st_size > 2], ignore_index=True)  # keeps the skip rows
     # datasets whose P/LP are all non-missense: the missense-only calibration has no P/LP (NU mode), so
     # there is nothing to re-weight or subsample; listed as their own category
@@ -154,7 +158,7 @@ def draw(t, refit, path):
     ax[0].barh(y, t.n_plp, color="#c9c8c2", height=0.7, label="all P/LP")
     ax[0].barh(y, t.n_mis, color=INK2, height=0.4, label="missense P/LP")
     ax[0].set_xscale("log")
-    ax[0].legend(loc="lower right", fontsize=7, frameon=False, handlelength=1)
+    ax[0].legend(loc="lower left", bbox_to_anchor=(0, 1.06), fontsize=7, frameon=False, handlelength=1, ncol=2)
     for v in (5, 10):
         ax[0].axvline(v, color=INK2, ls=":", lw=1)
     ax[0].set_title("A  P/LP (n)", fontsize=9, loc="left", color=INK)
@@ -172,7 +176,7 @@ def draw(t, refit, path):
         a.set_axisbelow(True)
         a.set_title(title, fontsize=9, loc="left", color=INK)
     for i in np.flatnonzero(t.n_mis.values == 0):
-        ax[1].text(0.02, i, "no missense P/LP: missense-only calibration is NU (no pathogenic controls)",
+        ax[1].text(0.02, i, "no missense P/LP: missense-only calibration is NU",
                    transform=ax[1].get_yaxis_transform(), va="center", fontsize=7, color=INK2)
     ax[2].set_xticks(range(0, 9))
     h, l = ax[1].get_legend_handles_labels()
@@ -201,7 +205,7 @@ def draw(t, refit, path):
            color=INK, ha="left", va="top")
     a.xaxis.set_label_position("top")
     # E: proposed
-    for col, pr, ttl in [(4, prop, f"E  proposed (E1)")] + ([(5, prop_rf, "F  proposed (refit)")] if have_rf else []):
+    for col, pr, ttl in [(4, prop, f"E  proposed")] + ([(5, prop_rf, "F  proposed (refit)")] if have_rf else []):
         a = ax[col]
         for i, v in enumerate(pr):
             a.add_patch(Rectangle((0.02, i - 0.4), 0.96, 0.8, facecolor=CAT[v], edgecolor="none", zorder=3))
@@ -245,11 +249,14 @@ def draw(t, refit, path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refit", action="store_true")
+    ap.add_argument("--e1-parts", default=str(E1_PARTS),
+                    help="E1 part files (default: corrected run; analysis_v3/e1_matched_subsample_parts = old run)")
+    ap.add_argument("--name", default="stability_rules_sens")
     args = ap.parse_args()
-    t = e1_table()
+    t = e1_table(args.e1_parts)
     if args.refit:
         t = t.merge(refit_table(), on="dataset", how="left")
-    tab = draw(t, args.refit, OUTDIR / ("stability_rules_refit.png" if args.refit else "stability_rules_e1.png"))
+    tab = draw(t, args.refit, OUTDIR / f"{args.name}.png")
     print(tab.proposed.value_counts().to_string())
 
 

@@ -1390,7 +1390,7 @@ def main():
                        help="Write a config template JSON (all datasets with n_c/benign_method=null) "
                             "and exit. Preserves override fields from --dataset-configs if provided.")
     parser.add_argument("--acmg-mapping-method",
-                       choices=["tavtigian", "acmg_bayes", "all"],
+                       choices=["tavtigian", "acmg_bayes", "lp_anchored", "all"],
                        default="tavtigian",
                        help="ACMG-mapping method (default: tavtigian). "
                             "'acmg_bayes' = prior-adaptive posterior-based classification, "
@@ -1398,7 +1398,10 @@ def main():
                             "display-only ACMG point label for reporting (supersedes the "
                             "former separate 'piecewise'/'continuous'/'strict_additive' "
                             "options); 'all' runs tavtigian and acmg_bayes and writes "
-                            "per-method output files for comparison.")
+                            "per-method output files for comparison. 'lp_anchored' (sensitivity "
+                            "analyses only, not production): 6 points give exactly a 0.90 "
+                            "posterior at the dataset prior, priors above 0.5 treated as 0.5, "
+                            "benign thresholds symmetric.")
     parser.add_argument("--acmg-bayes-targets", type=json.loads, default=None,
                        help="Override acmg_bayes target posteriors as a JSON object, "
                             "e.g. '{\"LB\": 0.01, \"B\": 0.001}'. Any key not given falls "

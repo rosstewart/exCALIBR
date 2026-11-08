@@ -42,11 +42,13 @@ warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
 PLP = "Pathogenic/Likely Pathogenic"
 
 
-def _em_weights(x, params, w0, max_iter=5000, tol=1e-10):
+def _em_weights(x, params, w0, max_iter=20000, tol=1e-10):
+    """Mixing weights maximising the likelihood of x under fixed components. The weights-only
+    log-likelihood is concave, so the optimum does not depend on the start; start from equal
+    weights (a fitted weight of exactly 0 is a point the multiplicative EM update can barely
+    leave, which occasionally stopped it short of an interior optimum). w0 only sets K."""
     from src.assay_calibration.fit_utils.cfusn import density_utils
-    w = np.asarray(w0, dtype=float)
-    w = np.clip(w, 1e-12, None)
-    w /= w.sum()
+    w = np.full(len(w0), 1.0 / len(w0))
     for _ in range(max_iter):
         post = density_utils.component_posteriors(x, params, w)
         w_new = np.asarray(post).mean(1)

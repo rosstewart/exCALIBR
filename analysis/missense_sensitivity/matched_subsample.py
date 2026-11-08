@@ -36,6 +36,9 @@ warnings.filterwarnings("ignore")
 ROOT = Path("/data/ross/assay_calibration/missense_only_calibrations")
 JOBS = Path("/data/ross/assay_calibration/missense_only_calibrations/explorer_jobs_pp_large_baseline")
 PLP = "Pathogenic/Likely Pathogenic"
+# calibration settings for every arm (set from the CLI in main; module-level so joblib workers see them
+# through the task arguments below)
+CALIB_OPTS = {"population_type": "gnomAD", "acmg_mapping_method": "tavtigian"}
 
 
 def training_rows(sa, scores, seed):
@@ -51,7 +54,8 @@ def training_rows(sa, scores, seed):
 
 def _calibrate(ds, df_ds, fits, seeds, n_c, benign_method, overrides, release, tmp, keep_dir=None):
     import run_igvf_batch as rib
-    args = Namespace(dataset="", min_clinvar_star=1, population_type="gnomAD", manual_prior=None)
+    args = Namespace(dataset="", min_clinvar_star=1, population_type=CALIB_OPTS["population_type"], manual_prior=None,
+                     acmg_mapping_method=CALIB_OPTS["acmg_mapping_method"])
     out = Path(tempfile.mkdtemp(dir=tmp))
     try:
         rib._run_one_combo(
@@ -83,7 +87,9 @@ def _score(cal, scores_plp, scores_vus):
                 vus_mean_path=float(np.clip(v, 0, None).mean()) if len(v) else np.nan)
 
 
-def _dataset_task(ds, df_ds, fits_ds, cfg_entry, n_subsets, tmp, keep_root=None):
+def _dataset_task(ds, df_ds, fits_ds, cfg_entry, n_subsets, tmp, keep_root=None, calib_opts=None):
+    if calib_opts:
+        CALIB_OPTS.update(calib_opts)
     import run_igvf_batch as rib
     from analysis.missense_sensitivity.compare_runs import _missense_map
     from analysis.missense_sensitivity.reweight_plp_missense import _em_weights
@@ -156,6 +162,11 @@ def main():
     ap.add_argument("--datasets", nargs="*", default=None)
     ap.add_argument("--config", default="src/igvf_configs/dataset_configs_aug_2026.json")
     ap.add_argument("--out", default=str(ROOT / "analysis_v3" / "e1_matched_subsample.csv"))
+    ap.add_argument("--population-type", default="gnomAD",
+                    help="prior population for every arm (e.g. gnomAD_missense_nsSNV for missense evidence)")
+    ap.add_argument("--acmg-mapping-method", default="tavtigian", choices=["tavtigian", "lp_anchored"])
+    ap.add_argument("--fits", default=str(JOBS / "bootstrap_results.json.gz"),
+                    help="bootstrap fits to re-weight (e.g. bootstrap_results_first100.json.gz to match the medium refits)")
     ap.add_argument("--keep-root", default=None,
                     help="keep each arm's calibration outputs under <keep-root>/<dataset>/<arm>/")
     ap.add_argument("--tmp", default="/tmp/claude-9996/-home-rcstewart-exCALIBR/"
@@ -168,7 +179,7 @@ def main():
     from analysis import config as _cfg
     from analysis.discovery import load_master_df, _filter_dataset_df
 
-    fits = json.load(gzip.open(JOBS / "bootstrap_results.json.gz"))
+    fits = json.load(gzip.open(args.fits))
     cfg = json.load(open(args.config))
     datasets = sorted(args.datasets or fits)
     df_full = load_master_df(_cfg.DATASET_TSV)
@@ -185,7 +196,8 @@ def main():
         f = parts / f"{ds}.csv"
         if f.exists():
             return
-        rows = _dataset_task(ds, slices[ds], fits[ds], _cfg_for(ds), args.n_subsets, args.tmp, args.keep_root)
+        rows = _dataset_task(ds, slices[ds], fits[ds], _cfg_for(ds), args.n_subsets, args.tmp, args.keep_root,
+                             dict(population_type=args.population_type, acmg_mapping_method=args.acmg_mapping_method))
         pd.DataFrame(rows).to_csv(f, index=False)
 
     todo = [ds for ds in datasets if _cfg_for(ds) is not None and not (parts / f"{ds}.csv").exists()]

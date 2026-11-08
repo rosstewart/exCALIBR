@@ -108,6 +108,23 @@ def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
     return int(fine_vals[np.argmin(fine_fails)])
 
 
+def lp_anchored_constant(prior: float, lp_posterior: float = 0.90, prior_cap: float = 0.5,
+                         lp_points: int = 6, vs_points: int = 8) -> float:
+    """Sensitivity-analysis alternative to get_tavtigian_constant (NOT production).
+
+    Choose C so that lp_points (6, the likely-pathogenic minimum) reach exactly
+    the LP posterior (0.90) at the given prior:
+        C^(lp_points/vs_points) * prior_odds = LP odds  ->  C = (LP odds / prior odds)^(vs_points/lp_points).
+    Priors above prior_cap (0.5) use the prior_cap value, so a higher prior never
+    makes points harder to reach. At prior 0.1 this gives C = 81^(4/3) = 350.4,
+    Tavtigian's 2018 constant. Benign thresholds stay symmetric (lrB = 1/lrP).
+    """
+    q = min(float(prior), prior_cap)
+    q = max(q, 1e-12)
+    lp_odds = lp_posterior / (1 - lp_posterior)
+    return float((lp_odds / (q / (1 - q))) ** (vs_points / lp_points))
+
+
 def pathogenicRulesPosterior(C: int, prior: float, original: bool) -> np.ndarray:
     fracs = [2**-3, 2**-2, 2**-1, 1]
     posterior = np.zeros(8)
