@@ -886,6 +886,7 @@ def _process_variant_oob(
     benign_island_reference_scores: Optional[np.ndarray] = None,
     benign_island_min_frac: float = 0.0,
     prior_degenerate: Optional[np.ndarray] = None,
+    keep_extreme_prior: bool = False,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
@@ -924,7 +925,11 @@ def _process_variant_oob(
                  else np.zeros(len(oob_indices), dtype=bool))
 
     # Filter invalid priors
-    valid = ~np.isnan(oob_priors) & (oob_priors > 0) & (oob_priors < 1)
+    if keep_extreme_prior:
+        # PipelineConfig.keep_extreme_prior_fits: 0/1 priors kept, median clipped below
+        valid = ~np.isnan(oob_priors) & (oob_priors >= 0) & (oob_priors <= 1)
+    else:
+        valid = ~np.isnan(oob_priors) & (oob_priors > 0) & (oob_priors < 1)
     n_valid = int(valid.sum())
     oob_priors, oob_fp, oob_fb = oob_priors[valid], oob_fp[valid], oob_fb[valid]
     oob_degen = oob_degen[valid]
@@ -935,6 +940,9 @@ def _process_variant_oob(
     # Undefined priors (if flagged) are left out of the median only; all
     # valid fits still enter the OOB LR+ below.
     prior = float(np.nanmedian(oob_priors[~oob_degen] if (~oob_degen).any() else oob_priors))
+    if keep_extreme_prior:
+        from .config import EXTREME_PRIOR_CLIP
+        prior = float(np.clip(prior, EXTREME_PRIOR_CLIP, 1 - EXTREME_PRIOR_CLIP))
     if prior <= 0 or prior >= 1:
         return variant_idx, {"_fail": f"invalid_median_prior ({prior})"}
 
@@ -1061,6 +1069,7 @@ def _compute_oob_evidence(
             benign_island_reference_scores=benign_island_reference_scores,
             benign_island_min_frac=benign_island_min_frac,
             prior_degenerate=prior_degenerate,
+            keep_extreme_prior=getattr(config, "keep_extreme_prior_fits", False),
         )
         for vidx, oob_idx in oob_map.items()
     )

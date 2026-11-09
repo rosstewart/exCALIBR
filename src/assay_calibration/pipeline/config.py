@@ -4,6 +4,9 @@ Configuration for Assay Calibration Pipeline
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional
 
+EXTREME_PRIOR_CLIP = 0.001  # keep_extreme_prior_fits clipping bound
+
+
 @dataclass
 class PipelineConfig:
     """Main configuration for the calibration pipeline"""
@@ -115,6 +118,15 @@ class PipelineConfig:
     # pathomechanism_method. Falls back to all kept fits (and flags
     # prior_unstable) if every kept fit is degenerate.
     exclude_degenerate_prior_fits: bool = False
+
+    # Sensitivity option (off = published behaviour). Standard EM priors <= 0.001 or
+    # >= 0.999 normally make get_fit_prior return NaN, dropping that bootstrap fit from
+    # every LR+ percentile, the median prior and OOB. When True those fits are kept
+    # (raw per-fit prior in [0, 1]) and only the final median prior -- the dataset
+    # prior and each variant's OOB median prior -- is clipped to
+    # [EXTREME_PRIOR_CLIP, 1 - EXTREME_PRIOR_CLIP]. Per-bootstrap point ranges use
+    # the clipped per-fit priors (thresholds are undefined at exactly 0 or 1).
+    keep_extreme_prior_fits: bool = False
 
     # EXPERIMENTAL, opt-in alternative to filter_pathogenic_sample_by_lr's
     # ad-hoc row filter, for any dataset with a pathogenic-labeled sample.

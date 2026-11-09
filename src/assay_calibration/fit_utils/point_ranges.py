@@ -1508,7 +1508,10 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
         # floor-instead-of-discard here only ends up changing which bootstrap
         # fits' curves feed the final LR+ plot for datasets that never had a
         # saturation problem to begin with. Keep the original behavior.
-        if prior_estimate <= 0.001 or prior_estimate >= 0.999:
+        # keep_extreme_prior (PipelineConfig.keep_extreme_prior_fits): keep the fit and its
+        # raw estimate (possibly 0 or 1); the caller clips the final median prior instead.
+        if (not kwargs.get("keep_extreme_prior", False)
+                and (prior_estimate <= 0.001 or prior_estimate >= 0.999)):
             return np.nan, mechanism_match_frac_hat
         return prior_estimate, mechanism_match_frac_hat
 

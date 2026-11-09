@@ -181,6 +181,7 @@ def run_single_dataset(
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=getattr(args, "filter_pathogenic_sample_by_lr", False),
         exclude_degenerate_prior_fits=getattr(args, "exclude_degenerate_prior_fits", False),
+        keep_extreme_prior_fits=getattr(args, "keep_extreme_prior_fits", False),
         pathomechanism_method=getattr(args, "pathomechanism_method", None),
         pathomechanism_boundary_joint_prior=getattr(
             args, "pathomechanism_boundary_joint_prior", "product"
@@ -554,6 +555,7 @@ def _run_one_combo(
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
         exclude_degenerate_prior_fits=getattr(args, "exclude_degenerate_prior_fits", False),
+        keep_extreme_prior_fits=getattr(args, "keep_extreme_prior_fits", False),
         pathomechanism_method=pathomechanism_method,
         pathomechanism_boundary_joint_prior=getattr(
             args, "pathomechanism_boundary_joint_prior", "product"
@@ -1297,6 +1299,11 @@ def main():
                             "OOB median prior; they are still used for every LR+ percentile. "
                             "Off by default (published calibrations do not use it). Global, "
                             "batch-wide.")
+    parser.add_argument("--keep-extreme-prior-fits", action="store_true", default=False,
+                       help="Sensitivity option: keep bootstrap fits whose standard EM prior is "
+                            "<= 0.001 or >= 0.999 (normally dropped from every LR+ percentile, "
+                            "the median prior and OOB); only the final median prior (dataset "
+                            "and per-variant OOB) is clipped to [0.001, 0.999]. Off by default.")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
     # experimentation only -- mutually exclusive with --pathomechanism-prior below.
     # Parses with default=None; resolve_prior_mode reconciles it after parsing.

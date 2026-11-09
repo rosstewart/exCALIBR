@@ -402,6 +402,7 @@ def process_component_fits(
     pct_pathogenic_rows_kept = None  # LR-filter row-level retention (filter_flag only)
     pct_bootstraps_kept = None  # fraction of bootstrap fits used for LR+/prior computation
 
+    keep_extreme = getattr(config, "keep_extreme_prior_fits", False)
     if config.manual_prior is not None:
         # Use manually specified prior — skip estimation. Both directions
         # collapse to the same manual value (dual pathomechanism curves never
@@ -460,6 +461,7 @@ def process_component_fits(
                         pathomechanism_boundary_joint_prior=getattr(
                             config, "pathomechanism_boundary_joint_prior", "product"
                         ),
+                        keep_extreme_prior=getattr(config, "keep_extreme_prior_fits", False),
                     )
                     for fit in fits
                 )
@@ -572,10 +574,17 @@ def process_component_fits(
         # entirely rather than partially retained -- simpler and lower-risk
         # than tracking two independently-filtered fit sets through the rest
         # of this function, at the cost of a small, documented efficiency loss.
-        valid_mask = ~(
-            np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1) |
-            np.isnan(fit_priors_pathogenic) | (fit_priors_pathogenic <= 0) | (fit_priors_pathogenic >= 1)
-        )
+        if keep_extreme:
+            # keep_extreme_prior_fits: priors of exactly 0 or 1 are kept (final median clipped below)
+            valid_mask = ~(
+                np.isnan(fit_priors) | (fit_priors < 0) | (fit_priors > 1) |
+                np.isnan(fit_priors_pathogenic) | (fit_priors_pathogenic < 0) | (fit_priors_pathogenic > 1)
+            )
+        else:
+            valid_mask = ~(
+                np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1) |
+                np.isnan(fit_priors_pathogenic) | (fit_priors_pathogenic <= 0) | (fit_priors_pathogenic >= 1)
+            )
         fit_priors = fit_priors[valid_mask]
         fit_priors_pathogenic = fit_priors_pathogenic[valid_mask]
         fit_mechanism_match_fracs = fit_mechanism_match_fracs[valid_mask]
@@ -588,7 +597,7 @@ def process_component_fits(
                     if pct_bootstraps_kept is not None else "  pct_bootstraps_kept: n/a (0 fits)")
 
         if len(fits) == 0:
-            logger.warning(f"  No valid priors; skipping {component_key}")
+            logger.warning(f"  No valid priors; skipping n_c={n_c}")
             return None
 
         # Compute prior(s). 'prior' (P(Y=1), benign-direction) is unchanged in
@@ -612,6 +621,12 @@ def process_component_fits(
             prior_degenerate = np.zeros(len(fit_priors), dtype=bool)
 
         prior = np.nanmedian(fit_priors[~prior_degenerate])
+        if keep_extreme:
+            from .config import EXTREME_PRIOR_CLIP
+            n_ext = int(((fit_priors <= EXTREME_PRIOR_CLIP) | (fit_priors >= 1 - EXTREME_PRIOR_CLIP)).sum())
+            logger.info(f"  keep_extreme_prior_fits: {n_ext}/{len(fit_priors)} kept fits have a prior "
+                        f"outside ({EXTREME_PRIOR_CLIP}, {1 - EXTREME_PRIOR_CLIP}); raw median {prior:.6f}")
+            prior = float(np.clip(prior, EXTREME_PRIOR_CLIP, 1 - EXTREME_PRIOR_CLIP))
         prior_pathogenic = np.nanmedian(fit_priors_pathogenic) if mechanism_flag else np.nan
         logger.info(f"  Prior (benign-direction, P(Y=1)): {prior:.6f}")
         if mechanism_flag:
@@ -776,7 +791,8 @@ def process_component_fits(
                     if log_fp_prefilter is not None else None
                 ),
             )
-            for j, (fit, prior) in enumerate(zip(fits, fit_priors))
+            for j, (fit, prior) in enumerate(zip(
+                fits, np.clip(fit_priors, 0.001, 0.999) if keep_extreme else fit_priors))
         )
 
         # Unpack results
@@ -788,7 +804,9 @@ def process_component_fits(
         # Get bootstrap score ranges
         results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
             delayed(get_bootstrap_score_ranges)(
-                fitIdx, fit, fp, fb, score_range, fit_priors, config.point_values,
+                fitIdx, fit, fp, fb, score_range,
+                (np.clip(fit_priors, 0.001, 0.999) if keep_extreme else fit_priors),
+                config.point_values,
                 acmg_mapping_method=acmg_mapping_method,
                 acmg_bayes_targets=getattr(config, "acmg_bayes_targets", None),
                 acmg_bayes_floor_at_neutral=getattr(

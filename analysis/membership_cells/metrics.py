@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path("/data/ross/assay_calibration/missense_only_calibrations")
-H = ROOT / "cells" / "hpc_medium" / "labeled"
+H = Path(__import__("os").environ.get("CELLS_DIR", str(ROOT / "cells" / "hpc_medium" / "labeled")))
 S = ROOT / "sens_popmis_lp"
 
 
