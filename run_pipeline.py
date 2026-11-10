@@ -304,6 +304,8 @@ Examples:
                             "for reporting (supersedes the former separate 'piecewise'/"
                             "'continuous'/'strict_additive' options); "
                             "'all' = run both and write per-method output files.")
+    parser.add_argument("--tavtigian-posterior-decimals", choices=["none", "3"], default=None,
+                       help="Rounding of rule posteriors when solving for Tavtigian's c: 'none' = exact (c = smallest integer meeting every combining rule; 351 at prior 0.1), '3' = round to 3 decimals as in the ExCALIBR manuscript (348 at prior 0.1). Default: the EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS environment variable, else exact.")
     parser.add_argument("--acmg-bayes-targets", type=json.loads, default=None,
                        help="Override acmg_bayes target posteriors as a JSON object, "
                             "e.g. '{\"LB\": 0.01, \"B\": 0.001}'. Any key not given falls "
@@ -346,6 +348,11 @@ Examples:
 
 
     args = parser.parse_args()
+
+    # Process-wide (read at call time by get_tavtigian_constant and inherited
+    # by joblib workers), so every threshold computation in this run agrees.
+    if args.tavtigian_posterior_decimals is not None:
+        os.environ["EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS"] = args.tavtigian_posterior_decimals
 
     # --n-bootstraps/--fits-per-bootstrap, if explicitly passed, override the
     # --preset shorthand for that one setting only.

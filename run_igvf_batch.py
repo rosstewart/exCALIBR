@@ -177,6 +177,7 @@ def run_single_dataset(
         **({} if getattr(args, "benign_island_prune", True) else {"benign_island_min_frac": 0.0}),
         benign_method=benign_method,
         scoreset_flipped_override=overrides.get("scoreset_flipped_override", None),
+        drop_wrong_side_pathogenic=overrides.get("drop_wrong_side_pathogenic", True),
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=getattr(args, "filter_pathogenic_sample_by_lr", False),
@@ -1411,6 +1412,8 @@ def main():
                             "benign thresholds fixed at Tavtigian's C = 350 (prior-independent). "
                             "'lp_anchored_b044' (sensitivity only): same, but benign "
                             "thresholds anchored at prior 0.044 (C ~= 1135).")
+    parser.add_argument("--tavtigian-posterior-decimals", choices=["none", "3"], default=None,
+                       help="Rounding of rule posteriors when solving for Tavtigian's c: 'none' = exact (c = smallest integer meeting every combining rule; 351 at prior 0.1), '3' = round to 3 decimals as in the ExCALIBR manuscript (348 at prior 0.1). Default: the EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS environment variable, else exact.")
     parser.add_argument("--no-output-suffix", action="store_true",
                        help="With a single --acmg-mapping-method, write production file names "
                             "(no _<method> suffix; the suffix is also appended to the Dataset "
@@ -1428,6 +1431,11 @@ def main():
                             "Ignored when acmg-mapping-method=tavtigian.")
 
     args = parser.parse_args()
+
+    # Process-wide (read at call time by get_tavtigian_constant and inherited
+    # by joblib workers), so every threshold computation in this run agrees.
+    if args.tavtigian_posterior_decimals is not None:
+        os.environ["EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS"] = args.tavtigian_posterior_decimals
 
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode

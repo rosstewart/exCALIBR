@@ -218,6 +218,7 @@ def make_combined_evidence_figure(
     label: str,
     figure_dir: Path,
     filename: Optional[str] = None,
+    title: bool = False,
 ):
     """Combined author + ClinVar evidence-distribution figure, matching
     test/plot_author_calibration_confusion.py's true call:
@@ -239,5 +240,8 @@ def make_combined_evidence_figure(
         clinvar_assignments=clinvar_danz,
         clinvar_classes=clinvar_classes,
     )
-    fig.suptitle(_pretty(label), fontsize=14, fontweight="bold", y=1.01)
+    # Manuscript Figure 3: no method-name title by default (`label` still
+    # names the output file); title=True restores the suptitle.
+    if title:
+        fig.suptitle(_pretty(label), fontsize=14, fontweight="bold", y=1.01)
     _save(fig, figure_dir / (filename or f"combined_evidence_distribution_{label}.png"))

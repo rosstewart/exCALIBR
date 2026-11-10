@@ -250,7 +250,8 @@ def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
     return total_jobs, num_arrays
 
 
-def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int) -> None:
+def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int,
+                      calibration_flags: str | None = None) -> None:
     slurm_dir = str(_SCRIPT_DIR)
     print(f"\n{'='*80}")
     print("Setup complete!")
@@ -264,6 +265,9 @@ def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int) -> None
     print(f"  2. Monitor:   python {slurm_dir}/count_bootstraps.py {output_dir}")
     print(f"  3. Aggregate: python {slurm_dir}/aggregate_results.py {output_dir}")
     print(f"  4. Logs:      {output_dir}/logs/")
+    if calibration_flags:
+        print(f"  5. Calibrate: python run_igvf_batch.py --precomputed-fits <aggregated results> "
+              f"{calibration_flags} ...")
     print(f"\nSee hpc/README.md for full workflow and tunable parameters.")
 
 
@@ -672,10 +676,19 @@ def run_default(args):
         "extra_sample_pull": getattr(args, "extra_sample_pull", "full"),
         "n_bootstraps": N_BOOTSTRAPS,
         "clinvar_default_release": default_release,
+        # Rounding of rule posteriors in the Tavtigian c search to use when
+        # these fits are calibrated (run_igvf_batch.py
+        # --tavtigian-posterior-decimals): pillar_project reproduces the
+        # ExCALIBR manuscript ("3"); other modes use exact c ("none").
+        "tavtigian_posterior_decimals": getattr(args, "tavtigian_posterior_decimals", "none"),
     }
+    for job in all_jobs:
+        job["tavtigian_posterior_decimals"] = sample_settings["tavtigian_posterior_decimals"]
     total_jobs, num_arrays = _save_manifest(output_dir, all_jobs, args.target_array_size, N_BOOTSTRAPS,
                                             extra_index_fields={"sample_settings": sample_settings})
-    _print_next_steps(output_dir, total_jobs, num_arrays)
+    _print_next_steps(output_dir, total_jobs, num_arrays,
+                      calibration_flags=(f"--clinvar-release {default_release} "
+                                         f"--tavtigian-posterior-decimals {sample_settings['tavtigian_posterior_decimals']}"))
 
 
 def run_mavedb(args):
@@ -2137,15 +2150,21 @@ def main():
 
     p_def = sub.add_parser("default", help="Univariate Scoreset from integrated TSV")
     _add_default_mode_args(p_def)
-    p_def.set_defaults(func=run_default, clinvar_default_release="2026")
+    p_def.set_defaults(func=run_default, clinvar_default_release="2026",
+                       tavtigian_posterior_decimals="none")
 
     p_pillar = sub.add_parser(
         "pillar_project",
         help="Same as 'default', but ClinVar 2025 in place of ClinVar 2026 "
-             "everywhere (datasets forced to 2018 are unaffected)",
+             "everywhere (datasets forced to 2018 are unaffected), and Tavtigian c "
+             "computed with rule posteriors rounded to 3 decimals at calibration, "
+             "as in the ExCALIBR manuscript",
     )
     _add_default_mode_args(p_pillar)
-    p_pillar.set_defaults(func=run_default, clinvar_default_release="2025")
+    # pillar_project reproduces the ExCALIBR manuscript: rule posteriors
+    # rounded to 3 decimals when solving for c at calibration.
+    p_pillar.set_defaults(func=run_default, clinvar_default_release="2025",
+                          tavtigian_posterior_decimals="3")
 
     # ── mavedb ───────────────────────────────────────────────────────────────
     p_mv = sub.add_parser("mavedb", help="Univariate Scoreset.from_mavedb")

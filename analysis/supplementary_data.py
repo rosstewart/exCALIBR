@@ -15,6 +15,8 @@ extended_data_appendix.build_appendix_pdf on the Domainome calibrations
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -64,6 +66,90 @@ def _resolved_calibration(dataset: str, tree, model_selections, dataset_configs,
         raise FileNotFoundError(f"{dataset}: no calibration json for component {comp}")
     with open(path) as f:
         return json.load(f)
+
+
+_BIDIR_HEADER_RE = re.compile(r" - INFO - Dataset (?P<ds>.+?): .*components=\[(?P<comps>[\d, ]+)\] (?P<bm>\w+)\s*$")
+_BIDIR_PROCESSING_RE = re.compile(r"^Processing (?P<n>\d+)c\.\.\.")
+_BIDIR_DETECT_RE = re.compile(r"Bidirectional auto-detect.*\((?P<pct>[\d.]+)%\).*-> (?P<decision>forcing|no override)")
+
+
+def bidirectional_decision(dataset: str, calibration: Dict, output_dir=None) -> tuple:
+    """Whether the auto-bidirectional postprocessing path was applied to this
+    dataset's selected calibration, as (bidirectional, fraction of bootstrap
+    fits flagged).
+
+    Read from the calibration JSON's ``bidirectional`` field when present.
+    Outputs predating that field only record the decision in the pipeline
+    log, so fall back to the last ``Bidirectional auto-detect`` line logged
+    under a run of this calibration's component count and benign method.
+    A selected calibration whose decision is not in the log raises: no
+    decision is never silently read as "not bidirectional".
+    """
+    if calibration.get("bidirectional") is not None:
+        return bool(calibration["bidirectional"]), float(calibration.get("bidirectional_frac_flagged") or 0.0)
+
+    # Match on the run's own component key ("3c_avg"): an avg run on a
+    # dataset without synonymous variants stores benign_method="benign".
+    comp_key = str(calibration["n_c"])
+    n_part, _, bm_part = comp_key.partition("_")
+    n_target = int(n_part.rstrip("c"))
+    bm_target = bm_part or calibration["benign_method"]
+    ds_dir = Path(output_dir or cfg.OUTPUT_DIR) / dataset
+    cal_path = ds_dir / f"{dataset}_{comp_key}_calibration.json"
+    cal_mtime = cal_path.stat().st_mtime if cal_path.exists() else None
+
+    # (timestamp, decision, frac) for every matching detection line, from the
+    # dataset log (needs the run header to know the combo) and the per-combo
+    # log {dataset}_{comp_key}_pipeline.log (one combo, no header).
+    candidates = []
+
+    def _stamp(line):
+        try:
+            return datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            return None
+
+    def _record(line, m):
+        candidates.append((_stamp(line), m["decision"] == "forcing", float(m["pct"]) / 100))
+
+    main_log = ds_dir / "logs" / f"{dataset}_pipeline.log"
+    if main_log.exists():
+        bm, n = None, None
+        with open(main_log, errors="replace") as f:
+            for line in f:
+                m = _BIDIR_HEADER_RE.search(line)
+                if m:
+                    if m["ds"] != dataset:
+                        bm, n = None, None
+                        continue
+                    comps = [int(c) for c in m["comps"].split(",")]
+                    bm, n = m["bm"], (comps[0] if len(comps) == 1 else None)
+                    continue
+                m = _BIDIR_PROCESSING_RE.match(line)
+                if m:
+                    n = int(m["n"])
+                    continue
+                m = _BIDIR_DETECT_RE.search(line)
+                if m and bm == bm_target and n == n_target:
+                    _record(line, m)
+    combo_log = ds_dir / "logs" / f"{dataset}_{comp_key}_pipeline.log"
+    if combo_log.exists():
+        with open(combo_log, errors="replace") as f:
+            for line in f:
+                m = _BIDIR_DETECT_RE.search(line)
+                if m:
+                    _record(line, m)
+
+    if not candidates:
+        raise ValueError(f"{dataset}: no bidirectional auto-detect line for {comp_key} in {main_log} or {combo_log}")
+    # The run that wrote the calibration: latest detection logged no later
+    # than the calibration file (1 min slack); else the latest logged.
+    stamped = [c for c in candidates if c[0] is not None]
+    if cal_mtime is not None and stamped:
+        before = [c for c in stamped if c[0] <= cal_mtime + 60]
+        if before:
+            return max(before, key=lambda c: c[0])[1:]
+    return candidates[-1][1:]
 
 
 def canonical_yang_rows(yang_df: pd.DataFrame, datasets, tree, model_selections, dataset_configs) -> pd.DataFrame:

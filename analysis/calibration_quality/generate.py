@@ -37,20 +37,82 @@ N_EVAL = 10_000  # held-out draws per evaluation class
 
 
 def _cell(experiment, n_plp, n_blb, richness, kappa, gamma, pi, lab_gamma=None, eps_p=0.0, eta_b=0.0,
-          n_pop=None, n_syn=None):
+          n_pop=None, n_syn=None, shape="gauss", shape_par=0.0):
     pop, syn = RICHNESS[richness]
     c = dict(experiment=experiment, n_plp=int(n_plp), n_blb=int(n_blb), richness=richness,
              n_pop=int(pop if n_pop is None else n_pop), n_syn=int(syn if n_syn is None else n_syn),
              kappa=float(kappa), gamma=float(gamma), lab_gamma=float(gamma if lab_gamma is None else lab_gamma),
-             pi=float(pi), eps_p=float(eps_p), eta_b=float(eta_b))
+             pi=float(pi), eps_p=float(eps_p), eta_b=float(eta_b), shape=shape, shape_par=float(shape_par))
     c["cell_id"] = cell_id(c)
     return c
 
 
 def cell_id(c):
-    return (f"{c['experiment']}__plp{c['n_plp']}_blb{c['n_blb']}_pop{c['n_pop']}_syn{c['n_syn']}"
-            f"__k{c['kappa']:g}_g{c['gamma']:g}_lg{c['lab_gamma']:g}_pi{c['pi']:g}"
-            f"_ep{c['eps_p']:g}_eb{c['eta_b']:g}")
+    s = (f"{c['experiment']}__plp{c['n_plp']}_blb{c['n_blb']}_pop{c['n_pop']}_syn{c['n_syn']}"
+         f"__k{c['kappa']:g}_g{c['gamma']:g}_lg{c['lab_gamma']:g}_pi{c['pi']:g}"
+         f"_ep{c['eps_p']:g}_eb{c['eta_b']:g}")
+    if c.get("shape", "gauss") != "gauss":  # Gaussian cells keep their original ids (and so their seeds)
+        s += f"__{c['shape']}{c['shape_par']:g}"
+    return s
+
+
+# Deliberately misspecified truths (fit with skew-locked Gaussian components, so the model cannot match them):
+#   skew     every class's scores are skew-normal with shape parameter a = shape_par, standardized to mean 0 and
+#            variance 1 before shifting, so means and variances match the Gaussian cells
+#   bimodal  the measured-mechanism abnormal class is an equal mixture of N(-kappa -+ shape_par, 1)
+#   heavy    every class's scores are Student t with shape_par degrees of freedom (scale 1) around its mean
+MISFIT = {"skew": (2.0, 4.0, 8.0, 16.0), "bimodal": (1.0, 2.0, 3.0, 4.0, 6.0), "heavy": (1.5, 2.0, 3.0, 5.0)}
+MISFIT_N = (10, 40, 160)
+
+
+def _skew_params(a):
+    d = a / np.sqrt(1 + a * a)
+    scale = 1 / np.sqrt(1 - 2 * d * d / np.pi)
+    return a, -scale * d * np.sqrt(2 / np.pi), scale
+
+
+def _draw_normal(rng, n, c):
+    if c.get("shape") == "heavy":
+        return sps.t.rvs(c["shape_par"], 0.0, 1.0, size=n, random_state=rng)
+    if c.get("shape") == "skew":
+        a, loc, sc = _skew_params(c["shape_par"])
+        return sps.skewnorm.rvs(a, loc, sc, size=n, random_state=rng)
+    return rng.normal(0.0, 1.0, n)
+
+
+def _draw_abnormal(rng, n, c):
+    k = c["kappa"]
+    if c.get("shape") == "heavy":
+        return sps.t.rvs(c["shape_par"], -k, 1.0, size=n, random_state=rng)
+    if c.get("shape") == "skew":
+        a, loc, sc = _skew_params(c["shape_par"])
+        return sps.skewnorm.rvs(a, loc - k, sc, size=n, random_state=rng)
+    if c.get("shape") == "bimodal":
+        side = np.where(rng.random(n) < 0.5, -1.0, 1.0)
+        return rng.normal(-k + side * c["shape_par"], 1.0, n)
+    return rng.normal(-k, 1.0, n)
+
+
+def _pdf_normal(x, c):
+    if c.get("shape") == "heavy":
+        return sps.t.pdf(x, c["shape_par"], 0.0, 1.0)
+    if c.get("shape") == "skew":
+        a, loc, sc = _skew_params(c["shape_par"])
+        return sps.skewnorm.pdf(x, a, loc, sc)
+    return sps.norm.pdf(x)
+
+
+def _pdf_abnormal(x, c):
+    k = c["kappa"]
+    if c.get("shape") == "heavy":
+        return sps.t.pdf(x, c["shape_par"], -k, 1.0)
+    if c.get("shape") == "skew":
+        a, loc, sc = _skew_params(c["shape_par"])
+        return sps.skewnorm.pdf(x, a, loc - k, sc)
+    if c.get("shape") == "bimodal":
+        d = c["shape_par"]
+        return 0.5 * sps.norm.pdf(x, -k - d) + 0.5 * sps.norm.pdf(x, -k + d)
+    return sps.norm.pdf(x, -k)
 
 
 def design():
@@ -73,6 +135,8 @@ def design():
             for lg in (0.0, 0.5, 0.75, 1.0):
                 if lg != g:
                     cells.append(_cell("mech_bias", n, n, "mid", k, g, 0.25, lab_gamma=lg))
+    for (shape, pars), n, g in itertools.product(MISFIT.items(), MISFIT_N, (1.0, 0.5)):
+        cells += [_cell("misfit", n, n, "mid", 4.0, g, 0.25, shape=shape, shape_par=a) for a in pars]
     seen, out = set(), []
     for c in cells:  # drop duplicate ids (e.g. asymmetric cells that coincide at small n)
         if c["cell_id"] not in seen:
@@ -85,27 +149,27 @@ def rng_for(cell, rep):
     return np.random.default_rng([zlib.crc32(cell["cell_id"].encode()), int(rep)])
 
 
-def _pathogenic(rng, n, gamma, kappa):
+def _pathogenic(rng, n, gamma, c):
     measured = rng.random(n) < gamma
-    return np.where(measured, rng.normal(-kappa, 1.0, n), rng.normal(0.0, 1.0, n))
+    return np.where(measured, _draw_abnormal(rng, n, c), _draw_normal(rng, n, c))
 
 
-def _mixed(rng, n, frac_path, gamma, kappa):
+def _mixed(rng, n, frac_path, gamma, c):
     is_path = rng.random(n) < frac_path
-    return np.where(is_path, _pathogenic(rng, n, gamma, kappa), rng.normal(0.0, 1.0, n)), is_path
+    return np.where(is_path, _pathogenic(rng, n, gamma, c), _draw_normal(rng, n, c)), is_path
 
 
 def make_data(rng, c):
-    """One replicate: the four samples (scores) and held-out evaluation draws."""
+    """One replicate: the four samples (scores) and held-out evaluation draws. For Gaussian cells the random
+    draws are exactly those of the original generator (same calls in the same order), so replicates regenerate."""
     plp_benign = rng.random(c["n_plp"]) < c["eps_p"]
-    plp = np.where(plp_benign, rng.normal(0.0, 1.0, c["n_plp"]),
-                   _pathogenic(rng, c["n_plp"], c["lab_gamma"], c["kappa"]))
-    blb, _ = _mixed(rng, c["n_blb"], c["eta_b"], c["gamma"], c["kappa"])
-    pop, _ = _mixed(rng, c["n_pop"], c["pi"], c["gamma"], c["kappa"])
-    syn = rng.normal(0.0, 1.0, c["n_syn"])
-    ev_path = _pathogenic(rng, N_EVAL, c["gamma"], c["kappa"])
-    ev_benign = rng.normal(0.0, 1.0, N_EVAL)
-    ev_pop, ev_pop_is_path = _mixed(rng, N_EVAL, c["pi"], c["gamma"], c["kappa"])
+    plp = np.where(plp_benign, _draw_normal(rng, c["n_plp"], c), _pathogenic(rng, c["n_plp"], c["lab_gamma"], c))
+    blb, _ = _mixed(rng, c["n_blb"], c["eta_b"], c["gamma"], c)
+    pop, _ = _mixed(rng, c["n_pop"], c["pi"], c["gamma"], c)
+    syn = _draw_normal(rng, c["n_syn"], c)
+    ev_path = _pathogenic(rng, N_EVAL, c["gamma"], c)
+    ev_benign = _draw_normal(rng, N_EVAL, c)
+    ev_pop, ev_pop_is_path = _mixed(rng, N_EVAL, c["pi"], c["gamma"], c)
     return dict(samples=[plp, blb, pop, syn], eval=dict(pathogenic=ev_path, benign=ev_benign, population=ev_pop),
                 eval_pop_is_path=ev_pop_is_path)
 
@@ -113,8 +177,12 @@ def make_data(rng, c):
 def true_log_lr(x, c):
     """log lr+(x) = log p1(x) / p0(x) for the population's pathogenic variants (mechanism mix gamma)."""
     g, k = c["gamma"], c["kappa"]
-    # p1/p0 = g exp(-k x - k^2/2) + (1 - g), computed stably
-    return np.logaddexp(np.log(g) - k * x - k * k / 2, np.log1p(-g) if g < 1 else -np.inf)
+    if c.get("shape", "gauss") == "gauss":
+        # p1/p0 = g exp(-k x - k^2/2) + (1 - g), computed stably
+        return np.logaddexp(np.log(g) - k * x - k * k / 2, np.log1p(-g) if g < 1 else -np.inf)
+    with np.errstate(divide="ignore"):
+        ratio = np.log(_pdf_abnormal(x, c)) - np.log(_pdf_normal(x, c))
+    return np.logaddexp(np.log(g) + ratio, np.log1p(-g) if g < 1 else -np.inf)
 
 
 def true_component_params(c):
@@ -134,5 +202,5 @@ def true_weights(c):
 def density(x, c, which):
     """True score density of a class: 'benign' or 'pathogenic' (population mechanism mix)."""
     if which == "benign":
-        return sps.norm.pdf(x)
-    return c["gamma"] * sps.norm.pdf(x, -c["kappa"]) + (1 - c["gamma"]) * sps.norm.pdf(x)
+        return _pdf_normal(x, c)
+    return c["gamma"] * _pdf_abnormal(x, c) + (1 - c["gamma"]) * _pdf_normal(x, c)

@@ -239,6 +239,10 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu",
         condition = cjob.get("condition")
         save_dir = output_dir / condition / dataset_name if condition else output_dir / dataset_name
         bs_seed = cjob["bootstrap_seed"]
+        # Rounding for any Tavtigian c computed in this task (fitting itself
+        # does not use c); recorded by hpc/prepare.py (pillar_project: "3").
+        if cjob.get("tavtigian_posterior_decimals") is not None:
+            os.environ["EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS"] = str(cjob["tavtigian_posterior_decimals"])
         shared = cjob["shared_data"]
         is_mv = cjob.get("multivariate", False)
 

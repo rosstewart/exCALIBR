@@ -17,6 +17,7 @@ import logging
 from ..fit_utils.fit import calculate_score_ranges, thresholds_from_prior
 from ..fit_utils.point_ranges import (
     enforce_monotonicity_point_ranges,
+    drop_wrong_side_pathogenic_fragments,
     extend_points_to_xlims,
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
@@ -887,6 +888,8 @@ def _process_variant_oob(
     benign_island_min_frac: float = 0.0,
     prior_degenerate: Optional[np.ndarray] = None,
     keep_extreme_prior: bool = False,
+    drop_wrong_side_pathogenic: bool = False,
+    pathogenic_side_support_scores: Optional[np.ndarray] = None,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
@@ -895,7 +898,7 @@ def _process_variant_oob(
     (PipelineConfig.exclude_degenerate_prior_fits) are left out of this
     variant's OOB median prior but kept for its OOB LR+.
 
-    This matches _process_single_variant_oob_full in point_ranges.py:
+    Steps (the same as the in-bag calibration in visualize.py's process_component_fits):
     1. Subset to OOB bootstraps
     2. Filter invalid priors
     3. Compute OOB median prior
@@ -985,6 +988,12 @@ def _process_variant_oob(
                 pr, point_values, vsr, benign_center, liberal=liberal, inf=True,
             )
         elif postprocess:
+            # Step 5b: same pathogenic side rule as the in-bag plain path, with the
+            # dataset-level benign_center and support sample (flags are in-bag only).
+            if drop_wrong_side_pathogenic:
+                drop_wrong_side_pathogenic_fragments(
+                    pr, point_values, benign_center, flipped, support_scores=pathogenic_side_support_scores,
+                )
             # Step 6: enforce monotonicity (first pass)
             enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
@@ -1039,6 +1048,12 @@ def _compute_oob_evidence(
     if benign_island_reference_scores is not None:
         benign_island_reference_scores = np.asarray(benign_island_reference_scores, dtype=float)
     benign_island_min_frac = calibration.get("benign_island_min_frac", 0.0) or 0.0
+    # Plain-path pathogenic side rule: on only if the in-bag fit applied it
+    # (in-memory key; absent for calibrations reconstructed from disk JSON).
+    drop_wrong_side = bool(calibration.get("drop_wrong_side_pathogenic", False))
+    side_support = calibration.get("pathogenic_side_support_scores", None)
+    if side_support is not None:
+        side_support = np.asarray(side_support, dtype=float)
     valid_seeds = np.asarray(calibration["valid_bootstrap_seeds"])
     prior_degenerate = calibration.get("prior_degenerate", None)
     if prior_degenerate is not None:
@@ -1070,6 +1085,8 @@ def _compute_oob_evidence(
             benign_island_min_frac=benign_island_min_frac,
             prior_degenerate=prior_degenerate,
             keep_extreme_prior=getattr(config, "keep_extreme_prior_fits", False),
+            drop_wrong_side_pathogenic=drop_wrong_side,
+            pathogenic_side_support_scores=side_support,
         )
         for vidx, oob_idx in oob_map.items()
     )

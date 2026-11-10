@@ -1,5 +1,30 @@
+import math
+import os
+
 import numpy as np
-from typing import Union
+from typing import Optional, Union
+
+
+# Rounding of rule posteriors in the c search. The ExCALIBR manuscript (and the
+# ExCALIBR-MV paper) used posteriors rounded to 3 decimals, as Tavtigian et al.
+# report them, so a rule counted as met once its posterior reached e.g. 0.8995
+# (c = 348 at prior 0.1). The default is exact arithmetic: c is the smallest
+# integer meeting every rule exactly (351 at prior 0.1; see
+# tavtigian_constant_closed_form). Set EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS=3
+# (or pass posterior_decimals=3) to reproduce the manuscripts. Read at call
+# time so every caller in a process (and its joblib workers, which inherit the
+# environment) uses the same setting.
+TAVTIGIAN_POSTERIOR_DECIMALS_ENV = "EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS"
+MANUSCRIPT_POSTERIOR_DECIMALS = 3
+
+
+def default_posterior_decimals() -> Optional[int]:
+    """Posterior rounding from EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS (unset or
+    'none' -> None, i.e. exact)."""
+    raw = os.environ.get(TAVTIGIAN_POSTERIOR_DECIMALS_ENV, "").strip().lower()
+    if raw in ("", "none"):
+        return None
+    return int(raw)
 
 
 # Exponents of C for each combining rule (Tavtigian et al. 2018), as in pathogenicRulesPosterior and friends below:
@@ -15,14 +40,16 @@ def _rule_exponents(rules, sign=1.0):
     return np.array([np.dot(r, sign * _FRACS) for r in rules])
 
 
-def _rule_posteriors(C_vals, prior, exponents):
-    """Posterior of every rule for every candidate C (rows: candidates), rounded as in the per-C functions."""
-    lr = np.asarray(C_vals)[:, None] ** exponents[None, :]
-    return np.round(lr * prior / ((lr - 1) * prior + 1), 3)
+def _rule_posteriors(C_vals, prior, exponents, decimals: Optional[int] = None):
+    """Posterior of every rule for every candidate C (rows: candidates),
+    rounded to ``decimals`` places when given (None: exact)."""
+    lr = np.asarray(C_vals, dtype=float)[:, None] ** exponents[None, :]
+    post = lr * prior / ((lr - 1) * prior + 1)
+    return post if decimals is None else np.round(post, decimals)
 
 
 def _tavtigian_fails(C_vals: np.ndarray, prior: float, original: bool, strict: bool,
-                      verbose: bool = False):
+                      verbose: bool = False, decimals: Optional[int] = None):
     """Total rule-violation count for each candidate C in C_vals -- the
     per-candidate objective get_tavtigian_constant minimizes. Factored out
     so it can be reused for both a coarse (wide-range, log-spaced) and a
@@ -33,16 +60,17 @@ def _tavtigian_fails(C_vals: np.ndarray, prior: float, original: bool, strict: b
     benignRulesPosterior / likelybenignRulesPosterior (same powers, formula and
     rounding), evaluated for all candidates at once; verified identical to the
     per-candidate loop on the coarse grid for 193 priors in [1e-4, 1 - 1e-4]
-    (and identical C* for 49 of them), about 65x faster.
+    (and identical C* for 49 of them), about 65x faster. ``decimals``: see
+    _rule_posteriors (the per-C functions round to 3).
     """
     # original rules: 2 strong lines are pathogenic; modified: 1 moderate + 1 very strong is pathogenic and
     # 2 strong moves to the likely pathogenic rules
     p_rules = _P_RULES + ([[0, 0, 2, 0]] if original else [[0, 1, 0, 1]])
     lp_rules = _LP_RULES + ([[0, 1, 0, 1]] if original else [[0, 0, 2, 0]])
-    pathogenic_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(p_rules))
-    likely_pathogenic_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(lp_rules))
-    benign_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(_B_RULES, -1.0))
-    likely_benign_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(_LB_RULES, -1.0))
+    pathogenic_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(p_rules), decimals)
+    likely_pathogenic_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(lp_rules), decimals)
+    benign_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(_B_RULES, -1.0), decimals)
+    likely_benign_posteriors = _rule_posteriors(C_vals, prior, _rule_exponents(_LB_RULES, -1.0), decimals)
 
     pathogenic_fails = np.sum(pathogenic_posteriors < 0.99, axis=1)
     lp_mask = likely_pathogenic_posteriors < 0.90
@@ -66,10 +94,36 @@ def _tavtigian_fails(C_vals: np.ndarray, prior: float, original: bool, strict: b
     return fails
 
 
+def tavtigian_constant_closed_form(prior: float) -> float:
+    """Exact real-valued smallest c meeting every (modified, non-strict)
+    combining rule at ``prior``, with no rounding of posteriors.
+
+    Each rule with T points has LR+ = c^(T/8), and every requirement
+    (pathogenic >= 0.99, likely pathogenic >= 0.90, benign <= 0.01, likely
+    benign <= 0.10) is a lower bound on c, so the smallest c is set by the
+    weakest rule of each category: 10 (pathogenic), 6 (likely pathogenic),
+    -8 (benign) and -2 (likely benign) points. With prior odds o:
+        c = max{(9/o)^(8/6), (99/o)^(8/10), 99 o, (9 o)^(8/2)}.
+    At prior 0.1 this is 81^(4/3) = 350.47 (likely pathogenic binds).
+    """
+    o = prior / (1.0 - prior)
+    return max((9.0 / o) ** (8 / 6), (99.0 / o) ** (8 / 10), 99.0 * o, (9.0 * o) ** (8 / 2))
+
+
 def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
+    """Smallest integer c (Tavtigian et al.'s O_PVSt) for which the ACMG/AMP
+    combining rules meet their posterior requirements at ``prior``.
+
+    posterior_decimals (default: EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS, unset =
+    None): None compares exact posteriors, so c = ceil(closed form) (351 at
+    prior 0.1); 3 rounds posteriors to 3 decimals before comparing, as in the
+    ExCALIBR manuscript (348 at prior 0.1). original/strict/C_max and any
+    rounding use the integer search below.
+    """
     original = kwargs.get("original", False)
     strict = kwargs.get("strict", False)
     verbose = kwargs.get("verbose", False)
+    decimals = kwargs.get("posterior_decimals", default_posterior_decimals())
     # Explicit C_max => legacy behavior: a single dense linear scan over
     # [1, C_max], exactly as before (kept for reproducibility/callers that
     # pin a specific search range).
@@ -77,8 +131,17 @@ def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
 
     if C_max is not None:
         C_vals = np.arange(1, C_max + 1)
-        fails = _tavtigian_fails(C_vals, prior, original, strict, verbose)
+        fails = _tavtigian_fails(C_vals, prior, original, strict, verbose, decimals)
         return C_vals[np.argmin(fails)]
+
+    # Exact posteriors with the modified, non-strict rules: every requirement
+    # is a lower bound on c, so the answer is the ceiling of the closed form
+    # (tiny relative tolerance so an exact-integer bound is not bumped up by
+    # floating-point error). Degenerate priors fall through to the search.
+    if decimals is None and not original and not strict and 0.0 < prior < 1.0:
+        c_exact = tavtigian_constant_closed_form(float(prior))
+        if math.isfinite(c_exact):
+            return max(1, int(math.ceil(c_exact * (1.0 - 1e-12))))
 
     # No C_max given: adaptive two-stage search with no hard ceiling. A
     # dense linear scan up to a fixed cap (previously 100000) silently
@@ -91,7 +154,7 @@ def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
     # the exact best integer, same precision as the old dense scan.
     coarse_vals = np.unique(np.round(np.logspace(0, 15, 600)).astype(np.int64))
     coarse_vals = coarse_vals[coarse_vals >= 1]
-    coarse_fails = _tavtigian_fails(coarse_vals, prior, original, strict)
+    coarse_fails = _tavtigian_fails(coarse_vals, prior, original, strict, decimals=decimals)
     best_i = int(np.argmin(coarse_fails))
     lo = coarse_vals[max(best_i - 1, 0)]
     hi = coarse_vals[min(best_i + 1, len(coarse_vals) - 1)]
@@ -107,7 +170,7 @@ def get_tavtigian_constant(prior: float, *args, **kwargs) -> Union[float, int]:
         fine_vals = np.unique(np.round(np.geomspace(max(1, lo), hi, 250_000)).astype(np.int64))
     else:
         fine_vals = np.arange(max(1, lo), hi + 1)
-    fine_fails = _tavtigian_fails(fine_vals, prior, original, strict, verbose)
+    fine_fails = _tavtigian_fails(fine_vals, prior, original, strict, verbose, decimals)
     return int(fine_vals[np.argmin(fine_fails)])
 
 

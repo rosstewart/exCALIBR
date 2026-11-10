@@ -20,6 +20,11 @@ python hpc/prepare.py default \
     --target-array-size 1000 \
     --n-jobs 30
 
+# ExCALIBR manuscript reproduction: same as default, but ClinVar 2025 and Tavtigian c
+# with rule posteriors rounded to 3 decimals (recorded in the manifest; pass
+# --clinvar-release 2025 --tavtigian-posterior-decimals 3 to run_igvf_batch.py when calibrating):
+python hpc/prepare.py pillar_project --output-dir ... [same options as default]
+
 # MaveDB / label-seq input:
 python hpc/prepare.py mavedb \
     --output-dir /projects/pedjas_lab/stewart.ro/my_run \

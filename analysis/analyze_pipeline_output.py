@@ -658,14 +658,77 @@ REG.check("tavtigian-c-0.1", abs(get_tavtigian_constant(0.1) / 350 - 1) < 0.01,
 REG.check("tavtigian-c-0.044", abs(get_tavtigian_constant(0.044) / 1124 - 1) < 0.01,
           f"c(0.044) = {get_tavtigian_constant(0.044):.1f} (text: 1124)", "main.tex Methods/Calibration framework")
 
+# Methods (calibration framework): how c is determined. This work's c (rule
+# posteriors rounded to 3 decimals; pinned by the analysis package) vs. the
+# exact smallest c (closed form), at which the binding rule meets its
+# requirement exactly. The combining rules themselves are cited from
+# Tavtigian et al. 2018, Table 1.
+from src.assay_calibration.fit_utils import evidence_thresholds as _et
+REG.num("MethTavtigianCPriorOneRounded", get_tavtigian_constant(0.1, posterior_decimals=3), kind="method",
+        source="get_tavtigian_constant(0.1) with posteriors rounded to 3 decimals (this work)")
+_c_exact_01 = _et.tavtigian_constant_closed_form(0.1)
+REG.num("SuppTavtigianCExactPriorOne", _c_exact_01, fmt=".1f", kind="method",
+        source="tavtigian_constant_closed_form(0.1): exact smallest c, 81^(4/3)")
+REG.num("SuppTavtigianCExactPriorThree", _et.tavtigian_constant_closed_form(0.3), fmt=".1f", kind="method",
+        source="tavtigian_constant_closed_form(0.3): exact smallest c, (27/7)^4 (likely benign -2 points binds)")
+REG.check("tavtigian-lp-binding-0.1", abs(float(_et._rule_posteriors([_c_exact_01], 0.1, np.array([6 / 8.0]))[0, 0]) - 0.90) < 1e-9,
+          "6 points meet 0.90 exactly at the exact c for prior 0.1", "main.tex Methods/Calibration framework")
+# Priors where the binding rule of the exact closed form changes: likely
+# pathogenic (6 points) -> pathogenic (10) where (9/o)^(4/3) = (99/o)^(4/5),
+# i.e. o = 3^5 / 99^(3/2); pathogenic -> likely benign (-2) where
+# (99/o)^(4/5) = (9 o)^4, i.e. o = (99 / 9^5)^(1/6). The benign rule never binds.
+_o_lp_p = 3 ** 5 / 99 ** 1.5
+_o_p_lb = (99 / 9 ** 5) ** (1 / 6)
+REG.num("MethTavtigianBindLPPrior", _o_lp_p / (1 + _o_lp_p), fmt=".3f", kind="method",
+        source="prior where exact c's binding rule changes from likely pathogenic (6 pts) to pathogenic (10 pts)")
+REG.num("MethTavtigianBindLBPrior", _o_p_lb / (1 + _o_p_lb), fmt=".3f", kind="method",
+        source="prior where exact c's binding rule changes from pathogenic (10 pts) to likely benign (-2 pts)")
+REG.check("tavtigian-binding-regions",
+          all(abs(_et.tavtigian_constant_closed_form(q) - b) < 1e-6 * b for q, b in [
+              (0.15, (9 / (0.15 / 0.85)) ** (4 / 3)), (0.23, (99 / (0.23 / 0.77)) ** 0.8), (0.3, (9 * 0.3 / 0.7) ** 4)]),
+          "closed form follows the LP / P / LB bounds in the three binding regions", "main.tex Methods/Calibration framework")
+
 # Supplement: datasets whose evidence thresholds were removed rather than
 # extended (liberal_monotonicity == 0 in the selected calibration).
 _thr_removed = sorted(d for d, c in _resolved_cals.items() if c.get("liberal_monotonicity") == 0)
 REG.num("SuppNumThresholdRemoved", len(_thr_removed), words=True,
         source="calibrations with liberal_monotonicity == 0")
+from analysis.plot_common import display_name as _display_name
+
+
+def _tt_dataset_list(names):
+    """Comma-separated \\texttt dataset names (display names, no internal
+    suffixes) that may line-break after any underscore."""
+    return ", ".join("\\texttt{" + _display_name(d).replace("_", "\\_\\allowbreak{}") + "}" for d in names)
+
+
 REG.text("SuppThresholdRemovedDatasets",
-         ", ".join("\\texttt{" + d.replace("_clinvar_2018", "").replace("_", "\\_") + "}" for d in _thr_removed),
+         _tt_dataset_list(_thr_removed),
          source="calibrations with liberal_monotonicity == 0")
+
+# Supplement (Evidence post-processing / Bidirectional assays) + main Methods:
+# datasets whose selected calibration took the auto-bidirectional
+# postprocessing path. Read from the calibration json, else the pipeline log
+# (outputs predating the saved field).
+from analysis.supplementary_data import bidirectional_decision
+from src.assay_calibration.fit_utils.point_ranges import BIDIRECTIONAL_VOTE_THRESHOLD
+_bidir_decisions = {}
+for _d, _c in _resolved_cals.items():
+    try:
+        _bidir_decisions[_d] = bidirectional_decision(_d, _c)
+    except (FileNotFoundError, ValueError) as _e:
+        print(f"  bidirectional decision missing: {_e}")
+_bidir = sorted(d for d, (is_bidir, _) in _bidir_decisions.items() if is_bidir)
+REG.check("bidirectional-decisions-found", len(_bidir_decisions) == len(_resolved_cals),
+          f"bidirectional decision resolved for {len(_bidir_decisions)}/{len(_resolved_cals)} selected calibrations",
+          "supplement Evidence post-processing")
+REG.num("MethNumBidirectional", len(_bidir), words=True, kind="method",
+        source="selected calibrations auto-detected bidirectional (calibration json, else pipeline log)")
+REG.text("SuppBidirectionalDatasets",
+         _tt_dataset_list(_bidir),
+         source="selected calibrations auto-detected bidirectional")
+REG.num("SuppBidirectionalVotePct", 100 * BIDIRECTIONAL_VOTE_THRESHOLD, fmt=".0f", kind="method",
+        source="point_ranges.BIDIRECTIONAL_VOTE_THRESHOLD")
 
 # %% [markdown]
 # ExCALIBR scores every variant the underlying assay measured, not just the
@@ -3328,6 +3391,159 @@ if "_ps_sim" in globals() and not config.warn_if_missing(str(_pol_path), "prior-
         REG.check("prior-sim-start-rich-invariant", _rich_dev < 0.001,  # text: "by less than 0.001"
                   f"rich controls: max |start 0.5 - start 0.1| {_rich_dev:.4f}",
                   "supplement.tex prior theory (unique maximizer: start value irrelevant when identified)")
+
+# %% [markdown]
+# ### A11i. Calibration-quality simulation -> Supplementary Figures (fig:calqual_degradation, fig:calqual_diagnostics) and Table (tab:calqual_min_controls)
+#
+# When is a calibration unreliable? Simulated datasets with known truth cross the
+# controls per class, the population/synonymous sample size, the separation of the
+# classes and the fraction of pathogenic variants the assay measures, plus slices
+# (unequal or mislabeled controls, P/LP mechanism-mix bias, priors 0.05-0.40) and
+# deliberately misspecified truths. Each replicate is scored by the truth, by the
+# pipeline run on the true component distributions (same bootstraps), and by the
+# ExCALIBR fit; acmgscaler (prior 0.10) is the comparison method. The replicates are
+# computed outside the build (analysis/calibration_quality: tasks make/run/collect on
+# the HPC, then acmgscaler_arm locally); this section summarizes them and applies the
+# prior-spread diagnostic to the real calibrations.
+
+# %%
+_cq_dir = Path(config.CALIBRATION_QUALITY_DIR)
+_cq_res = _cq_dir / "results.csv"
+if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation results"):
+    from analysis.calibration_quality import summarize as _cq
+    from analysis.calibration_quality.figures import make_degradation_figure as _cq_fig1, \
+        make_diagnostics_figure as _cq_fig2
+    REG.require(_cq_res, "calibration-quality simulation results (Supp Figures/Table)",
+                regen="python -m analysis.calibration_quality.tasks collect <dir>  # after the HPC grid")
+    _cq_df = _cq.load(_cq_dir)
+    _cq_inp = dict(inputs=[_cq_res])
+    _cq_m = _cq.acmgscaler_compare(_cq_dir, _cq_df)
+    _cq_merged = _cq_m[0] if _cq_m is not None else _cq_df.assign(acmg_ok=False)
+    _cq_mis = _cq_df[_cq_df["experiment"] == "misfit"]
+    if not len(_cq_mis) and Path(config.CALIBRATION_QUALITY_MISFIT_CSV).exists():
+        _cq_mis = _cq.add_outcomes(pd.read_csv(config.CALIBRATION_QUALITY_MISFIT_CSV, low_memory=False)
+                                   .query("status == 'ok'").copy())
+    _cq_core = _cq_df[_cq_df["experiment"] == "core"]
+
+    _f = _cq_fig1(_cq_df, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_calqual_degradation.png")
+    REG.figure("fig:calqual_degradation", _f, **_cq_inp)
+    _f = _cq_fig2(_cq_merged, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_calqual_diagnostics.png",
+                  misfit=_cq_mis if len(_cq_mis) else None, core_ref=_cq_core.sample(min(3000, len(_cq_core)),
+                                                                                   random_state=0))
+    REG.figure("fig:calqual_diagnostics", _f, **_cq_inp)
+    REG.table("tab:calqual_min_controls",
+              _cq.latex_min_controls_table(_cq.minimum_controls(_cq_df, "prior_bad"),
+                                           _cq.minimum_controls_retention(_cq_df)), **_cq_inp)
+
+    # Design
+    REG.num("SuppCalQualNCells", int(_cq_df["cell_id"].nunique()), kind="method", source="simulated settings",
+            **_cq_inp)
+    REG.num("SuppCalQualNCoreCells", int(_cq_core["cell_id"].nunique()), kind="method",
+            source="core crossed grid settings", **_cq_inp)
+    REG.num("SuppCalQualNReps", int(_cq_df.groupby("cell_id").size().max()), kind="method",
+            source="replicates per setting", **_cq_inp)
+    REG.num("SuppCalQualNRepsDone", len(_cq_df), source="replicates completed", **_cq_inp)
+    REG.num("SuppCalQualNBoot", int(_cq_df["B"].iloc[0]), kind="method", source="bootstrap iterations", **_cq_inp)
+    REG.num("SuppCalQualNRestarts", int(_cq_df["R"].iloc[0]), kind="method", source="restarts per bootstrap",
+            **_cq_inp)
+
+    # Safety: overstated evidence (share of truly pathogenic and benign variants with stronger evidence than the
+    # truth), ExCALIBR vs acmgscaler, on the ACMG/AMP levels (cells where acmgscaler runs)
+    _ov = lambda d, p: float(100 * ((d[f"{p}_vs_truth_pathogenic_tier_over"] +
+                                     d[f"{p}_vs_truth_benign_tier_over"]) / 2).mean())
+    _a = _cq_merged[_cq_merged["experiment"].isin(["core", "prior"]) & _cq_merged["acmg_ok"]]
+    if len(_a):
+        REG.num("SuppCalQualOverExc", _ov(_a, "fit"), fmt=".1f",
+                source="% variants overstated, ExCALIBR, cells where acmgscaler runs", **_cq_inp)
+        REG.num("SuppCalQualOverAcmg", _ov(_a, "acmg"), fmt=".1f",
+                source="% variants overstated, acmgscaler (prior 0.10)", **_cq_inp)
+        _a10 = _a[np.isclose(_a["pi"], 0.10)]
+        REG.num("SuppCalQualOverExcPiTen", _ov(_a10, "fit"), fmt=".1f",
+                source="% overstated, ExCALIBR, true prior 0.10", **_cq_inp)
+        REG.num("SuppCalQualOverAcmgPiTen", _ov(_a10, "acmg"), fmt=".1f",
+                source="% overstated, acmgscaler, true prior 0.10 (its own prior)", **_cq_inp)
+    _na = _cq_merged[(_cq_merged["experiment"] == "core") & (_cq_merged["n_plp"] < 10)]
+    REG.num("SuppCalQualAcmgNotRunPct", 100 * float((~_na["acmg_ok"]).mean()) if len(_na) else 100.0, fmt=".0f",
+            source="% of core replicates with < 10 controls per class acmgscaler cannot calibrate", **_cq_inp)
+    _o = _cq_df[~_cq_df["experiment"].isin(["mech_bias", "misfit"])]
+    REG.num("SuppCalQualOverExcAll", float(100 * ((_o.fit_vs_truth_pathogenic_over +
+                                                    _o.fit_vs_truth_benign_over) / 2).mean()), fmt=".1f",
+            source="% variants overstated, ExCALIBR, all settings except mechanism-mix bias and misfit", **_cq_inp)
+    _mb = _cq_df[_cq_df["experiment"] == "mech_bias"]
+    _mbo = _mb[_mb["lab_gamma"] > _mb["gamma"]]  # P/LP over-represent the measured mechanism
+    REG.num("SuppCalQualMechOverMean", float(100 * _mbo.fit_vs_truth_pathogenic_over.mean()), fmt=".0f",
+            source="% truly pathogenic variants overstated when P/LP over-represent the measured mechanism",
+            **_cq_inp)
+    REG.num("SuppCalQualMechOverMax", float(100 * _mbo.groupby("cell_id").fit_vs_truth_pathogenic_over.mean()
+                                            .max()), fmt=".0f",
+            source="worst mechanism-mix-bias setting: % truly pathogenic variants overstated", **_cq_inp)
+
+    # Power: evidence retained in the best and the hardest corners of the core grid
+    from analysis.calibration_quality.figures import retention_by_cell as _ret
+    _best = _cq_core[(_cq_core.kappa == 4) & (_cq_core.gamma == 1) & (_cq_core.richness == "high") &
+                     (_cq_core.n_plp == 80)]
+    REG.num("SuppCalQualRetBest", 100 * _ret(_best), fmt=".0f",
+            source="% of the truth's evidence retained, kappa 4, gamma 1, rich samples, 80 controls", **_cq_inp)
+    _mod = _cq_core[(_cq_core.kappa == 2.5) & (_cq_core.gamma == 0.5) & (_cq_core.richness == "mid") &
+                    (_cq_core.n_plp == 80)]
+    REG.num("SuppCalQualRetModerate", 100 * _ret(_mod), fmt=".0f",
+            source="% of the truth's evidence retained, kappa 2.5, gamma 0.5, mid samples, 80 controls", **_cq_inp)
+
+    # Prior reliability and its diagnostic
+    REG.num("SuppCalQualPriorBadBest", 100 * float(_best.prior_bad.mean()), fmt=".0f",
+            source="% replicates with prior > 10 pp off, best corner", **_cq_inp)
+    _hard = _cq_core[(_cq_core.kappa == 1.5) & (_cq_core.gamma == 0.25)]
+    REG.num("SuppCalQualPriorBadHard", 100 * float(_hard.prior_bad.mean()), fmt=".0f",
+            source="% replicates with prior > 10 pp off, kappa 1.5, gamma 0.25 (all sizes)", **_cq_inp)
+    REG.num("SuppCalQualTruePriorBadHard", 100 * float(_hard.true_prior_bad.mean()), fmt=".0f",
+            source="same with the true component distributions", **_cq_inp)
+    _dt = _cq.diagnostic_table(_cq_df[_cq_df.experiment != "misfit"], "prior_bad").set_index("column")
+    REG.num("SuppCalQualPriorSDAUC", float(_dt.loc["fit_prior_sd", "auc"]), fmt=".2f",
+            source="AUC of the bootstrap SD of the prior for a prior > 10 pp off", **_cq_inp)
+    REG.num("SuppCalQualDiscardAUC", float(_dt.loc["fit_pct_discarded", "auc"]), fmt=".2f",
+            source="AUC of the share of bootstraps discarded", **_cq_inp)
+    _pt = _cq.threshold_table(_cq_df[_cq_df.experiment != "misfit"], "prior_bad", "fit_prior_sd", [0.05, 0.10])
+    _pt = _pt.set_index("cutoff")
+    REG.num("SuppCalQualPriorSDSens", 100 * float(_pt.loc[0.10, "sensitivity"]), fmt=".0f",
+            source="prior SD > 0.10: % of unreliable priors flagged", **_cq_inp)
+    REG.num("SuppCalQualPriorSDSpec", 100 * float(_pt.loc[0.10, "specificity"]), fmt=".0f",
+            source="prior SD > 0.10: % of reliable priors not flagged", **_cq_inp)
+    _lo = _cq_df[(_cq_df.experiment != "misfit") & (_cq_df.fit_prior_sd < 0.05)]
+    REG.num("SuppCalQualPriorBadLowSD", 100 * float(_lo.prior_bad.mean()), fmt=".0f",
+            source="% replicates with prior > 10 pp off when the prior SD is below 0.05", **_cq_inp)
+    _dtf = _cq.diagnostic_table(_cq_df[_cq_df.experiment != "misfit"], "overstated").set_index("column")
+    REG.num("SuppCalQualYangAUC", float(_dtf.loc["yang_val_max", "auc"]), fmt=".2f",
+            source="AUC of the held-out Yang distance for overstated evidence (correctly specified settings)",
+            **_cq_inp)
+
+    # Misspecified truths: overstated evidence above vs below a held-out Yang distance of 0.2
+    if len(_cq_mis):
+        _hi = _cq_mis[_cq_mis.yang_val_max > config.YANG_GOOD_FIT_THRESHOLD]
+        _lw = _cq_mis[_cq_mis.yang_val_max <= config.YANG_GOOD_FIT_THRESHOLD]
+        _om = lambda d: float(100 * ((d.fit_vs_truth_pathogenic_over + d.fit_vs_truth_benign_over) / 2).mean())
+        REG.num("SuppCalQualMisfitHighYangPct", 100 * len(_hi) / len(_cq_mis), fmt=".0f",
+                source="% misspecified replicates with held-out Yang distance > 0.2", **_cq_inp)
+        REG.num("SuppCalQualMisfitOverHigh", _om(_hi) if len(_hi) else float("nan"), fmt=".1f",
+                source="% variants overstated, misspecified, Yang > 0.2", **_cq_inp)
+        REG.num("SuppCalQualMisfitOverLow", _om(_lw) if len(_lw) else float("nan"), fmt=".1f",
+                source="% variants overstated, misspecified, Yang <= 0.2", **_cq_inp)
+
+    # The prior-spread diagnostic applied to the real calibrations: SD of the bootstrap priors approximated from
+    # their 5th and 95th percentiles (lr_values.json.gz priors_pct), (p95 - p5) / 3.29.
+    import gzip as _cq_gzip
+    _sd_real = {}
+    for _d, _c in _resolved_cals.items():
+        _lv = Path(config.OUTPUT_DIR) / _d / f"{_d}_{_c.get('n_c')}_lr_values.json.gz"
+        if _lv.exists():
+            with _cq_gzip.open(_lv, "rt") as _fh:
+                _pp = json.load(_fh).get("priors_pct")
+            if _pp and all(np.isfinite(_pp)):
+                _sd_real[_d] = (_pp[2] - _pp[0]) / 3.29
+    _flag = sorted(d for d, s in _sd_real.items() if s > 0.10)
+    REG.num("SuppCalQualRealNWithSD", len(_sd_real), source="real calibrations with bootstrap prior percentiles")
+    REG.num("SuppCalQualRealNFlagged", len(_flag),
+            source="real calibrations whose approximate bootstrap prior SD exceeds 0.10")
+    print(f"  real calibrations with prior SD > 0.10: {len(_flag)} of {len(_sd_real)}: {_flag}")
 
 # %% [markdown]
 # ## A12. Supplementary Data 1-3

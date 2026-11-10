@@ -17,6 +17,7 @@ logging.getLogger('PIL').setLevel(logging.WARNING)
 from .config import PipelineConfig
 
 from ..fit_utils.utils import serialize_dict
+from ..fit_utils.evidence_thresholds import default_posterior_decimals as _tavtigian_posterior_decimals
 from ..data_utils.dataset import Scoreset, BasicScoreset
 
 def setup_logging(output_dir: str, dataset_name: str) -> logging.Logger:
@@ -112,6 +113,20 @@ def save_results(
             # Benign blocks removed on the auto-bidirectional path as
             # [lo, hi, population share] -- see prune_small_benign_blocks.
             'pruned_benign_islands': calibration.get('pruned_benign_islands', []),
+            # Dataset-level auto-bidirectional decision and fraction of
+            # bootstrap fits flagged (None for outputs predating this field;
+            # see analysis.supplementary_data.bidirectional_decision).
+            'bidirectional': calibration.get('bidirectional', None),
+            'bidirectional_frac_flagged': calibration.get('bidirectional_frac_flagged', None),
+            # Benign reference mean score, and the record of the plain-path
+            # pathogenic side rule (drop_wrong_side_pathogenic_fragments;
+            # None on the bidirectional path or for outputs predating it).
+            'benign_center': calibration.get('benign_center', None),
+            'pathogenic_side_rule': calibration.get('pathogenic_side_rule', None),
+            # Rounding of rule posteriors in the Tavtigian c search used for
+            # this calibration (None = exact; 3 = manuscript setting). See
+            # fit_utils.evidence_thresholds.default_posterior_decimals.
+            'tavtigian_posterior_decimals': _tavtigian_posterior_decimals(),
             'dataset': config.dataset_name,
             'relax': True,
             'liberal_monotonicity': config.liberal_monotonicity,

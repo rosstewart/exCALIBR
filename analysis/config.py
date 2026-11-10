@@ -294,6 +294,18 @@ PRIOR_SIMULATION_DIR = _env(
     "/data/ross/assay_calibration/prior_simulation",
 )
 
+# Calibration-quality simulation (Reviewer 2 comment on minimal truth sets; section A11i): results.csv and
+# acmgscaler_rows.csv from `python -m analysis.calibration_quality.tasks collect` / `.acmgscaler_arm`, and the
+# deliberately misspecified cells (misfit_results.csv, or included in results.csv once run on the HPC).
+CALIBRATION_QUALITY_DIR = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_DIR",
+    "/data/ross/assay_calibration/calibration_quality/hpc_grid",
+)
+CALIBRATION_QUALITY_MISFIT_CSV = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_MISFIT_CSV",
+    "/data/ross/assay_calibration/calibration_quality/misfit_results.csv",
+)
+
 # Pathomechanism-aware ExCALIBR rerun ("canonical" vs "pathomech_boundary"
 # comparison -- see Supplementary Section sec:pathomechanism_prior). Same
 # ExCALIBR-shaped output tree as OUTPUT_DIR/SKEW_LOCKED_OUTPUT_DIR, so it's

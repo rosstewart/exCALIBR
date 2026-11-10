@@ -195,7 +195,9 @@ def run_cell(cell, rep, B=B_DEFAULT, R=R_DEFAULT):
         splits = {int(b): bootstrap_splits(ss, b) for b in seeds}
         xl = {int(b): tuple(f["fit"]["xlims"]) for f, b in zip(fits, seeds)}
         xl["data"] = (float(ss.scores.min()), float(ss.scores.max()))
-        arms = {"fit": (fits, seeds), "true": (true_arm(ss, c, seeds, splits, xl), seeds)}
+        arms = {"fit": (fits, seeds)}
+        if c.get("shape", "gauss") == "gauss":  # the true-component arm needs a two-Gaussian truth
+            arms["true"] = (true_arm(ss, c, seeds, splits, xl), seeds)
         for mapping, pre in MAPPINGS.items():
             truth = {k: truth_points(G.true_log_lr(x, c), c["pi"], mapping) for k, x in ev.items()}
             pts = {}
@@ -217,7 +219,8 @@ def run_cell(cell, rep, B=B_DEFAULT, R=R_DEFAULT):
                 if ctrl:
                     cp = points_of(cal, np.concatenate(ctrl))
                     row[f"{pre}{arm}_ctrl_determinate"] = float((cp != 0).mean())
-            for est, ref in (("fit", "truth"), ("fit", "true"), ("true", "truth")):
+            for est, ref in [p for p in (("fit", "truth"), ("fit", "true"), ("true", "truth"))
+                             if all(a in pts or a == "truth" for a in p)]:
                 for k in ev:
                     e = pts[est][k]
                     r = truth[k] if ref == "truth" else pts[ref][k]

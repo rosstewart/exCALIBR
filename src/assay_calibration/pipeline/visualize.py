@@ -24,12 +24,12 @@ from ..fit_utils.point_ranges import (
     get_bootstrap_score_ranges_dual,
     check_thresholds_reached,
     extend_points_to_xlims,
+    drop_wrong_side_pathogenic_fragments,
     compute_single_fit_log_densities,
     compute_pathomechanism_lr_curves,
     resolve_pathomechanism_anchor,
     _compute_log_fp_only,
     is_bidirectional_by_weights,
-    is_bidirectional_by_raw_points,
     resolve_bidirectional_weight_vectors,
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
@@ -1037,17 +1037,16 @@ def process_component_fits(
     # PipelineConfig.auto_bidirectional and BIDIRECTIONAL_VOTE_THRESHOLD
     # (fit_utils/point_ranges.py).
     #
-    # Method choice depends on n_c: the mixture-component-weights method
-    # (is_bidirectional_by_weights) needs >=2 non-reference components (one
-    # on each side of the reference) plus the reference itself, i.e. >=3
-    # components total, so it's meaningless for 2c fits (only one
-    # non-reference component exists -- nothing for it to detect). For n_c<3,
-    # use the raw-points method instead: it looks for a
-    # pathogenic->benign->pathogenic pattern directly in each fit's raw
-    # (pre-postprocess) threshold-crossing point ranges, which a 2c fit's
-    # non-monotonic LR+ curve can still exhibit even with only one
-    # non-reference component.
+    # Detection applies only to n_c >= 3: the mixture-component-weights
+    # method (is_bidirectional_by_weights) needs a pathogenic-like component
+    # on each side of a benign-like one. For n_c < 3 detection is skipped:
+    # a two-component LR+ is monotonic wherever the density constraint is
+    # enforced (Supplementary Theorem S1), so any pathogenic->benign->
+    # pathogenic reversal in a 2c fit is a tail density violation (the wider
+    # abnormal component outlasting the normal one past e^-7), not
+    # bidirectional signal -- see is_bidirectional_by_raw_points (unused).
     force_no_postprocess = False
+    frac_flagged = 0.0
     auto_bidirectional = getattr(config, "auto_bidirectional", False)
     if auto_bidirectional and n_c >= 3:
         n_flagged = 0
@@ -1073,17 +1072,9 @@ def process_component_fits(
             f"{'forcing postprocess_point_ranges=False' if force_no_postprocess else 'no override'}"
         )
     elif auto_bidirectional:
-        n_flagged = sum(
-            1 for ranges_p, ranges_b in zip(ranges_pathogenic, ranges_benign)
-            if is_bidirectional_by_raw_points(ranges_p, ranges_b)
-        )
-        frac_flagged = n_flagged / len(fits) if fits else 0.0
-        force_no_postprocess = frac_flagged >= BIDIRECTIONAL_VOTE_THRESHOLD
         logger.info(
-            f"  Bidirectional auto-detect (raw-points, n_c={n_c}): {n_flagged}/{len(fits)} "
-            f"bootstrap fits flagged ({frac_flagged:.1%}), "
-            f"threshold={BIDIRECTIONAL_VOTE_THRESHOLD:.0%} -> "
-            f"{'forcing postprocess_point_ranges=False' if force_no_postprocess else 'no override'}"
+            f"  Bidirectional auto-detect skipped (n_c={n_c}): two-component lr+ is monotonic "
+            f"where the density constraint holds; reversals are tail density violations"
         )
     # benign_center: same actual-score mean already used for scoreset_flipped
     # detection above (ben_mean_score), reused here as the reference position
@@ -1091,7 +1082,17 @@ def process_component_fits(
     # than trying to identify "the benign component" from an EM fit (which
     # has no stable identity across bootstrap fits; see git history for the
     # per-fit component-weighted-argmax version this replaced).
-    benign_center = float(ben_mean_score) if force_no_postprocess else None
+    # Also used (always, not only when bidirectional) as the reference position
+    # for drop_wrong_side_pathogenic_fragments on the plain path.
+    benign_center = float(ben_mean_score) if np.isfinite(ben_mean_score) else None
+    # Support for drop_wrong_side_pathogenic_fragments: the P/LP sample, or the
+    # population sample in NU mode (no P/LP).
+    _support_idx = pathogenic_idx if pathogenic_idx is not None else gnomad_idx
+    pathogenic_side_support_scores = (
+        np.asarray(scoreset.scores)[np.asarray(scoreset.sample_assignments)[:, _support_idx].astype(bool)]
+        if _support_idx is not None else np.array([])
+    )
+    pathogenic_side_rule = None
     # Population-sample scores for prune_small_benign_blocks (bidirectional
     # path only), shared with the OOB path below via the result dict.
     benign_island_min_frac = getattr(config, "benign_island_min_frac", BENIGN_ISLAND_MIN_FRAC)
@@ -1134,6 +1135,18 @@ def process_component_fits(
                 logger.info(f"    {k:+d}: {point_ranges[k]}")
 
         if getattr(config, "postprocess_point_ranges", True) and not force_no_postprocess:
+            if getattr(config, "drop_wrong_side_pathogenic", True):
+                pathogenic_side_rule = drop_wrong_side_pathogenic_fragments(
+                    point_ranges, config.point_values, benign_center, scoreset_flipped,
+                    support_scores=pathogenic_side_support_scores,
+                )
+                if pathogenic_side_rule["action"] != "none":
+                    logger.info(f"  Pathogenic side rule: {pathogenic_side_rule['action']} "
+                                f"(benign_center={benign_center}, support low/high="
+                                f"{pathogenic_side_rule['support_low']}/{pathogenic_side_rule['support_high']}, "
+                                f"dropped={pathogenic_side_rule['dropped']})")
+                if pathogenic_side_rule["flag"]:
+                    logger.warning(f"  REVIEW: {pathogenic_side_rule['flag']}")
             # Enforce monotonicity (first pass)
             enforce_monotonicity_point_ranges(
                 point_ranges,
@@ -1264,7 +1277,17 @@ def process_component_fits(
         # vs none) as this global in-bag fit, instead of always using the plain
         # path regardless of how this dataset was actually postprocessed.
         'force_no_postprocess': force_no_postprocess,
+        # Saved to *_calibration.json (pipeline/utils.py:save_results): the
+        # dataset-level bidirectional decision and the fraction of bootstrap
+        # fits flagged (0.0 when detection did not run, e.g. n_c < 3).
+        'bidirectional': bool(force_no_postprocess),
+        'bidirectional_frac_flagged': float(frac_flagged),
         'benign_center': benign_center,
+        # Plain path only (None otherwise): see drop_wrong_side_pathogenic_fragments.
+        'pathogenic_side_rule': pathogenic_side_rule,
+        # In-memory only: reused by the OOB path for its per-variant rule.
+        'pathogenic_side_support_scores': pathogenic_side_support_scores,
+        'drop_wrong_side_pathogenic': bool(getattr(config, "drop_wrong_side_pathogenic", True)),
         'benign_island_reference_scores': benign_island_reference_scores,
         'benign_island_min_frac': benign_island_min_frac,
         # Saved to *_calibration.json: benign blocks removed by

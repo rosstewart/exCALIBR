@@ -52,19 +52,27 @@ class PipelineConfig:
     # is_bidirectional_by_weights/resolve_bidirectional_weight_vectors in
     # fit_utils/point_ranges.py, which also handle the PU/NU sample-
     # availability cases via a gnomAD fallback). When a majority of
-    # bootstrap fits are flagged (BIDIRECTIONAL_VOTE_THRESHOLD), skips
-    # monotonicity enforcement for this dataset (like --no-postprocess) and
-    # instead extends only the outermost pathogenic evidence island on each
-    # side to the axis limit, via extend_bidirectional_pathogenic_islands --
-    # see that function's docstring for the full rationale/algorithm.
-    # Weights-based detection only applies when n_c >= 3 (needs a
-    # pathogenic-like component on each side of the reference, so a 2c fit's
-    # single non-reference component has nothing to detect). For n_c < 3,
-    # is_bidirectional_by_raw_points is used instead -- it looks for a
-    # pathogenic->benign->pathogenic pattern directly in each fit's raw
-    # (pre-postprocess) threshold-crossing point ranges, which a 2c fit's
-    # non-monotonic LR+ curve can still exhibit.
+    # bootstrap fits are flagged (BIDIRECTIONAL_VOTE_THRESHOLD), the standard
+    # monotonic postprocessing is replaced for this dataset by
+    # clean_benign_fragments_no_extend (+ prune_small_benign_blocks) on the
+    # benign side and clean_bidirectional_pathogenic_evidence (standard
+    # monotonic postprocessing run separately on each side of the benign
+    # reference mean score) on the pathogenic side -- see those docstrings.
+    # Detection applies only when n_c >= 3 (needs a pathogenic-like component
+    # on each side of the reference). It is skipped for n_c < 3: a 2c LR+ is
+    # monotonic where the density constraint holds, so reversals there are
+    # tail density violations (see is_bidirectional_by_raw_points, unused).
     auto_bidirectional: bool = True
+
+    # Plain (single-direction) postprocessing only: before the first
+    # monotonicity pass, drop raw pathogenic fragments on the far side of the
+    # benign reference mean score when fragments exist on both sides and the
+    # expected side holds at least as much P/LP support (population sample in
+    # NU mode) -- see drop_wrong_side_pathogenic_fragments in
+    # fit_utils/point_ranges.py. Opposite-side-only or opposite-side-supported
+    # cases are flagged, not changed. Per-dataset override key:
+    # "drop_wrong_side_pathogenic".
+    drop_wrong_side_pathogenic: bool = True
 
     # On the auto-bidirectional path only: after the benign-side cleanup, drop
     # any contiguous benign evidence block holding less than this fraction of
