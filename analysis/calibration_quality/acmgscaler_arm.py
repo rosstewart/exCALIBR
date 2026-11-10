@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.calibration_quality import generate as G
-from analysis.calibration_quality.run import MAPPINGS, compare, to_tier, truth_points
+from analysis.calibration_quality.run import MAPPINGS, compare, posterior, posterior_metrics, to_tier, truth_points
 
 FIXED_PRIOR = 0.10
 N_EVAL_ACMG = 3000  # per class: acmgscaler scores every row, so a smaller draw keeps the R call fast
@@ -49,6 +49,21 @@ def run_one(cell, rep, prior=FIXED_PRIOR):
                 ref = to_tier(truth_points(G.true_log_lr(x, cell), cell["pi"], mapping))
                 for m, v in compare(p, ref).items():
                     row[f"{pre}acmg_vs_truth_{k}_tier_{m}"] = v
+        # Posteriors (exact; no evidence-level mapping): the conservative likelihood ratio is the lower end of
+        # acmgscaler's interval where it exceeds 1, the upper end where it is below 1, else 1; prior 0.10.
+        lr = out["acmgscaler_lr"].to_numpy(float)[len(plp) + len(blb):]
+        lo = out["acmgscaler_lr_lower"].to_numpy(float)[len(plp) + len(blb):]
+        hi = out["acmgscaler_lr_upper"].to_numpy(float)[len(plp) + len(blb):]
+        lr_c = np.where(lo > 1, lo, np.where(hi < 1, hi, 1.0))
+        o = 0
+        for k, x in ev.items():
+            sl = slice(o, o + len(x))
+            o += len(x)
+            true_post = posterior(np.exp(G.true_log_lr(x, cell)), cell["pi"])
+            is_path = d["eval_pop_is_path"][:len(x)] if k == "population" else None
+            for m, v in posterior_metrics(posterior(lr_c[sl], prior), true_post, lr_c[sl], is_path).items():
+                row[f"acmg_{k}_{m}"] = v
+            row[f"acmg_{k}_post_mae_central"] = float(np.abs(posterior(lr[sl], prior) - true_post).mean())
         row["acmg_status"] = "ok"
     except Exception as e:
         row["acmg_status"] = f"error: {type(e).__name__}: {e}"[:300]

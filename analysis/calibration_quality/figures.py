@@ -140,8 +140,8 @@ def _mean_ci(x):
 def make_diagnostics_figure(merged, out_path, misfit=None, core_ref=None):
     """merged: results joined with the acmgscaler rows (summarize.acmgscaler_compare). misfit: results of the
     deliberately misspecified cells (optional panel F); core_ref: Gaussian replicates shown for reference in F."""
-    fig, axes = plt.subplots(2, 2, figsize=(7.2, 5.8), gridspec_kw=dict(hspace=0.5, wspace=0.32))
-    fig.subplots_adjust(left=0.09, right=0.98, top=0.94, bottom=0.12)
+    fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.2), gridspec_kw=dict(hspace=0.55, wspace=0.32))
+    fig.subplots_adjust(left=0.09, right=0.98, top=0.94, bottom=0.16)
     m = merged[merged["experiment"].isin(["core", "prior"])]
 
     # (A) overstated evidence vs controls per class
@@ -158,7 +158,7 @@ def make_diagnostics_figure(merged, out_path, misfit=None, core_ref=None):
         ok = np.isfinite(y)
         ax.errorbar(np.arange(len(x))[ok], y[ok], yerr=e[ok], color=col, marker="o", ms=4, lw=1.4, capsize=0,
                     label=lab)
-    ax.text(0, 4.2, "acmgscaler\nnot run (<10)", fontsize=5.6, color=MUTED, ha="center")
+    ax.text(0.05, 7.0, "acmgscaler\nnot run (<10)", fontsize=5.6, color=MUTED, ha="left")
     ax.set_xticks(range(len(N_ORDER)))
     ax.set_xticklabels(N_ORDER)
     _style(ax, "controls per class", "variants with overstated evidence (%)")
@@ -213,8 +213,12 @@ def make_diagnostics_figure(merged, out_path, misfit=None, core_ref=None):
                        label={"skew": "skewed classes", "bimodal": "bimodal abnormal class",
                               "heavy": "heavy-tailed classes"}[shape])
         ax.axvline(0.2, color=MUTED, ls="--", lw=0.8)
-        ax.legend(frameon=False, fontsize=5.6, loc="upper left", markerscale=1.6)
-    _style(ax, "Yang distance, max over samples (held out)", "variants with overstated evidence (%)")
+        ax.set_xscale("log")
+        ax.set_xlim(0.01, 20)
+        ax.set_ylim(-3, 103)
+        ax.text(0.22, 96, "0.2", fontsize=5.6, color=MUTED)
+        ax.legend(frameon=False, fontsize=5.6, loc="upper left", bbox_to_anchor=(0.0, -0.22), ncol=2, markerscale=1.6)
+    _style(ax, "Yang distance, max over samples (held out; log scale)", "variants with overstated evidence (%)")
     ax.set_title(f"{_letter(3)} Misfit and Yang distance", loc="left", color=INK, fontweight="bold")
 
     out_path = Path(out_path)

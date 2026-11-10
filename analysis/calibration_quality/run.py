@@ -174,6 +174,68 @@ def yang_per_sample(fits, seeds, splits, cols, split):
     return {k: float(np.nanmedian(v)) if np.isfinite(v).any() else np.nan for k, v in per.items()}
 
 
+# ── posteriors (exact; no evidence-level mapping) ───────────────────────────────────────────────────────────────
+
+POST_BINS = (0.9, 0.99)  # calibration bins: posterior >= b (pathogenic end) and <= 1 - b (benign end)
+POST_OVER_TOL = 0.01
+
+
+def posterior(lr, prior):
+    lr = np.asarray(lr, float)
+    return prior * lr / (prior * lr + (1 - prior))
+
+
+def conservative_lr(log_lr5, log_lr95):
+    """The reported likelihood ratio: the 5th-percentile lr+ where it exceeds 1 (pathogenic evidence), else the
+    95th percentile where it is below 1 (benign evidence), else 1 (the bootstrap interval crosses 1: no evidence)."""
+    lr5, lr95 = np.exp(log_lr5), np.exp(log_lr95)
+    return np.where(lr5 > 1, lr5, np.where(lr95 < 1, lr95, 1.0))
+
+
+def lr_bounds(cal, x):
+    """5th, 50th and 95th percentile of log lr+ across bootstrap fits at scores x (curves interpolated as in the
+    variant tables; scores beyond the grid take the edge value)."""
+    sr = np.asarray(cal["score_range"], float)
+    llr = np.asarray(cal["log_lr_plus"], float)
+    at = np.vstack([np.interp(x, sr, row) for row in llr])
+    return [np.nanpercentile(at, q, axis=0) for q in (5, 50, 95)]
+
+
+def posterior_metrics(post, post_true, lr_used, is_path=None):
+    """Agreement of an estimated posterior with the exact one on the same variants. `lr_used` is the likelihood
+    ratio behind `post` (its side defines the direction of the claim)."""
+    claim = np.where(lr_used > 1, post - post_true, np.where(lr_used < 1, post_true - post, 0.0))
+    out = dict(post_mae=float(np.abs(post - post_true).mean()),
+               post_over=float((claim > POST_OVER_TOL).mean()),
+               post_over_mean=float(np.clip(claim, 0, None).mean()))
+    if is_path is not None:  # calibration: the observed pathogenic share among variants with extreme posteriors
+        for b in POST_BINS:
+            hi, lo = post >= b, post <= 1 - b
+            tag = f"{int(round(100 * b))}"
+            out[f"post_ge{tag}_share"] = float(hi.mean())
+            out[f"post_ge{tag}_obs"] = float(is_path[hi].mean()) if hi.any() else np.nan
+            low = f"{100 - int(round(100 * b)):02d}"  # e.g. le10 = posterior <= 0.10, le01 = posterior <= 0.01
+            out[f"post_le{low}_share"] = float(lo.mean())
+            out[f"post_le{low}_obs"] = float(is_path[lo].mean()) if lo.any() else np.nan
+    return out
+
+
+def posterior_rows(cal, ev, c, is_path_pop, arm):
+    """Conservative (reported) and central posterior of one calibration vs the exact posterior."""
+    row = {}
+    prior = float(cal["prior"])
+    for k, x in ev.items():
+        true_post = posterior(np.exp(G.true_log_lr(x, c)), c["pi"])
+        l5, l50, l95 = lr_bounds(cal, x)
+        lr_c = conservative_lr(l5, l95)
+        for m, v in posterior_metrics(posterior(lr_c, prior), true_post, lr_c,
+                                      is_path_pop if k == "population" else None).items():
+            row[f"{arm}_{k}_{m}"] = v
+        lr_m = np.exp(l50)
+        row[f"{arm}_{k}_post_mae_central"] = float(np.abs(posterior(lr_m, prior) - true_post).mean())
+    return row
+
+
 # ── one replicate ────────────────────────────────────────────────────────────────────────────────────────────────
 
 SHORT = {"Pathogenic/Likely Pathogenic": "plp", "Benign/Likely Benign": "blb", "gnomAD": "pop", "Synonymous": "syn"}
@@ -215,6 +277,8 @@ def run_cell(cell, rep, B=B_DEFAULT, R=R_DEFAULT):
                         row[f"{arm}_{k}"] = v
                     row[f"{arm}_prior_err"] = row[f"{arm}_prior"] - c["pi"]
                 pts[arm] = {k: points_of(cal, x) for k, x in ev.items()}
+                if not pre:  # posteriors do not depend on the evidence-level mapping
+                    row.update(posterior_rows(cal, ev, c, d["eval_pop_is_path"], arm))
                 ctrl = [s for s in (d["samples"][0], d["samples"][1]) if len(s)]
                 if ctrl:
                     cp = points_of(cal, np.concatenate(ctrl))

@@ -3527,6 +3527,19 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
                 source="% variants overstated, misspecified, Yang > 0.2", **_cq_inp)
         REG.num("SuppCalQualMisfitOverLow", _om(_lw) if len(_lw) else float("nan"), fmt=".1f",
                 source="% variants overstated, misspecified, Yang <= 0.2", **_cq_inp)
+        REG.num("SuppCalQualMisfitOverAll", _om(_cq_mis), fmt=".1f",
+                source="% variants overstated, misspecified truths (all)", **_cq_inp)
+        _k4 = _cq_core[(_cq_core.kappa == 4) & (_cq_core.richness == "mid")]
+        REG.num("SuppCalQualCorrectOverKFour", _om(_k4), fmt=".1f",
+                source="% variants overstated, correctly specified, kappa 4, population/synonymous 200/100",
+                **_cq_inp)
+        _small = _cq_mis[_cq_mis.n_plp == _cq_mis.n_plp.min()]
+        REG.num("SuppCalQualMisfitHighYangSmallPct",
+                100 * float((_small.yang_val_max > config.YANG_GOOD_FIT_THRESHOLD).mean()), fmt=".0f",
+                source="% misspecified replicates with the fewest controls with held-out Yang distance > 0.2",
+                **_cq_inp)
+        REG.num("SuppCalQualMisfitMinN", int(_small.n_plp.iloc[0]), kind="method",
+                source="fewest controls per class among misspecified settings", **_cq_inp)
 
     # The prior-spread diagnostic applied to the real calibrations: SD of the bootstrap priors approximated from
     # their 5th and 95th percentiles (lr_values.json.gz priors_pct), (p95 - p5) / 3.29.

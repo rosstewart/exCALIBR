@@ -42,6 +42,10 @@ def load(out_dir):
 
 
 def add_outcomes(df, pre=""):
+    # misspecified-truth replicates have no true-component arm: those columns are absent or all NaN
+    for k in ("true_prior_err", f"{pre}fit_vs_true_pathogenic_mae", f"{pre}fit_vs_true_benign_mae"):
+        if k not in df:
+            df[k] = np.nan
     df[f"{pre}prior_bad"] = df["fit_prior_err"].abs().gt(PRIOR_TOL) | df["fit_prior_err"].isna()
     df[f"{pre}true_prior_bad"] = df["true_prior_err"].abs().gt(PRIOR_TOL) | df["true_prior_err"].isna()
     for k in ("pathogenic", "benign"):
