@@ -178,6 +178,29 @@ def yang_per_sample(fits, seeds, splits, cols, split):
 
 POST_BINS = (0.9, 0.99)  # calibration bins: posterior >= b (pathogenic end) and <= 1 - b (benign end)
 POST_OVER_TOL = 0.01
+# Posterior bin edges for the reliability curve and the true-vs-model histograms (finer near 0 and 1)
+POST_EDGES = np.array([0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99,
+                       0.995, 0.999, 1.0])
+
+
+def _bin(post):
+    return np.clip(np.searchsorted(POST_EDGES, post, side="right") - 1, 0, len(POST_EDGES) - 2)
+
+
+def posterior_histograms(post, post_true=None, is_path=None):
+    """Compact per-replicate counts, ';'-joined: with `is_path` (population draws), variants and true pathogenic
+    variants per model-posterior bin (reliability curve); with `post_true`, the true x model posterior histogram,
+    row-major over (true bin, model bin)."""
+    out = {}
+    b = _bin(post)
+    K = len(POST_EDGES) - 1
+    if is_path is not None:
+        out["rel_n"] = ";".join(map(str, np.bincount(b, minlength=K)))
+        out["rel_path"] = ";".join(map(str, np.bincount(b, weights=is_path.astype(float), minlength=K).astype(int)))
+    if post_true is not None:
+        h = np.bincount(_bin(post_true) * K + b, minlength=K * K)
+        out["hist2d"] = ";".join(map(str, h))
+    return out
 
 
 def posterior(lr, prior):
@@ -228,8 +251,11 @@ def posterior_rows(cal, ev, c, is_path_pop, arm):
         true_post = posterior(np.exp(G.true_log_lr(x, c)), c["pi"])
         l5, l50, l95 = lr_bounds(cal, x)
         lr_c = conservative_lr(l5, l95)
-        for m, v in posterior_metrics(posterior(lr_c, prior), true_post, lr_c,
-                                      is_path_pop if k == "population" else None).items():
+        post_c = posterior(lr_c, prior)
+        for m, v in posterior_metrics(post_c, true_post, lr_c, is_path_pop if k == "population" else None).items():
+            row[f"{arm}_{k}_{m}"] = v
+        for m, v in posterior_histograms(post_c, true_post if k != "population" else None,
+                                         is_path_pop if k == "population" else None).items():
             row[f"{arm}_{k}_{m}"] = v
         lr_m = np.exp(l50)
         row[f"{arm}_{k}_post_mae_central"] = float(np.abs(posterior(lr_m, prior) - true_post).mean())
