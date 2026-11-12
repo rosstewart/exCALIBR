@@ -132,15 +132,16 @@ def to_tier(pts):
 def prior_effect(ss, fits, seeds, cal, true_prior, x):
     """Effect of the prior's error alone on the evidence: the production calibration rerun with the prior fixed at
     the true value (manual_prior) on the bootstraps the fitted-prior calibration kept (a fixed prior keeps them all
-    otherwise), compared with the same rerun at the fitted prior, on the evaluation variants `x` (the population /
-    gnomAD reference set). Returns the share of variants whose points change and the mean |change|."""
+    otherwise), compared with the fitted-prior calibration `cal`, on the evaluation variants `x` (the population /
+    gnomAD reference set). Returns the share of variants whose points change and the mean |change|. (A rerun fixed
+    at the fitted prior on the same bootstraps reproduces `cal`'s points exactly, checked in a pilot, so `cal` is
+    the reference.) Costs one calibration call, ~1 s; no refitting."""
     keep = np.asarray(cal.get("valid_mask", np.ones(len(fits), bool)), bool)
     fk, sk = [f for f, k in zip(fits, keep) if k], np.asarray(seeds)[keep]
-    at_fit, at_true = calibrate(ss, fk, sk, manual_prior=float(cal["prior"])), calibrate(ss, fk, sk,
-                                                                                       manual_prior=true_prior)
-    if at_fit is None or at_true is None:
+    at_true = calibrate(ss, fk, sk, manual_prior=true_prior)
+    if at_true is None:
         return {}
-    a, b = points_of(at_fit, x), points_of(at_true, x)
+    a, b = points_of(cal, x), points_of(at_true, x)
     return dict(prior_effect_pop_changed=float((a != b).mean()),
                 prior_effect_pop_mean_abs=float(np.abs(a - b).mean()))
 

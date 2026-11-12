@@ -1,36 +1,35 @@
 """Calibration-reliability diagnostics for the real calibrations, from the calibration-quality simulation.
 
 Two checks, one per failure mode:
-- prior reliability (weak-signal failure), in ACMG/AMP evidence points: posterior log-odds = prior log-odds + log LR,
-  so a prior whose odds are off by a factor F shifts every posterior by log F, and one Tavtigian point is an odds
-  factor of 350^(1/8) (POINT). The error |logit(fitted) - logit(true)| / log(POINT) therefore has the same meaning
-  at every prior. Reported: a reliability score, P(prior error < 1 point), from a gradient-boosted classifier with an
-  logistic (Platt) recalibration fitted on its grouped cross-validated predictions; and the predicted error in points
-  (median, 90th percentile; below). The bootstrap 90% interval of the prior is shown for reference only: in the
-  simulation it contains the true prior in ~75% of fits (bias that resampling does not see);
-- prior error: the size of the prior's error on the log-odds scale,
-  |logit(fitted prior) - logit(true prior)|, so that an error means the same at every prior. Gradient-boosted
-  quantile regressions trained on the simulation predict its median and 90th percentile (log scale), each shifted by
-  a constant from grouped cross-validation so that the bounds cover 50% and 90% of simulated fits (split-conformal).
-  The prediction is reported as prior intervals around the fitted prior, logit(prior) +- predicted error: a typical
-  (median) and a 90% interval. A linear model was not used: its coverage fails at fitted priors below 7% and above
-  50% (it covers 27% and 66% at its 90% bound). The boosted model also under-covers at fitted priors above 50%
-  and below 3%, where the simulation has few fits (the 0.01, 0.025 and 0.60 prior slices in the rerun add them);
+- prior reliability (weak-signal failure): how well the prior itself is determined, on the angular scale
+  theta = asin(sqrt(p)). For a proportion estimated from n draws Var(p_hat) ~ p(1-p)/n, and the delta method gives
+  Var(theta_hat) ~ 1/(4n) whatever p: an angular error stands for the same amount of information at a prior of 1%
+  or 40% (twice it is the Fisher-Rao distance between the two Bernoulli distributions). Reliability is a skill score
+  with no tolerance: 1 - E|theta_fitted - theta_true| / (pi/6), floored at 0, where pi/6 is the mean angular error
+  between two priors drawn independently from the Jeffreys prior (uniform in theta): 0 = no better than an
+  uninformed guess, 1 = exact. E|error| comes from a gradient-boosted regression trained on the simulation; a
+  90% bound from a quantile regression (split-conformal shift) gives the prior range sin^2(theta +- bound). The
+  bootstrap 90% interval is shown for reference only (it contains the true prior in ~75% of simulated fits);
 - bad fit (systematically wrong evidence from a mixture that does not match the data): a fixed rule on the Yang
   distance, flagged when any sample's in-sample distance exceeds YANG_T, or its held-out distance does with at least
   YANG_MIN_HELDOUT held-out variants (config.YANG_GOOD_FIT_THRESHOLD = 0.2; distances are medians across bootstraps,
   production definition, analysis/yang_distance).
 
 Prior-model features, all computed from a real calibration's production outputs:
-- the log10 SD of the bootstrap priors on the probability and (delta method, SD / (p (1 - p))) the logit scale, and the share of bootstraps whose prior stays at the EM start (0.5), from the
-  per-bootstrap priors recomputed with production code (analysis.calibration_quality.recompute_priors; only datasets
-  whose recomputation reproduces the saved calibration exactly get them), with the simulation's definition
-  (run.prior_diagnostics: priors in (0.001, 0.999));
+- the SD of the bootstrap priors, in probability and (delta method, SD / (2 sqrt(p (1 - p)))) angular units, and
+  the share of bootstraps whose prior stays at the EM start (0.5), from the per-bootstrap priors recomputed with
+  production code (analysis.calibration_quality.recompute_priors; only datasets whose recomputation reproduces the
+  saved calibration exactly get them), with the simulation's definition (run.prior_diagnostics: priors in
+  (0.001, 0.999));
 - share of bootstraps discarded (calibration pct_bootstraps_kept);
-- share of the labeled controls (P/LP and/or B/LB) with no evidence (in-sample points, variants csv);
-- largest in-sample Yang distance over the samples.
-The control separation (AUC) and control counts are still computed and reported, but not used by the model.
-No-P/LP (NU) calibrations are not simulated: the model gives them a prediction, but its accuracy there is untested.
+- share of the labeled controls (P/LP and/or B/LB; synonymous when neither) with no evidence (in-sample points);
+- largest in-sample Yang distance over the samples;
+- separation (AUC, direction-free) of the pathogenic-labeled sample from the benign reference: P/LP vs B/LB; P/LP vs
+  synonymous without B/LB; and, with no benign reference (PU), P/LP vs gnomAD, gnomAD taken as putatively neutral
+  (mostly benign, not devoid of pathogenic variants) -- with `is_pu` marking that case. Missing for NU (no P/LP); the
+  boosted models handle missing values.
+The fitted prior itself is not a feature: the simulated true priors take a few fixed values, so a model given it
+learns the distance to the nearest simulated value (until the rerun's continuous-prior slice).
 The mechanism-mix-bias slice is left out of training: control-composition bias cannot be seen in the fit.
 
     python -m analysis.calibration_quality.diagnostics [--out DIR] [--n-jobs 12] [--no-plots] [--datasets ...]
@@ -44,34 +43,31 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Every feature is defined whichever samples a calibration has (PN, PU or NU), so single-class calibrations get a
-# prediction and the simulated PU / no-B/LB replicates are in the training set. The control separation and the
-# smaller control count were dropped: undefined (or degenerate) without both classes, and they add nothing once
-# these five are in (grouped-CV AUC 0.822 with them on two-class replicates, 0.825 without, on all).
-# The fitted prior itself is not a feature: the simulated true priors take a few fixed values, so a model given the
-# fitted prior learns the distance to the nearest simulated value as "error" (intervals ending at exactly 0.25 or
-# 0.10 for precise calibrations). It still sets where each interval is centred.
-FEATURES = ["log_prior_sd", "log_sd_logit", "frac_at_start", "pct_discarded", "no_evidence", "yang_train_max"]
+FEATURES = ["log_prior_sd", "log_sd_ang", "frac_at_start", "pct_discarded", "no_evidence", "yang_train_max",
+            "sep_auc", "is_pu"]
+NULLABLE = {"sep_auc"}  # missing where undefined (NU); the boosted models handle missing values
 FEATURE_LABELS = {
-    "logit_prior": "fitted prior",
     "log_prior_sd": "prior SD (bootstrap)",
-    "log_sd_logit": "prior SD, log-odds scale",
+    "log_sd_ang": "prior SD, angular scale",
     "frac_at_start": "bootstraps with prior at EM start",
     "pct_discarded": "bootstraps discarded",
     "no_evidence": "controls with no evidence",
     "yang_train_max": "max in-sample Yang distance",
-    "ctrl_auc": "P/LP vs B/LB separation (AUC)",
-    "log_n_ctrl": "smaller control count",
+    "sep_auc": "separation (AUC)",
+    "is_pu": "PU (P/LP vs gnomAD)",
 }
-ERR_CAP = 5.0  # log-odds error given to a replicate with no prior (calibration failed); errors are capped here
-ERR_EPS = 0.02  # offset of the log transform of the error
-QUANTILES = (0.5, 0.9)
-POINT = float(np.log(350) / 8)  # log odds factor of one evidence point (Tavtigian et al.)
+ANG_REF = float(np.pi / 6)  # mean |theta1 - theta2|, both uniform on [0, pi/2] (Jeffreys prior)
 REL_COLORS = [(0.9, "#4a9b6e"), (0.75, "#93b85a"), (0.5, "#d9b440"), (0.25, "#e07b39"), (-1, "#c8423b")]
 
 
 def rel_color(r):
     return next(c for lo, c in REL_COLORS if r >= lo)
+
+
+def ang(p):
+    return np.arcsin(np.sqrt(np.clip(p, 0, 1)))
+
+
 YANG_T = 0.2
 YANG_MIN_HELDOUT = 5
 SAMPLES = {"plp": "P/LP", "blb": "B/LB", "gnomad": "gnomAD", "synonymous": "Synonymous"}
@@ -95,6 +91,17 @@ def prior_stats(priors):
             float(np.mean(np.abs(kept - 0.5) < 1e-3)) if len(kept) else np.nan)
 
 
+def separation(plp, blb, syn, pop):
+    """(AUC of the pathogenic-labeled sample against the benign reference, is_pu): P/LP vs B/LB; P/LP vs synonymous
+    without B/LB; P/LP vs gnomAD (putatively neutral) with neither (PU); missing without P/LP (NU)."""
+    if not len(plp):
+        return np.nan, 0
+    for ref, pu in ((blb, 0), (syn, 0), (pop, 1)):
+        if len(ref):
+            return _auc(np.r_[np.ones(len(plp)), np.zeros(len(ref))], np.r_[plp, ref]), pu
+    return np.nan, 0
+
+
 # ── simulation: features, training, the Yang rule ────────────────────────────────────────────────────────────────
 
 def simulation_table(out_dir, n_jobs=16):
@@ -105,7 +112,7 @@ def simulation_table(out_dir, n_jobs=16):
     from analysis.calibration_quality.summarize import load
     out_dir = Path(out_dir)
     df = load(out_dir)
-    cache = out_dir / "summary" / "ctrl_auc.csv"
+    cache = out_dir / "summary" / "sep_auc.csv"
     if cache.exists():
         ca = pd.read_csv(cache)
     else:
@@ -113,99 +120,75 @@ def simulation_table(out_dir, n_jobs=16):
 
         def one(cid, rep):
             c = G.for_rep(cells[cid], rep)
-            d = G.make_data(G.rng_for(c, rep), c)
-            p, b = d["samples"][0], d["samples"][1]
-            return _auc(np.r_[np.ones(len(p)), np.zeros(len(b))], np.r_[p, b]) if len(p) and len(b) else np.nan
+            plp, blb, pop, syn = G.make_data(G.rng_for(c, rep), c)["samples"]
+            return separation(plp, blb, syn, pop)
         ca = df[["cell_id", "rep"]].copy()
-        ca["ctrl_auc"] = Parallel(n_jobs=n_jobs)(delayed(one)(c, r) for c, r in zip(ca.cell_id, ca.rep))
+        res = Parallel(n_jobs=n_jobs)(delayed(one)(c, r) for c, r in zip(ca.cell_id, ca.rep))
+        ca["sep_auc"], ca["is_pu"] = [a for a, _ in res], [b for _, b in res]
         cache.parent.mkdir(exist_ok=True)
         ca.to_csv(cache, index=False)
     df = df.merge(ca, on=["cell_id", "rep"], how="left")
     df["log_prior_sd"] = np.log10(df.fit_prior_sd.clip(lower=1e-4))
     fp = df.fit_prior.clip(1e-4, 1 - 1e-4)
-    df["logit_prior"] = np.log(fp / (1 - fp))
-    df["log_sd_logit"] = np.log10((df.fit_prior_sd / (fp * (1 - fp))).clip(lower=1e-4))
+    df["log_sd_ang"] = np.log10((df.fit_prior_sd / (2 * np.sqrt(fp * (1 - fp)))).clip(lower=1e-4))
     df["frac_at_start"] = df.fit_frac_at_start
     df["pct_discarded"] = df.fit_pct_discarded
     df["no_evidence"] = 1 - df.fit_ctrl_determinate
-    df["log_n_ctrl"] = np.log10(np.minimum(df.n_plp, df.n_blb).clip(lower=1))
     # held-out Yang in the simulation already counts only samples with >= run.YANG_MIN_N (5) held-out variants
     df["yang_flag"] = (df.yang_train_max > YANG_T) | (df.yang_val_max > YANG_T)
     df["over_share"] = (df.fit_vs_truth_pathogenic_over + df.fit_vs_truth_benign_over) / 2
     return df
 
 
-def logodds_err(s):
-    """|logit(fitted prior) - logit(true prior)|, capped at ERR_CAP; a replicate with no prior counts as the cap."""
-    fp = s.fit_prior.clip(1e-4, 1 - 1e-4)
-    e = np.abs(np.log(fp / (1 - fp)) - np.log(s.pi / (1 - s.pi)))
-    return e.where(s.fit_prior.notna(), ERR_CAP).clip(upper=ERR_CAP).to_numpy()
+def angular_err(s):
+    """|asin(sqrt(fitted prior)) - asin(sqrt(true prior))|; a replicate with no prior counts as ANG_REF (no
+    information)."""
+    e = np.abs(ang(s.fit_prior) - ang(s.pi))
+    return e.where(s.fit_prior.notna(), ANG_REF).to_numpy()
 
 
-def _hgb(q):
+def _hgb(loss="squared_error", q=None):
     from sklearn.ensemble import HistGradientBoostingRegressor
-    return HistGradientBoostingRegressor(loss="quantile", quantile=q, max_iter=300, learning_rate=0.05,
-                                         max_leaf_nodes=15, min_samples_leaf=40, random_state=0)
+    kw = dict(loss=loss, max_iter=300, learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=40, random_state=0)
+    if q is not None:
+        kw["quantile"] = q
+    return HistGradientBoostingRegressor(**kw)
 
 
 def train(sim):
-    """Gradient-boosted quantile regressions (median, 90th percentile) of log(log-odds prior error + ERR_EPS).
-    Grouped (by simulated setting) 5-fold cross-validation gives a constant shift per quantile on the log scale that
-    makes the cross-validated bounds cover 50% and 90% of fits (split-conformal); reported: coverage after the shift
-    overall, by true prior and by fitted prior, the Spearman correlation of the predicted median with the error, and
-    the simulated feature ranges (real values are clipped to them before prediction)."""
+    """E|angular prior error| (gradient-boosted regression) and its 90th percentile (quantile regression with a
+    split-conformal shift), from grouped (by simulated setting) 5-fold cross-validation. Reported: Spearman of the
+    predicted mean with the error, mean predicted vs observed error and the reliability they imply, overall, by true
+    prior, by fitted prior and by control mode, and the 90% bound's coverage on the same splits."""
     from scipy.stats import spearmanr
     from sklearn.model_selection import GroupKFold
-    s = sim[sim.experiment != "mech_bias"].dropna(subset=FEATURES)
-    X, err, grp = s[FEATURES].to_numpy(), logodds_err(s), s.cell_id.to_numpy()
-    ly = np.log(err + ERR_EPS)
-    cv = {q: np.zeros(len(s)) for q in QUANTILES}
-    for tr, te in GroupKFold(5).split(X, ly, grp):
-        for q in QUANTILES:
-            cv[q][te] = _hgb(q).fit(X[tr], ly[tr]).predict(X[te])
-    shift = {q: float(np.quantile(ly - cv[q], q)) for q in QUANTILES}
-    pred = {q: np.exp(cv[q] + shift[q]) - ERR_EPS for q in QUANTILES}
+    s = sim[sim.experiment != "mech_bias"].dropna(subset=[f for f in FEATURES if f not in NULLABLE])
+    X, err, grp = s[FEATURES].to_numpy(float), angular_err(s), s.cell_id.to_numpy()
+    cv_m, cv_q = np.zeros(len(s)), np.zeros(len(s))
+    for tr, te in GroupKFold(5).split(X, err, grp):
+        cv_m[te] = _hgb().fit(X[tr], err[tr]).predict(X[te])
+        cv_q[te] = _hgb("quantile", 0.9).fit(X[tr], err[tr]).predict(X[te])
+    shift = float(np.quantile(err - cv_q, 0.9))
+    cv_m = np.clip(cv_m, 0, None)
 
-    def cover(mask):
-        return {f"q{int(100 * q)}": round(float((err[mask] <= pred[q][mask]).mean()), 3) for q in QUANTILES}
+    def summ(mask):
+        m, o = cv_m[mask], err[mask]
+        return dict(n=int(mask.sum()), pred_err=round(float(m.mean()), 4), obs_err=round(float(o.mean()), 4),
+                    pred_rel=round(float(np.clip(1 - m / ANG_REF, 0, 1).mean()), 3),
+                    obs_rel=round(float(np.clip(1 - o / ANG_REF, 0, 1).mean()), 3),
+                    cover90=round(float((o <= cv_q[mask] + shift).mean()), 3))
     fb = pd.cut(s.fit_prior, [0, 0.03, 0.07, 0.15, 0.3, 0.5, 1])
-    # reliability: P(error < 1 evidence point)
-    from sklearn.ensemble import HistGradientBoostingClassifier
-    yc = (err < POINT).astype(int)
-    clf = lambda: HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=15,
-                                                 min_samples_leaf=40, random_state=0)
-    pc = np.zeros(len(s))
-    for tr, te in GroupKFold(5).split(X, yc, grp):
-        pc[te] = clf().fit(X[tr], yc[tr]).predict_proba(X[te])[:, 1]
-    # smooth (Platt) recalibration on the logit of the cross-validated probabilities; isotonic gives ties
-    from sklearn.linear_model import LogisticRegression
-    _lg = lambda p: np.log(np.clip(p, 1e-4, 1 - 1e-4) / (1 - np.clip(p, 1e-4, 1 - 1e-4))).reshape(-1, 1)
-    platt = LogisticRegression().fit(_lg(pc), yc)
-    iso = lambda p: platt.predict_proba(_lg(p))[:, 1]
-    rel = iso(pc)
-    rb = pd.cut(rel, [-0.001, 0.25, 0.5, 0.75, 0.9, 1.0])
-
-    def calib(mask):
-        d = pd.DataFrame(dict(b=rb[mask], p=rel[mask], y=yc[mask]))
-        return {str(k): (round(float(g.p.mean()), 3), round(float(g.y.mean()), 3), len(g))
-                for k, g in d.groupby("b", observed=True)}
-    from sklearn.metrics import roc_auc_score
-    return dict(models={q: _hgb(q).fit(X, ly) for q in QUANTILES}, shift=shift, n=len(s),
-                clf=clf().fit(X, yc), iso=iso, rel_auc=float(roc_auc_score(yc, rel)),
-                rel_share_reliable=float(yc.mean()),
-                rel_calibration=calib(np.ones(len(s), bool)),
-                rel_calibration_by_true_prior={f"{p:g}": calib((s.pi == p).to_numpy()) for p in sorted(s.pi.unique())},
-                rel_calibration_by_fitted_prior={str(b): (round(float(rel[(fb == b).to_numpy()].mean()), 3),
-                                                          round(float(yc[(fb == b).to_numpy()].mean()), 3))
-                                                 for b in fb.cat.categories},
-                spearman=float(spearmanr(pred[0.5], err).correlation),
-                coverage=cover(np.ones(len(s), bool)),
-                coverage_by_true_prior={f"{p:g}": cover((s.pi == p).to_numpy()) for p in sorted(s.pi.unique())},
-                coverage_by_fitted_prior={str(b): cover((fb == b).to_numpy()) for b in fb.cat.categories},
-                coverage_by_mode={m: cover((s.experiment == m).to_numpy()) for m in ("pu", "no_blb", "core", "misfit")},
+    rb = pd.cut(np.clip(1 - cv_m / ANG_REF, 0, 1), [-0.001, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0])
+    mode = np.where(s.is_pu == 1, "PU", np.where(s.n_plp == 0, "NU", "PN"))
+    return dict(mean_model=_hgb().fit(X, err), q90_model=_hgb("quantile", 0.9).fit(X, err), q90_shift=shift,
+                n=len(s), spearman=float(spearmanr(cv_m, err).correlation),
+                overall=summ(np.ones(len(s), bool)),
+                by_reliability_bin={str(b): summ((rb == b)) for b in rb.categories if (rb == b).any()},
+                by_true_prior={f"{p:g}": summ((s.pi == p).to_numpy()) for p in sorted(s.pi.unique())},
+                by_fitted_prior={str(b): summ((fb == b).to_numpy()) for b in fb.cat.categories},
+                by_mode={m: summ(mode == m) for m in np.unique(mode)},
                 range={f: (float(s[f].quantile(0.005)), float(s[f].quantile(0.995))) for f in FEATURES},
-                sim_sorted={f: np.sort(s[f].to_numpy()) for f in FEATURES},
-                sim_err_sorted=np.sort(pred[0.5]))
+                sim_sorted={f: np.sort(s[f].dropna().to_numpy()) for f in FEATURES})
 
 
 def yang_rule_summary(sim):
@@ -266,9 +249,8 @@ def real_features(cals, priors_json, output_dir=None):
         r["boot_p5"], r["boot_p95"] = (p["saved_pct"][0], p["saved_pct"][2]) if p.get("match") else (np.nan, np.nan)
         r["log_prior_sd"] = np.log10(max(r["prior_sd"], 1e-4)) if np.isfinite(r["prior_sd"]) else np.nan
         pf = min(max(float(c["prior"]), 1e-4), 1 - 1e-4) if c.get("prior") is not None else np.nan
-        r["logit_prior"] = np.log(pf / (1 - pf))
-        r["log_sd_logit"] = (np.log10(max(r["prior_sd"] / (pf * (1 - pf)), 1e-4)) if np.isfinite(r["prior_sd"])
-                             else np.nan)
+        r["log_sd_ang"] = (np.log10(max(r["prior_sd"] / (2 * np.sqrt(pf * (1 - pf))), 1e-4))
+                           if np.isfinite(r["prior_sd"]) else np.nan)
         kept = c.get("pct_bootstraps_kept")
         r["pct_discarded"] = 1 - float(kept) if kept is not None else np.nan
         vp = output_dir / d / f"{d}_{n_c}_variants.csv"
@@ -283,7 +265,10 @@ def real_features(cals, priors_json, output_dir=None):
             one = v[is_p ^ is_b]  # controls in exactly one class
             yp = one["sample"].astype(str).str.contains(PLP, regex=False)
             r["ctrl_auc"] = _auc(yp, one["score"]) if yp.any() and (~yp).any() else np.nan
-            r["log_n_ctrl"] = np.log10(max(min(r["n_plp"], r["n_blb"]), 1))
+            is_g = s.str.contains("population", regex=False)
+            sc = v["score"].to_numpy(float)
+            r["sep_auc"], r["is_pu"] = separation(sc[is_p & ~is_b], sc[is_b & ~is_p], sc[is_s & ~is_p],
+                                                  sc[is_g & ~is_p])
         y = yt[(yt.dataset == d) & (yt.n_c.astype(str) == str(n_c))]
         y = y if len(y) else yt[yt.dataset == d]
         h = yh[yh.dataset == d]
@@ -305,33 +290,24 @@ def _expit(x):
 
 
 def predict(model, feats):
-    """Predicted log-odds prior error (median, 90th percentile) and the prior intervals they give around the fitted
-    prior; features clipped to the simulated range, `n_extrapolated` counting those outside it. `error_fifth` places
-    the predicted median among the simulated fits' (1 = smallest error, 5 = largest)."""
+    """Prior reliability (1 - E|angular error| / (pi/6), floored at 0), the predicted mean and 90% angular errors and
+    the 90% prior range sin^2(theta_fitted +- bound); features clipped to the simulated range, `n_extrapolated`
+    counting those outside it."""
     X = feats[FEATURES].astype(float).copy()
     out = pd.DataFrame(index=feats.index)
     out["n_extrapolated"] = sum(((X[f] < lo) | (X[f] > hi)).astype(int) for f, (lo, hi) in model["range"].items())
     for f, (lo, hi) in model["range"].items():
         X[f] = X[f].clip(lo, hi)
-    ok = X.notna().all(axis=1).to_numpy()
-    lp = feats["logit_prior"].to_numpy(float)
-    for q in QUANTILES:
-        e = np.full(len(X), np.nan)
-        if ok.any():
-            e[ok] = np.exp(model["models"][q].predict(X[ok].to_numpy()) + model["shift"][q]) - ERR_EPS
-        e = np.maximum(e, 0)
-        tag = f"q{int(100 * q)}"
-        out[f"err_logodds_{tag}"] = e
-        out[f"prior_lo_{tag}"], out[f"prior_hi_{tag}"] = _expit(lp - e), _expit(lp + e)
-    rel = np.full(len(X), np.nan)
+    ok = X[[f for f in FEATURES if f not in NULLABLE]].notna().all(axis=1).to_numpy()
+    e_m, e_q = np.full(len(X), np.nan), np.full(len(X), np.nan)
     if ok.any():
-        rel[ok] = model["iso"](model["clf"].predict_proba(X[ok].to_numpy())[:, 1])
-    out["prior_reliability"] = rel
-    for q in QUANTILES:
-        out[f"err_points_q{int(100 * q)}"] = out[f"err_logodds_q{int(100 * q)}"] / POINT
-    ss = model["sim_err_sorted"]
-    out["error_fifth"] = [np.nan if not np.isfinite(v) else min(int(5 * np.searchsorted(ss, v) / len(ss)) + 1, 5)
-                          for v in out["err_logodds_q50"]]
+        e_m[ok] = np.clip(model["mean_model"].predict(X[ok].to_numpy()), 0, None)
+        e_q[ok] = np.clip(model["q90_model"].predict(X[ok].to_numpy()) + model["q90_shift"], 0, None)
+    th = ang(feats["prior"].astype(float).to_numpy())
+    out["ang_err_mean"], out["ang_err_q90"] = e_m, e_q
+    out["prior_reliability"] = np.clip(1 - e_m / ANG_REF, 0, 1)
+    out["prior_lo_q90"] = np.sin(np.clip(th - e_q, 0, np.pi / 2)) ** 2
+    out["prior_hi_q90"] = np.sin(np.clip(th + e_q, 0, np.pi / 2)) ** 2
     return out
 
 
@@ -345,20 +321,19 @@ def _fmt(f, v):
         return "n/a"
     if f == "log_prior_sd":
         return f"{10 ** v:.3f}"
-    if f == "log_sd_logit":
-        return f"{10 ** v:.2f}"
-    if f == "logit_prior":
-        return f"{1 / (1 + np.exp(-v)):.3f}"
-    if f == "log_n_ctrl":
-        return f"{10 ** v:.0f}"
+    if f == "log_sd_ang":
+        return f"{10 ** v:.3f}"
+    if f == "is_pu":
+        return "yes" if v else "no"
     if f in ("pct_discarded", "no_evidence", "frac_at_start"):
         return f"{100 * v:.0f}%"
     return f"{v:.2f}"
 
 
 def draw_panel(ax, row, model):
-    """Diagnostics panel: prior-model features (value and simulated percentile), the fitted prior with its predicted
-    50% and 90% ranges, and the per-sample Yang distances with the bad-fit flag."""
+    """Diagnostics panel: prior-model features (value and simulated percentile), prior reliability with the fitted
+    prior's predicted 90% range and its bootstrap interval, and the per-sample Yang distances with the bad-fit
+    flag."""
     from matplotlib.patches import Rectangle
     ax.axis("off")
     y = 0.99
@@ -371,7 +346,7 @@ def draw_panel(ax, row, model):
         lo, hi = model["range"][f]
         out = np.isfinite(v) and (v < lo or v > hi)
         ss = model["sim_sorted"][f]
-        ptxt = f" (p{int(100 * np.searchsorted(ss, v) / len(ss))})" if np.isfinite(v) else ""
+        ptxt = f" (p{int(100 * np.searchsorted(ss, v) / len(ss))})" if np.isfinite(v) and f != "is_pu" else ""
         ax.text(0, y, FEATURE_LABELS[f], fontsize=9, va="top")
         ax.text(1, y, _fmt(f, v) + ptxt + (" *" if out else ""), fontsize=9, va="top", ha="right",
                 color="#b03030" if out else "black", family="monospace")
@@ -392,15 +367,16 @@ def draw_panel(ax, row, model):
         ax.add_patch(Rectangle((0, y - 0.02), 1, 0.02, color="#eee", transform=ax.transAxes, clip_on=False))
         ax.add_patch(Rectangle((0, y - 0.02), rel, 0.02, color=col, transform=ax.transAxes, clip_on=False))
         y -= 0.03
-        ax.text(0, y, "P(prior error shifts posteriors by < 1 evidence point)", fontsize=8, color="#444", va="top")
+        ax.text(0, y, "0 = no better than an uninformed guess, 1 = exact (angular scale)", fontsize=8,
+                color="#444", va="top")
         y -= 0.035
-        ax.text(0, y, "predicted prior error (points)", fontsize=9, va="top")
-        ax.text(1, y, f"median {row['err_points_q50']:.2f}, 90% {row['err_points_q90']:.2f}", fontsize=9,
-                va="top", ha="right", family="monospace")
+        ax.text(0, y, "fitted prior (predicted 90% range)", fontsize=9, va="top")
+        ax.text(1, y, f"{row['prior']:.3f} ({row['prior_lo_q90']:.3f}-{row['prior_hi_q90']:.3f})", fontsize=9,
+                va="top", ha="right", family="monospace", color=col, weight="bold")
         y -= 0.032
-        ax.text(0, y, "fitted prior (bootstrap 90%)", fontsize=9, va="top")
-        ax.text(1, y, f"{row['prior']:.3f} ({row['boot_p5']:.3f}-{row['boot_p95']:.3f})", fontsize=9, va="top",
-                ha="right", family="monospace")
+        ax.text(0, y, "bootstrap 90% interval", fontsize=9, va="top")
+        ax.text(1, y, f"{row['boot_p5']:.3f}-{row['boot_p95']:.3f}", fontsize=9, va="top", ha="right",
+                family="monospace")
         y -= 0.028
         ax.text(0, y, "bootstrap intervals contain the true prior in ~75% of simulated fits", fontsize=7.5,
                 color="#666", va="top")
@@ -481,7 +457,7 @@ def overview_figure(tab, model, out):
     ax.set_yticks(yy)
     ax.set_yticklabels([f"{display_name(d)} ({p:.3f})" for d, p in zip(t.dataset, t.prior)], fontsize=5)
     ax.set_xlim(0, 1)
-    ax.set_xlabel("prior reliability: P(prior error < 1 evidence point)")
+    ax.set_xlabel("prior reliability (angular skill score; 1 = exact)")
     ax.spines[["top", "right"]].set_visible(False)
     ax = axs[1]
     t["yang_any"] = t[["yang_train_max", "yang_val_max"]].max(axis=1)
@@ -517,33 +493,27 @@ def main():
     sim = simulation_table(a.sim_dir, n_jobs=a.n_jobs)
     model = train(sim)
     yr = yang_rule_summary(sim)
-    print(f"prior error model: {model['n']} replicates; grouped-CV Spearman {model['spearman']:.3f}; "
-          f"coverage {model['coverage']}")
-    print(f"  by true prior {model['coverage_by_true_prior']}")
-    print(f"  by fitted prior {model['coverage_by_fitted_prior']}")
-    print(f"  by mode {model['coverage_by_mode']}")
-    print(f"prior reliability P(error < 1 point): share reliable {model['rel_share_reliable']:.3f}, "
-          f"AUC {model['rel_auc']:.3f}")
-    print(f"  calibration (mean predicted, observed, n) {model['rel_calibration']}")
-    print(f"  by true prior {model['rel_calibration_by_true_prior']}")
-    print(f"  by fitted prior (mean predicted, observed) {model['rel_calibration_by_fitted_prior']}")
+    print(f"prior reliability model: {model['n']} replicates; grouped-CV Spearman {model['spearman']:.3f}")
+    for k in ("overall", "by_reliability_bin", "by_true_prior", "by_fitted_prior", "by_mode"):
+        print(f"  {k}: {model[k]}")
     print(f"Yang rule in the simulation: {json.dumps(yr, indent=1)}")
 
     cals = real_datasets()
     feats = real_features(cals, out / "recomputed_priors.json")
     tab = pd.concat([feats, predict(model, feats)], axis=1)
     tab.to_csv(out / "real_diagnostics.csv", index=False)
-    summary = {k: v for k, v in model.items() if k not in ("models", "clf", "iso", "sim_sorted", "sim_err_sorted")}
+    summary = {k: v for k, v in model.items()
+               if k not in ("mean_model", "q90_model", "sim_sorted")}
     summary.update(features=FEATURES, yang_rule=dict(threshold=YANG_T, min_heldout=YANG_MIN_HELDOUT,
                                                      simulation=yr, real_flagged=tab.loc[tab.yang_flag, "dataset"]
                                                      .tolist()))
     (out / "model_summary.json").write_text(json.dumps(summary, indent=1, default=float))
     overview_figure(tab, model, out / "overview.png")
     print(f"real calibrations: {len(tab)}; priors reproduced {int(tab.priors_reproduced.sum())}; with a prediction "
-          f"{int(tab.err_logodds_q50.notna().sum())}; Yang-flagged {int(tab.yang_flag.sum())}")
+          f"{int(tab.prior_reliability.notna().sum())}; Yang-flagged {int(tab.yang_flag.sum())}")
     print(tab[["dataset", "prior", "prior_sd", "frac_at_start", "pct_discarded", "no_evidence", "yang_train_max",
-               "yang_val_max", "ctrl_auc", "n_plp", "n_blb", "n_extrapolated", "prior_reliability",
-               "err_points_q50", "err_points_q90", "boot_p5", "boot_p95"]]
+               "yang_val_max", "sep_auc", "is_pu", "n_plp", "n_blb", "n_extrapolated", "prior_reliability",
+               "ang_err_mean", "prior_lo_q90", "prior_hi_q90", "boot_p5", "boot_p95"]]
           .sort_values("prior_reliability").round(3).to_string(index=False))
     if a.no_plots:
         return
