@@ -218,7 +218,8 @@ def _all_rows_ms(m, names):
             return build_combined_multiscoreset(
                 gene, fs, datasets, config.PREDICTOR_RAW_DATA_DIR,
                 functionally_assayed_variants=get_functionally_assayed_protein_variants(df, gene, datasets),
-                require_both_modalities=False)
+                require_both_modalities=config.COMBINED_POPULATION == "intersection",
+                predictor_label_copies=config.PREDICTOR_LABEL_COPIES)
     else:
         return None
     from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims

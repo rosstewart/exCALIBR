@@ -144,12 +144,13 @@ def make_diagnostics_figure(merged, out_path, misfit=None, core_ref=None):
     fig.subplots_adjust(left=0.09, right=0.98, top=0.94, bottom=0.16)
     m = merged[merged["experiment"].isin(["core", "prior"])]
 
-    # (A) overstated evidence vs controls per class
+    # (A) overstated evidence vs controls per class, at a true prior of 0.10 (acmgscaler's own prior), core grid
     ax = axes[0, 0]
+    m10 = merged[(merged["experiment"] == "core") & np.isclose(merged["pi"], 0.10)]
     for pre, col, lab in (("fit", CAT[0], "ExCALIBR"), ("acmg", CAT[1], "acmgscaler (prior 0.10)")):
         pts = []
         for n in N_ORDER:
-            g = m[m["n_plp"] == n]
+            g = m10[m10["n_plp"] == n]
             if pre == "acmg":
                 g = g[g["acmg_ok"]]
             mu, ci = _mean_ci(100 * _over(g, pre)) if len(g) else (np.nan, np.nan)
@@ -164,7 +165,7 @@ def make_diagnostics_figure(merged, out_path, misfit=None, core_ref=None):
     _style(ax, "controls per class", "variants with overstated evidence (%)")
     ax.set_ylim(bottom=0)
     ax.legend(frameon=False, fontsize=6, loc="upper right")
-    ax.set_title(f"{_letter(0)} Overstated evidence", loc="left", color=INK, fontweight="bold")
+    ax.set_title(f"{_letter(0)} Overstated evidence, true prior 0.10", loc="left", color=INK, fontweight="bold")
 
     # (B) overstated evidence vs true prior (same cells for every prior)
     ax = axes[0, 1]
@@ -221,6 +222,116 @@ def make_diagnostics_figure(merged, out_path, misfit=None, core_ref=None):
     _style(ax, "Yang distance, max over samples (held out; log scale)", "variants with overstated evidence (%)")
     ax.set_title(f"{_letter(3)} Misfit and Yang distance", loc="left", color=INK, fontweight="bold")
 
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300)
+    fig.savefig(out_path.with_suffix(".pdf"))
+    plt.close(fig)
+    return out_path
+
+
+# ── posterior-based summaries (exact, no evidence-level mapping) ────────────────────────────────────────────────────
+
+def _counts(col):
+    """Sum ';'-joined per-replicate count strings over replicates."""
+    arr = [np.array(s.split(";"), float) for s in col.dropna() if isinstance(s, str)]
+    return np.sum(arr, axis=0) if arr else None
+
+
+def precision_curve(df, pre):
+    """Observed pathogenic share among population variants with posterior >= t (pathogenic side) and observed benign
+    share among those with posterior <= t (benign side), for every bin edge t; plus the share of variants called."""
+    from analysis.calibration_quality.run import POST_EDGES
+    n, p = _counts(df[f"{pre}_population_rel_n"]), _counts(df[f"{pre}_population_rel_path"])
+    if n is None:
+        return None
+    rows = []
+    for i, t in enumerate(POST_EDGES[1:-1], start=1):
+        hi_n, hi_p = n[i:].sum(), p[i:].sum()
+        lo_n, lo_p = n[:i].sum(), p[:i].sum()
+        rows.append(dict(t=t, ppv=hi_p / hi_n if hi_n else np.nan, called_path=hi_n / n.sum(),
+                         npv=1 - lo_p / lo_n if lo_n else np.nan, called_benign=lo_n / n.sum()))
+    return pd.DataFrame(rows)
+
+
+def make_posterior_figure(merged, out_path):
+    """(A) precision of pathogenic calls (observed pathogenic share among variants with posterior >= t) and (B) of
+    benign calls, at a true prior of 0.10 (acmgscaler's own prior), core grid with >= 10 controls per class;
+    (C) precision at posterior >= 0.9 by true prior; (D, E) true vs model posterior for ExCALIBR and acmgscaler."""
+    from analysis.calibration_quality.run import POST_EDGES
+    fig = plt.figure(figsize=(7.2, 6.4))
+    gs = fig.add_gridspec(2, 3, hspace=0.55, wspace=0.42, left=0.08, right=0.98, top=0.94, bottom=0.09)
+    base = merged[(merged["experiment"] == "core") & np.isclose(merged["pi"], 0.10) & (merged["n_plp"] >= 10)]
+    acm = base[base["acmg_ok"]]
+    arms = [("fit", CAT[0], "ExCALIBR", base), ("acmg", CAT[1], "acmgscaler (prior 0.10)", acm)]
+
+    ax = fig.add_subplot(gs[0, 0])
+    for pre, col, lab, d in arms:
+        pc = precision_curve(d, pre)
+        if pc is None:
+            continue
+        s = pc[pc["t"] >= 0.8]  # below ~0.8, no-evidence variants at the estimated prior dominate (not calls)
+        ax.plot(s["t"], 100 * s["ppv"], marker="o", ms=3.5, lw=1.4, color=col, label=lab)
+    tt = np.linspace(0.8, 1, 50)
+    ax.plot(tt, 100 * tt, color=MUTED, lw=0.8, ls=":")
+    ax.text(0.81, 79.5, "observed = posterior", fontsize=5.4, color=MUTED, rotation=38)
+    _style(ax, "posterior threshold t", "pathogenic among posterior ≥ t (%)")
+    ax.set_ylim(75, 101)
+    ax.legend(frameon=False, fontsize=5.6, loc="lower right")
+    ax.set_title(f"{_letter(0)} Pathogenic calls", loc="left", color=INK, fontweight="bold")
+
+    ax = fig.add_subplot(gs[0, 1])
+    for pre, col, lab, d in arms:
+        pc = precision_curve(d, pre)
+        if pc is None:
+            continue
+        s = pc[pc["t"] <= 0.5]
+        ax.plot(s["t"], 100 * s["npv"], marker="o", ms=3.5, lw=1.4, color=col, label=lab)
+    tt = np.linspace(0, 0.5, 50)
+    ax.plot(tt, 100 * (1 - tt), color=MUTED, lw=0.8, ls=":")
+    _style(ax, "posterior threshold t", "benign among posterior ≤ t (%)")
+    ax.set_xscale("symlog", linthresh=0.01)
+    ax.set_ylim(40, 101)
+    ax.set_title(f"{_letter(1)} Benign calls", loc="left", color=INK, fontweight="bold")
+
+    ax = fig.add_subplot(gs[0, 2])
+    pr = merged[merged["experiment"].isin(["core", "prior"]) & (merged["richness"] == "mid") &
+                merged["n_plp"].isin([20, 80]) & merged["kappa"].isin([2.5, 4.0]) & merged["gamma"].isin([0.25, 1.0])]
+    for pre, col, lab in (("fit", CAT[0], "ExCALIBR"), ("acmg", CAT[1], "acmgscaler (prior 0.10)")):
+        d0 = pr[pr["acmg_ok"]] if pre == "acmg" else pr
+        ys = []
+        for pi in sorted(d0["pi"].unique()):
+            pc = precision_curve(d0[np.isclose(d0["pi"], pi)], pre)
+            ys.append((pi, 100 * float(pc.loc[np.isclose(pc["t"], 0.9), "ppv"].iloc[0])))
+        x, y = zip(*ys)
+        ax.plot(x, y, marker="o", ms=4, lw=1.4, color=col, label=lab)
+    ax.axhline(90, color=MUTED, ls=":", lw=0.8)
+    ax.axvline(0.10, color=MUTED, ls="--", lw=0.8)
+    _style(ax, "true prior", "pathogenic among posterior ≥ 0.9 (%)")
+    ax.set_title(f"{_letter(2)} By true prior", loc="left", color=INK, fontweight="bold")
+
+    lab_e = POST_EDGES
+    for j, (pre, title, d) in enumerate((("fit", "ExCALIBR", base), ("acmg", "acmgscaler (prior 0.10)", acm))):
+        ax = fig.add_subplot(gs[1, j])
+        K = len(lab_e) - 1
+        h = sum(_counts(d[f"{pre}_{k}_hist2d"]).reshape(K, K) for k in ("pathogenic", "benign")
+                if _counts(d[f"{pre}_{k}_hist2d"]) is not None)
+        hn = h / h.sum()
+        im = ax.imshow(np.log10(hn + 1e-6), origin="lower", cmap=SEQ, vmin=-6, vmax=0, aspect="equal")
+        ax.plot([-0.5, K - 0.5], [-0.5, K - 0.5], color=MUTED, lw=0.7, ls=":")
+        ticks = [0, 6, 9, 12, 15, 18]
+        ax.set_xticks([t - 0.5 for t in ticks])
+        ax.set_xticklabels([f"{lab_e[t]:g}" for t in ticks], rotation=45, ha="right", fontsize=5.6)
+        ax.set_yticks([t - 0.5 for t in ticks])
+        ax.set_yticklabels([f"{lab_e[t]:g}" for t in ticks], fontsize=5.6)
+        ax.set_xlabel("model posterior")
+        ax.set_ylabel("true posterior")
+        ax.set_title(f"{_letter(3 + j)} {title}", loc="left", color=INK, fontweight="bold")
+    cax = fig.add_subplot(gs[1, 2])
+    cax.axis("off")
+    cb = fig.colorbar(im, ax=cax, fraction=0.5, location="left")
+    cb.set_label("share of variants (log10)", fontsize=6.3)
+    cb.outline.set_visible(False)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300)

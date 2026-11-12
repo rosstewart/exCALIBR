@@ -299,7 +299,7 @@ PRIOR_SIMULATION_DIR = _env(
 # deliberately misspecified cells (misfit_results.csv, or included in results.csv once run on the HPC).
 CALIBRATION_QUALITY_DIR = _env(
     "EXCALIBR_CALIBRATION_QUALITY_DIR",
-    "/data/ross/assay_calibration/calibration_quality/hpc_grid",
+    "/data/ross/assay_calibration/calibration_quality/hpc_grid_r8",
 )
 CALIBRATION_QUALITY_MISFIT_CSV = _env(
     "EXCALIBR_CALIBRATION_QUALITY_MISFIT_CSV",

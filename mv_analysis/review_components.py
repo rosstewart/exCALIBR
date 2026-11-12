@@ -53,6 +53,21 @@ def selection_table():
     return pd.read_csv(OUT / "component_selection.csv")
 
 
+@__import__("functools").lru_cache(maxsize=1)
+def _results():
+    import gzip
+    import json
+    return json.load(gzip.open(config.PAPER_RESULTS_JSON, "rt"))
+
+
+def heldout_k(m):
+    """The held-out rule straight from the fits: 4 if the median paired
+    held-out log-likelihood 4c - 3c over bootstraps is positive, else 3."""
+    b = _results()[m["dataset_name"]]
+    d = [b[s]["4c_unc"]["val_ll"] - b[s]["3c_unc"]["val_ll"] for s in b if b[s].get("4c_unc") and b[s].get("3c_unc")]
+    return 4 if d and np.median(d) > 0 else 3
+
+
 def mv_matrix(key, cfg):
     """production_oob._mv_one for another config: L, priors, OOB masks of the
     same bootstrap splits -> components/oob/<key>/mv_<cfg>.npz."""
@@ -121,17 +136,20 @@ def _oob_metrics(key, mv):
 def run():
     from mv_analysis import baselines as B
     warnings.filterwarnings("ignore")
-    sel = selection_table()
+    sel = None if R.SUBSET_FROM else selection_table()
     rows = []
     for key, m in R.paper_keys():
         canon = m["config"]
         k_canon = int(canon[0])
         cl = "gene" if m["cluster_idx"] == 0 else f"cluster{m['cluster_idx'] + 1}"
-        s = sel[(sel["gene"].astype(str).str.upper() == m["gene"].upper()) & (sel["cluster"] == cl)
-                & (sel["panel"] == m["panel"])]
-        if m["gene_set"] in ("tp53",):
-            s = s[s["gene_set"] == "tp53"]
-        k_held = int(s["k_by_heldout"].iloc[0]) if len(s) and np.isfinite(s["k_by_heldout"].iloc[0]) else k_canon
+        if sel is None:  # alternative fits / model subset: the rule from the fits themselves
+            k_held = heldout_k(m)
+        else:
+            s = sel[(sel["gene"].astype(str).str.upper() == m["gene"].upper()) & (sel["cluster"] == cl)
+                    & (sel["panel"] == m["panel"])]
+            if m["gene_set"] in ("tp53",):
+                s = s[s["gene_set"] == "tp53"]
+            k_held = int(s["k_by_heldout"].iloc[0]) if len(s) and np.isfinite(s["k_by_heldout"].iloc[0]) else k_canon
         if config.fixed_mv_config(m["gene"], m["gene_set"]):
             k_held = k_canon  # an author-fixed config (TP53 functional, 4c) stays under both rules
         base = _oob_metrics(key, R.mv_npz(key))

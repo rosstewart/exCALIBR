@@ -1377,6 +1377,7 @@ def _build_gene_set_ms_map(gene_set, args):
                 # which also drops the __predictor_dup label copies.
                 require_both_modalities=getattr(args, "combined_population", "union") == "intersection",
                 predictor_transform=getattr(args, "predictor_transform_value", None),
+                predictor_label_copies=getattr(args, "predictor_label_copies", True),
             )
             if ms is None:
                 print(f"  {gene}: no predictor CSVs under {args.predictor_data_dir}, skipping")
@@ -2463,12 +2464,23 @@ def main():
                             "predictor score, the population that is evaluated). Writes a "
                             "combined_population.txt marker that mv_analysis/config.py reads "
                             "so scoring rebuilds the same rows.")
+        p.add_argument("--no-predictor-label-copies", dest="predictor_label_copies",
+                       action="store_false", default=True,
+                       help="[combined] One row per variant: a variant with >=1 functional "
+                            "score keeps only its functional-release label (predictor-CSV label "
+                            "cleared, no __predictor_dup copy); every other variant keeps its "
+                            "predictor-CSV label. Writes a predictor_label_copies.txt marker "
+                            "(\"false\") that mv_analysis/config.py reads.")
 
     args = parser.parse_args()
     if getattr(args, "combined_population", "union") != "union":
         os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "combined_population.txt"), "w") as f:
             f.write(args.combined_population + "\n")
+    if not getattr(args, "predictor_label_copies", True):
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "predictor_label_copies.txt"), "w") as f:
+            f.write("false\n")
 
     # Sample one dataset slice to estimate per-worker memory more accurately
     _sample_slice = None

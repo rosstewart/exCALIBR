@@ -219,6 +219,22 @@ if not COMBINED_POPULATION:
                 COMBINED_POPULATION = _f.read().strip()
             break
 COMBINED_POPULATION = COMBINED_POPULATION or "union"
+
+# A run built with hpc/prepare.py --no-predictor-label-copies carries a
+# predictor_label_copies.txt marker ("false"): combined multiscoresets are then
+# rebuilt with one row per variant (no __predictor_dup rows). Default True
+# (the paper's union fits); $MV_PREDICTOR_LABEL_COPIES (true|false) wins.
+_PLC = os.environ.get("MV_PREDICTOR_LABEL_COPIES", "")
+if not _PLC:
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        _m = os.path.join(_d, "predictor_label_copies.txt")
+        if os.path.exists(_m):
+            with open(_m) as _f:
+                _PLC = _f.read().strip()
+            break
+if _PLC.lower() not in ("", "true", "false"):
+    raise ValueError(f"MV_PREDICTOR_LABEL_COPIES must be true or false, not {_PLC!r}")
+PREDICTOR_LABEL_COPIES = _PLC.lower() != "false"
 if COMBINED_POPULATION not in ("union", "intersection"):
     raise ValueError(f"MV_COMBINED_POPULATION must be union or intersection, not {COMBINED_POPULATION!r}")
 
@@ -705,7 +721,8 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
                 # (which would mismatch the stored fit's variant/weight-row
                 # shape, same issue seen for TP53/BRCA2's role-count
                 # mismatch warnings this session).
-                require_both_modalities=COMBINED_POPULATION == "intersection")
+                require_both_modalities=COMBINED_POPULATION == "intersection",
+                predictor_label_copies=PREDICTOR_LABEL_COPIES)
             if ms is None:
                 print(f"  [{gene}] could not build combined ms, skipping")
                 continue

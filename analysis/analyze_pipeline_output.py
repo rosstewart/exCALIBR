@@ -3431,6 +3431,39 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
                   misfit=_cq_mis if len(_cq_mis) else None, core_ref=_cq_core.sample(min(3000, len(_cq_core)),
                                                                                    random_state=0))
     REG.figure("fig:calqual_diagnostics", _f, **_cq_inp)
+
+    # Posterior (exact, no evidence-level mapping): precision of calls at posterior thresholds, by method and true prior
+    from analysis.calibration_quality.figures import make_posterior_figure as _cq_fig3, \
+        precision_curve as _cq_prec
+    _f = _cq_fig3(_cq_merged, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_calqual_posterior.png")
+    REG.figure("fig:calqual_posterior", _f, **_cq_inp)
+    _p10 = _cq_merged[(_cq_merged.experiment == "core") & np.isclose(_cq_merged.pi, 0.10) & (_cq_merged.n_plp >= 10)]
+    _ppv = lambda d, p, t=0.9: float(_cq_prec(d, p).set_index("t").loc[t, "ppv"]) if len(d) else float("nan")
+    _npv = lambda d, p, t=0.1: float(_cq_prec(d, p).set_index("t").loc[t, "npv"]) if len(d) else float("nan")
+    REG.num("SuppCalQualPPVExc", 100 * _ppv(_p10, "fit"), fmt=".1f",
+            source="% pathogenic among posterior >= 0.9, ExCALIBR, true prior 0.10, >= 10 controls", **_cq_inp)
+    REG.num("SuppCalQualNPVExc", 100 * _npv(_p10, "fit"), fmt=".1f",
+            source="% benign among posterior <= 0.1, ExCALIBR, true prior 0.10", **_cq_inp)
+    _p10a = _p10[_p10["acmg_ok"]]
+    if len(_p10a):
+        REG.num("SuppCalQualPPVAcmg", 100 * _ppv(_p10a, "acmg"), fmt=".1f",
+                source="% pathogenic among posterior >= 0.9, acmgscaler, true prior 0.10", **_cq_inp)
+        REG.num("SuppCalQualNPVAcmg", 100 * _npv(_p10a, "acmg"), fmt=".1f",
+                source="% benign among posterior <= 0.1, acmgscaler, true prior 0.10", **_cq_inp)
+    _pr = _cq_merged[_cq_merged.experiment.isin(["core", "prior"]) & (_cq_merged.richness == "mid") &
+                     _cq_merged.n_plp.isin([20, 80]) & _cq_merged.kappa.isin([2.5, 4.0]) &
+                     _cq_merged.gamma.isin([0.25, 1.0])]
+    for _pi, _tag in ((0.05, "Five"), (0.40, "Forty")):
+        _s = _pr[np.isclose(_pr.pi, _pi)]
+        REG.num(f"SuppCalQualPPVExcPi{_tag}", 100 * _ppv(_s, "fit"), fmt=".1f",
+                source=f"% pathogenic among posterior >= 0.9, ExCALIBR, true prior {_pi}", **_cq_inp)
+        if _s["acmg_ok"].any():
+            REG.num(f"SuppCalQualPPVAcmgPi{_tag}", 100 * _ppv(_s[_s["acmg_ok"]], "acmg"), fmt=".1f",
+                    source=f"% pathogenic among posterior >= 0.9, acmgscaler, true prior {_pi}", **_cq_inp)
+    _ok3 = _cq_core[_cq_core.fit_prior_err.abs() < 0.03]
+    REG.num("SuppCalQualPostOverPriorOk", 100 * float(_ok3.fit_pathogenic_post_over.mean()), fmt=".1f",
+            source="% truly pathogenic variants with an overconfident posterior when the prior is within 3 pp",
+            **_cq_inp)
     REG.table("tab:calqual_min_controls",
               _cq.latex_min_controls_table(_cq.minimum_controls(_cq_df, "prior_bad"),
                                            _cq.minimum_controls_retention(_cq_df)), **_cq_inp)

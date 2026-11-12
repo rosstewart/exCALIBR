@@ -81,7 +81,7 @@ def _oob_comparison(p, main_cmp):
         o = R.oob_points(key, p)
         never = int((o["n_oob"] == 0).sum())
         o = o[o["n_oob"] > 0]
-        ins = R.insample_points(key, p) if p != 5 else np.asarray(R.prep(key)[0]["mv_points"], float)
+        ins = R.insample_points(key, p) if p != 5 else R.insample_paper_points(key)
         for method, pts in (("MV", o["points"].to_numpy(float)), ("mv_insample", ins[o["row"].to_numpy()])):
             r = [x for x in report._rows_for_points(method, np.nan_to_num(pts, nan=0.0), o["label"].to_numpy(int))
                  if x["threshold"] == EVIDENCE_DIRECTION][0]
@@ -98,7 +98,9 @@ def _strength(p, main_sp):
     out = []
     for key, x in main_sp.groupby("key"):
         x = x[x["sample"] != "VUS"].copy()
-        if p != 5:
+        if R.SUBSET_FROM and key not in KEYS():
+            continue
+        if p != 5 or R.ALT_FITS:
             d, _ = R.prep(key)
             pos = {str(v): i for i, v in enumerate(d["variants"])}
             ins = R.insample_points(key, p)
@@ -113,8 +115,22 @@ def _strength(p, main_sp):
     return out
 
 
+def KEYS():
+    return {k for k, _ in R.paper_keys()}
+
+
 def build(p, figures=False):
     dst = R.out_dir(f"percentile/p{p}")
+    if R.SUBSET_FROM:  # alternative fits / a subset of models: the out-of-bag
+        # comparison and the strength points only (the results tables and
+        # figures are the paper fits' own)
+        for sub in ("production_oob", "strength"):
+            (dst / sub).mkdir(parents=True, exist_ok=True)
+        main_cmp = pd.read_csv(MAIN / "production_oob/production_oob_comparison.csv")
+        _oob_comparison(p, main_cmp[main_cmp["key"].isin(KEYS())]).to_csv(
+            dst / "production_oob/production_oob_comparison.csv", index=False)
+        _strength(p, R.strength_points()).to_csv(dst / "strength/strength_points.csv", index=False)
+        return dst
     for sub in COPY_DIRS:
         if (MAIN / sub).exists():
             shutil.copytree(MAIN / sub, dst / sub, dirs_exist_ok=True)
@@ -141,6 +157,8 @@ def selection():
     out = R.out_dir("percentile/selection")
     cal = []
     for panel in ("functional", "predictor", "combined"):
+        if not R.paper_keys(panel):
+            continue
         t = V.control_table(panel)
         c = V.calibration(t, panel)
         cal.append(c[c["method"].str.startswith("joint") | (c["method"] == "nonconflicting comparator")])

@@ -97,12 +97,12 @@ def true_arm(ss, c, seeds, splits, xlims):
     return fits
 
 
-def calibrate(ss, fits, seeds, mapping="tavtigian"):
+def calibrate(ss, fits, seeds, mapping="tavtigian", manual_prior=None):
     from src.assay_calibration.pipeline.config import PipelineConfig
     from src.assay_calibration.pipeline.visualize import process_component_fits
     cfg = PipelineConfig(dataset_csv="", dataset_name="sim", output_dir="/tmp", components=[2],
                          benign_method="avg", use_median_prior=True, use_2c_equation=False,
-                         point_values=POINTS, n_jobs=1, acmg_mapping_method=mapping)
+                         point_values=POINTS, n_jobs=1, acmg_mapping_method=mapping, manual_prior=manual_prior)
     lg = logging.getLogger("calqual")
     lg.setLevel(logging.ERROR)
     return process_component_fits(fits=fits, scoreset=ss, config=cfg, n_c=2, logger=lg, bootstrap_seeds=seeds)
@@ -127,6 +127,22 @@ def to_tier(pts):
     for t in sorted(TIERS):
         out[a >= t] = t
     return np.sign(pts) * out
+
+
+def prior_effect(ss, fits, seeds, cal, true_prior, x):
+    """Effect of the prior's error alone on the evidence: the production calibration rerun with the prior fixed at
+    the true value (manual_prior) on the bootstraps the fitted-prior calibration kept (a fixed prior keeps them all
+    otherwise), compared with the same rerun at the fitted prior, on the evaluation variants `x` (the population /
+    gnomAD reference set). Returns the share of variants whose points change and the mean |change|."""
+    keep = np.asarray(cal.get("valid_mask", np.ones(len(fits), bool)), bool)
+    fk, sk = [f for f, k in zip(fits, keep) if k], np.asarray(seeds)[keep]
+    at_fit, at_true = calibrate(ss, fk, sk, manual_prior=float(cal["prior"])), calibrate(ss, fk, sk,
+                                                                                       manual_prior=true_prior)
+    if at_fit is None or at_true is None:
+        return {}
+    a, b = points_of(at_fit, x), points_of(at_true, x)
+    return dict(prior_effect_pop_changed=float((a != b).mean()),
+                prior_effect_pop_mean_abs=float(np.abs(a - b).mean()))
 
 
 def points_of(cal, x):
@@ -251,6 +267,19 @@ def posterior_rows(cal, ev, c, is_path_pop, arm):
         true_post = posterior(np.exp(G.true_log_lr(x, c)), c["pi"])
         l5, l50, l95 = lr_bounds(cal, x)
         lr_c = conservative_lr(l5, l95)
+        tl = G.true_log_lr(x, c)
+        with np.errstate(divide="ignore"):
+            rl = np.log(lr_c)
+        # log-LR retention (mapping-free): mean |reported log LR| and mean |true log LR|; their ratio of totals over
+        # replicates is the share of the truth's evidence retained. "_dir" keeps only reported evidence pointing the
+        # same way as the truth (wrong-direction evidence counts as none).
+        row[f"{arm}_{k}_llr_rep_abs"] = float(np.abs(rl).mean())
+        row[f"{arm}_{k}_llr_rep_abs_dir"] = float(np.where(np.sign(rl) == np.sign(tl), np.abs(rl), 0.0).mean())
+        row[f"{arm}_{k}_llr_true_abs"] = float(np.abs(tl).mean())
+        cap = np.log(LLR_CAP)  # usable evidence: |log LR| capped at Very Strong (LR 350, 8 points at prior 0.10)
+        row[f"{arm}_{k}_llr_rep_abs_dir_cap"] = float(np.where(np.sign(rl) == np.sign(tl), np.minimum(np.abs(rl), cap),
+                                                               0.0).mean())
+        row[f"{arm}_{k}_llr_true_abs_cap"] = float(np.minimum(np.abs(tl), cap).mean())
         post_c = posterior(lr_c, prior)
         for m, v in posterior_metrics(post_c, true_post, lr_c, is_path_pop if k == "population" else None).items():
             row[f"{arm}_{k}_{m}"] = v
@@ -262,6 +291,36 @@ def posterior_rows(cal, ev, c, is_path_pop, arm):
     return row
 
 
+TRUE_DRAWS = 3000
+LLR_CAP = 350.0  # Tavtigian's very-strong odds (prior 0.10)
+
+
+def yang_true_per_sample(fits, seeds, splits, cols, c, rep):
+    """Median across bootstraps of the distance between each sample's fitted mixture and its true distribution (the
+    held-out Yang distance with the observed held-out scores replaced by TRUE_DRAWS draws from the truth), normalized
+    by the training score range as in the manuscript."""
+    from analysis.yang_distance import _process_single_bootstrap
+    import zlib
+    rng = np.random.default_rng([zlib.crc32(c["cell_id"].encode()), int(rep), 99])
+    draws = {j: G.sample_draws(rng, c, i, TRUE_DRAWS) for j, i in enumerate(cols)}
+    obs = np.concatenate([draws[j] for j in range(len(cols))])
+    sa = np.zeros((len(obs), len(cols)), bool)
+    o = 0
+    for j in range(len(cols)):
+        sa[o:o + TRUE_DRAWS, j] = True
+        o += TRUE_DRAWS
+    keys = {G.NAMES[i]: j for j, i in enumerate(cols)}
+    per = {k: [] for k in keys}
+    for f, b in zip(fits, seeds):
+        job = dict(splits[int(b)])
+        job["true_observations"], job["true_sample_assignments"] = obs, sa
+        d = _process_single_bootstrap(int(b), "sim", "x", {int(b): {"x": f}}, {int(b): job}, keys,
+                                      n_grid=YANG_N_GRID, split="true")
+        for k, v in d.items():
+            per[k].append(v)
+    return {k: float(np.nanmedian(v)) if np.isfinite(v).any() else np.nan for k, v in per.items()}
+
+
 # ── one replicate ────────────────────────────────────────────────────────────────────────────────────────────────
 
 SHORT = {"Pathogenic/Likely Pathogenic": "plp", "Benign/Likely Benign": "blb", "gnomAD": "pop", "Synonymous": "syn"}
@@ -269,7 +328,7 @@ SHORT = {"Pathogenic/Likely Pathogenic": "plp", "Benign/Likely Benign": "blb", "
 
 def run_cell(cell, rep, B=B_DEFAULT, R=R_DEFAULT):
     t0 = time.time()
-    c = cell
+    c = G.for_rep(cell, rep)
     row = {**c, "rep": int(rep), "B": B, "R": R}
     rng = G.rng_for(c, rep)
     d = G.make_data(rng, c)
@@ -305,7 +364,13 @@ def run_cell(cell, rep, B=B_DEFAULT, R=R_DEFAULT):
                 pts[arm] = {k: points_of(cal, x) for k, x in ev.items()}
                 if not pre:  # posteriors do not depend on the evidence-level mapping
                     row.update(posterior_rows(cal, ev, c, d["eval_pop_is_path"], arm))
-                ctrl = [s for s in (d["samples"][0], d["samples"][1]) if len(s)]
+                if not pre and arm == "fit":  # prior-error effect on the population variants' evidence
+                    row.update({f"fit_{k}": v for k, v in
+                                prior_effect(ss, fs, sd, cal, c["pi"], ev["population"]).items()})
+                # labeled controls (P/LP, B/LB); with neither (synonymous-only NU), the synonymous sample, as the
+                # real-data diagnostic does (diagnostics.real_features)
+                ctrl = [s for s in (d["samples"][0], d["samples"][1]) if len(s)] or \
+                    [s for s in (d["samples"][3],) if len(s)]
                 if ctrl:
                     cp = points_of(cal, np.concatenate(ctrl))
                     row[f"{pre}{arm}_ctrl_determinate"] = float((cp != 0).mean())
@@ -325,6 +390,8 @@ def run_cell(cell, rep, B=B_DEFAULT, R=R_DEFAULT):
         for split in ("train", "val"):
             for name, v in yang_per_sample(fits, seeds, splits, cols, split).items():
                 row[f"yang_{split}_{SHORT[name]}"] = v
+        for name, v in yang_true_per_sample(fits, seeds, splits, cols, c, rep).items():
+            row[f"yang_true_{SHORT[name]}"] = v
         row["status"] = "ok"
     except Exception as e:  # recorded, not raised: a failed calibration is itself a result
         row["status"] = f"error: {type(e).__name__}: {e}"[:300]

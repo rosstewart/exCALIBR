@@ -134,6 +134,7 @@ def split_predictor_clinvar_leakage(
     functionally_assayed_variants: Set[str],
     leakage_cols=_PREDICTOR_CLINVAR_COLS,
     dup_suffix: str = "__predictor_dup",
+    make_copies: bool = True,
 ) -> PredictorScoreset:
     """Split (not discard) a PredictorScoreset's own P/LP(0)/B/LB(1) label
     for any variant that was directly, functionally assayed for this gene
@@ -169,6 +170,16 @@ def split_predictor_clinvar_leakage(
     to leak, since it's never jointly observed with anything. Variants
     with no functional data at all are untouched (nothing to split).
 
+    ``make_copies=False`` (build_combined_multiscoreset's
+    ``predictor_label_copies=False``) only clears the predictor label on the
+    assayed rows and adds no duplicates: every variant then has exactly one
+    row, labelled by the functional release when it has a functional score
+    and by the predictor CSV otherwise. The duplicates double count the
+    variant's predictor scores, can be in bag while the real row is out of
+    bag, and -- because mixture components and sample weights are shared
+    across dimensions -- still move the weights used for every variant, so
+    they do not isolate the newer label to the predictor marginal.
+
     Mutates ``predictor_scoreset`` in place (and returns it): its
     ``scores``/``_ids``/``_sample_assignments`` arrays are extended with
     the duplicate rows, and the original rows' leakage columns are cleared.
@@ -186,6 +197,14 @@ def split_predictor_clinvar_leakage(
     if not split_mask.any():
         return predictor_scoreset
 
+    if not make_copies:
+        for col in leakage_cols:
+            if col < sa.shape[1]:
+                sa[split_mask, col] = False
+        predictor_scoreset._sample_assignments = sa
+        predictor_scoreset.sample_counts = sa.sum(axis=0)
+        return predictor_scoreset
+
     dup_scores = predictor_scoreset.scores[split_mask]
     dup_sample_assignments = sa[split_mask].copy()   # full original label, pre-clearing
     dup_ids = np.array([f"{vid}{dup_suffix}" for vid in ids[split_mask]])
@@ -199,6 +218,19 @@ def split_predictor_clinvar_leakage(
     predictor_scoreset._ids = np.concatenate([ids, dup_ids])
     predictor_scoreset.sample_counts = predictor_scoreset._sample_assignments.sum(axis=0)
     return predictor_scoreset
+
+
+def functionally_observed_variants(functional_scoresets) -> Set[str]:
+    """IDs (predictor-CSV format) of variants with at least one observed
+    score among ``functional_scoresets`` -- exactly the rows that carry a
+    functional score in the combined matrix."""
+    out: Set[str] = set()
+    for fs in functional_scoresets:
+        p = fs if isinstance(fs, PredictorScoreset) else PredictorScoreset.from_functional_scoreset(fs)
+        s = np.asarray(p.scores, dtype=float)
+        ok = ~np.isnan(s) if s.ndim == 1 else ~np.isnan(s).all(axis=1)
+        out |= set(np.asarray(p._ids)[ok].astype(str))
+    return out
 
 
 def select_variants(ms, mask: np.ndarray) -> None:
@@ -301,6 +333,7 @@ def build_combined_multiscoreset(
     functionally_assayed_variants: Optional[Set[str]] = None,
     require_both_modalities: bool = True,
     predictor_transform: Optional[str] = None,
+    predictor_label_copies: bool = True,
 ) -> Optional[MultiPredictorFunctionalScoreset]:
     """Join gene's predictor dimensions (REVEL/MP2/AM) with its functional
     dimensions into one MultiPredictorFunctionalScoreset.
@@ -325,6 +358,14 @@ def build_combined_multiscoreset(
     correlation structure. Pass False to restore the old union-only
     behavior.
 
+    ``predictor_label_copies`` (default True, the legacy behavior of the
+    paper's union fits): split the predictor label of every assayed variant
+    onto a predictor-only duplicate row. False: no duplicates; "assayed"
+    means at least one observed functional score in the combined matrix
+    (functionally_observed_variants, not ``functionally_assayed_variants``),
+    the predictor label is cleared on those rows and kept on every other
+    row -- one row and one label source per variant.
+
     ``predictor_transform``: see predictors.df_to_basic_scoreset (default
     $MV_PREDICTOR_TRANSFORM, else "none"); functional dimensions are untouched.
 
@@ -342,7 +383,11 @@ def build_combined_multiscoreset(
 
     predictor_scoresets = [df_to_basic_scoreset(predictor_dfs[p], p, transform=predictor_transform)
                            for p in have]
-    if functionally_assayed_variants:
+    if not predictor_label_copies:
+        observed = functionally_observed_variants(functional_scoresets)
+        for ps in predictor_scoresets:
+            split_predictor_clinvar_leakage(ps, observed, make_copies=False)
+    elif functionally_assayed_variants:
         for ps in predictor_scoresets:
             split_predictor_clinvar_leakage(ps, functionally_assayed_variants)
     predictor_names = [PREDICTOR_DATASET_NAMES.get(p, p) for p in have]

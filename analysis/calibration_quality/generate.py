@@ -37,12 +37,14 @@ N_EVAL = 10_000  # held-out draws per evaluation class
 
 
 def _cell(experiment, n_plp, n_blb, richness, kappa, gamma, pi, lab_gamma=None, eps_p=0.0, eta_b=0.0,
-          n_pop=None, n_syn=None, shape="gauss", shape_par=0.0):
+          n_pop=None, n_syn=None, shape="gauss", shape_par=0.0, pi_range=None):
     pop, syn = RICHNESS[richness]
     c = dict(experiment=experiment, n_plp=int(n_plp), n_blb=int(n_blb), richness=richness,
              n_pop=int(pop if n_pop is None else n_pop), n_syn=int(syn if n_syn is None else n_syn),
              kappa=float(kappa), gamma=float(gamma), lab_gamma=float(gamma if lab_gamma is None else lab_gamma),
              pi=float(pi), eps_p=float(eps_p), eta_b=float(eta_b), shape=shape, shape_par=float(shape_par))
+    if pi_range is not None:
+        c["pi_range"] = [float(pi_range[0]), float(pi_range[1])]
     c["cell_id"] = cell_id(c)
     return c
 
@@ -53,6 +55,8 @@ def cell_id(c):
          f"_ep{c['eps_p']:g}_eb{c['eta_b']:g}")
     if c.get("shape", "gauss") != "gauss":  # Gaussian cells keep their original ids (and so their seeds)
         s += f"__{c['shape']}{c['shape_par']:g}"
+    if c.get("pi_range"):  # true prior drawn per replicate (for_rep); other cells keep their ids
+        s += f"__piLU{c['pi_range'][0]:g}-{c['pi_range'][1]:g}"
     return s
 
 
@@ -120,17 +124,26 @@ def design():
     cells = [_cell("core", n, n, r, k, g, pi)
              for n, r, k, g, pi in itertools.product(CORE_N, RICHNESS, CORE_KAPPA, CORE_GAMMA, CORE_PI)]
     for n, k, g in itertools.product(SLICE_N, SLICE_KAPPA, SLICE_GAMMA):
-        # Asymmetric controls: few P/LP with many B/LB and the reverse, no B/LB (synonymous reference), and no
-        # benign reference at all (PU: no B/LB, no synonymous).
+        # Asymmetric controls: few P/LP with many B/LB and the reverse, no B/LB (synonymous reference), no benign
+        # reference at all (PU: no B/LB, no synonymous), and no P/LP (NU).
         cells += [_cell("asym_plp_few", max(n // 4, 2), n, "mid", k, g, 0.25),
                   _cell("asym_blb_few", n, max(n // 4, 2), "mid", k, g, 0.25),
                   _cell("no_blb", n, 0, "mid", k, g, 0.25),
-                  _cell("pu", n, 0, "mid", k, g, 0.25, n_syn=0)]
+                  _cell("pu", n, 0, "mid", k, g, 0.25, n_syn=0),
+                  # NU (no P/LP): B/LB with the synonymous sample, and the synonymous sample alone as the only
+                  # benign-labelled sample (n controls per class -> n synonymous).
+                  _cell("nu", 0, n, "mid", k, g, 0.25),
+                  _cell("nu_syn_only", 0, 0, "mid", k, g, 0.25, n_syn=n)]
         for e in (0.05, 0.10, 0.20):
             cells += [_cell("noise_plp", n, n, "mid", k, g, 0.25, eps_p=e),
                       _cell("noise_blb", n, n, "mid", k, g, 0.25, eta_b=e)]
         # Priors outside the core grid (shows where a fixed prior, e.g. acmgscaler's 0.10, fails).
-        cells += [_cell("prior", n, n, "mid", k, g, pi) for pi in (0.05, 0.40)]
+        # 0.01, 0.025 and 0.60 extend the slice over the manuscript's range of fitted priors (2.4% to 71%); priors
+        # near 0.001 are not simulated, as production discards bootstrap priors <= 0.001 as degenerate.
+        cells += [_cell("prior", n, n, "mid", k, g, pi) for pi in (0.01, 0.025, 0.05, 0.40, 0.60)]
+        # True prior drawn per replicate, log-uniform on PI_RANGE (for_rep): continuous priors let the
+        # reliability diagnostics use the fitted prior as a feature without learning the fixed grid of priors above.
+        cells.append(_cell("prior_cont", n, n, "mid", k, g, float("nan"), pi_range=PI_RANGE))
         if g < 1:  # mechanism-mix bias only exists when some mechanisms are unmeasured
             for lg in (0.0, 0.5, 0.75, 1.0):
                 if lg != g:
@@ -143,6 +156,21 @@ def design():
             seen.add(c["cell_id"])
             out.append(c)
     return out
+
+
+PI_RANGE = (0.01, 0.70)  # log-uniform range of the true prior in the continuous-prior slice
+
+
+def for_rep(cell, rep):
+    """The cell as replicate `rep` sees it: for a continuous-prior cell (pi_range set), a copy with its true prior
+    drawn log-uniformly from pi_range, from its own stream (independent of the data draws, rng_for); other cells are
+    returned unchanged. Every consumer of a cell and replicate (run.run_cell, acmgscaler_arm, diagnostics) calls
+    this first, so the drawn prior is the one recorded in the results row."""
+    if not cell.get("pi_range"):
+        return cell
+    lo, hi = cell["pi_range"]
+    u = np.random.default_rng([zlib.crc32(cell["cell_id"].encode()), int(rep), 7]).random()
+    return {**cell, "pi": float(np.exp(np.log(lo) + u * (np.log(hi) - np.log(lo))))}
 
 
 def rng_for(cell, rep):
@@ -172,6 +200,19 @@ def make_data(rng, c):
     ev_pop, ev_pop_is_path = _mixed(rng, N_EVAL, c["pi"], c["gamma"], c)
     return dict(samples=[plp, blb, pop, syn], eval=dict(pathogenic=ev_path, benign=ev_benign, population=ev_pop),
                 eval_pop_is_path=ev_pop_is_path)
+
+
+def sample_draws(rng, c, sample, n):
+    """n draws from the true score distribution of one sample (0 P/LP, 1 B/LB, 2 population, 3 synonymous), for
+    distances between a fitted sample mixture and the truth. Uses its own generator, so make_data is unaffected."""
+    if sample == 0:
+        benign = rng.random(n) < c["eps_p"]
+        return np.where(benign, _draw_normal(rng, n, c), _pathogenic(rng, n, c["lab_gamma"], c))
+    if sample == 1:
+        return _mixed(rng, n, c["eta_b"], c["gamma"], c)[0]
+    if sample == 2:
+        return _mixed(rng, n, c["pi"], c["gamma"], c)[0]
+    return _draw_normal(rng, n, c)
 
 
 def true_log_lr(x, c):

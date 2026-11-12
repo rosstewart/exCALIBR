@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.calibration_quality import generate as G
-from analysis.calibration_quality.run import (MAPPINGS, compare, posterior, posterior_histograms,
+from analysis.calibration_quality.run import (LLR_CAP, MAPPINGS, compare, posterior, posterior_histograms,
                                              posterior_metrics, to_tier, truth_points)
 
 FIXED_PRIOR = 0.10
@@ -29,6 +29,7 @@ N_EVAL_ACMG = 3000  # per class: acmgscaler scores every row, so a smaller draw 
 def run_one(cell, rep, prior=FIXED_PRIOR):
     from analysis.comparison_methods import run_acmgscaler
     t0 = time.time()
+    cell = G.for_rep(cell, rep)
     row = {**cell, "rep": int(rep), "acmg_prior": prior, "acmg_prior_err": prior - cell["pi"]}
     if cell["n_plp"] < 10 or cell["n_blb"] < 10:
         row["acmg_status"] = "not calibratable (<10 P/LP or B/LB)"
@@ -63,6 +64,16 @@ def run_one(cell, rep, prior=FIXED_PRIOR):
             o += len(x)
             true_post = posterior(np.exp(G.true_log_lr(x, cell)), cell["pi"])
             is_path = d["eval_pop_is_path"][:len(x)] if k == "population" else None
+            tl = G.true_log_lr(x, cell)
+            with np.errstate(divide="ignore"):
+                rl = np.log(lr_c[sl])
+            row[f"acmg_{k}_llr_rep_abs"] = float(np.abs(rl).mean())
+            row[f"acmg_{k}_llr_rep_abs_dir"] = float(np.where(np.sign(rl) == np.sign(tl), np.abs(rl), 0.0).mean())
+            row[f"acmg_{k}_llr_true_abs"] = float(np.abs(tl).mean())
+            cap = np.log(LLR_CAP)
+            row[f"acmg_{k}_llr_rep_abs_dir_cap"] = float(np.where(np.sign(rl) == np.sign(tl),
+                                                                  np.minimum(np.abs(rl), cap), 0.0).mean())
+            row[f"acmg_{k}_llr_true_abs_cap"] = float(np.minimum(np.abs(tl), cap).mean())
             post_c = posterior(lr_c[sl], prior)
             for m, v in posterior_metrics(post_c, true_post, lr_c[sl], is_path).items():
                 row[f"acmg_{k}_{m}"] = v
