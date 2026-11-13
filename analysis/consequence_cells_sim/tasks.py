@@ -43,6 +43,7 @@ def _run_one(out_dir, t):
     from analysis.consequence_cells_sim.run import run_cell
     row = run_cell(t["cell"], t["rep"], t["B"], t["R"])
     tmp = f.with_suffix(".tmp")
+    f.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([row]).to_csv(tmp, index=False)
     tmp.rename(f)
 

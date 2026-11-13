@@ -176,6 +176,72 @@ def strength_points():
     return sp
 
 
+MIN_PER_CLASS = 20  # below this many controls of either class, no per-model readout decisions
+
+
+def evidence_log_lrs(med, lo, hi, prior, points):
+    """The three log LR+ versions scored by Cllr, per control, all capped at
+    +-log c(prior) (the Very Strong LR: 8 points, the most evidence the
+    pipeline can assign; beyond it mixture-tail LRs never become evidence):
+      median      the model's estimate of the LR (information)
+      percentile  the one-sided bound the evidence rule uses: the 5th
+                  percentile if it is above 0, the 95th if below 0, else 0
+                  (LR = 1); folds in the bootstrap variance
+      points      the LR implied by the points assigned, points/8 x log c
+                  (the evidence as applied: step function and prior included)"""
+    lc = np.array([log_c(p) if np.isfinite(p) else np.nan for p in np.atleast_1d(prior)], float)
+    med, lo, hi = (np.asarray(v, float) for v in (med, lo, hi))
+    pct = np.where(lo > 0, lo, np.where(hi < 0, hi, 0.0))
+    pct = np.where(np.isfinite(lo) & np.isfinite(hi), pct, np.nan)
+    return dict(median=np.clip(med, -lc, lc), percentile=np.clip(pct, -lc, lc),
+                points=np.asarray(points, float) / 8 * lc)
+
+
+def cllr_costs(log_lr, y):
+    """Per-control log-likelihood-ratio cost terms (bits) and their weights.
+
+    Cllr (Brummer & du Preez 2006) = 1/2 [mean over P/LP of log2(1 + 1/LR)
+    + mean over B/LB of log2(1 + LR)]: the log loss at even prior odds with
+    the two classes weighted equally, so it scores the LR alone (no prior),
+    is proper (overstated LRs are penalized) and equals 1 bit for no evidence
+    (LR = 1). log_lr is the natural log LR+ (NaN: no evidence, LR = 1).
+    Returns (cost per control, weight per control) with Cllr = sum(w * cost);
+    the weights are 1/(2 n_class)."""
+    lr = np.nan_to_num(np.asarray(log_lr, float))
+    y = np.asarray(y, bool)
+    cost = np.where(y, np.logaddexp(0, -lr), np.logaddexp(0, lr)) / np.log(2)
+    n_p, n_b = y.sum(), (~y).sum()
+    w = np.where(y, 0.5 / max(n_p, 1), 0.5 / max(n_b, 1))
+    return cost, w
+
+
+def cllr(log_lr, y, idx=None):
+    """Cllr in bits (see cllr_costs); idx: a stratified resample of the controls."""
+    c, w = cllr_costs(log_lr, y)
+    if idx is None:
+        return float((c * w).sum())
+    yy = np.asarray(y, bool)[idx]
+    w = np.where(yy, 0.5 / max(yy.sum(), 1), 0.5 / max((~yy).sum(), 1))
+    return float((c[idx] * w).sum())
+
+
+def cllr_min(log_lr, y):
+    """Cllr after the optimal monotone recalibration of the LRs (pool-adjacent
+    violators on the controls): the discrimination part of Cllr; Cllr -
+    Cllr_min is the calibration loss."""
+    from sklearn.isotonic import IsotonicRegression
+    lr = np.nan_to_num(np.asarray(log_lr, float))
+    y = np.asarray(y, bool)
+    n_p, n_b = y.sum(), (~y).sum()
+    if not n_p or not n_b:
+        return np.nan
+    # PAV on class-balanced weights gives the posterior at even prior odds
+    w = np.where(y, 0.5 / n_p, 0.5 / n_b)
+    q = IsotonicRegression(y_min=0, y_max=1, out_of_bounds="clip").fit(lr, y.astype(float), sample_weight=w).predict(lr)
+    q = np.clip(q, 1e-9, 1 - 1e-9)
+    return cllr(np.log(q / (1 - q)), y)
+
+
 def mh_lr(n_p, n_b, tot_p, tot_b):
     """Mantel-Haenszel-style pooled likelihood ratio over genes: sum n_p*B/N over
     sum n_b*P/N, the odds of a level among P/LP vs B/LB controls standardized

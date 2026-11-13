@@ -12,9 +12,15 @@ review/assay_contribution/cache/.
   drop_one.csv   per model and readout: out-of-bag MCC, determinate rate,
                  errors and mean |points| on the controls with that readout
                  marginalized out, the changes from the full model, and the
-                 out-of-bag log loss of the posterior (a proper score; the
-                 posterior from the median out-of-bag log LR+ and the out-of-bag
-                 prior)
+                 out-of-bag log loss of the posterior (the posterior from the
+                 median out-of-bag log LR+ and the out-of-bag prior), and the
+                 Cllr (bits; review_common.cllr) of three versions of each
+                 control's out-of-bag log LR+, all capped at the Very Strong
+                 LR (review_common.evidence_log_lrs): median (cllr, with its
+                 discrimination part cllr_min), the evidence rule's one-sided
+                 percentile bound (cllr_pct) and the LR implied by the points
+                 (cllr_points); few_controls marks models with fewer than
+                 MIN_PER_CLASS controls of either class
   descriptors.csv per model and readout: coverage (variants, controls with a
                  score), univariate separation of the controls (AUC), the
                  readout's own univariate prior, max |Spearman r| with the
@@ -111,7 +117,7 @@ def score_masked(key, masked=()):
     return L, priors, kept
 
 
-def oob_eval(key, L, priors, seeds, p=5):
+def oob_eval(key, L, priors, seeds, p=5, return_lr=False):
     """Out-of-bag points and posteriors of the evaluation controls under (L,
     priors, seeds), using the canonical splits' masks matched by seed."""
     from mv_analysis.production_oob import _points
@@ -126,7 +132,7 @@ def oob_eval(key, L, priors, seeds, p=5):
     # kept fits leave a control without out-of-bag fits)
     rows = np.flatnonzero(d["eval_mask"])
     rows = rows[mv["oob"][:, rows].any(0)]
-    pts, post = [], []
+    pts, post, meds, los, his, prs = [], [], [], [], [], []
     with warnings.catch_warnings(), np.errstate(all="ignore"):
         warnings.simplefilter("ignore")
         for j in rows:
@@ -134,22 +140,38 @@ def oob_eval(key, L, priors, seeds, p=5):
             if not o.any():
                 pts.append(np.nan)
                 post.append(np.nan)
+                meds.append(np.nan)
+                los.append(np.nan)
+                his.append(np.nan)
+                prs.append(np.nan)
                 continue
             lv, pr = L[o, j], float(np.median(priors[o]))
-            pts.append(_points(np.nanpercentile(lv, p), np.nanpercentile(lv, 100 - p), pr, mv["point_values"]))
+            lo, hi = np.nanpercentile(lv, p), np.nanpercentile(lv, 100 - p)
+            pts.append(_points(lo, hi, pr, mv["point_values"]))
             med = np.nanmedian(lv)
+            meds.append(med)
+            los.append(lo)
+            his.append(hi)
+            prs.append(pr)
             post.append(1 / (1 + (1 - pr) / pr * np.exp(-med)) if np.isfinite(med) else pr)
     y = np.asarray(d["plp"], bool)[rows]
+    if return_lr:
+        pts = np.asarray(pts, float)
+        return pts, np.asarray(post, float), y, R.evidence_log_lrs(meds, los, his, prs, pts)
     return np.asarray(pts, float), np.asarray(post, float), y
 
 
-def _metrics(pts, post, y):
+def _metrics(pts, post, y, lr=None):
     from mv_analysis.review_priors import _metrics as M
     eps = 1e-6
     q = np.clip(post, eps, 1 - eps)
     out = M(pts, y)
     out.update(mean_abs_points=float(np.mean(np.abs(np.nan_to_num(pts)))),
                log_loss=float(np.nanmean(-np.where(y, np.log(q), np.log(1 - q)))))
+    if lr is not None:  # Cllr (bits) of the capped median / percentile / points log LR+
+        out.update(cllr=R.cllr(lr["median"], y), cllr_min=R.cllr_min(lr["median"], y),
+                   cllr_pct=R.cllr(lr["percentile"], y), cllr_points=R.cllr(lr["points"], y),
+                   few_controls=bool(min(y.sum(), (~y).sum()) < R.MIN_PER_CLASS))
     return out
 
 
@@ -159,11 +181,11 @@ def _drop_one(key):
     _, m = R.prep(key)
     names = [str(n) for n in _ms(key).dataset_names]
     rows = [dict(key=key, panel=m["panel"], gene=m["gene"], dropped="(none)",
-                 **_metrics(*oob_eval(key, *score_masked(key))))]
+                 **_metrics(*oob_eval(key, *score_masked(key), return_lr=True)))]
     if len(names) > 1:
         for n in names:
             rows.append(dict(key=key, panel=m["panel"], gene=m["gene"], dropped=n,
-                             **_metrics(*oob_eval(key, *score_masked(key, (n,))))))
+                             **_metrics(*oob_eval(key, *score_masked(key, (n,)), return_lr=True))))
     return rows
 
 
@@ -205,7 +227,7 @@ def run(workers=8, keys=None):
             print(res[0]["key"], flush=True)
     t = pd.DataFrame(rows)
     full = t[t["dropped"] == "(none)"].set_index("key")
-    for c in ("mcc", "det_rate", "errors", "mean_abs_points", "log_loss"):
+    for c in ("mcc", "det_rate", "errors", "mean_abs_points", "log_loss", "cllr", "cllr_min", "cllr_pct", "cllr_points"):
         t[f"delta_{c}"] = t[c] - t["key"].map(full[c])
     t.to_csv(OUT / "drop_one.csv", index=False)
     return t

@@ -154,7 +154,19 @@ def discordance(t, panel, p=5):
 def population(panel):
     sp = R.strength_points()
     g = sp[(sp["panel"] == panel) & (sp["sample"] == "gnomAD")]
-    cols = {"joint (in-sample, p5)": "joint_points", "nonconflicting comparator": "indep_points"}
+    keys = {k for k, _ in R.paper_keys(panel)}
+    g = g[g["key"].isin(keys)]
+    if R.ALT_FITS:  # the alternative fits' in-sample points (p = 5) for the joint model
+        parts = []
+        for key, x in g.groupby("key"):
+            d, _ = R.prep(key)
+            pos = {str(v): i for i, v in enumerate(d["variants"])}
+            j = x["variant"].astype(str).map(pos)
+            x = x[j.notna()].copy()
+            x["joint_points"] = R.insample_paper_points(key)[j.dropna().astype(int).to_numpy()]
+            parts.append(x)
+        g = pd.concat(parts, ignore_index=True) if parts else g.iloc[:0]
+    cols ={"joint (in-sample, p5)": "joint_points", "nonconflicting comparator": "indep_points"}
     if panel == "predictor":
         cols.update({f"{k} alone (Chen)": c for k, c in CHEN_SINGLE.items()})
     recs = []

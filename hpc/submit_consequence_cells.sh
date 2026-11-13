@@ -26,7 +26,7 @@ N_ARRAYS="${N_ARRAYS:-50}"
 N_TASKS=$(python3 -c "import json; print(len(json.load(open('$TASKS'))))")
 PER_INDEX="${PER_INDEX:-$(( (N_TASKS + N_ARRAYS - 1) / N_ARRAYS ))}"
 MAX_IDX=$(( (N_TASKS + PER_INDEX - 1) / PER_INDEX - 1 ))
-mkdir -p "$OUT/logs"
+mkdir -p "$OUT/logs" "$OUT/runs"
 
 ACCOUNT="${SLURM_ACCOUNT:-predrag}"
 JOB_NAME="${SLURM_JOB_NAME:-excalibr_csqcells_sim}"
