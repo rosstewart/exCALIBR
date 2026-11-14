@@ -77,7 +77,7 @@ def _cartoon_samples(ax):
     _bar(ax, 3, [(0.7 * g, PATH_C, ""), (0.7 * (1 - g), UNMEAS, ""), (0.3, BENIGN, "////")], "P/LP",
          "5–80; mix γ_P/LP, benign ε")
     _bar(ax, 2, [(0.8, BENIGN, ""), (0.2, PATH_C, "////")], "B/LB", "0–80; pathogenic η")
-    _bar(ax, 1, [(0.25 * g, PATH_C, ""), (0.25 * (1 - g), UNMEAS, ""), (0.75, BENIGN, "")], "population",
+    _bar(ax, 1, [(0.25 * g, PATH_C, ""), (0.25 * (1 - g), UNMEAS, ""), (0.75, BENIGN, "")], "gnomAD",
          "50 / 200 / 1000; prior π")
     _bar(ax, 0, [(1, BENIGN, "")], "synonymous", "0 / 100 / 500")
     ax.set_ylim(-0.6, 3.6)
@@ -520,7 +520,7 @@ def make_diagnostics_figure(df, out_path, sd_real=None):
         ax.axvline(0.10, color=MUTED, ls="--", lw=0.8)
         ax.text(0.105, ax.get_ylim()[1] * 0.9, f"{int((v > 0.10).sum())} of {len(v)}\nabove 0.10", fontsize=5.6,
                 color=INK)
-        _style(ax, "approximate SD of the bootstrap priors", "real calibrations")
+        _style(ax, "SD of the bootstrap priors", "real calibrations")
     else:
         ax.axis("off")
         ax.text(0.5, 0.5, "real calibrations: drawn in the notebook", ha="center", fontsize=6, color=MUTED)

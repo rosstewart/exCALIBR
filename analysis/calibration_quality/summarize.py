@@ -35,6 +35,19 @@ DIAGNOSTICS = {  # user-facing diagnostic -> column (higher = worse)
 }
 
 
+# Slices added in hpc_grid_r8_v2 for the reliability diagnostics (analysis.calibration_quality.diagnostics); the
+# supplement's figures and numbers are computed on the original design (original_design) so they stay comparable.
+NEW_EXPERIMENTS = ("nu", "nu_syn_only", "prior_cont")
+NEW_PRIOR_SLICE_PRIORS = (0.01, 0.025, 0.60)
+
+
+def original_design(df):
+    """The 516 settings of the original grid: drops the NU, continuous-prior and 1% / 2.5% / 60% prior slices."""
+    new_prior = (df["experiment"] == "prior") & np.isclose(df["pi"].to_numpy(float)[:, None],
+                                                           np.array(NEW_PRIOR_SLICE_PRIORS)[None, :]).any(axis=1)
+    return df[~df["experiment"].isin(NEW_EXPERIMENTS) & ~new_prior].copy()
+
+
 def load(out_dir):
     df = pd.read_csv(Path(out_dir) / "results.csv", low_memory=False)
     df = df[df["status"] == "ok"].copy()
@@ -85,9 +98,10 @@ def minimum_controls(df, outcome):
 
 def minimum_controls_retention(df, target=0.5):
     """Smallest controls per class at which the fit keeps at least `target` of the truth's evidence (ratio of cell
-    totals, figures.retention_by_cell); NaN where no simulated count reaches it, or where the truth itself gives
-    too little evidence to rate."""
-    from analysis.calibration_quality.figures import retention_by_cell
+    totals of the capped log likelihood ratio, figures_v2.llr_retention_by_cell, as Figure S3C; points when the
+    log-LR columns are absent); NaN where no simulated count reaches it, or where the truth itself gives too little
+    evidence to rate."""
+    from analysis.calibration_quality.figures_v2 import llr_retention_by_cell as retention_by_cell
     c = df[df["experiment"] == "core"]
     r = c.groupby(GRID).apply(retention_by_cell).rename("retention").reset_index()
     rows = []

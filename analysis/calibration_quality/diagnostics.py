@@ -10,10 +10,16 @@ Two checks, one per failure mode:
   uninformed guess, 1 = exact. E|error| comes from a gradient-boosted regression trained on the simulation; a
   90% bound from a quantile regression (split-conformal shift) gives the prior range sin^2(theta +- bound). The
   bootstrap 90% interval is shown for reference only (it contains the true prior in ~75% of simulated fits);
-- bad fit (systematically wrong evidence from a mixture that does not match the data): a fixed rule on the Yang
-  distance, flagged when any sample's in-sample distance exceeds YANG_T, or its held-out distance does with at least
-  YANG_MIN_HELDOUT held-out variants (config.YANG_GOOD_FIT_THRESHOLD = 0.2; distances are medians across bootstraps,
-  production definition, analysis/yang_distance).
+- bad fit (systematically wrong evidence from a mixture that does not match the data): flagged when any sample's
+  in-sample Yang distance exceeds YANG_T (config.YANG_GOOD_FIT_THRESHOLD = 0.2; median across bootstraps,
+  production definition, analysis/yang_distance), with no sample-size minimum. Checked against the distance between
+  the fitted and the true distributions in the simulation: flags 0.3% of fits within 0.2 of the truth and catches 9%
+  of those beyond it, and half its flags are truly bad fits. Adding the held-out distance (>= 5 held-out variants)
+  catches 20% but raises false alarms eightfold (2.4%; under a quarter of flags truly bad): with small held-out
+  sets it mostly measures sampling noise (AUC 0.44 for a fitted-vs-true distance > 0.2, vs 0.85 in-sample). A
+  minimum sample size for the in-sample distance removes every true detection (bad fits occur in small samples).
+  Above 0.2: the fit does not match the data; below: no sign of misfit, not a guarantee of a good fit. Held-out
+  distances are still reported.
 
 Prior-model features, all computed from a real calibration's production outputs:
 - the SD of the bootstrap priors, in probability and (delta method, SD / (2 sqrt(p (1 - p)))) angular units, and
@@ -28,8 +34,11 @@ Prior-model features, all computed from a real calibration's production outputs:
   synonymous without B/LB; and, with no benign reference (PU), P/LP vs gnomAD, gnomAD taken as putatively neutral
   (mostly benign, not devoid of pathogenic variants) -- with `is_pu` marking that case. Missing for NU (no P/LP); the
   boosted models handle missing values.
-The fitted prior itself is not a feature: the simulated true priors take a few fixed values, so a model given it
-learns the distance to the nearest simulated value (until the rerun's continuous-prior slice).
+- the fitted prior, as a coarse band (<=3%, 3-7%, 7-15%, 15-30%, 30-50%, >50%; PRIOR_BAND_EDGES). Most simulated
+  true priors lie on a fixed grid (10,707 of 16,866 runs at 25%), so a model given the exact fitted prior learns
+  the distance to the nearest grid value (real 90% ranges ending at 0.250); the band keeps what the fitted prior
+  legitimately tells (fitted priors above 50% are much less reliable: predicted 0.39 vs observed 0.42, from 0.61 vs
+  0.42 without it) without that (range bounds near a grid prior: 23 of 174, vs 17 with no prior and 34 exact).
 The mechanism-mix-bias slice is left out of training: control-composition bias cannot be seen in the fit.
 
     python -m analysis.calibration_quality.diagnostics [--out DIR] [--n-jobs 12] [--no-plots] [--datasets ...]
@@ -43,10 +52,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-FEATURES = ["log_prior_sd", "log_sd_ang", "frac_at_start", "pct_discarded", "no_evidence", "yang_train_max",
-            "sep_auc", "is_pu"]
+PRIOR_BAND_EDGES = [0.03, 0.07, 0.15, 0.3, 0.5]  # fitted prior enters only as one of these six bands
+FEATURES = ["prior_band", "log_prior_sd", "log_sd_ang", "frac_at_start", "pct_discarded", "no_evidence",
+            "yang_train_max", "sep_auc", "is_pu"]
 NULLABLE = {"sep_auc"}  # missing where undefined (NU); the boosted models handle missing values
 FEATURE_LABELS = {
+    "prior_band": "fitted prior band",
     "log_prior_sd": "prior SD (bootstrap)",
     "log_sd_ang": "prior SD, angular scale",
     "frac_at_start": "bootstraps with prior at EM start",
@@ -131,11 +142,13 @@ def simulation_table(out_dir, n_jobs=16):
     df["log_prior_sd"] = np.log10(df.fit_prior_sd.clip(lower=1e-4))
     fp = df.fit_prior.clip(1e-4, 1 - 1e-4)
     df["log_sd_ang"] = np.log10((df.fit_prior_sd / (2 * np.sqrt(fp * (1 - fp)))).clip(lower=1e-4))
+    df["prior_band"] = np.where(df.fit_prior.notna(), np.searchsorted(PRIOR_BAND_EDGES, df.fit_prior.fillna(0)),
+                                np.nan)
     df["frac_at_start"] = df.fit_frac_at_start
     df["pct_discarded"] = df.fit_pct_discarded
     df["no_evidence"] = 1 - df.fit_ctrl_determinate
     # held-out Yang in the simulation already counts only samples with >= run.YANG_MIN_N (5) held-out variants
-    df["yang_flag"] = (df.yang_train_max > YANG_T) | (df.yang_val_max > YANG_T)
+    df["yang_flag"] = df.yang_train_max > YANG_T
     df["over_share"] = (df.fit_vs_truth_pathogenic_over + df.fit_vs_truth_benign_over) / 2
     return df
 
@@ -178,17 +191,27 @@ def train(sim):
                     obs_rel=round(float(np.clip(1 - o / ANG_REF, 0, 1).mean()), 3),
                     cover90=round(float((o <= cv_q[mask] + shift).mean()), 3))
     fb = pd.cut(s.fit_prior, [0, 0.03, 0.07, 0.15, 0.3, 0.5, 1])
+    pc = pd.cut(s.pi, [0, 0.03, 0.07, 0.15, 0.3, 0.5, 0.7])
     rb = pd.cut(np.clip(1 - cv_m / ANG_REF, 0, 1), [-0.001, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0])
     mode = np.where(s.is_pu == 1, "PU", np.where(s.n_plp == 0, "NU", "PN"))
     return dict(mean_model=_hgb().fit(X, err), q90_model=_hgb("quantile", 0.9).fit(X, err), q90_shift=shift,
                 n=len(s), spearman=float(spearmanr(cv_m, err).correlation),
                 overall=summ(np.ones(len(s), bool)),
                 by_reliability_bin={str(b): summ((rb == b)) for b in rb.categories if (rb == b).any()},
-                by_true_prior={f"{p:g}": summ((s.pi == p).to_numpy()) for p in sorted(s.pi.unique())},
+                by_true_prior={f"{p:g}": summ(((s.pi == p) & (s.experiment != "prior_cont")).to_numpy())
+                               for p in sorted(s[s.experiment != "prior_cont"].pi.unique())},
+                by_true_prior_continuous={str(b): summ(((pc == b) & (s.experiment == "prior_cont")).to_numpy())
+                                          for b in pc.cat.categories},
                 by_fitted_prior={str(b): summ((fb == b).to_numpy()) for b in fb.cat.categories},
                 by_mode={m: summ(mode == m) for m in np.unique(mode)},
                 range={f: (float(s[f].quantile(0.005)), float(s[f].quantile(0.995))) for f in FEATURES},
-                sim_sorted={f: np.sort(s[f].dropna().to_numpy()) for f in FEATURES})
+                sim_sorted={f: np.sort(s[f].dropna().to_numpy()) for f in FEATURES},
+                # cross-validated predictions with the simulated truth, for the reliability figure (figures_v3)
+                cv=pd.DataFrame(dict(pred_err=cv_m, err=err, fit_prior=s.fit_prior.to_numpy(), pi=s.pi.to_numpy(),
+                                     experiment=s.experiment.to_numpy(),
+                                     yang_train_max=s.yang_train_max.to_numpy(),
+                                     yang_true_max=s[[c for c in s if c.startswith("yang_true_")]].max(axis=1)
+                                     .to_numpy() if any(c.startswith("yang_true_") for c in s) else np.nan)))
 
 
 def yang_rule_summary(sim):
@@ -249,6 +272,7 @@ def real_features(cals, priors_json, output_dir=None):
         r["boot_p5"], r["boot_p95"] = (p["saved_pct"][0], p["saved_pct"][2]) if p.get("match") else (np.nan, np.nan)
         r["log_prior_sd"] = np.log10(max(r["prior_sd"], 1e-4)) if np.isfinite(r["prior_sd"]) else np.nan
         pf = min(max(float(c["prior"]), 1e-4), 1 - 1e-4) if c.get("prior") is not None else np.nan
+        r["prior_band"] = float(np.searchsorted(PRIOR_BAND_EDGES, pf)) if np.isfinite(pf) else np.nan
         r["log_sd_ang"] = (np.log10(max(r["prior_sd"] / (2 * np.sqrt(pf * (1 - pf))), 1e-4))
                            if np.isfinite(r["prior_sd"]) else np.nan)
         kept = c.get("pct_bootstraps_kept")
@@ -280,7 +304,7 @@ def real_features(cals, priors_json, output_dir=None):
         val = [r[f"yang_val_{k}"] if r[f"n_val_{k}"] >= YANG_MIN_HELDOUT else np.nan for k in SAMPLES]
         r["yang_train_max"] = float(np.nanmax(ins)) if np.isfinite(ins).any() else np.nan
         r["yang_val_max"] = float(np.nanmax(val)) if np.isfinite(val).any() else np.nan
-        r["yang_flag"] = bool(np.nan_to_num(ins, nan=0).max() > YANG_T or np.nan_to_num(val, nan=0).max() > YANG_T)
+        r["yang_flag"] = bool(np.nan_to_num(ins, nan=0).max() > YANG_T)  # in-sample only (module docstring)
         rows.append(r)
     return pd.DataFrame(rows)
 
@@ -325,6 +349,9 @@ def _fmt(f, v):
         return f"{10 ** v:.3f}"
     if f == "is_pu":
         return "yes" if v else "no"
+    if f == "prior_band":
+        e = [0] + PRIOR_BAND_EDGES + [1]
+        return f"{e[int(v)]:g}-{e[int(v) + 1]:g}"
     if f in ("pct_discarded", "no_evidence", "frac_at_start"):
         return f"{100 * v:.0f}%"
     return f"{v:.2f}"
@@ -346,11 +373,12 @@ def draw_panel(ax, row, model):
         lo, hi = model["range"][f]
         out = np.isfinite(v) and (v < lo or v > hi)
         ss = model["sim_sorted"][f]
-        ptxt = f" (p{int(100 * np.searchsorted(ss, v) / len(ss))})" if np.isfinite(v) and f != "is_pu" else ""
+        ptxt = (f" (p{int(100 * np.searchsorted(ss, v) / len(ss))})"
+                if np.isfinite(v) and f not in ("is_pu", "prior_band") else "")
         ax.text(0, y, FEATURE_LABELS[f], fontsize=9, va="top")
         ax.text(1, y, _fmt(f, v) + ptxt + (" *" if out else ""), fontsize=9, va="top", ha="right",
                 color="#b03030" if out else "black", family="monospace")
-        y -= 0.034
+        y -= 0.029
     npl, nbl = row.get("n_plp", np.nan), row.get("n_blb", np.nan)
     mode = "PU (no B/LB)" if nbl == 0 else ("NU (no P/LP)" if npl == 0 else "P/LP and B/LB")
     ax.text(0, y, f"controls: {mode}", fontsize=8.5, color="#444", va="top")
@@ -388,7 +416,17 @@ def draw_panel(ax, row, model):
         ax.text(0, y, reason, fontsize=8, color="#444", va="top")
         y -= 0.04
     ax.text(0, y, "* outside the simulated range (clipped)", fontsize=7.5, color="#666", va="top")
-    y -= 0.05
+    y -= 0.04
+    if np.isfinite(row.get("typ_unchanged", np.nan)):
+        ax.text(0, y, "Evidence impact (gnomAD variants unchanged)", fontsize=10.5, weight="bold", va="top")
+        y -= 0.036
+        for lab, k in (("prior off by a typical error", "typ_unchanged"), ("anywhere in its 90% range", "q90_unchanged")):
+            ax.text(0, y, lab, fontsize=9, va="top")
+            ax.text(1, y, f"{100 * row[k]:.0f}%", fontsize=9, va="top", ha="right", family="monospace")
+            y -= 0.03
+        ax.text(0, y, f"production rerun at fixed priors; {100 * row.get('share_with_evidence', np.nan):.0f}% of "
+                      "gnomAD variants have evidence", fontsize=7.5, color="#666", va="top")
+        y -= 0.045
 
     ax.text(0, y, f"Bad fit (Yang distance > {YANG_T:g})", fontsize=10.5, weight="bold", va="top")
     y -= 0.04
@@ -402,18 +440,16 @@ def draw_panel(ax, row, model):
         ax.text(0, y, lab, fontsize=9, va="top")
         ax.text(0.42, y, f"{vi:.3f}" if np.isfinite(vi) else "n/a", fontsize=9, va="top", ha="right",
                 family="monospace", color="#b03030" if np.isfinite(vi) and vi > YANG_T else "black")
-        counts = np.isfinite(n) and n >= YANG_MIN_HELDOUT
         vtxt = (f"{vv:.3f}" if np.isfinite(vv) else "n/a") + (f" ({int(n)})" if np.isfinite(n) else "")
-        ax.text(1, y, vtxt, fontsize=9, va="top", ha="right", family="monospace",
-                color=("#b03030" if counts and vv > YANG_T else ("black" if counts else "#999")))
+        ax.text(1, y, vtxt, fontsize=9, va="top", ha="right", family="monospace", color="#999")
         y -= 0.03
     y -= 0.008
     flag = bool(row.get("yang_flag"))
     ax.text(0, y, "FLAGGED: fit does not match the data" if flag else "not flagged", fontsize=11, weight="bold",
             va="top", color="#c8423b" if flag else "#4a9b6e")
     y -= 0.04
-    ax.text(0, y, f"held-out values in grey have < {YANG_MIN_HELDOUT} held-out variants\n"
-                  "(median across bootstraps) and are not used", fontsize=7.5, color="#666", va="top")
+    ax.text(0, y, "flag uses the in-sample distance (median across bootstraps);\n"
+                  "held-out values in grey, for reference", fontsize=7.5, color="#666", va="top")
 
 
 def plot_dataset(dataset, row, model, out_png):
@@ -437,7 +473,7 @@ def plot_dataset(dataset, row, model, out_png):
         x, y = t.get_position()
         t.set_position((x * scale, y))
     fig.suptitle(display_name(dataset), x=0.02, ha="left", fontsize=15, weight="bold")
-    draw_panel(fig.add_axes([scale + 0.012, 0.05, 1 - scale - 0.025, 0.88]), row, model)
+    draw_panel(fig.add_axes([scale + 0.012, 0.02, 1 - scale - 0.025, 0.92]), row, model)
     fig.savefig(out_png, dpi=130)
     plt.close(fig)
     return str(out_png)
@@ -460,7 +496,7 @@ def overview_figure(tab, model, out):
     ax.set_xlabel("prior reliability (angular skill score; 1 = exact)")
     ax.spines[["top", "right"]].set_visible(False)
     ax = axs[1]
-    t["yang_any"] = t[["yang_train_max", "yang_val_max"]].max(axis=1)
+    t["yang_any"] = t["yang_train_max"]
     ax.scatter(t.prior_reliability, t.yang_any, s=28, c=cols, alpha=0.9, edgecolor="white", lw=0.5)
     for _, r in t[t.prior_reliability < 0.5].iterrows():
         ax.annotate(display_name(r.dataset), (r.prior_reliability, r.yang_any), fontsize=6.5, xytext=(3, 2),
@@ -468,7 +504,7 @@ def overview_figure(tab, model, out):
     ax.axhline(YANG_T, color="#c8423b", ls="--", lw=0.8)
     ax.set_xlabel("prior reliability")
     ax.set_xlim(0, 1)
-    ax.set_ylabel(f"largest Yang distance (in-sample, or held-out with >= {YANG_MIN_HELDOUT})")
+    ax.set_ylabel("largest in-sample Yang distance")
     ax.set_ylim(0, max(0.25, t.yang_any.max() * 1.1))
     ax.set_title(f"Prior error and fit quality (n = {len(t)})", fontsize=11)
     ax.spines[["top", "right"]].set_visible(False)
@@ -494,16 +530,24 @@ def main():
     model = train(sim)
     yr = yang_rule_summary(sim)
     print(f"prior reliability model: {model['n']} replicates; grouped-CV Spearman {model['spearman']:.3f}")
-    for k in ("overall", "by_reliability_bin", "by_true_prior", "by_fitted_prior", "by_mode"):
+    for k in ("overall", "by_reliability_bin", "by_true_prior", "by_true_prior_continuous", "by_fitted_prior",
+              "by_mode"):
         print(f"  {k}: {model[k]}")
     print(f"Yang rule in the simulation: {json.dumps(yr, indent=1)}")
 
     cals = real_datasets()
     feats = real_features(cals, out / "recomputed_priors.json")
     tab = pd.concat([feats, predict(model, feats)], axis=1)
+    # evidence impact (analysis.calibration_quality.prior_impact; computed from this table's prior ranges, so a
+    # retrained model needs a rerun of prior_impact)
+    if (out / "prior_impact.csv").exists():
+        imp = pd.read_csv(out / "prior_impact.csv")
+        keep = ["dataset", "share_with_evidence", "baseline_agree", "typ_unchanged", "q90_unchanged",
+                "typ_unchanged_among_evidence", "q90_unchanged_among_evidence"]
+        tab = tab.merge(imp[[c for c in keep if c in imp]], on="dataset", how="left")
     tab.to_csv(out / "real_diagnostics.csv", index=False)
     summary = {k: v for k, v in model.items()
-               if k not in ("mean_model", "q90_model", "sim_sorted")}
+               if k not in ("mean_model", "q90_model", "sim_sorted", "cv")}
     summary.update(features=FEATURES, yang_rule=dict(threshold=YANG_T, min_heldout=YANG_MIN_HELDOUT,
                                                      simulation=yr, real_flagged=tab.loc[tab.yang_flag, "dataset"]
                                                      .tolist()))

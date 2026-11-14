@@ -23,12 +23,13 @@ from analysis.prior_simulation.simulate_priors import (ASSAYS, CLASSES, DEFAULT_
 from analysis.prior_simulation.summary import load, sel
 
 # Categorical slots 1-3 of the validated default palette, in fixed order.
-COLORS = dict(zip(ASSAYS, ["#2a78d6", "#eb6834", "#1baf7a"]))
+# assays are settings, not methods: the manuscript reserves blue / orange / green for ExCALIBR / author / acmgscaler
+COLORS = dict(zip(ASSAYS, ["#c49a5a", "#8b6fb0", "#3b2d52"]))
 SHORT = dict(zip(ASSAYS, ["A1", "A2", "A3"]))
 LONG = dict(zip(ASSAYS, ["M1 only", "M2 only", "M1 + M2"]))
 DETECTED = dict(zip(ASSAYS, [POP_M1_FRAC, 1 - POP_M1_FRAC, 1.0]))
 INK, MUTED, GRID, BOX = "#14171c", "#565d68", "#e6e8ec", "#f4f5f7"
-BENIGN = "#7a828d"
+BENIGN = "#1D7AAB"  # B/LB blue (manuscript sample colours)
 
 plt.rcParams.update({
     "font.size": 7, "axes.titlesize": 7.5, "axes.labelsize": 7, "xtick.labelsize": 6.5, "ytick.labelsize": 6.5,
@@ -76,7 +77,7 @@ def _points(ax, df, xcol, span, experiment=None):
             ax.plot(s[xcol].to_numpy() + base, pred, color=c, lw=1.0, alpha=0.45, zorder=2)
 
 
-PATH_C = "#a8434f"  # pathogenic (any mechanism) in the sample cartoons
+PATH_C = "#B1535F"  # pathogenic (any mechanism) in the sample cartoons; manuscript pink ramp
 
 
 def _clouds(ax, kappa=4.0, rho=0.0, n=90, seed=3, lim=(-7.5, 3)):
@@ -143,14 +144,17 @@ def _schematic(ax, base):
         ax.text(x0 + 0.19, y + h - 0.022, f"({score})", fontsize=6.1, color=MUTED, va="top")
         arrow((x_arrow, 0.58), (x0 - 0.01, y + h / 2))
         d_ax = ax.inset_axes([x0 + 0.012, y + 0.06, 0.23, h - 0.15], transform=ax.transAxes)
+        peak = 0.0
         for c, style, col in (("B", "-", BENIGN), ("M1", "--", COLORS[ASSAYS[0]]), ("M2", ":", COLORS[ASSAYS[1]])):
-            d_ax.plot(xs, class_density(xs, c, assay, 4.0, 0.0), ls=style, color=col, lw=1.1)
+            dens = class_density(xs, c, assay, 4.0, 0.0)
+            peak = max(peak, float(np.nanmax(dens)))
+            d_ax.plot(xs, dens, ls=style, color=col, lw=1.1)
         d_ax.set_yticks([])
         d_ax.set_xticks([-4, 0], ["abnormal", "normal"])
         d_ax.tick_params(length=0, labelsize=6)
         d_ax.spines["left"].set_visible(False)
         d_ax.set_xlim(-8, 3.5)
-        d_ax.set_ylim(0, 0.45)
+        d_ax.set_ylim(0, max(0.45, 1.12 * peak))  # A3 (min of e1, e2) has a taller benign peak: keep it in the box
         s_ax = ax.inset_axes([x0 + 0.3, y + 0.105, 0.265, h - 0.2], transform=ax.transAxes)
         r = base[base.assay == assay].iloc[0]
         c = COLORS[assay]
@@ -178,7 +182,11 @@ def _schematic(ax, base):
 
 
 # Sample cartoons above panels b-j: what each experiment changes.
-_SAMPLES = ("P/LP", "B/LB", "population", "synonymous")
+_SAMPLES = ("P/LP", "B/LB", "gnomAD", "synonymous")
+# manuscript sample colours for the benign part of each sample bar (analysis/figure4/panels.py SAMPLE_COLORS)
+SAMPLE_BENIGN = {"B/LB": "#1D7AAB", "gnomAD": "#A0A0A0", "synonymous": "#6BAA75"}
+# display names: the simulated unlabeled sample is a generic population, not gnomAD (data keys stay "gnomAD")
+SAMPLE_DISPLAY = {"gnomAD": "population"}
 
 
 def _bar(ax, y, parts, label, note=""):
@@ -201,11 +209,12 @@ def _cartoon_sizes(ax, counts):
     """Bars proportional to log10(n + 1) on a common scale (500 = full), one per sample, coloured by class."""
     _cartoon_axes(ax)
     full = np.log10(501)
-    comp = {"P/LP": [(1, PATH_C, "")], "B/LB": [(1, BENIGN, "")],
-            "population": [(0.25, PATH_C, ""), (0.75, BENIGN, "")], "synonymous": [(1, BENIGN, "")]}
+    comp = {"P/LP": [(1, PATH_C, "")], "B/LB": [(1, SAMPLE_BENIGN["B/LB"], "")],
+            "gnomAD": [(0.25, PATH_C, ""), (0.75, SAMPLE_BENIGN["gnomAD"], "")],
+            "synonymous": [(1, SAMPLE_BENIGN["synonymous"], "")]}
     for k, (name, n) in enumerate(zip(_SAMPLES, counts)):
         L = np.log10(n + 1) / full
-        _bar(ax, 3 - k, [(f * L, c, h) for f, c, h in comp[name]], name, str(n))
+        _bar(ax, 3 - k, [(f * L, c, h) for f, c, h in comp[name]], SAMPLE_DISPLAY.get(name, name), str(n))
     ax.set_ylim(-0.6, 3.6)
 
 
@@ -267,7 +276,7 @@ def make_figure(summ, out_path):
         inner = outer[r].subgridspec(2, 3, height_ratios=[0.36, 1], hspace=0.14, wspace=0.34)
         carts += [fig.add_subplot(inner[0, c]) for c in range(3)]
         grid += [fig.add_subplot(inner[1, c]) for c in range(3)]
-    clean = [("rich", "Rich samples"), ("TPK1-like", "Sparse samples"), ("KCNH2_Kozek-like", "Very sparse samples")]
+    clean = [("rich", "Rich samples"), ("sparse", "Sparse samples"), ("very_sparse", "Very sparse samples")]
     for ax, cax, (reg, title) in zip(grid[:3], carts[:3], clean):
         df = sel(summ, experiment="1_clean", regime=reg)
         ax.plot([0, 0.45], [0, 0.45], color=MUTED, ls="--", lw=0.8, zorder=1)
@@ -330,15 +339,22 @@ def make_figure(summ, out_path):
     return out_path
 
 
-def make_sample_size_figure(ss, out_path):
+def make_sample_size_figure(ss, out_path, scarcity=None):
     """Supplementary figure: bias (a-d) and SD (e-h) of the true-component prior estimate as one control sample at a
-    time is reduced (true prior 0.25; others at 100/100/500/200). Filled: all estimates (before the discard rule);
-    open: estimates kept by the discard rule (prior <= 0.001 or >= 0.999 dropped). Lines: closed-form predictions
-    (delta-method P/LP bias; asymptotic SD, Proposition 2)."""
+    time is reduced (true prior 0.25; others at 100/100/500/200). Filled circles: all estimates (before the discard rule);
+    open squares: estimates kept by the discard rule (prior <= 0.001 or >= 0.999 dropped). Lines: closed-form predictions
+    (delta-method P/LP bias; asymptotic SD, Proposition 2). With `scarcity`
+    (analysis.calibration_quality.figures_v3.prior_scarcity_stats), a third row adds panel (I): mean |fitted - true
+    prior| when all samples are scarce together, from the calibration-quality simulation."""
     from analysis.prior_simulation.simulate_priors import predicted_plp_bias, predicted_sd
     from analysis.prior_simulation.summary import BASE_COUNTS, SAMPLES
-    fig, axes = plt.subplots(2, 4, figsize=(7.2, 4.4), gridspec_kw=dict(hspace=0.55, wspace=0.38))
-    fig.subplots_adjust(left=0.075, right=0.99, top=0.93, bottom=0.17)
+    if scarcity is None:
+        fig, axes = plt.subplots(2, 4, figsize=(7.2, 4.4), gridspec_kw=dict(hspace=0.55, wspace=0.38))
+        fig.subplots_adjust(left=0.075, right=0.99, top=0.93, bottom=0.17)
+    else:
+        fig = plt.figure(figsize=(7.2, 6.6))
+        gs = fig.add_gridspec(3, 4, hspace=0.62, wspace=0.38, left=0.075, right=0.99, top=0.955, bottom=0.07)
+        axes = np.array([[fig.add_subplot(gs[r, c]) for c in range(4)] for r in range(2)])
     for j, sample in enumerate(SAMPLES):
         g = ss[ss["sample"] == sample]
         sizes = sorted(g["size"].unique(), reverse=True)
@@ -358,7 +374,7 @@ def make_sample_size_figure(ss, out_path):
                     x = np.array([pos[n] for n in r["size"]]) + (i - 1) * 0.16 + (dx if row == 0 else 0)
                     m = r[col].to_numpy()
                     err = np.vstack([m - r[lo].to_numpy(), r[hi].to_numpy() - m])
-                    ax.errorbar(x, m, yerr=err, fmt="o", ms=3.2, lw=1.0, capsize=0, color=c, zorder=3,
+                    ax.errorbar(x, m, yerr=err, fmt="o" if filled else "s", ms=3.2 if filled else 3.0, lw=1.0, capsize=0, color=c, zorder=3,
                                 mfc=c if filled else "white", mec=c, mew=0.9)
                 xs = np.arange(len(sizes)) + (i - 1) * 0.16
                 counts = [{**BASE_COUNTS, sample: n} for n in sizes]
@@ -374,18 +390,34 @@ def make_sample_size_figure(ss, out_path):
             ax.set_xticks(range(len(sizes)))
             ax.set_xticklabels([str(int(n)) for n in sizes])
             ax.set_xlim(-0.5, len(sizes) - 0.5)
-            name = "population" if sample == "gnomAD" else sample
+            name = SAMPLE_DISPLAY.get(sample, sample)
             _style(ax, f"{name} reduced" if row == 0 else "", f"{name} variants", ylim, ylabel=ylabel)
             _panel_letter(ax, _letter(row * 4 + j), x=-0.3, y=1.04)
     handles = [plt.Line2D([], [], marker="o", ls="", color=COLORS[a], mec="white", ms=5,
                           label=f"{SHORT[a]}: {LONG[a]}") for a in ASSAYS]
     handles += [
-        plt.Line2D([], [], marker="o", ls="", color=MUTED, ms=4.5, label="all estimates"),
-        plt.Line2D([], [], marker="o", ls="", color=MUTED, mfc="white", ms=4.5, label="after discard rule"),
+        plt.Line2D([], [], marker="o", ls="", color=MUTED, ms=4.5, label="true components, all estimates"),
+        plt.Line2D([], [], marker="s", ls="", color=MUTED, mfc="white", ms=4.2,
+                   label="true components, after discard rule"),
         plt.Line2D([], [], color=MUTED, alpha=0.45, lw=1.0, label="closed-form prediction"),
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=6, frameon=False, fontsize=6.3, columnspacing=1.0,
-               handletextpad=0.4, bbox_to_anchor=(0.5, 0.0))
+    if scarcity is None:
+        fig.legend(handles=handles, loc="lower center", ncol=6, frameon=False, fontsize=6.3, columnspacing=1.0,
+                   handletextpad=0.4, bbox_to_anchor=(0.5, 0.0))
+    else:
+        from analysis.calibration_quality.figures_v3 import draw_prior_scarcity
+        ax = fig.add_subplot(gs[2, :2])
+        # greys: tan/purple/dark already mean assays A1-A3 in panels A-H
+        draw_prior_scarcity(ax, scarcity, dict(fontsize=6.3, title_fontsize=6.3, loc="upper left",
+                                               bbox_to_anchor=(1.04, 1.0), alignment="left"),
+                            colors=["#bdbdbd", "#7f7f7f", "#2f2f2f"])
+        _style(ax, "All samples reduced together: ExCALIBR fit, A3-like assay", "controls per class (P/LP and B/LB)",
+               (0, None), ylabel="Mean |estimate − 0.25|")
+        _panel_letter(ax, _letter(8), x=-0.15, y=1.04)
+        lax = fig.add_subplot(gs[2, 2:])
+        lax.axis("off")
+        lax.legend(handles=handles, loc="upper right", ncol=1, frameon=False, fontsize=6.3, handletextpad=0.4,
+                   title="Panels A–H", title_fontsize=6.3, alignment="left", bbox_to_anchor=(1.0, 1.08))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300)

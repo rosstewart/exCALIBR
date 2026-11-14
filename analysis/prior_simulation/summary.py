@@ -92,12 +92,18 @@ def key_numbers(reps, tests, summ):
     k["np20"] = {a: one(sel(summ, experiment="2_noise_plp"), a, eps_p=0.2) for a in ASSAYS}
     k["nb20"] = {a: one(sel(summ, experiment="2_noise_blb"), a, delta_b=0.2) for a in ASSAYS}
 
-    kc = sel(summ, experiment="1_clean", regime="KCNH2_Kozek-like")
+    kc = sel(summ, experiment="1_clean", regime="very_sparse")
     k["kc"] = kc
-    kt = tests[(tests.test == "bias_vs_truth") & (tests.regime == "KCNH2_Kozek-like") & (tests.arm == "fit")
+    kt = tests[(tests.test == "bias_vs_truth") & (tests.regime == "very_sparse") & (tests.arm == "fit")
                & (tests.p_holm < 0.05)]
     k["kc_lo"], k["kc_hi"] = kt["mean_diff"].min(), kt["mean_diff"].max()
     k["kc_at05"] = sel(kc, assay=A1)["at05"].mean()
+    # sparse regime (rich composition scaled down 5-fold): significant fit biases and A1 bootstraps at the EM start
+    st = tests[(tests.test == "bias_vs_truth") & (tests.regime == "sparse") & (tests.arm == "fit")
+               & (tests.p_holm < 0.05)]
+    k["sp_n_sig"] = len(st)
+    k["sp_lo"], k["sp_hi"] = (st["mean_diff"].min(), st["mean_diff"].max()) if len(st) else (0.0, 0.0)
+    k["sp_at05"] = sel(sel(summ, experiment="1_clean", regime="sparse"), assay=A1)["at05"].mean()
 
     sep = sel(summ, experiment="4_separation", true_prior=0.25)
     k["sep15"] = one(sep, A1, delta=1.5)
@@ -142,7 +148,7 @@ TABLE_SETTINGS = (
        ("75\\% of P/LP via M1", dict(experiment="3_mech_bias", lab_m1_frac=0.75)),
        ("$\\kappa = 1.5$ SD", dict(experiment="4_separation", true_prior=0.25, delta=1.5)),
        ("$\\rho = 0.6$, $\\kappa = 2.5$", dict(experiment="5_correlation", true_prior=0.25, delta=2.5, rho=0.6))]
-    + [(f"3/0/10/6 samples, $P(Y=1) = {p:.2f}$", dict(experiment="1_clean", regime="KCNH2_Kozek-like", true_prior=p))
+    + [(f"5/5/25/10 samples, $P(Y=1) = {p:.2f}$", dict(experiment="1_clean", regime="very_sparse", true_prior=p))
        for p in (0.10, 0.25)]
 )
 

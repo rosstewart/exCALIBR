@@ -255,6 +255,10 @@ def main():
     ap.add_argument("--design", choices=("main", "sample_size", "policy"), default="main",
                     help="main grid (paired_*.csv), one-at-a-time sample downsampling (sample_size_*.csv), or the "
                          "boundary-prior policy test (policy_*.csv; raw per-bootstrap priors, 20 bootstraps)")
+    ap.add_argument("--only-regimes", nargs="+", default=None,
+                    help="run only the settings of these regimes (with their usual seeds) and merge them into the "
+                         "existing replicates file: rows of these regimes, and of regimes no longer defined, are "
+                         "replaced; the tests are recomputed on the merged file")
     args = ap.parse_args()
 
     settings = {"main": build_settings, "sample_size": build_sample_size_settings,
@@ -267,16 +271,26 @@ def main():
     # The policy design keeps each bootstrap fit's gnomAD-point densities, so prior rules (start value, discard or
     # clip, fallbacks) can be rerun later without refitting.
     density_dir = args.out_dir / f"{prefix}_densities" if args.design == "policy" else None
+    # seeds are assigned over the full list first, so a subset (--only-regimes) keeps each setting's usual seed
+    pairs = [(s, seed) for s, seed in zip(settings, seeds) if not args.only_regimes or s[1] in args.only_regimes]
     tasks = [delayed(replicate_task)(s, int(seed), r, True, args.n_boot, args.n_restarts, density_dir)
-             for s, seed in zip(settings, seeds) for r in range(args.n_rep_fit)]
+             for s, seed in pairs for r in range(args.n_rep_fit)]
     tasks += [delayed(oracle_chunk)(s, int(seed), r0, min(r0 + ORACLE_CHUNK, args.n_rep_oracle))
-              for s, seed in zip(settings, seeds)
+              for s, seed in pairs
               for r0 in range(args.n_rep_fit, args.n_rep_oracle, ORACLE_CHUNK)]
+    settings = [s for s, _ in pairs]
     print(f"{len(settings)} settings: {args.n_rep_fit} fitted + {args.n_rep_oracle - args.n_rep_fit} "
           f"true-component-only replicates each; {len(tasks)} tasks on {args.n_jobs} workers", flush=True)
     # Fit tasks first: they dominate the runtime.
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(tasks)
     reps = pd.DataFrame([row for res in results for row in res])
+    if args.only_regimes:
+        old_path = args.out_dir / f"{prefix}_replicates.csv"
+        old = pd.read_csv(old_path)
+        known = set(REGIMES) | set(SAMPLE_SIZE_REGIMES)
+        keep = old[old["regime"].isin(known) & ~old["regime"].isin(args.only_regimes)]
+        print(f"merging {len(reps)} new rows with {len(keep)} kept of {len(old)} in {old_path.name}", flush=True)
+        reps = pd.concat([keep.drop(columns=["expected_prior"], errors="ignore"), reps], ignore_index=True)
     ek = ["assay", "regime", "true_prior", "delta", "rho", "eps_p", "delta_b", "lab_m1_frac"]
     uniq = reps[ek].drop_duplicates().copy()
     uniq["expected_prior"] = [

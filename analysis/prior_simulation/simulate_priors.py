@@ -57,10 +57,11 @@ ASSAYS = ["A1 (M1 only)", "A2 (M2 only)", "A3 (M1+M2)"]
 CLASSES = ["B", "M1", "M2"]
 
 # (P/LP, B/LB, gnomAD, synonymous) counts.
+# sparse and very sparse: the rich composition scaled down 5- and 20-fold (only sample size changes)
 REGIMES = {
     "rich": (100, 100, 500, 200),
-    "TPK1-like": (8, 1, 50, 20),
-    "KCNH2_Kozek-like": (3, 0, 10, 6),
+    "sparse": (20, 20, 100, 40),
+    "very_sparse": (5, 5, 25, 10),
 }
 
 P_IDX, B_IDX, G_IDX, S_IDX = 0, 1, 2, 3

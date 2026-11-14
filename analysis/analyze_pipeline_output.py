@@ -3178,8 +3178,8 @@ if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
     _f3("SuppPriorSimGapSepMulti", _psk["fo23_sep25"], "A2/A3, pi = 0.25, all Delta: largest |fit - true components|")
     _f3("SuppPriorSimCorrGapMax", _psk["rho6_gap_max"], "A1, Delta = 2.5, rho = 0.6: largest |fit - true components|")
     _f3("SuppPriorSimSepOneFiveErr", _psk["sep15_o_err"], "Delta = 1.5: largest |true-component - truth|")
-    _f2("SuppPriorSimSparseBiasLo", _psk["kc_lo"], "3/0/10/6 controls: smallest significant fit bias")
-    _f2("SuppPriorSimSparseBiasHi", _psk["kc_hi"], "3/0/10/6 controls: largest significant fit bias")
+    _f2("SuppPriorSimSparseBiasLo", _psk["kc_lo"], "very sparse 5/5/25/10: smallest significant fit bias")
+    _f2("SuppPriorSimSparseBiasHi", _psk["kc_hi"], "very sparse 5/5/25/10: largest significant fit bias")
     def _ps_range(lo, hi, fmt=".2f"):
         lo, hi = format(lo, fmt), format(hi, fmt)
         return lo if lo == hi else f"{lo}--{hi}"
@@ -3208,7 +3208,13 @@ if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
               f"Delta 1.5: {[round(v, 3) for v in _psk['sd_sep15'].values()]}",
               "supplement.tex prior simulation (less separation -> less precise, not biased)")
     REG.num("SuppPriorSimSparseEMInitPct", 100 * _psk["kc_at05"], fmt=".0f",
-            source="3/0/10/6 controls, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
+            source="very sparse 5/5/25/10, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
+    _f2("SuppPriorSimModSparseBiasLo", _psk["sp_lo"], "sparse 20/20/100/40: smallest significant fit bias")
+    _f2("SuppPriorSimModSparseBiasHi", _psk["sp_hi"], "sparse 20/20/100/40: largest significant fit bias")
+    REG.num("SuppPriorSimModSparseNSig", _psk["sp_n_sig"], fmt=".0f",
+            source="sparse 20/20/100/40: settings (of 12) with a significant fit bias (Holm)", **_ps_inp)
+    REG.num("SuppPriorSimModSparseEMInitPct", 100 * _psk["sp_at05"], fmt=".0f",
+            source="sparse 20/20/100/40, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
 
     REG.check("prior-sim-true-unbiased", _psk["o_bias_max"] < 0.02 and _psk["o_bias_nsig"] == 0,
               f"rich clean true-component |bias| max {_psk['o_bias_max']:.4f}, {_psk['o_bias_nsig']} significant",
@@ -3265,8 +3271,25 @@ if "_ps_sim" in globals() and not config.warn_if_missing(str(_ss_reps_path), "pr
                 regen="python -m analysis.prior_simulation.test_priors --design sample_size --n-jobs 120")
     _ss_r = pd.read_csv(_ss_reps_path, low_memory=False)
     _ss = _ss_summary(_ss_r)
-    _ss_fig = _ss_make_figure(_ss, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_prior_sample_size.png")
-    REG.figure("fig:prior_sample_size", _ss_fig, inputs=[_ss_reps_path])
+    # Panel I: all samples scarce together, from the calibration-quality core grid (true prior 0.25, gamma = 1,
+    # kappa = 4); left out (8-panel figure) if that grid is missing.
+    _cq_res = Path(config.CALIBRATION_QUALITY_DIR) / "results.csv"
+    _ss_scar = None
+    if not config.warn_if_missing(str(_cq_res), "calibration-quality results (S2 joint-scarcity panel)"):
+        from analysis.calibration_quality import summarize as _cq_sum_s2, figures_v3 as _cq_v3_s2
+        _ss_scar = _cq_v3_s2.prior_scarcity_stats(_cq_sum_s2.load(config.CALIBRATION_QUALITY_DIR))
+    _ss_fig = _ss_make_figure(_ss, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_prior_sample_size.png",
+                              scarcity=_ss_scar)
+    REG.figure("fig:prior_sample_size", _ss_fig, inputs=[_ss_reps_path] + ([_cq_res] if _ss_scar is not None else []))
+    if _ss_scar is not None:
+        for _lv, _tag in (("50, 0", "Low"), ("200, 100", "Mid"), ("1000, 500", "High")):
+            _gs2 = _ss_scar[_ss_scar.level == _lv]
+            REG.num(f"SuppPriorScarceErr{_tag}Lo", 100 * _gs2["mean"].min(), fmt=".1f", inputs=[_cq_res],
+                    source=f"S2I, population/synonymous {_lv}: smallest mean |prior error| (pp) over 5-80 controls")
+            REG.num(f"SuppPriorScarceErr{_tag}Hi", 100 * _gs2["mean"].max(), fmt=".1f", inputs=[_cq_res],
+                    source=f"S2I, population/synonymous {_lv}: largest mean |prior error| (pp) over 5-80 controls")
+        REG.num("SuppPriorScarceNReps", int(_ss_scar["n_reps"].min()), fmt=".0f", kind="method", inputs=[_cq_res],
+                source="S2I: replicates per setting (calibration-quality core grid)")
     _ss_inp = dict(inputs=[_ss_reps_path])
     _A1, _A2, _A3 = _ps_sim.ASSAYS
 
@@ -3356,9 +3379,9 @@ if "_ps_sim" in globals() and not config.warn_if_missing(str(_pol_path), "prior-
     REG.num("SuppPriorRuleGnomadBiasClip", _p2.bias, fmt=".3f", source=f"{_pg}, A1, fit: bias, clip", **_pol_inp)
     REG.num("SuppPriorRuleGnomadNonePct", 100 * _p0.nan_frac, fmt=".0f",
             source=f"{_pg}, A1, fit: % of datasets with no prior under discarding", **_pol_inp)
-    _fb = _polr("1_clean", "KCNH2_Kozek-like", 0.40, _ps_sim.ASSAYS[0], "P4")
+    _fb = _polr("1_clean", "very_sparse", 0.40, _ps_sim.ASSAYS[0], "P4")
     REG.num("SuppPriorRuleFallbackBiasHigh", _fb.bias, fmt=".3f",
-            source="KCNH2-like, true prior 0.40, A1, fit: bias of the 0.1 fallback", **_pol_inp)
+            source="very sparse, true prior 0.40, A1, fit: bias of the 0.1 fallback", **_pol_inp)
     _kept = {d: _resolved_cals[d].get("pct_bootstraps_kept") for d in datasets}
     _kept = {d: float(v) for d, v in _kept.items() if v is not None}
     REG.num("SuppPriorRuleNDatasetsLossTen", sum(v < 0.9 for v in _kept.values()),
@@ -3372,16 +3395,16 @@ if "_ps_sim" in globals() and not config.warn_if_missing(str(_pol_path), "prior-
             return _sv[(_sv.regime == reg) & np.isclose(_sv.true_prior, tp) & (_sv.assay == assay)
                        & np.isclose(_sv.start, start) & (_sv.arm == arm)].iloc[0]
         _A1 = _ps_sim.ASSAYS[0]
-        REG.num("SuppPriorStartAtStartPct", 100 * max(_svr("KCNH2_Kozek-like", tp, _A1, 0.5).at_start
+        REG.num("SuppPriorStartAtStartPct", 100 * max(_svr("very_sparse", tp, _A1, 0.5).at_start
                                                       for tp in (0.05, 0.10, 0.25, 0.40)), fmt=".0f",
-                source="KCNH2-like, A1: largest % of true-component estimates at the EM start", **_pol_inp)
+                source="very sparse, A1: largest % of true-component estimates at the EM start", **_pol_inp)
         for _tp, _tag in ((0.05, "Five"), (0.25, "TwentyFive"), (0.40, "Forty")):
             for _st, _st_tag in ((0.5, "Half"), (0.1, "Tenth")):
-                REG.num(f"SuppPriorStartBias{_tag}{_st_tag}", _svr("KCNH2_Kozek-like", _tp, _A1, _st).bias,
-                        fmt=".3f", source=f"KCNH2-like, true prior {_tp}, A1, true components: bias, EM start {_st}",
+                REG.num(f"SuppPriorStartBias{_tag}{_st_tag}", _svr("very_sparse", _tp, _A1, _st).bias,
+                        fmt=".3f", source=f"very sparse, true prior {_tp}, A1, true components: bias, EM start {_st}",
                         **_pol_inp)
-                REG.num(f"SuppPriorStartFitBias{_tag}{_st_tag}", _svr("KCNH2_Kozek-like", _tp, _A1, _st, "fit").bias,
-                        fmt=".3f", source=f"KCNH2-like, true prior {_tp}, A1, ExCALIBR fit: bias, EM start {_st}",
+                REG.num(f"SuppPriorStartFitBias{_tag}{_st_tag}", _svr("very_sparse", _tp, _A1, _st, "fit").bias,
+                        fmt=".3f", source=f"very sparse, true prior {_tp}, A1, ExCALIBR fit: bias, EM start {_st}",
                         **_pol_inp)
         _rich_sv = _sv[_sv.regime == "rich"].pivot_table(index=["true_prior", "assay", "arm"], columns="start",
                                                           values="mean")
@@ -3415,7 +3438,9 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
         make_diagnostics_figure as _cq_fig2
     REG.require(_cq_res, "calibration-quality simulation results (Supp Figures/Table)",
                 regen="python -m analysis.calibration_quality.tasks collect <dir>  # after the HPC grid")
-    _cq_df = _cq.load(_cq_dir)
+    # original 516-setting design only: the NU, continuous-prior and 1%/2.5%/60% slices of hpc_grid_r8_v2 train the
+    # reliability diagnostics (analysis.calibration_quality.diagnostics), not the supplement's numbers
+    _cq_df = _cq.original_design(_cq.load(_cq_dir))
     _cq_inp = dict(inputs=[_cq_res])
     _cq_m = _cq.acmgscaler_compare(_cq_dir, _cq_df)
     _cq_merged = _cq_m[0] if _cq_m is not None else _cq_df.assign(acmg_ok=False)
@@ -3437,6 +3462,25 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
         precision_curve as _cq_prec
     _f = _cq_fig3(_cq_merged, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_calqual_posterior.png")
     REG.figure("fig:calqual_posterior", _f, **_cq_inp)
+
+    # Revised figure set (analysis.calibration_quality.figures_v2): design + evidence retained (S3), overstated
+    # evidence vs acmgscaler (S4), posterior precision (S5), prior-spread diagnostics (S6), fit quality (S7). The
+    # figures above are kept; S5 here supersedes fig:calqual_posterior's earlier version under its own label.
+    from analysis.calibration_quality import figures_v2 as _cq_v2
+    _cq_mdir = Path(FIGURE_SUBDIRS["manuscript"])
+    REG.figure("fig:calqual_design", _cq_v2.make_design_figure(_cq_df, _cq_mdir / "supp_calqual_design.png"),
+               **_cq_inp)
+    REG.figure("fig:calqual_overstated",
+               _cq_v2.make_overstated_figure(_cq_merged, _cq_mdir / "supp_calqual_overstated.png"), **_cq_inp)
+    REG.figure("fig:calqual_posterior_v2",
+               _cq_v2.make_posterior_figure(_cq_merged, _cq_mdir / "supp_calqual_posterior_v2.png"), **_cq_inp)
+    _cq_ex_path = Path(config.CALIBRATION_QUALITY_DIR).parent / "example_fits.json"
+    if _cq_ex_path.exists():
+        _cq_ex = json.loads(_cq_ex_path.read_text())
+        _cq_order = ["well", "overfit", "underfit"]
+        _cq_ex = sorted(_cq_ex, key=lambda e: next(i for i, k in enumerate(_cq_order) if e["name"].startswith(k)))
+        REG.figure("fig:calqual_misfit", _cq_v2.make_misfit_figure(_cq_df, _cq_ex, _cq_mdir / "supp_calqual_misfit.png"),
+                   inputs=[_cq_res, _cq_ex_path])
     _p10 = _cq_merged[(_cq_merged.experiment == "core") & np.isclose(_cq_merged.pi, 0.10) & (_cq_merged.n_plp >= 10)]
     _ppv = lambda d, p, t=0.9: float(_cq_prec(d, p).set_index("t").loc[t, "ppv"]) if len(d) else float("nan")
     _npv = lambda d, p, t=0.1: float(_cq_prec(d, p).set_index("t").loc[t, "npv"]) if len(d) else float("nan")
@@ -3512,15 +3556,16 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
             source="worst mechanism-mix-bias setting: % truly pathogenic variants overstated", **_cq_inp)
 
     # Power: evidence retained in the best and the hardest corners of the core grid
-    from analysis.calibration_quality.figures import retention_by_cell as _ret
+    # log-LR retention, as Figure S3C and the minimum-controls table (points when the log-LR columns are absent)
+    from analysis.calibration_quality.figures_v2 import llr_retention_by_cell as _ret
     _best = _cq_core[(_cq_core.kappa == 4) & (_cq_core.gamma == 1) & (_cq_core.richness == "high") &
                      (_cq_core.n_plp == 80)]
     REG.num("SuppCalQualRetBest", 100 * _ret(_best), fmt=".0f",
-            source="% of the truth's evidence retained, kappa 4, gamma 1, rich samples, 80 controls", **_cq_inp)
+            source="% of the truth's capped log LR retained, kappa 4, gamma 1, rich samples, 80 controls", **_cq_inp)
     _mod = _cq_core[(_cq_core.kappa == 2.5) & (_cq_core.gamma == 0.5) & (_cq_core.richness == "mid") &
                     (_cq_core.n_plp == 80)]
     REG.num("SuppCalQualRetModerate", 100 * _ret(_mod), fmt=".0f",
-            source="% of the truth's evidence retained, kappa 2.5, gamma 0.5, mid samples, 80 controls", **_cq_inp)
+            source="% of the truth's capped log LR retained, kappa 2.5, gamma 0.5, mid samples, 80 controls", **_cq_inp)
 
     # Prior reliability and its diagnostic
     REG.num("SuppCalQualPriorBadBest", 100 * float(_best.prior_bad.mean()), fmt=".0f",
@@ -3574,11 +3619,38 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
         REG.num("SuppCalQualMisfitMinN", int(_small.n_plp.iloc[0]), kind="method",
                 source="fewest controls per class among misspecified settings", **_cq_inp)
 
-    # The prior-spread diagnostic applied to the real calibrations: SD of the bootstrap priors approximated from
-    # their 5th and 95th percentiles (lr_values.json.gz priors_pct), (p95 - p5) / 3.29.
+    # Distance between the fitted and the true P/LP distribution (Figure S7F; yang_true_*, needs hpc_grid_r8_v2):
+    # overstated evidence in correctly specified settings above vs within 0.2, and how well the in-sample Yang
+    # distance (the largest over samples) identifies fits more than 0.2 from the truth (largest over samples)
+    if "yang_true_plp" in _cq_df and _cq_df["yang_true_plp"].notna().any():
+        from sklearn.metrics import roc_auc_score as _cq_auc
+        _cs = _cq_df[~_cq_df["experiment"].isin(["mech_bias", "misfit"])]
+        _ovr = lambda d: float(100 * ((d.fit_vs_truth_pathogenic_over + d.fit_vs_truth_benign_over) / 2).mean())
+        REG.num("SuppCalQualTrueDistOverHigh", _ovr(_cs[_cs.yang_true_plp > config.YANG_GOOD_FIT_THRESHOLD]),
+                fmt=".1f", source="% variants overstated, correctly specified, fitted-vs-true P/LP distance > 0.2",
+                **_cq_inp)
+        REG.num("SuppCalQualTrueDistOverLow", _ovr(_cs[_cs.yang_true_plp <= config.YANG_GOOD_FIT_THRESHOLD]),
+                fmt=".1f", source="% variants overstated, correctly specified, fitted-vs-true P/LP distance <= 0.2",
+                **_cq_inp)
+        _yt = _cs[[c for c in _cs if c.startswith("yang_true_")]].max(axis=1)
+        REG.num("SuppCalQualInSampleYangTrueAUC",
+                float(_cq_auc(_yt > config.YANG_GOOD_FIT_THRESHOLD, _cs["yang_train_max"])), fmt=".2f",
+                source="AUC of the largest in-sample Yang distance for a fitted-vs-true distance > 0.2 (largest "
+                       "over samples), correctly specified settings", **_cq_inp)
+
+    # The prior-spread diagnostic applied to the real calibrations: SD of the per-bootstrap priors, recomputed with
+    # production code (analysis.calibration_quality.recompute_priors; kept only where the recomputation reproduces
+    # the saved calibration exactly). Without that file: approximated from the saved 5th/95th percentiles
+    # (lr_values.json.gz priors_pct), (p95 - p5) / 3.29.
     import gzip as _cq_gzip
+    from analysis.calibration_quality.diagnostics import prior_stats as _cq_prior_stats
+    _cq_rp_path = Path(config.CALIBRATION_QUALITY_DIR).parent / "real_diagnostics" / "recomputed_priors.json"
+    _cq_rp = json.loads(_cq_rp_path.read_text()) if _cq_rp_path.exists() else {}
     _sd_real = {}
     for _d, _c in _resolved_cals.items():
+        if _cq_rp.get(_d, {}).get("match"):
+            _sd_real[_d] = _cq_prior_stats(_cq_rp[_d]["priors"])[0]
+            continue
         _lv = Path(config.OUTPUT_DIR) / _d / f"{_d}_{_c.get('n_c')}_lr_values.json.gz"
         if _lv.exists():
             with _cq_gzip.open(_lv, "rt") as _fh:
@@ -3586,10 +3658,18 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
             if _pp and all(np.isfinite(_pp)):
                 _sd_real[_d] = (_pp[2] - _pp[0]) / 3.29
     _flag = sorted(d for d, s in _sd_real.items() if s > 0.10)
-    REG.num("SuppCalQualRealNWithSD", len(_sd_real), source="real calibrations with bootstrap prior percentiles")
+    _n_exact = sum(bool(_cq_rp.get(d, {}).get("match")) for d in _sd_real)
+    REG.num("SuppCalQualRealNWithSD", len(_sd_real), source="real calibrations with a bootstrap prior SD",
+            inputs=[_cq_rp_path] if _cq_rp else ())
     REG.num("SuppCalQualRealNFlagged", len(_flag),
-            source="real calibrations whose approximate bootstrap prior SD exceeds 0.10")
+            source=f"real calibrations whose bootstrap prior SD exceeds 0.10 ({_n_exact} exact from recomputed "
+                   f"per-bootstrap priors, the rest approximated from the saved percentiles)")
     print(f"  real calibrations with prior SD > 0.10: {len(_flag)} of {len(_sd_real)}: {_flag}")
+    # Figure S6 with its real-data panel (D): the bootstrap prior SDs above
+    REG.figure("fig:calqual_diagnostics_v2",
+               _cq_v2.make_diagnostics_figure(_cq_df, _cq_mdir / "supp_calqual_diagnostics_v2.png",
+                                              sd_real=list(_sd_real.values())),
+               inputs=[_cq_res] + ([_cq_rp_path] if _cq_rp else []))
 
 # %% [markdown]
 # ## A12. Supplementary Data 1-3

@@ -396,10 +396,10 @@ def sd1_bootstrap_kept(path=SD1_CSV, calib_dir=CALIB_DIR):
 
 POLICY_ROWS = [  # (experiment, regime, true prior, label) shown in the policy table
     ("1_clean", "rich", 0.25, "rich controls, 0.25"),
-    ("1_clean", "TPK1-like", 0.05, "TPK1-like, 0.05"), ("1_clean", "TPK1-like", 0.25, "TPK1-like, 0.25"),
-    ("1_clean", "TPK1-like", 0.40, "TPK1-like, 0.40"),
-    ("1_clean", "KCNH2_Kozek-like", 0.05, "KCNH2-like, 0.05"), ("1_clean", "KCNH2_Kozek-like", 0.10, "KCNH2-like, 0.10"),
-    ("1_clean", "KCNH2_Kozek-like", 0.25, "KCNH2-like, 0.25"), ("1_clean", "KCNH2_Kozek-like", 0.40, "KCNH2-like, 0.40"),
+    ("1_clean", "sparse", 0.05, "sparse, 0.05"), ("1_clean", "sparse", 0.25, "sparse, 0.25"),
+    ("1_clean", "sparse", 0.40, "sparse, 0.40"),
+    ("1_clean", "very_sparse", 0.05, "very sparse, 0.05"), ("1_clean", "very_sparse", 0.10, "very sparse, 0.10"),
+    ("1_clean", "very_sparse", 0.25, "very sparse, 0.25"), ("1_clean", "very_sparse", 0.40, "very sparse, 0.40"),
     ("6_sample_size", "gnomAD = 10", 0.25, "gnomAD = 10, 0.25"), ("6_sample_size", "gnomAD = 20", 0.25, "gnomAD = 20, 0.25"),
     ("6_sample_size", "P/LP = 10", 0.25, "P/LP = 10, 0.25"),
 ]
@@ -424,7 +424,7 @@ def start_value_html(reps):
                           values="mean")
     n_big = int(((allp[0.5] - allp[0.1]).abs() > 0.01).sum())
     body = []
-    for reg, lab in (("TPK1-like", "Sparse (8/1/50/20)"), ("KCNH2_Kozek-like", "Very sparse (3/0/10/6)")):
+    for reg, lab in (("sparse", "Sparse (20/20/100/40)"), ("very_sparse", "Very sparse (5/5/25/10)")):
         for a in ASSAYS:
             for tp in (0.05, 0.10, 0.25, 0.40):
                 cells = []
@@ -442,7 +442,7 @@ def start_value_html(reps):
              "<th>True comp., start 0.5</th><th>True comp., start 0.1</th><th>Fit, start 0.5</th>"
              "<th>Fit, start 0.1</th></tr></thead><tbody>" + "".join(body) + "</tbody></table></div>")
     A1 = ASSAYS[0]
-    k = {(tp, arm, st): g("KCNH2_Kozek-like", tp, A1, arm, st) for tp in (0.05, 0.25, 0.40)
+    k = {(tp, arm, st): g("very_sparse", tp, A1, arm, st) for tp in (0.05, 0.25, 0.40)
          for arm in ("oracle", "fit") for st in (0.5, 0.1)}
     return f"""<h3>EM starting value: 0.1 instead of 0.5</h3>
 <p>Every replicate was also re-estimated with the prior EM started at 0.1 instead of production's 0.5, using the same
@@ -504,10 +504,10 @@ def policy_html(ps, reps, kept):
              + "</tr></thead><tbody>" + "".join(body) + "</tbody></table></div>")
     # headline numbers
     g10 = {p: g(fit, "6_sample_size", "gnomAD = 10", 0.25, ASSAYS[0], p) for p in ("P0", "P2a", "P4")}
-    k05 = {p: g(fit, "1_clean", "KCNH2_Kozek-like", 0.05, ASSAYS[2], p) for p in ("P0", "P2a")}
-    k40 = {p: g(fit, "1_clean", "KCNH2_Kozek-like", 0.40, ASSAYS[0], p) for p in ("P0", "P2a", "P3", "P4")}
-    k10 = {p: g(fit, "1_clean", "KCNH2_Kozek-like", 0.10, ASSAYS[0], p) for p in ("P2a", "P3")}
-    t25 = {p: g(fit, "1_clean", "TPK1-like", 0.25, ASSAYS[0], p) for p in ("P0", "P2a")}
+    k05 = {p: g(fit, "1_clean", "very_sparse", 0.05, ASSAYS[2], p) for p in ("P0", "P2a")}
+    k40 = {p: g(fit, "1_clean", "very_sparse", 0.40, ASSAYS[0], p) for p in ("P0", "P2a", "P3", "P4")}
+    k10 = {p: g(fit, "1_clean", "very_sparse", 0.10, ASSAYS[0], p) for p in ("P2a", "P3")}
+    t25 = {p: g(fit, "1_clean", "sparse", 0.25, ASSAYS[0], p) for p in ("P0", "P2a")}
     rich_max = float(fit[(fit.regime == "rich") & (fit.true_prior >= 0.10)].groupby(["true_prior", "assay"])["mean"]
                      .agg(lambda x: x.max() - x.min()).max())
     floor_max = float(fit[fit.policy == "P2a"].floor.max())
@@ -552,7 +552,7 @@ variants, the M1-only bias fell from {g10['P0'].bias:+.3f} (discard; {100 * g10[
 no prior) to {g10['P2a'].bias:+.3f} (clip), with RMSE {g10['P0'].rmse:.3f} and {g10['P2a'].rmse:.3f}. For the
 KCNH2-like controls at a true prior of 0.05, the combined assay's bias fell from {k05['P0'].bias:+.3f} to
 {k05['P2a'].bias:+.3f}, and {100 * k05['P0'].nan_frac:.0f}% of datasets had no prior under discarding. But at
-higher true priors, discarding had the lower error: TPK1-like at 0.25, M1-only RMSE {t25['P0'].rmse:.3f} (discard)
+higher true priors, discarding had the lower error: sparse at 0.25, M1-only RMSE {t25['P0'].rmse:.3f} (discard)
 versus {t25['P2a'].rmse:.3f} (clip); KCNH2-like at 0.40, {k40['P0'].rmse:.3f} versus {k40['P2a'].rmse:.3f}. Over all
 fitted settings where the two differ (RMSE difference over 0.005), clipping had the lower error in {wins['fit'][0]} of
 {wins['fit'][1]}, all at a true prior of {min(clip_wins_low):.2f}–{max(clip_wins_low):.2f}; with the true components,
@@ -677,7 +677,7 @@ def build(out_dir):
     n_f = int(reps.groupby(KEYS)["fit"].count().max())
 
     base = sel(summ, experiment="1_clean", regime="rich", true_prior=0.25)
-    clean = {reg: sel(summ, experiment="1_clean", regime=reg) for reg in ("rich", "TPK1-like", "KCNH2_Kozek-like")}
+    clean = {reg: sel(summ, experiment="1_clean", regime=reg) for reg in ("rich", "sparse", "very_sparse")}
     noise_p = sel(summ, experiment="2_noise_plp")
     noise_b = sel(summ, experiment="2_noise_blb")
     mech = sel(summ, experiment="3_mech_bias")
@@ -687,8 +687,8 @@ def build(out_dir):
 
     pticks = [0, 0.1, 0.2, 0.3, 0.4, 0.5]
     charts_clean = "".join(panel(
-        {"rich": "Rich samples (100 / 100 / 500 / 200)", "TPK1-like": "TPK1-like (8 / 1 / 50 / 20)",
-         "KCNH2_Kozek-like": "KCNH2_Kozek-like (3 / 0 / 10 / 6)"}[reg],
+        {"rich": "Rich samples (100 / 100 / 500 / 200)", "sparse": "Sparse (20 / 20 / 100 / 40)",
+         "very_sparse": "Very sparse (5 / 5 / 25 / 10)"}[reg],
         "True prior", (0, 0.45), (0, 0.6), [0, 0.1, 0.2, 0.3, 0.4], [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
         series_for(df, "true_prior", lambda r: f"true prior {r.true_prior:.2f}"), identity=True)
         for reg, df in clean.items())
@@ -728,7 +728,7 @@ def build(out_dir):
         + [(f"P/LP 20% benign", np20[a]) for a in ASSAYS]
         + [(f"B/LB 20% pathogenic", nb20[a]) for a in ASSAYS]
         + [(f"P/LP 75% M1", m75[a]) for a in ASSAYS]
-        + [(f"KCNH2_Kozek-like, P(Y=1) = {r.true_prior:.2f}", r) for _, r in kc.iterrows()]
+        + [(f"very_sparse, P(Y=1) = {r.true_prior:.2f}", r) for _, r in kc.iterrows()]
     )
 
     resp4a = (
@@ -1097,7 +1097,7 @@ experiment: bias against the true prior; deviation from the large-sample expecta
 <p>With rich controls, the true-component estimates are unbiased for every assay (largest mean error
 {o_bias_max:.3f}), and so is the fit (largest {max(f23_bias_max, fa1_max):.3f}; none significant). The M1-only
 assay is less
-precise than the others (significantly larger absolute error). With TPK1-like controls the M1-only assay is unstable. With KCNH2_Kozek-like controls (3 P/LP, 0 B/LB) every assay
+precise than the others (significantly larger absolute error). With sparse controls the M1-only assay is unstable. With very_sparse controls (3 P/LP, 0 B/LB) every assay
 is biased upward at low priors. When the few P/LP variants contain none that score abnormally, the prior EM cannot move
 from its starting value of 0.5 ({100 * kc_at05:.0f}% of M1-only bootstraps in this regime).</p>
 </section>

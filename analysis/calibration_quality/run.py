@@ -247,7 +247,10 @@ def posterior_metrics(post, post_true, lr_used, is_path=None):
     claim = np.where(lr_used > 1, post - post_true, np.where(lr_used < 1, post_true - post, 0.0))
     out = dict(post_mae=float(np.abs(post - post_true).mean()),
                post_over=float((claim > POST_OVER_TOL).mean()),
-               post_over_mean=float(np.clip(claim, 0, None).mean()))
+               post_over_mean=float(np.clip(claim, 0, None).mean()),
+               post_over_any=float((claim > 0).mean()),  # share overshooting at all (no tolerance)
+               post_over_5=float((claim > 0.05).mean()),  # share overshooting by > 5 pp
+               post_over_10=float((claim > 0.10).mean()))  # share overshooting by > 10 pp
     if is_path is not None:  # calibration: the observed pathogenic share among variants with extreme posteriors
         for b in POST_BINS:
             hi, lo = post >= b, post <= 1 - b

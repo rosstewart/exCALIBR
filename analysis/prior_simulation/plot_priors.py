@@ -85,10 +85,10 @@ def main():
         ax[0].plot(x, x * DETECTED[assay], ls=":", lw=1.2, color=COLORS[assay])
     ax[0].text(0.44, 0.02, "dotted: fraction of gnomAD that is\npathogenic AND detected by the assay",
                fontsize=7, color=MUTED, ha="right")
-    _panel(ax[1], df, "b  Clean labels, TPK1-like (8/1/50/20)", "true_prior", "True prior",
-           experiment="1_clean", regime="TPK1-like")
-    _panel(ax[2], df, "c  Clean labels, KCNH2_Kozek-like (3/0/10/6)", "true_prior", "True prior",
-           experiment="1_clean", regime="KCNH2_Kozek-like")
+    _panel(ax[1], df, "b  Clean labels, sparse (20/20/100/40)", "true_prior", "True prior",
+           experiment="1_clean", regime="sparse")
+    _panel(ax[2], df, "c  Clean labels, very sparse (5/5/25/10)", "true_prior", "True prior",
+           experiment="1_clean", regime="very_sparse")
     _panel(ax[3], df, "d  Benign variants labeled P/LP", "eps_p", "Fraction of P/LP that are benign",
            experiment="2_noise_plp")
     _panel(ax[4], df, "e  Pathogenic variants labeled B/LB", "delta_b",

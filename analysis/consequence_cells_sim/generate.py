@@ -66,6 +66,10 @@ DEFAULTS = dict(
     mis_mech=dict(stability=0.45, activity=0.40, other=0.15),
     tau_ptv=0.95,   # P/LP PTV pathogenic-evidence share: SGE 0.95 (VAMP-seq 0.80)
     nu=0.3,         # hypomorph slice only
+    # PTV loss of function scores at -ptv_loc * kappa (1 = same abnormal component as missense). Real data: the P/LP PTV
+    # median sits 1.0x the P/LP missense distance from benign where PTV and missense overlap, 1.3x elsewhere and 4-6x
+    # in LDLR, G6PD and CTCF (real_overlap/rel_yang_real.csv). Slices only; != 1 adds a component (K + 1).
+    ptv_loc=1.0,
     # population consequence shares: median over the large-cell datasets (missense 0.75, synonymous 0.22, PTV 0.02)
     pop_share=dict(synonymous=0.22, missense=0.75, PTV=0.03),
     # control mixes among the modelled consequences: P/LP PTV 0.31, synonymous 0.001; B/LB synonymous 0.91
@@ -79,6 +83,9 @@ SIZES = {"small": (10, 15, 150, 50), "mid": (40, 60, 500, 150), "large": (160, 2
 MIXES = {"balanced": (0.50, 0.10), "realistic": (0.91, 0.31), "extreme": (0.97, 0.50)}  # (B/LB syn share, P/LP PTV)
 KAPPAS = (2.0, 3.5, 5.0)  # kappa proxy (biased high: P/LP with evidence) medians SGE 5.6, VAMP 6.7, other 4.2
 PI_MIS = (0.0441, 0.09, 0.136)  # Pejaver 2022; SGE median; SGE q75
+
+
+CLASSES = ("ptv", "abn", "int", "nor")
 
 
 def _anchored_defaults():
@@ -144,6 +151,10 @@ def design():
                 sl(mis_mech=dict(stability=st, activity=round(g - st, 4), other=round(1 - g, 4)))
         sl(hypomorph=True, nu=0.3)
         sl(n_blb=0)                               # PU-like: no B/LB
+    # PTV-location slices (2026-11-13): PTV LoF beyond abnormal missense, as in the real non-overlap datasets.
+    # Moderate (kappa 3.5, PTV at 1.5x) and missense-hypomorphic (kappa 2, PTV at 2.5x), mid and large, both assays.
+    for (kap, loc), size, assay in itertools.product(((3.5, 1.5), (2.0, 2.5)), ("mid", "large"), ("fitness", "abundance")):
+        cells.append(make_cell("ptvloc", size, "realistic", kappa=kap, assay=assay, ptv_loc=loc))
     sl_mis = make_cell("misfit", "mid", "realistic", assay="fitness", shape="skew")
     cells.append(sl_mis)
     seen, out = set(), []
@@ -173,7 +184,9 @@ def _mechanisms(c, csq):
 
 def _protein_class(m, assay, hypomorph):
     """Score class from the protein mechanism alone: 'abn', 'int' (intermediate) or 'nor'."""
-    if m == "LoF" or (m == "stability"):
+    if m == "LoF":
+        return "ptv"
+    if m == "stability":
         return "abn"
     if m == "activity":
         return "abn" if assay == "fitness" else "nor"
@@ -197,8 +210,10 @@ def enumerate_states(c, csq):
                     p_pp = c["pi_prot"][csq] if pp else 1 - c["pi_prot"][csq]
                     for m, p_m in (mech.items() if pp else [(None, 1.0)]):
                         cls = _protein_class(m, c["assay"], c.get("hypomorph")) if pp else "nor"
-                        if c["assay"] == "fitness" and d:
+                        if c["assay"] == "fitness" and d and cls != "ptv":
                             cls = "abn"                  # splicing is measured: disruption scores as LoF
+                        if cls == "ptv" and c.get("ptv_loc", 1.0) == 1.0:
+                            cls = "abn"                  # PTV LoF shares the abnormal component
                         out.append((ph * p_d * p_sp * p_pp * p_m, hi, sp or pp, cls))
     return out
 
@@ -214,8 +229,8 @@ def truth(c, csq):
     pp = sum(s[0] for s in st if s[2])
     sh = lambda path, cls: sum(s[0] for s in st if s[2] == path and s[3] == cls)
     pi = pp / tot
-    P = {k: (sh(True, k) / pp if pp > 0 else 0.0) for k in ("abn", "int", "nor")}
-    B = {k: sh(False, k) / (tot - pp) for k in ("abn", "int", "nor")}
+    P = {k: (sh(True, k) / pp if pp > 0 else 0.0) for k in CLASSES}
+    B = {k: sh(False, k) / (tot - pp) for k in CLASSES}
     return dict(pi=pi, P=P, B=B)
 
 
@@ -225,8 +240,9 @@ def _comp_logpdf(x, c):
         a = 4.0
         dl = a / np.sqrt(1 + a * a); mu, sd = dl * np.sqrt(2 / np.pi), np.sqrt(1 - 2 * dl * dl / np.pi)
         f = lambda loc: sps.skewnorm.logpdf(x, a, loc=loc - mu / sd, scale=1 / sd)
-        return dict(abn=f(-k), int=f(-k / 2), nor=f(0.0))
-    return dict(abn=sps.norm.logpdf(x, -k, 1), int=sps.norm.logpdf(x, -k / 2, 1), nor=sps.norm.logpdf(x, 0, 1))
+        return dict(ptv=f(-k * c.get("ptv_loc", 1.0)), abn=f(-k), int=f(-k / 2), nor=f(0.0))
+    return dict(ptv=sps.norm.logpdf(x, -k * c.get("ptv_loc", 1.0), 1), abn=sps.norm.logpdf(x, -k, 1),
+                int=sps.norm.logpdf(x, -k / 2, 1), nor=sps.norm.logpdf(x, 0, 1))
 
 
 def _mix_logpdf(x, c, shares):
@@ -245,12 +261,13 @@ def true_log_lr(x, c, csq):
 def true_component_params(c):
     """True components in production (skew, loc, scale) format, abnormal first."""
     k = c["kappa"]
-    comps = [(0.0, -k, 1.0)] + ([(0.0, -k / 2, 1.0)] if c.get("hypomorph") else []) + [(0.0, 0.0, 1.0)]
+    comps = ([(0.0, -k * c["ptv_loc"], 1.0)] if c.get("ptv_loc", 1.0) != 1.0 else []) + [(0.0, -k, 1.0)] + \
+        ([(0.0, -k / 2, 1.0)] if c.get("hypomorph") else []) + [(0.0, 0.0, 1.0)]
     return comps
 
 
 def n_components(c):
-    return 3 if c.get("hypomorph") else 2
+    return 2 + bool(c.get("hypomorph")) + (c.get("ptv_loc", 1.0) != 1.0)
 
 
 # ── sampling ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -271,7 +288,8 @@ def _draw(rng, c, csq, n, path=None, path_weight=None):
         z = (sps.skewnorm.rvs(a, size=n, random_state=rng) - mu) / sd
     else:
         z = rng.standard_normal(n)
-    loc = np.where(cls == "abn", -k, np.where(cls == "int", -k / 2, 0.0))
+    loc = np.where(cls == "ptv", -k * c.get("ptv_loc", 1.0),
+                   np.where(cls == "abn", -k, np.where(cls == "int", -k / 2, 0.0)))
     return loc + z, hi, pth, cls
 
 

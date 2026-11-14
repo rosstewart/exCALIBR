@@ -164,6 +164,10 @@ def evaluate(row, arm, csq, prior, l5, l50, l95, ev, c, cal=None):
         row[f"{p}_pts_over"] = float(((est > np.maximum(tru, 0)) | (est < np.minimum(tru, 0))).mean())
         row[f"{p}_pts_wrong"] = float((((est > 0) & (tru < 0)) | ((est < 0) & (tru > 0))).mean())
         row[f"{p}_pts_det"] = float((est != 0).mean())
+        # label-level errors (the real-data cost of pooling: P/LP missense with benign evidence)
+        row[f"{p}_path_benign"] = float((est[is_path] < 0).mean()) if is_path.any() else np.nan
+        row[f"{p}_path_pathev"] = float((est[is_path] > 0).mean()) if is_path.any() else np.nan
+        row[f"{p}_ben_pathev"] = float((est[~is_path] > 0).mean()) if (~is_path).any() else np.nan
         row[f"{p}_truth_pts_det"] = float((tru != 0).mean())
 
 
@@ -238,6 +242,13 @@ def run_cell(cell, rep, B=B_DEFAULT, R=R_DEFAULT):
             po, pp_ = lr_bounds(pool, x), lr_bounds(own, x)
             evaluate(row, "mm_ownprior_poolLR", csq, float(own["prior"]), *po, ev, c)
             evaluate(row, "mm_poolprior_ownLR", csq, float(pool["prior"]), *pp_, ev, c)
+        # overlap diagnostics (2026-11-13): points of the pooled, cell_all and cell_mis calibrations on every population
+        # row (make_data order; scores and consequences are regenerated from the seed), so PTV-vs-missense overlap
+        # tests (e.g. unlabeled PTV vs missense among rows with >= +1 pooled points) can be computed offline
+        pop_rows = d["mask"][:, POP]
+        for arm in ("pooled", "cell_all", "cell_mis"):
+            if arm in cal_store:
+                row[f"pop_points__{arm}"] = ";".join(map(str, points_of(cal_store[arm], sc[pop_rows])))
         row["status"] = "ok"
     except Exception as e:  # recorded, not raised
         import traceback
