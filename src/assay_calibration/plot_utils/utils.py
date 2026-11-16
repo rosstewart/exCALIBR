@@ -2731,11 +2731,14 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                 author_name = dataset.split('_')[1]
                 
                 # Panel letter on far left (matching Yang plot position)
-                ax.text(0.00, 1.23 if panel_idx < 2 else 1.18, f"({letter})",
-                       transform=ax.transAxes,
-                       fontsize=14, fontweight='bold',
-                       verticalalignment='top',
-                       horizontalalignment='left')
+                # fixed offset in points above the top axis, so the letter sits at the same height whatever the
+                # number of sample rows (an axes-fraction offset put (D) on the axis line when its panel had
+                # more rows, and hence a shorter top axis, than the others)
+                ax.annotate(f"({letter})", xy=(0.0, 1.0), xycoords='axes fraction',
+                            xytext=(0, 3), textcoords='offset points',
+                            fontsize=14, fontweight='bold',
+                            verticalalignment='bottom',
+                            horizontalalignment='left', annotation_clip=False)
                 
                 # Gene and author name centered (matching Yang plot)
                 _bold_italic_gene_title(ax, gene_name, f" – {author_name}",

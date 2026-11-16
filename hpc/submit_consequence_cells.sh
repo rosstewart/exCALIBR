@@ -11,6 +11,9 @@
 # Collect with
 #   python -m analysis.consequence_cells_sim.tasks collect <out_dir>
 #
+# MODULE=cellfits runs analysis.consequence_cells_sim.cellfits instead (cells-only refits that keep the per-cell
+# weights; writes <out_dir>/fits/<task id>.npz).
+#
 # SLURM parameters can be overridden via environment variables (as submit_array.sh).
 
 set -euo pipefail
@@ -22,11 +25,12 @@ TASKS="$OUT/tasks.json"
 [ -f "$TASKS" ] || { echo "Error: $TASKS not found (run analysis.consequence_cells_sim.tasks make)"; exit 1; }
 
 WORKERS="${WORKERS:-16}"
+MODULE="${MODULE:-tasks}"
 N_ARRAYS="${N_ARRAYS:-50}"
 N_TASKS=$(python3 -c "import json; print(len(json.load(open('$TASKS'))))")
 PER_INDEX="${PER_INDEX:-$(( (N_TASKS + N_ARRAYS - 1) / N_ARRAYS ))}"
 MAX_IDX=$(( (N_TASKS + PER_INDEX - 1) / PER_INDEX - 1 ))
-mkdir -p "$OUT/logs" "$OUT/runs"
+mkdir -p "$OUT/logs" "$OUT/runs" "$OUT/fits"
 
 ACCOUNT="${SLURM_ACCOUNT:-predrag}"
 JOB_NAME="${SLURM_JOB_NAME:-excalibr_csqcells_sim}"
@@ -54,11 +58,12 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 export PYTHONPATH=${REPO}
 cd ${REPO}
 # keep on one line: a backslash continuation here becomes a stray argument
-${PYTHON} -m analysis.consequence_cells_sim.tasks run ${OUT} --index \${SLURM_ARRAY_TASK_ID} --per-index ${PER_INDEX} --workers ${WORKERS}
+${PYTHON} -m analysis.consequence_cells_sim.${MODULE} run ${OUT} --index \${SLURM_ARRAY_TASK_ID} --per-index ${PER_INDEX} --workers ${WORKERS}
 SBATCH_SCRIPT
 )
 
 echo "Submitted job array ${JOB_ID}"
 echo "  Tasks      : ${N_TASKS}, ${PER_INDEX} per array task (indices 0-${MAX_IDX}, max ${MAX_CONCURRENT} concurrent)"
 echo "  workers    : ${WORKERS}   mem / cpus : ${MEM} / ${CPUS}   partition ${PARTITION}, time limit ${TIME}"
-echo "Progress:   ls ${OUT}/runs/*.csv | wc -l   (of ${N_TASKS})"
+echo "Module     : analysis.consequence_cells_sim.${MODULE}"
+echo "Progress:   ls ${OUT}/runs/*.csv ${OUT}/fits/*.npz 2>/dev/null | wc -l   (of ${N_TASKS})"

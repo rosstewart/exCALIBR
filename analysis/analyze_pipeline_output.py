@@ -3178,8 +3178,8 @@ if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
     _f3("SuppPriorSimGapSepMulti", _psk["fo23_sep25"], "A2/A3, pi = 0.25, all Delta: largest |fit - true components|")
     _f3("SuppPriorSimCorrGapMax", _psk["rho6_gap_max"], "A1, Delta = 2.5, rho = 0.6: largest |fit - true components|")
     _f3("SuppPriorSimSepOneFiveErr", _psk["sep15_o_err"], "Delta = 1.5: largest |true-component - truth|")
-    _f2("SuppPriorSimSparseBiasLo", _psk["kc_lo"], "very sparse 5/5/25/10: smallest significant fit bias")
-    _f2("SuppPriorSimSparseBiasHi", _psk["kc_hi"], "very sparse 5/5/25/10: largest significant fit bias")
+    _f2("SuppPriorSimSparseBiasLo", _psk["kc_lo"], "very sparse regime: smallest significant fit bias")
+    _f2("SuppPriorSimSparseBiasHi", _psk["kc_hi"], "very sparse regime: largest significant fit bias")
     def _ps_range(lo, hi, fmt=".2f"):
         lo, hi = format(lo, fmt), format(hi, fmt)
         return lo if lo == hi else f"{lo}--{hi}"
@@ -3208,36 +3208,46 @@ if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
               f"Delta 1.5: {[round(v, 3) for v in _psk['sd_sep15'].values()]}",
               "supplement.tex prior simulation (less separation -> less precise, not biased)")
     REG.num("SuppPriorSimSparseEMInitPct", 100 * _psk["kc_at05"], fmt=".0f",
-            source="very sparse 5/5/25/10, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
-    _f2("SuppPriorSimModSparseBiasLo", _psk["sp_lo"], "sparse 20/20/100/40: smallest significant fit bias")
-    _f2("SuppPriorSimModSparseBiasHi", _psk["sp_hi"], "sparse 20/20/100/40: largest significant fit bias")
+            source="very sparse regime, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
+    _f2("SuppPriorSimModSparseBiasLo", _psk["sp_lo"], "sparse regime: smallest significant fit bias")
+    _f2("SuppPriorSimModSparseBiasHi", _psk["sp_hi"], "sparse regime: largest significant fit bias")
     REG.num("SuppPriorSimModSparseNSig", _psk["sp_n_sig"], fmt=".0f",
-            source="sparse 20/20/100/40: settings (of 12) with a significant fit bias (Holm)", **_ps_inp)
+            source="sparse regime: settings (of 12) with a significant fit bias (Holm)", **_ps_inp)
     REG.num("SuppPriorSimModSparseEMInitPct", 100 * _psk["sp_at05"], fmt=".0f",
-            source="sparse 20/20/100/40, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
+            source="sparse regime, A1: % of fitted bootstraps returning the EM start 0.5", **_ps_inp)
 
     REG.check("prior-sim-true-unbiased", _psk["o_bias_max"] < 0.02 and _psk["o_bias_nsig"] == 0,
               f"rich clean true-component |bias| max {_psk['o_bias_max']:.4f}, {_psk['o_bias_nsig']} significant",
               "supplement.tex prior simulation (unbiased with true components)")
-    REG.check("prior-sim-fit-matches-multi", _psk["fo23"] < 0.02 and _psk["f23_bias_max"] < 0.02,
-              f"A2/A3 fit - true max {_psk['fo23']:.4f}; fit |bias| max {_psk['f23_bias_max']:.4f}",
+    # the text's claim covers the separation series at 0.25 ("at every separation") and the clean rich settings;
+    # fo23 (all rich settings, incl. correlation at 0.10) is reported in the message only
+    REG.check("prior-sim-fit-matches-multi", _psk["fo23_sep25"] < 0.02 and _psk["f23_bias_max"] < 0.02,
+              f"A2/A3 fit - true max {_psk['fo23_sep25']:.4f} (separation, 0.25; all rich settings {_psk['fo23']:.4f}); "
+              f"fit |bias| max {_psk['f23_bias_max']:.4f}",
               "supplement.tex prior simulation (fit matches for assays detecting most pathogenic variants)")
-    REG.check("prior-sim-fit-unbiased-rich", _psk["n_rich_sig"] == 0 and max(_psk["fa1_max"], _psk["f23_bias_max"]) < 0.05,
-              f"rich clean: {_psk['n_rich_sig']} significant biases (both arms); fit |bias| max "
-              f"A1 {_psk['fa1_max']:.4f}, A2/A3 {_psk['f23_bias_max']:.4f}",
-              "supplement.tex prior simulation (fit unbiased for every assay with rich, well-separated controls)")
+    # 80/80/1000/500 (2026-11-15): true components and the A2/A3 fit unbiased; the A1 (minority-mechanism) fit
+    # overestimates only at the lowest true prior
+    REG.check("prior-sim-fit-unbiased-rich", _psk["o_bias_nsig"] == 0 and _psk["f23_bias_max"] < 0.02
+              and _psk["fa1_sig_priors"] in ([], [min(_ps_sim_priors := sorted(_psk["bt"].true_prior.unique()))])
+              and _psk["fa1_max_prior"] == _ps_sim_priors[0],
+              f"rich clean: true-component significant biases {_psk['o_bias_nsig']}; A2/A3 fit |bias| max "
+              f"{_psk['f23_bias_max']:.4f}; A1 fit |bias| max {_psk['fa1_max']:.4f} at {_psk['fa1_max_prior']:g}, "
+              f"significant at {_psk['fa1_sig_priors']}",
+              "supplement.tex prior simulation (true components and A2/A3 fit unbiased with rich controls; A1 fit "
+              "too high only at the lowest true prior)")
+    REG.num("SuppPriorSimFitBiasMinorityPrior", _psk["fa1_max_prior"], fmt="g", kind="method",
+            source="true prior at which the A1 fit's bias is largest (rich clean)", **_ps_inp)
     REG.check("prior-sim-fit-minority-weak-sep",
               _gs[(0.25, 2.5)][0] > 0.03 and _gs[(0.25, 2.5)][1] < 0.05
               and _gs[(0.25, 4.0)][1] >= 0.05 and _gs[(0.25, 1.5)][1] >= 0.05
-              and min(_gs[(0.1, 2.5)][0], _gs[(0.1, 1.5)][0]) > 0.05
-              and max(_gs[(0.1, 2.5)][1], _gs[(0.1, 1.5)][1]) < 0.05
+              and max(_gs[(0.1, 2.5)][1], _gs[(0.1, 1.5)][1]) < 0.05 and _gs[(0.1, 4.0)][1] >= 0.05
               and _psk["fo23_sep25"] < 0.02 and _psk["rho6_gap_max"] < 0.02,
               f"A1 fit - true at pi 0.25 (Delta 4/2.5/1.5): "
               + ", ".join(f"{_gs[(0.25, d)][0]:+.3f} (p {_gs[(0.25, d)][1]:.3g})" for d in (4.0, 2.5, 1.5))
               + "; pi 0.10: " + ", ".join(f"{_gs[(0.1, d)][0]:+.3f} (p {_gs[(0.1, d)][1]:.3g})" for d in (4.0, 2.5, 1.5))
               + f"; A2/A3 max {_psk['fo23_sep25']:.4f}; rho 0.6 gap {_psk['rho6_gap_max']:.4f}",
-              "supplement.tex prior simulation (fit excess for the M1-only assay: significant only at -2.5 at 0.25; "
-              "larger at 0.10)")
+              "supplement.tex prior simulation (fit excess for the M1-only assay: significant only at 2.5 at 0.25; "
+              "at 0.10 significant at 2.5 and 1.5, not at 4)")
     REG.check("prior-sim-a3-immune", max(_psk["a3_mech_err"], _psk["a3_mech_err_o"]) < 0.02,
               f"A3 under P/LP mechanism bias: max |estimate - 0.25| fit {_psk['a3_mech_err']:.4f}, "
               f"true {_psk['a3_mech_err_o']:.4f}",
@@ -3288,6 +3298,14 @@ if "_ps_sim" in globals() and not config.warn_if_missing(str(_ss_reps_path), "pr
                     source=f"S2I, population/synonymous {_lv}: smallest mean |prior error| (pp) over 5-80 controls")
             REG.num(f"SuppPriorScarceErr{_tag}Hi", 100 * _gs2["mean"].max(), fmt=".1f", inputs=[_cq_res],
                     source=f"S2I, population/synonymous {_lv}: largest mean |prior error| (pp) over 5-80 controls")
+        for _lv, _tag in (("50, 0", "Low"), ("200, 100", "Mid"), ("1000, 500", "High")):
+            _gs2 = _ss_scar[_ss_scar.level == _lv]
+            REG.num(f"SuppPriorScarceSD{_tag}Lo", _gs2["sd"].min(), fmt=".3f", inputs=[_cq_res],
+                    source=f"S2J, population/synonymous {_lv}: smallest SD of the fitted prior over 5-80 controls")
+            REG.num(f"SuppPriorScarceSD{_tag}Hi", _gs2["sd"].max(), fmt=".3f", inputs=[_cq_res],
+                    source=f"S2J, population/synonymous {_lv}: largest SD of the fitted prior over 5-80 controls")
+        REG.num("SuppPriorScarceBiasMax", float(_ss_scar["bias"].abs().max()), fmt=".3f", inputs=[_cq_res],
+                source="S2I: largest |bias| of the fitted prior over all sizes and 5-80 controls")
         REG.num("SuppPriorScarceNReps", int(_ss_scar["n_reps"].min()), fmt=".0f", kind="method", inputs=[_cq_res],
                 source="S2I: replicates per setting (calibration-quality core grid)")
     _ss_inp = dict(inputs=[_ss_reps_path])
@@ -3301,7 +3319,7 @@ if "_ps_sim" in globals() and not config.warn_if_missing(str(_ss_reps_path), "pr
         REG.num(f"SuppPriorSSMin{_tag}", _mins[_s], kind="method", source=f"smallest {_s} sample size simulated")
     _f3s = lambda name, v, src: REG.num(name, v, fmt=".3f", source=src, **_ss_inp)
     for _a, _tag in ((_A1, "AOne"), (_A3, "AThree")):
-        _f3s(f"SuppPriorSSSDBase{_tag}", _ssr("gnomAD", 500, _a, "oracle_raw").sd, f"SD, rich controls, {_a}")
+        _f3s(f"SuppPriorSSSDBase{_tag}", _ssr("gnomAD", _ps_sim.REGIMES["rich"][2], _a, "oracle_raw").sd, f"SD, rich controls, {_a}")
         _f3s(f"SuppPriorSSSDGnomad{_tag}", _ssr("gnomAD", _g, _a, "oracle_raw").sd, f"SD, gnomAD = {_g}, {_a}")
         _f3s(f"SuppPriorSSSDGnomadPred{_tag}", _ps_sim.predicted_sd(_a, 0.25, _g, _rich[0]),
              f"asymptotic SD (Proposition 2), gnomAD = {_g}, {_a}")
@@ -3327,7 +3345,7 @@ if "_ps_sim" in globals() and not config.warn_if_missing(str(_ss_reps_path), "pr
              f"P/LP = {_n}, A1: bias before the discard rule")
         _f3s(f"SuppPriorSSPLPPred{_tag}", _ps_sim.predicted_plp_bias(_A1, 0.25, _n),
              f"P/LP = {_n}, A1: delta-method bias")
-    _plp_a3 = max(abs(_ssr("P/LP", _n, _A3, "oracle_raw").bias) for _n in (50, 20, 10, 5))
+    _plp_a3 = max(abs(_ssr("P/LP", _n, _A3, "oracle_raw").bias) for _n in _ps_test.SAMPLE_SIZE_GRID["P/LP"])
     _f3s("SuppPriorSSPLPAThreeMax", _plp_a3, "P/LP reduced, A3: largest |bias|")
     _oth = _ss[_ss["sample"].isin(["B/LB", "synonymous"]) & ~_ss.is_base & (_ss.arm == "oracle_raw")]
     _f3s("SuppPriorSSOtherBiasMax", float(_oth.bias.abs().max()), "B/LB or synonymous reduced: largest |bias|")
@@ -3450,6 +3468,55 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
                                    .query("status == 'ok'").copy())
     _cq_core = _cq_df[_cq_df["experiment"] == "core"]
 
+    # Overshoot shares for the text (figures plot the mean overshoot per variant): % of held-out truly pathogenic and
+    # benign variants (class average) whose posterior goes past the true one, in the claimed direction, by > 1 / 5 /
+    # 10 pp. > 1 pp is stored in the grid; > 5 / 10 pp come from the local rerun (CALIBRATION_QUALITY_OVERSHOOT_DIR).
+    # Full grid (not original_design): S4's true priors include the 1% and 60% slices.
+    _ov_dir = Path(config.CALIBRATION_QUALITY_OVERSHOOT_DIR)
+    if not config.warn_if_missing(str(_ov_dir / "results.csv"), "calibration-quality overshoot rerun"):
+        from analysis.calibration_quality import figures_v3 as _cq_v3
+        _cq_v3s = _cq_v3
+        _ov_inp = dict(inputs=[_cq_res, _ov_dir / "results.csv", _ov_dir / "acmg" / "acmgscaler_rows.csv"])
+        _ov_df = _cq_v3.with_rerun(_cq.load(_cq_dir), _ov_dir)
+        _cc_res = Path(config.CALIBRATION_QUALITY_CAPC_DIR) / "results.csv"
+        if not config.warn_if_missing(str(_cc_res), "calibration-quality retention rerun (prior-specific cap)"):
+            _ov_df = _cq_v3.merge_capc_rerun(_ov_df, config.CALIBRATION_QUALITY_CAPC_DIR)
+            _ov_inp["inputs"].append(_cc_res)
+        _ov_m = _cq.acmgscaler_compare(_cq_v3.acmg_rows_with_rerun(_ov_dir), _ov_df)[0]
+        _OV_METS = (("One", "post_over_share"), ("Five", "post_over_share5"), ("Ten", "post_over_share10"))
+        _ov_c = _ov_m[(_ov_m["experiment"] == "core") & np.isclose(_ov_m["pi"], 0.25)]
+        _ov_mid = _ov_c[_ov_c["richness"] == _cq_v3s.MAIN_SIZE]  # default size (1000/500); name kept
+        _ov_sets = {  # S3 (true prior 0.25; pooled over 5-80 controls per class)
+            "Clean": _ov_c[np.isclose(_ov_c["kappa"], 4) & np.isclose(_ov_c["gamma"], 1)],
+            "KOneFive": _ov_mid[np.isclose(_ov_mid["kappa"], 1.5) & np.isclose(_ov_mid["gamma"], 1)],
+            "KTwoFive": _ov_mid[np.isclose(_ov_mid["kappa"], 2.5) & np.isclose(_ov_mid["gamma"], 1)],
+            "GHalf": _ov_mid[np.isclose(_ov_mid["kappa"], 4) & np.isclose(_ov_mid["gamma"], 0.5)],
+            "GQuarter": _ov_mid[np.isclose(_ov_mid["kappa"], 4) & np.isclose(_ov_mid["gamma"], 0.25)],
+        }
+        _ov_desc = {"Clean": "kappa 4, gamma 1, all population/synonymous sizes", "KOneFive": "kappa 1.5, gamma 1, 1000/500",
+                    "KTwoFive": "kappa 2.5, gamma 1, 1000/500", "GHalf": "kappa 4, gamma 0.5, 1000/500",
+                    "GQuarter": "kappa 4, gamma 0.25, 1000/500"}
+        for _k, _d in _ov_sets.items():
+            for _t, _met in _OV_METS:
+                REG.num(f"SuppCalQualShare{_t}{_k}", 100 * _cq_v3.METRICS[_met][0](_d, "fit").mean(), fmt=".1f",
+                        source=f"S3, true prior 0.25, {_ov_desc[_k]}, 5-80 controls: % of held-out variants "
+                               f"overshooting by > {dict(One=1, Five=5, Ten=10)[_t]} pp (ExCALIBR)", **_ov_inp)
+        # S4 (gamma 1, kappa 4, 1000/500; 10 and 80 controls per class pooled): ExCALIBR and acmgscaler by true prior
+        _ov_s4 = _ov_m[_ov_m["experiment"].isin(["core", "prior"]) & np.isclose(_ov_m["gamma"], 1)
+                       & np.isclose(_ov_m["kappa"], 4) & (_ov_m["richness"] == _cq_v3s.MAIN_SIZE)
+                       & _ov_m["n_plp"].isin(list(_cq_v3s.S4_CONTROLS))]
+        for _pi, _ptag in ((0.01, "PiOne"), (0.10, "PiTen"), (0.60, "PiSixty")):
+            _d = _ov_s4[np.isclose(_ov_s4["pi"], _pi)]
+            for _pre, _mtag, _mname in (("fit", "Exc", "ExCALIBR"), ("acmg", "Acm", "acmgscaler (prior 0.10)")):
+                _dd = _d[_d["acmg_ok"]] if _pre == "acmg" else _d
+                for _t, _met in _OV_METS:
+                    if not np.isfinite(_cq_v3.METRICS[_met][0](_dd, _pre).mean()):
+                        continue  # > 5/10 pp shares not rerun for this setting (e.g. ExCALIBR at 0.10, 1000/500)
+                    REG.num(f"SuppCalQual{_mtag}Share{_t}{_ptag}", 100 * _cq_v3.METRICS[_met][0](_dd, _pre).mean(),
+                            fmt=".1f", source=f"S4, true prior {_pi}, 10/80 controls: % of held-out variants "
+                                              f"overshooting by > {dict(One=1, Five=5, Ten=10)[_t]} pp ({_mname})",
+                            **_ov_inp)
+
     _f = _cq_fig1(_cq_df, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_calqual_degradation.png")
     REG.figure("fig:calqual_degradation", _f, **_cq_inp)
     _f = _cq_fig2(_cq_merged, Path(FIGURE_SUBDIRS["manuscript"]) / "supp_calqual_diagnostics.png",
@@ -3468,7 +3535,8 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
     # figures above are kept; S5 here supersedes fig:calqual_posterior's earlier version under its own label.
     from analysis.calibration_quality import figures_v2 as _cq_v2
     _cq_mdir = Path(FIGURE_SUBDIRS["manuscript"])
-    REG.figure("fig:calqual_design", _cq_v2.make_design_figure(_cq_df, _cq_mdir / "supp_calqual_design.png"),
+    # v2 design figure kept under its own label; fig:calqual_design is the v3 S3 below
+    REG.figure("fig:calqual_design_v2", _cq_v2.make_design_figure(_cq_df, _cq_mdir / "supp_calqual_design_v2.png"),
                **_cq_inp)
     REG.figure("fig:calqual_overstated",
                _cq_v2.make_overstated_figure(_cq_merged, _cq_mdir / "supp_calqual_overstated.png"), **_cq_inp)
@@ -3481,6 +3549,165 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
         _cq_ex = sorted(_cq_ex, key=lambda e: next(i for i, k in enumerate(_cq_order) if e["name"].startswith(k)))
         REG.figure("fig:calqual_misfit", _cq_v2.make_misfit_figure(_cq_df, _cq_ex, _cq_mdir / "supp_calqual_misfit.png"),
                    inputs=[_cq_res, _cq_ex_path])
+
+    # Final figure set (analysis.calibration_quality.figures_v3, 2026-11-14): S3 fewer data (design; evidence
+    # retained and mean overshoot by controls, separation and measured fraction; true prior 0.25), S4 ExCALIBR vs
+    # acmgscaler (mean overshoot by controls at 0.10 and by true prior 0.01-0.60; precision at posterior >= 0.9),
+    # S5 calibration quality metrics (prior reliability score + in-sample Yang). Full grid (S4's priors include the
+    # 1% / 2.5% / 60% slices); the S5 model is the one saved by analysis.calibration_quality.diagnostics.
+    from analysis.calibration_quality import figures_v3 as _cq_v3
+    _v3_df = _ov_df if "_ov_df" in globals() else _cq.load(_cq_dir)  # grid + 1000/500 rerun cells
+    _v3_m = (_ov_m if "_ov_m" in globals() else _cq.acmgscaler_compare(_cq_dir, _v3_df)[0])
+    REG.figure("fig:calqual_design", _cq_v3.make_fewer_data_figure(_v3_df, _cq_mdir / "supp_calqual_design.png"),
+               **_cq_inp)
+    REG.figure("fig:calqual_methods", _cq_v3.make_methods_figure(_v3_m, _cq_mdir / "supp_calqual_methods.png"),
+               **_cq_inp)
+    _rd_dir = Path(config.CALIBRATION_QUALITY_DIR).parent / "real_diagnostics"
+    _rd_model, _rd_csv, _rd_json = _rd_dir / "model.joblib", _rd_dir / "real_diagnostics.csv", _rd_dir / "model_summary.json"
+    if all(p.exists() for p in (_rd_model, _rd_csv, _rd_json)):
+        import joblib as _joblib
+        _rd_real = pd.read_csv(_rd_csv)
+        _rd_inp = dict(inputs=[_cq_res, _rd_model, _rd_csv, _rd_json])
+        REG.figure("fig:calqual_reliability",
+                   _cq_v3.make_reliability_figure(_joblib.load(_rd_model), _rd_real,
+                                                  _cq_mdir / "supp_calqual_reliability.png"), **_rd_inp)
+        _rd_sum = json.loads(_rd_json.read_text())
+        _rd_chk = _rd_sum["checks"]
+        REG.num("SuppCalQualRelSpearman", _rd_sum["spearman"], fmt=".2f", source="prior reliability: grouped-CV "
+                "Spearman of predicted with observed angular prior error (simulation)", **_rd_inp)
+        REG.num("SuppCalQualRelSpearmanSD", _rd_chk["spearman_sd_only"], fmt=".2f",
+                source="same, bootstrap prior SD alone (angular, mapped to error)", **_rd_inp)
+        REG.num("SuppCalQualRelGainLo", _rd_chk["spearman_gain_ci"][0], fmt=".2f",
+                source="Spearman gain of the full score over the SD alone: 2.5% bootstrap quantile over settings",
+                **_rd_inp)
+        REG.num("SuppCalQualRelGainHi", _rd_chk["spearman_gain_ci"][2], fmt=".2f",
+                source="same: 97.5% bootstrap quantile", **_rd_inp)
+        _gh = _rd_chk["fitted_prior_gt_half"]
+        REG.num("SuppCalQualRelHiObs", _gh["obs_err"], fmt=".2f", source="fitted prior > 0.5: observed mean angular "
+                "prior error", **_rd_inp)
+        REG.num("SuppCalQualRelHiSD", _gh["pred_sd_only"], fmt=".2f", source="fitted prior > 0.5: predicted by the "
+                "SD alone", **_rd_inp)
+        _rb = _rd_chk["by_reliability"]
+        _rlo, _rhi = _rb[list(_rb)[0]], _rb[list(_rb)[-1]]
+        REG.num("SuppCalQualRelLowOver", _rlo["over_mean"], fmt=".1f", source="simulation, reliability <= 0.5: "
+                "mean overshoot per variant (pp)", **_rd_inp)
+        REG.num("SuppCalQualRelHighOver", _rhi["over_mean"], fmt=".1f", source="simulation, reliability > 0.9: "
+                "mean overshoot per variant (pp)", **_rd_inp)
+        REG.num("SuppCalQualRelLowEvid", _rlo["evid_median"], fmt=".0f", source="simulation, reliability <= 0.5: "
+                "median % of controls with evidence", **_rd_inp)
+        REG.num("SuppCalQualRelHighEvid", _rhi["evid_median"], fmt=".0f", source="simulation, reliability > 0.9: "
+                "median % of controls with evidence", **_rd_inp)
+        _ys = _rd_chk["yang_in_sample"]
+        for _k, _n in (("false_alarm", "FalseAlarm"), ("catch", "Catch"), ("ppv", "PPV")):
+            REG.num(f"SuppCalQualYangIn{_n}", 100 * _ys[_k], fmt=".1f" if _k == "false_alarm" else ".0f",
+                    source=f"simulation: in-sample Yang > 0.2 vs fitted-vs-true distance > 0.2: {_k} (%)", **_rd_inp)
+        REG.num("SuppCalQualRealRelBelowHalf", int((_rd_real.prior_reliability < 0.5).sum()), fmt=".0f",
+                source="real calibrations with prior reliability < 0.5", **_rd_inp)
+        REG.num("SuppCalQualRealRelMedian", float(_rd_real.prior_reliability.median()), fmt=".2f",
+                source="real calibrations: median prior reliability", **_rd_inp)
+        REG.num("SuppCalQualRealYangFlagged", int((_rd_real.yang_train_max > config.YANG_GOOD_FIT_THRESHOLD).sum()),
+                fmt=".0f", source="real calibrations with in-sample Yang > 0.2", **_rd_inp)
+        REG.num("SuppCalQualRealYangMax", float(_rd_real.yang_train_max.max()), fmt=".2f",
+                source="real calibrations: largest in-sample Yang distance", **_rd_inp)
+        REG.num("SuppCalQualRealN", int(_rd_real.prior_reliability.notna().sum()), fmt=".0f",
+                source="real calibrations with a prior reliability score", **_rd_inp)
+        # Supp prior theory: datasets fit with only one control class (PU: no benign reference; NU: no P/LP), whose
+        # prior comes from the bounds of Section pu_nu rather than Equation prior_em
+        REG.num("SuppPriorTheoryNumOneClass", int((_rd_real.is_pu == 1).sum() + (_rd_real.n_plp == 0).sum()),
+                fmt="d", words=True, source="calibrations fit in PU or NU mode (real_diagnostics.csv)", **_rd_inp)
+
+    # S3 / S4 text numbers (true prior 0.25 unless stated; 200 population / 100 synonymous where one size)
+    _v3_ret = lambda d: float(100 * _cq_v3.llr_retention(d).mean())
+    _v3_mo = lambda d, pre="fit": float(100 * _cq_v3.METRICS["post_over"][0](d, pre).mean())
+    _v3_c = _v3_df[(_v3_df.experiment == "core") & np.isclose(_v3_df.pi, 0.25)]
+    _v3_mid = _v3_c[_v3_c.richness == _cq_v3.MAIN_SIZE]  # default size (1000/500); name kept
+    _v3_sel = lambda k, g: _v3_mid[np.isclose(_v3_mid.kappa, k) & np.isclose(_v3_mid.gamma, g)]
+    _v3_clean = _v3_c[np.isclose(_v3_c.kappa, 4) & np.isclose(_v3_c.gamma, 1)]
+    _cl_r = _v3_clean.groupby(["richness", "n_plp"]).apply(_v3_ret)
+    _cl_o = _v3_clean.groupby(["richness", "n_plp"]).apply(_v3_mo)
+    _v3n = lambda name, v, fmt, src: REG.num(name, v, fmt=fmt, source=src, **_cq_inp)
+    _v3n("SuppCalQualRetCleanLo", _cl_r.min(), ".0f", "S3B: kappa 4, gamma 1: lowest % evidence retained (any controls/size)")
+    _v3n("SuppCalQualRetCleanHi", _cl_r.max(), ".0f", "S3B: kappa 4, gamma 1: highest % evidence retained")
+    _v3n("SuppCalQualOverCleanMax", _cl_o.max(), ".1f", "S3C: kappa 4, gamma 1: largest mean overshoot (pp)")
+    for _k, _kt in ((4, "Four"), (2.5, "TwoFive"), (1.5, "OneFive")):
+        _d = _v3_sel(_k, 1)
+        _v3n(f"SuppCalQualRetFiveK{_kt}", _v3_ret(_d[_d.n_plp == 5]), ".0f", f"S3D: kappa {_k}, 5 controls: % retained")
+        _v3n(f"SuppCalQualRetEightyK{_kt}", _v3_ret(_d[_d.n_plp == 80]), ".0f", f"S3D: kappa {_k}, 80 controls: % retained")
+        _o = _d.groupby("n_plp").apply(_v3_mo)
+        _v3n(f"SuppCalQualOverK{_kt}Lo", _o.min(), ".1f", f"S3E: kappa {_k}: lowest mean overshoot over 5-80 controls (pp)")
+        _v3n(f"SuppCalQualOverK{_kt}Hi", _o.max(), ".1f", f"S3E: kappa {_k}: highest mean overshoot (pp)")
+    for _g, _gt in ((0.25, "Quarter"), (0.5, "Half")):
+        _d = _v3_sel(4, _g)
+        _r, _o = _d.groupby("n_plp").apply(_v3_ret), _d.groupby("n_plp").apply(_v3_mo)
+        _v3n(f"SuppCalQualRetG{_gt}Lo", _r.min(), ".0f", f"S3F: gamma {_g}: lowest % retained over 5-80 controls")
+        _v3n(f"SuppCalQualRetG{_gt}Hi", _r.max(), ".0f", f"S3F: gamma {_g}: highest % retained")
+        _v3n(f"SuppCalQualOverG{_gt}Lo", _o.min(), ".1f", f"S3G: gamma {_g}: lowest mean overshoot (pp)")
+        _v3n(f"SuppCalQualOverG{_gt}Hi", _o.max(), ".1f", f"S3G: gamma {_g}: highest mean overshoot (pp)")
+    # gamma < 1: overshoot only where the prior is underestimated (kappa 4, 200/100, pooled over controls)
+    for _g, _gt in ((0.25, "Quarter"), (0.5, "Half")):
+        _d = _v3_sel(4, _g)
+        _e = _d.fit_prior - _d.pi
+        for _cls, _ct in (("pathogenic", "Path"), ("benign", "Ben")):
+            _v3n(f"SuppCalQualLowPriorOver{_ct}G{_gt}", float(100 * _d.loc[_e < -0.02, f"fit_{_cls}_post_over_mean"].mean()),
+                 ".1f", f"gamma {_g}: mean overshoot of truly {_cls} variants when the fitted prior is > 2 pp too low")
+        _v3n(f"SuppCalQualOkPriorOverG{_gt}", float(100 * ((_d.fit_pathogenic_post_over_mean
+                                                         + _d.fit_benign_post_over_mean) / 2)[_e >= -0.02].mean()),
+             ".2f", f"gamma {_g}: mean overshoot when the fitted prior is not > 2 pp too low")
+    # mislabeled controls and P/LP mechanism mix (one-factor slices; baseline = matching core cells)
+    # one confounder at a time: the 1000/500, kappa 4, gamma 1 (mechanism mix: gamma 0.25), 80-control cells
+    _v3_one = lambda e: _v3_df[(_v3_df.experiment == e) & (_v3_df.richness == _cq_v3.MAIN_SIZE)
+                               & np.isclose(_v3_df.kappa, 4) & (_v3_df.n_plp == 80)]
+    _noise_shift, _noise_over = {}, []
+    for _e, _col, _et in (("noise_plp", "eps_p", "PLP"), ("noise_blb", "eta_b", "BLB")):
+        _x = _v3_one(_e)
+        _x = _x[np.isclose(_x.gamma, 1)]
+        _keys = _x[["kappa", "gamma", "n_plp", "richness", "pi"]].drop_duplicates()
+        _base = _v3_df[_v3_df.experiment == "core"].merge(_keys, on=list(_keys.columns))
+        if _et == "PLP":
+            _v3n("SuppCalQualNoiseBaseRet", _v3_ret(_base), ".0f", "mislabeling slices: % retained without mislabeling")
+            _v3n("SuppCalQualNoiseBasePrior", abs(float(100 * (_base.fit_prior - _base.pi).mean())), ".1f",
+                 "mislabeling slices: |fitted minus true prior| (pp) without mislabeling")
+        for _v, _vt in ((0.05, "Five"), (0.1, "Ten"), (0.2, "Twenty")):
+            _d = _x[np.isclose(_x[_col], _v)]
+            _v3n(f"SuppCalQualNoise{_et}Ret{_vt}", _v3_ret(_d), ".0f", f"{_e} {_v}: % evidence retained")
+            # magnitude only: the text states the direction (P/LP mislabeling overestimates, B/LB underestimates),
+            # guarded by the claim checks below
+            _shift = float(100 * (_d.fit_prior - _d.pi).mean())
+            _noise_shift[(_et, _v)] = _shift
+            _v3n(f"SuppCalQualNoise{_et}Prior{_vt}", abs(_shift), ".1f",
+                 f"{_e} {_v}: |fitted minus true prior| (pp)")
+            _noise_over.append(_v3_mo(_d))
+            _v3n(f"SuppCalQualNoise{_et}Over{_vt}", _noise_over[-1], ".1f", f"{_e} {_v}: mean overshoot (pp)")
+    _v3n("SuppCalQualNoiseOverMax", max(_noise_over), ".1f",
+         "mislabeled P/LP or B/LB (5-20%): largest mean overshoot over the six settings (pp)")
+    REG.check("calqual-mislabel-plp-overestimates", all(_noise_shift[("PLP", v)] > 0 for v in (0.05, 0.1, 0.2)),
+              f"P/LP mislabeling shifts {[round(_noise_shift[('PLP', v)], 1) for v in (0.05, 0.1, 0.2)]} pp",
+              "supplement.tex calqual (benign variants among P/LP: prior overestimated)")
+    REG.check("calqual-mislabel-blb-underestimates", all(_noise_shift[("BLB", v)] < 0 for v in (0.05, 0.1, 0.2)),
+              f"B/LB mislabeling shifts {[round(_noise_shift[('BLB', v)], 1) for v in (0.05, 0.1, 0.2)]} pp",
+              "supplement.tex calqual (pathogenic variants among B/LB: prior underestimated)")
+    _mb = _v3_one("mech_bias")
+    _mbo = _mb.groupby("lab_gamma").apply(_v3_mo)
+    _v3n("SuppCalQualMechOverLo", _mbo[_mbo.index > _mb.gamma.iloc[0]].min(), ".0f",
+         "P/LP over-representing the measured mechanism: smallest mean overshoot (pp)")
+    _v3n("SuppCalQualMechOverHi", _mbo.max(), ".0f", "same: largest mean overshoot (pp; all P/LP via it)")
+    # S4 (gamma 1, kappa 4, 200/100): mean overshoot and precision at posterior >= 0.9 by true prior
+    _s4 = _v3_m[_v3_m.experiment.isin(["core", "prior"]) & np.isclose(_v3_m.gamma, 1) & np.isclose(_v3_m.kappa, 4)
+                & (_v3_m.richness == _cq_v3.MAIN_SIZE) & _v3_m.n_plp.isin(list(_cq_v3.S4_CONTROLS))]
+    _s4o = {(_pre, _pi): _v3_mo(_d[_d.acmg_ok] if _pre == "acmg" else _d, _pre)
+            for _pre in ("fit", "acmg") for _pi, _d in _s4.groupby("pi")}
+    _v3n("SuppCalQualExcOverMax", max(v for (p, _), v in _s4o.items() if p == "fit"), ".1f",
+         "S4B: ExCALIBR largest mean overshoot over true priors 0.01-0.60 (pp)")
+    for _pi, _pt in ((0.01, "PiOne"), (0.10, "PiTen"), (0.60, "PiSixty")):
+        _k = min(_s4o, key=lambda k: abs(k[1] - _pi))[1]
+        _v3n(f"SuppCalQualAcmOver{_pt}", _s4o[("acmg", _k)], ".1f", f"S4B: acmgscaler mean overshoot, true prior {_pi} (pp)")
+        _v3n(f"SuppCalQualExcOver{_pt}", _s4o[("fit", _k)], ".2f", f"S4B: ExCALIBR mean overshoot, true prior {_pi} (pp)")
+        _d = _s4[np.isclose(_s4.pi, _pi)]
+        for _pre, _mt in (("fit", "Exc"), ("acmg", "Acm")):
+            _dd = _d[_d.acmg_ok] if _pre == "acmg" else _d
+            _v3n(f"SuppCalQual{_mt}PrecFinal{_pt}",
+                 100 * float(_cq_prec(_dd, _pre).set_index("t").loc[0.9, "ppv"]), ".0f",
+                 f"S4C: {_mt} % pathogenic among population variants with posterior >= 0.9, true prior {_pi}")
     _p10 = _cq_merged[(_cq_merged.experiment == "core") & np.isclose(_cq_merged.pi, 0.10) & (_cq_merged.n_plp >= 10)]
     _ppv = lambda d, p, t=0.9: float(_cq_prec(d, p).set_index("t").loc[t, "ppv"]) if len(d) else float("nan")
     _npv = lambda d, p, t=0.1: float(_cq_prec(d, p).set_index("t").loc[t, "npv"]) if len(d) else float("nan")
@@ -3701,6 +3928,20 @@ from analysis.yang_distance import heldout_yang_table
 _yang_heldout_df = heldout_yang_table() if Path(config.YANG_HELDOUT_CSV).exists() else None
 sd1_df, _sd1_problems = build_sd1(datasets, tree, model_selections, dataset_configs, df_primary,
                                   df_all_groups=df_all_groups, yang_df=_yang_df, yang_heldout_df=_yang_heldout_df)
+# prior reliability score per calibration (analysis.calibration_quality.diagnostics; Supplementary Section calqual),
+# placed after the prior; the in-sample Yang distances used by the fit check are already in SD1
+_rd_sd1 = Path(config.CALIBRATION_QUALITY_DIR).parent / "real_diagnostics" / "real_diagnostics.csv"
+if _rd_sd1.exists():
+    from analysis.plot_common import display_name as _sd1_display
+    _rel = pd.read_csv(_rd_sd1)[["dataset", "prior_reliability"]]
+    _rel["dataset"] = _rel["dataset"].map(_sd1_display)  # SD1 uses display names (internal suffix dropped)
+    sd1_df = sd1_df.drop(columns=["prior_reliability"], errors="ignore").merge(_rel, on="dataset", how="left")
+    _cols = list(sd1_df.columns)
+    _cols.insert(_cols.index("prior") + 1, _cols.pop(_cols.index("prior_reliability")))
+    sd1_df = sd1_df[_cols]
+    REG.check("sd1-prior-reliability", sd1_df["prior_reliability"].notna().all(),
+              f"{int(sd1_df['prior_reliability'].notna().sum())} of {len(sd1_df)} datasets have a prior reliability score",
+              "Supplementary Data 1 (prior reliability column)")
 sd1_df.to_csv(SUPP_DATA_DIR / "SD1_dataset_summaries.csv", index=False)
 print(f"  SD1: {len(sd1_df)} rows -> {SUPP_DATA_DIR / 'SD1_dataset_summaries.csv'}")
 for _p in _sd1_problems:

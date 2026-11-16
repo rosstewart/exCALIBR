@@ -36,10 +36,18 @@ LEVELS = ("#c49a5a", "#8b6fb0", "#3b2d52")  # tan -> purple, the ends of the man
 
 EXC, ACM = "#1f77b4", "#2ca02c"
 EXC_LIGHT, ACM_LIGHT = "#aec7e8", "#98df8a"
-RICH = [("low", "50, 0", LEVELS[0]), ("mid", "200, 100", LEVELS[1]), ("high", "1000, 500", LEVELS[2])]
+# population/synonymous sizes in greys (the population sample's colour), so tan/purple/dark (gamma) and the red
+# kappa ramp (as in the design panel) each keep one meaning within S3
+SIZE_GREYS = ("#b0b0b0", "#707070", "#262626")
+RICH = [("low", "50, 0", SIZE_GREYS[0]), ("mid", "200, 100", SIZE_GREYS[1]), ("high", "1000, 500", SIZE_GREYS[2])]
 GNOMAD_SYN = "population, synonymous variants"
 MAIN_KAPPA = 4.0  # as in the prior simulation (Section 3) and Figure 1; 2.5 and 1.5 shown alongside
-MAIN_PI = 0.25  # the prior simulation (Figures S1/S2) uses 0.25
+MAIN_PI = 0.25
+# default population/synonymous size (2026-11-14): 1000/500, so each one-factor panel changes one thing at a time
+# from the richest baseline; matches the prior simulation's rich regime (80/80/1000/500)
+MAIN_SIZE = "high"
+# controls per class shown by true prior in S4B/C: acmgscaler's minimum (10) and the richest setting (80)
+S4_CONTROLS = (10, 80)  # the prior simulation (Figures S1/S2) uses 0.25
 
 # metric -> (per-replicate value from columns {pre}_{class}_..., y label, scale); the log-LR error metrics slot in
 # here once run.py stores them
@@ -69,11 +77,56 @@ def merge_overshoot_rerun(df, rerun_csv):
                                                                how="left")
 
 
+def with_rerun(df, rerun_dir):
+    """The grid `df` plus the local rerun in `rerun_dir` (config.CALIBRATION_QUALITY_OVERSHOOT_DIR): the rerun's new
+    overshoot columns merged onto the grid rows it reproduces, and the rows of cells the grid does not have (the
+    1000/500 one-factor and true-prior cells) appended, with the grid's derived outcome columns added."""
+    from pathlib import Path
+    from analysis.calibration_quality.summarize import add_outcomes
+    r = pd.read_csv(Path(rerun_dir) / "results.csv", low_memory=False)
+    out = merge_overshoot_rerun(df, Path(rerun_dir) / "results.csv")
+    new = r[~r["cell_id"].isin(df["cell_id"])]
+    if len(new):
+        new = add_outcomes(new[new["status"] == "ok"].copy())
+        out = pd.concat([out, new], ignore_index=True)
+    return out
+
+
+def acmg_rows_with_rerun(rerun_dir):
+    """acmgscaler rows: the full rerun arm plus its 1000/500 true-prior cells, written as one acmgscaler_rows.csv in
+    `rerun_dir`/acmg_all (what summarize.acmgscaler_compare reads); returns that directory."""
+    from pathlib import Path
+    d = Path(rerun_dir) / "acmg"
+    parts = [pd.read_csv(f, low_memory=False) for f in sorted(d.glob("acmgscaler_rows*.csv"))]
+    out = Path(rerun_dir) / "acmg_all"
+    out.mkdir(exist_ok=True)
+    pd.concat(parts, ignore_index=True).drop_duplicates(["cell_id", "rep"]).to_csv(out / "acmgscaler_rows.csv",
+                                                                                 index=False)
+    return out
+
+
 def llr_retention(d, pre="fit"):
-    """Per-replicate share of the truth's capped |log LR| that the reported LR keeps in the truth's direction."""
-    num = d[f"{pre}_pathogenic_llr_rep_abs_dir_cap"] + d[f"{pre}_benign_llr_rep_abs_dir_cap"]
-    den = d[f"{pre}_pathogenic_llr_true_abs_cap"] + d[f"{pre}_benign_llr_true_abs_cap"]
-    return num / den.where(den > 0)
+    """Per-replicate share of the truth's capped |log LR| that the reported LR keeps in the truth's direction. The
+    cap is the Tavtigian C of the replicate's true prior (very strong evidence; `_capc` columns, run.py) where those
+    columns exist, else the fixed LR 350 (`_cap`, the stored grid)."""
+    def ret(suffix):
+        num = d[f"{pre}_pathogenic_llr_rep_abs_dir_{suffix}"] + d[f"{pre}_benign_llr_rep_abs_dir_{suffix}"]
+        den = d[f"{pre}_pathogenic_llr_true_abs_{suffix}"] + d[f"{pre}_benign_llr_true_abs_{suffix}"]
+        return num / den.where(den > 0)
+    out = ret("cap")
+    if f"{pre}_pathogenic_llr_true_abs_capc" in d:
+        out = ret("capc").where(d[f"{pre}_pathogenic_llr_true_abs_capc"].notna(), out)
+    return out
+
+
+def merge_capc_rerun(df, rerun_dir):
+    """Add the prior-specific-cap retention columns (`*_capc`, run.py) from the local rerun in `rerun_dir`
+    (config.CALIBRATION_QUALITY_CAPC_DIR) by (cell_id, rep); rows it did not cover keep NaN (-> 350 cap)."""
+    from pathlib import Path
+    r = pd.read_csv(Path(rerun_dir) / "results.csv", low_memory=False)
+    new = [c for c in r.columns if c.endswith("_capc")]
+    return df.drop(columns=[c for c in new if c in df]).merge(r[["cell_id", "rep"] + new], on=["cell_id", "rep"],
+                                                               how="left")
 
 
 def _mean_ci(x):
@@ -84,7 +137,7 @@ def _mean_ci(x):
     return x.mean(), 1.96 * x.std(ddof=1) / np.sqrt(len(x))
 
 
-CI_STYLE = "bars"  # "bars": error bars on the points; "band": shaded 95% CI band behind the line
+CI_STYLE = "band"  # "band" (manuscript, 2026-11-14): shaded 95% CI behind the line; "bars": error bars
 
 
 def _line(ax, xs, ys, es, col, lab, **kw):
@@ -171,7 +224,7 @@ def _design_samples(ax):
 
 # ── S3 ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def make_fewer_data_figure(df, out_path, metric="post_over", pi=MAIN_PI):
+def make_fewer_data_figure(df, out_path, metric="post_over", pi=MAIN_PI, ref_richness=MAIN_SIZE):
     """True prior `pi` (0.25, as in the prior simulation), core grid. (A) design; (B) log-LR retained and (C) `metric`
     by controls per class, gamma = 1, kappa = MAIN_KAPPA, one line per gnomAD/synonymous size; (D) log-LR retained by
     separation kappa (gamma = 1) and (E) by the measured fraction gamma (kappa = MAIN_KAPPA), both with 200 gnomAD and
@@ -203,18 +256,20 @@ def make_fewer_data_figure(df, out_path, metric="post_over", pi=MAIN_PI):
     ax.legend(frameon=False, fontsize=5.3, loc="upper right", title=GNOMAD_SYN, title_fontsize=5.5)
 
     # rows 3-4: by separation (gamma = 1) and by measured fraction (kappa = MAIN_KAPPA); columns: retained | overconf.
-    m = core[core["richness"] == "mid"]
-    factors = (("kappa", [1.5, 2.5, 4.0], ("gamma", 1.0), "separation κ", "separation (γ = 1)"),
+    m = core[core["richness"] == ref_richness]  # D-G: one population/synonymous size (200/100 in the manuscript)
+    sz = {lv: lab.replace(", ", "/") for lv, lab, _ in RICH}[ref_richness]
+    factors = (("kappa", [1.5, 2.5, 4.0], ("gamma", 1.0), "separation κ", f"κ (γ = 1; {sz})",
+                [PATH_RAMP[k] for k in (1.5, 2.5, 4.0)]),
                ("gamma", [0.25, 0.5, 1.0], ("kappa", MAIN_KAPPA), "measured fraction γ",
-                f"measured fraction (κ = {MAIN_KAPPA:g})"))
-    for i, (col, levels, fixed, lab, what) in enumerate(factors):
+                f"γ (κ = {MAIN_KAPPA:g}; {sz})", list(LEVELS)))
+    for i, (col, levels, fixed, lab, what, cols) in enumerate(factors):
         row = outer[2 + i].subgridspec(1, 2, wspace=0.3)
         g0 = m[np.isclose(m[fixed[0]], fixed[1])]
         for j, (metric_fn, sc, ylim, ytxt, head) in enumerate((
                 (lambda g: llr_retention(g), 100, (0, 100), "evidence retained (%)", "Evidence retained"),
                 (lambda g: value(g, "fit"), scale, None, ylab, "Overconfidence"))):
             ax = fig.add_subplot(row[0, j])
-            for lv, c in zip(levels, LEVELS):
+            for lv, c in zip(levels, cols):
                 g = g0[np.isclose(g0[col], lv)]
                 st = [(n, *_mean_ci(sc * metric_fn(g[g["n_plp"] == n]))) for n in N_ORDER]
                 _line(ax, [s[0] for s in st], [s[1] for s in st], [s[2] for s in st], c, f"{lv:g}")
@@ -230,26 +285,41 @@ def make_fewer_data_figure(df, out_path, metric="post_over", pi=MAIN_PI):
 # ── S2 addition: prior error when every sample is scarce ───────────────────────────────────────────────────────
 
 def prior_scarcity_stats(df, pi=MAIN_PI):
-    """Tidy table for the S2 joint-scarcity panel: mean |fitted - true prior| (probability units) and 95% CI half-width
-    by controls per class (n_plp = n_blb) and population/synonymous level; core grid, gamma = 1, kappa = MAIN_KAPPA."""
+    """Tidy table for the S2 joint-scarcity panels: mean |fitted - true prior|, bias (fitted - true) and SD of the
+    fitted prior (probability units), each with a 95% CI half-width (SD: normal approximation), by controls per class
+    (n_plp = n_blb) and population/synonymous level; core grid, gamma = 1, kappa = MAIN_KAPPA."""
     d = _core(df[np.isclose(df["pi"], pi)])
     rows = []
     for r, lab, col in RICH:
         g = d[d["richness"] == r]
         for n in N_ORDER:
-            m, e = _mean_ci((g[g["n_plp"] == n]["fit_prior"] - g[g["n_plp"] == n]["pi"]).abs())
-            rows.append(dict(level=lab, color=col, n=n, mean=m, ci=e, n_reps=int((g["n_plp"] == n).sum())))
+            err = (g[g["n_plp"] == n]["fit_prior"] - g[g["n_plp"] == n]["pi"]).dropna()
+            m, e = _mean_ci(err.abs())
+            b, be = _mean_ci(err)
+            sd = float(err.std(ddof=1))
+            rows.append(dict(level=lab, color=col, n=n, mean=m, ci=e, bias=b, bias_ci=be, sd=sd,
+                             sd_ci=1.96 * sd / np.sqrt(2 * (len(err) - 1)), n_reps=len(err)))
     return pd.DataFrame(rows)
 
 
-def draw_prior_scarcity(ax, stats, legend_kw=None, colors=None):
+def draw_prior_scarcity(ax, stats, legend_kw=None, colors=None, styles=None, open_markers=False, title=GNOMAD_SYN,
+                        value="mean", legend=True):
     """Draw `prior_scarcity_stats` output: one line per population/synonymous level, controls per class on x.
-    `colors` overrides the level colours (e.g. greys where tan/purple/dark already mean assays)."""
+    `colors` / `styles` override the level colours / line styles (e.g. one assay colour, levels by line style);
+    `open_markers` draws white-filled markers (the ExCALIBR-fit convention of the prior-simulation figures)."""
     for i, (lab, g) in enumerate(stats.groupby("level", sort=False)):
-        _line(ax, g["n"], g["mean"], g["ci"], colors[i] if colors else g["color"].iloc[0], lab)
+        kw = {}
+        if styles:
+            kw["ls"] = styles[i]
+        if open_markers:
+            kw.update(mfc="white", mew=1.0)
+        _line(ax, g["n"], g[value], g["ci" if value == "mean" else f"{value}_ci"],
+              colors[i] if colors else g["color"].iloc[0], lab, **kw)
     _controls_axis(ax)
-    ax.set_ylim(bottom=0)
-    ax.legend(frameon=False, title=GNOMAD_SYN, **(legend_kw or dict(fontsize=5.2, title_fontsize=5.4)))
+    if value != "bias":
+        ax.set_ylim(bottom=0)
+    if legend:
+        ax.legend(frameon=False, title=title, **(legend_kw or dict(fontsize=5.2, title_fontsize=5.4)))
 
 
 def make_prior_scarcity_panel(df, out_path, pi=MAIN_PI):
@@ -310,7 +380,7 @@ def make_overshoot_metric_comparison(df, out_path, pi=MAIN_PI,
 # ── S4 ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def make_methods_figure(merged, out_path, metric="post_over", pi=0.10):
-    """ExCALIBR (200 gnomAD, 100 synonymous variants) vs acmgscaler (prior 0.10, >= 10 controls per class), same replicates,
+    """ExCALIBR (MAIN_SIZE population/synonymous sample) vs acmgscaler (prior 0.10, >= 10 controls per class), same replicates,
     gamma = 1, kappa = MAIN_KAPPA. (A) overconfidence (`metric`) by controls per class at true prior `pi` (core grid);
     `pi` is 0.10, acmgscaler's own prior, so the control-count comparison is fair to it.
     (B) the same and (C) the share pathogenic among population variants with posterior >= 0.9 by true prior (prior
@@ -319,7 +389,7 @@ def make_methods_figure(merged, out_path, metric="post_over", pi=0.10):
     arms = (("fit", (EXC_LIGHT, EXC), "ExCALIBR"), ("acmg", (ACM_LIGHT, ACM), "acmgscaler (prior 0.10)"))
     fig = plt.figure(figsize=(7.2, 3.0))
     gs = fig.add_gridspec(1, 3, wspace=0.38, left=0.08, right=0.98, top=0.88, bottom=0.2)
-    sel = lambda d: d[np.isclose(d["gamma"], 1) & np.isclose(d["kappa"], MAIN_KAPPA) & (d["richness"] == "mid")]
+    sel = lambda d: d[np.isclose(d["gamma"], 1) & np.isclose(d["kappa"], MAIN_KAPPA) & (d["richness"] == MAIN_SIZE)]
     base = sel(merged[(merged["experiment"] == "core") & np.isclose(merged["pi"], pi)])
     ax = fig.add_subplot(gs[0, 0])
     for pre, (_, col), lab in arms:
@@ -333,12 +403,12 @@ def make_methods_figure(merged, out_path, metric="post_over", pi=0.10):
     _title(ax, 0, f"By controls (true prior {pi:.2f})")
     ax.legend(frameon=False, fontsize=5.4, loc="upper right")
 
-    sl = sel(merged[merged["experiment"].isin(["core", "prior"]) & merged["n_plp"].isin([20, 80])])
+    sl = sel(merged[merged["experiment"].isin(["core", "prior"]) & merged["n_plp"].isin(list(S4_CONTROLS))])
     priors = sorted(sl["pi"].unique())
     ax, ax2 = fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])
-    ppv_all = []
+    ppv_all, none_called = [], []
     for pre, (light, dark), lab in arms:
-        for n, col in ((20, light), (80, dark)):
+        for n, col in zip(S4_CONTROLS, (light, dark)):
             d = sl[sl["n_plp"] == n]
             d = d[d["acmg_ok"]] if pre == "acmg" else d
             st = [(p, *_mean_ci(scale * value(d[np.isclose(d["pi"], p)], pre))) for p in priors]
@@ -347,6 +417,8 @@ def make_methods_figure(merged, out_path, metric="post_over", pi=0.10):
             for p in priors:
                 pc = precision_curve(d[np.isclose(d["pi"], p)], pre)
                 pp.append(100 * float(pc.set_index("t").loc[0.9, "ppv"]) if pc is not None else np.nan)
+                if pc is not None and float(pc.set_index("t").loc[0.9, "called_path"]) == 0:
+                    none_called.append((p, col))  # precision undefined: no variant reached posterior 0.9
             ax2.plot(priors, pp, color=col, marker="o", ms=3, lw=1.2, label=f"{lab.split(' ')[0]}, {n}")
             ppv_all.extend(v for v in pp if np.isfinite(v))
     for a in (ax, ax2):
@@ -363,6 +435,10 @@ def make_methods_figure(merged, out_path, metric="post_over", pi=0.10):
     lo = 5 * np.floor((min(ppv_all) - 3) / 5) if ppv_all else 0  # observed range, not 0-100
     ax2.set_ylim(lo, 101)
     _style(ax2, "true prior", "pathogenic among posterior ≥ 0.9 (%)")
+    for p, col in none_called:  # mark where a method made no call at posterior >= 0.9 (precision undefined)
+        ax2.plot([p], [lo + 0.6], marker="x", ms=4, mew=1.2, color=col, ls="", zorder=4, clip_on=False)
+        ax2.annotate("no calls ≥ 0.9", (p, lo + 0.6), xytext=(4, 4), textcoords="offset points", fontsize=5.2,
+                     color=col, ha="left", va="bottom")
     _title(ax2, 2, "Precision by true prior")
     ax2.legend(frameon=False, fontsize=5.0, ncol=1, loc="lower right", title="method, controls per class",
                title_fontsize=5.2)
@@ -443,7 +519,6 @@ def _reliability_schematic(ax):
     a.set_xticks([0, 1])
     a.set_xticklabels(["0", "1"], fontsize=6.5)
     a.tick_params(length=0)
-    ax.text(0.835, 0.72, r"$R$", transform=ax.transAxes, ha="center", va="bottom", fontsize=9, color=INK)
 
 
 def make_reliability_figure(model, real, out_path, yang_t=0.2):
@@ -452,9 +527,9 @@ def make_reliability_figure(model, real, out_path, yang_t=0.2):
     over the samples (diagnostics.real_features), against `yang_t`."""
     from analysis.calibration_quality.diagnostics import ANG_REF
     cv = model["cv"]
-    fig = plt.figure(figsize=(7.2, 5.2))
-    gs = fig.add_gridspec(2, 3, height_ratios=[0.42, 1], hspace=0.42, wspace=0.42, left=0.08, right=0.98,
-                          top=0.95, bottom=0.09)
+    fig = plt.figure(figsize=(7.2, 4.3))
+    gs = fig.add_gridspec(2, 3, height_ratios=[0.27, 1], hspace=0.12, wspace=0.42, left=0.08, right=0.98,
+                          top=0.96, bottom=0.1)
     ax = fig.add_subplot(gs[0, :])
     _reliability_schematic(ax)
 

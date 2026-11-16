@@ -74,6 +74,8 @@ def key_numbers(reps, tests, summ):
     fa1 = bt[(bt.arm == "fit") & (bt.assay == A1)]
     k["fa1_max"] = fa1.mean_diff.abs().max()
     k["fa1_nsig"] = int((fa1.p_holm < 0.05).sum())
+    k["fa1_sig_priors"] = sorted(float(p) for p in fa1[fa1.p_holm < 0.05].true_prior)  # where the A1 fit is biased
+    k["fa1_max_prior"] = float(fa1.loc[fa1.mean_diff.abs().idxmax(), "true_prior"]) if len(fa1) else float("nan")
 
     dv = tests[tests.test == "dev_vs_expectation"]
     k["n_dev"], k["n_dev_sig"] = int(dv.p_holm.notna().sum()), int((dv.p_holm < 0.05).sum())
@@ -165,7 +167,8 @@ def table_rows(summ):
 # ── sample-size experiment (test_priors.py --design sample_size) ─────────────────────────────────────────────
 
 SAMPLES = ("P/LP", "B/LB", "gnomAD", "synonymous")
-BASE_COUNTS = dict(zip(SAMPLES, (100, 100, 500, 200)))
+from analysis.prior_simulation.simulate_priors import REGIMES as _REGIMES
+BASE_COUNTS = dict(zip(SAMPLES, _REGIMES["rich"]))  # the sample-size design's base (= rich regime)
 
 
 def load_sample_size(data_dir=DEFAULT_OUT_DIR):

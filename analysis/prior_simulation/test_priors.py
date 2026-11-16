@@ -74,11 +74,13 @@ def build_settings():
 # One-at-a-time downsampling of the standard (rich) controls, at the base setting (true prior 0.25):
 # which sample's size drives the error of the prior estimate, and is it bias or variance?
 SAMPLE_SIZE_PRIOR = 0.25
+# 2026-11-14: base = rich (80/80/1000/500); reductions include the calibration-quality levels (20 and 5 controls,
+# 200 and 50 population, 100 and 0 synonymous)
 SAMPLE_SIZE_GRID = {
-    "P/LP": (50, 20, 10, 5),
-    "B/LB": (50, 20, 10, 5, 0),
-    "gnomAD": (200, 100, 50, 20, 10),
-    "synonymous": (50, 20, 10, 5),
+    "P/LP": (40, 20, 10, 5),
+    "B/LB": (40, 20, 10, 5, 0),
+    "gnomAD": (500, 200, 100, 50, 20, 10),
+    "synonymous": (200, 100, 50, 20, 10, 5, 0),
 }
 SAMPLE_ORDER = ("P/LP", "B/LB", "gnomAD", "synonymous")
 
@@ -295,7 +297,7 @@ def main():
     uniq = reps[ek].drop_duplicates().copy()
     uniq["expected_prior"] = [
         expected_prior(r.assay, r.true_prior, r.delta, r.rho, r.eps_p, r.delta_b, r.lab_m1_frac,
-                       has_benign=regime_counts(r.regime)[1] > 0)
+                       has_benign=regime_counts(r.regime)[1] > 0, has_syn=regime_counts(r.regime)[3] > 0)
         for r in uniq.itertuples()
     ]
     reps = reps.merge(uniq, on=ek, how="left")

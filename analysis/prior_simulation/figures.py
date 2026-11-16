@@ -206,9 +206,9 @@ def _cartoon_axes(ax):
 
 
 def _cartoon_sizes(ax, counts):
-    """Bars proportional to log10(n + 1) on a common scale (500 = full), one per sample, coloured by class."""
+    """Bars proportional to log10(n + 1) on a common scale (1000 = full), one per sample, coloured by class."""
     _cartoon_axes(ax)
-    full = np.log10(501)
+    full = np.log10(1001)
     comp = {"P/LP": [(1, PATH_C, "")], "B/LB": [(1, SAMPLE_BENIGN["B/LB"], "")],
             "gnomAD": [(0.25, PATH_C, ""), (0.75, SAMPLE_BENIGN["gnomAD"], "")],
             "synonymous": [(1, SAMPLE_BENIGN["synonymous"], "")]}
@@ -341,7 +341,7 @@ def make_figure(summ, out_path):
 
 def make_sample_size_figure(ss, out_path, scarcity=None):
     """Supplementary figure: bias (a-d) and SD (e-h) of the true-component prior estimate as one control sample at a
-    time is reduced (true prior 0.25; others at 100/100/500/200). Filled circles: all estimates (before the discard rule);
+    time is reduced (true prior 0.25; others at the rich counts). Filled circles: all estimates (before the discard rule);
     open squares: estimates kept by the discard rule (prior <= 0.001 or >= 0.999 dropped). Lines: closed-form predictions
     (delta-method P/LP bias; asymptotic SD, Proposition 2). With `scarcity`
     (analysis.calibration_quality.figures_v3.prior_scarcity_stats), a third row adds panel (I): mean |fitted - true
@@ -367,16 +367,20 @@ def make_sample_size_figure(ss, out_path, scarcity=None):
                 ax.axhline(0, color=MUTED, ls="--", lw=0.8, zorder=1)
             for i, assay in enumerate(ASSAYS):
                 c = COLORS[assay]
-                for arm, filled, dx in (("oracle_raw", True, -0.07), ("oracle", False, 0.07)):
-                    if row == 1 and arm == "oracle":
-                        continue
+                # true components: all estimates (filled circle) and, for bias, after the discard rule (open
+                # square); ExCALIBR fit (open circle, as in Figure S1)
+                arms = ((("oracle_raw", "o", True, -0.08), ("oracle", "s", False, 0.0), ("fit", "o", False, 0.08))
+                        if row == 0 else (("oracle_raw", "o", True, -0.05), ("fit", "o", False, 0.05)))
+                for arm, mk, filled, dx in arms:
                     r = g[(g.assay == assay) & (g.arm == arm)].sort_values("size", ascending=False)
-                    x = np.array([pos[n] for n in r["size"]]) + (i - 1) * 0.16 + (dx if row == 0 else 0)
+                    if not len(r):
+                        continue
+                    x = np.array([pos[n] for n in r["size"]]) + (i - 1) * 0.25 + dx
                     m = r[col].to_numpy()
                     err = np.vstack([m - r[lo].to_numpy(), r[hi].to_numpy() - m])
-                    ax.errorbar(x, m, yerr=err, fmt="o" if filled else "s", ms=3.2 if filled else 3.0, lw=1.0, capsize=0, color=c, zorder=3,
+                    ax.errorbar(x, m, yerr=err, fmt=mk, ms=3.0, lw=0.9, capsize=0, color=c, zorder=3,
                                 mfc=c if filled else "white", mec=c, mew=0.9)
-                xs = np.arange(len(sizes)) + (i - 1) * 0.16
+                xs = np.arange(len(sizes)) + (i - 1) * 0.25
                 counts = [{**BASE_COUNTS, sample: n} for n in sizes]
                 if row == 0 and sample == "P/LP":
                     # delta-method approximation: drawn only where >= 2.5 P/LP are expected to act through the
@@ -388,7 +392,10 @@ def make_sample_size_figure(ss, out_path, scarcity=None):
                     ax.plot(xs, [predicted_sd(assay, 0.25, k["gnomAD"], k["P/LP"]) for k in counts], color=c,
                             lw=1.0, alpha=0.45, zorder=2)
             ax.set_xticks(range(len(sizes)))
-            ax.set_xticklabels([str(int(n)) for n in sizes])
+            crowded = len(sizes) > 6 or max(sizes) >= 1000  # e.g. 1000, 500, 200, ... would touch
+            ax.set_xticklabels([str(int(n)) for n in sizes], rotation=45 if crowded else 0,
+                               ha="right" if crowded else "center", rotation_mode="anchor" if crowded else "default",
+                               fontsize=6.3 if crowded else None)
             ax.set_xlim(-0.5, len(sizes) - 0.5)
             name = SAMPLE_DISPLAY.get(sample, sample)
             _style(ax, f"{name} reduced" if row == 0 else "", f"{name} variants", ylim, ylabel=ylabel)
@@ -406,18 +413,32 @@ def make_sample_size_figure(ss, out_path, scarcity=None):
                    handletextpad=0.4, bbox_to_anchor=(0.5, 0.0))
     else:
         from analysis.calibration_quality.figures_v3 import draw_prior_scarcity
-        ax = fig.add_subplot(gs[2, :2])
-        # greys: tan/purple/dark already mean assays A1-A3 in panels A-H
-        draw_prior_scarcity(ax, scarcity, dict(fontsize=6.3, title_fontsize=6.3, loc="upper left",
-                                               bbox_to_anchor=(1.04, 1.0), alignment="left"),
-                            colors=["#bdbdbd", "#7f7f7f", "#2f2f2f"])
-        _style(ax, "All samples reduced together: ExCALIBR fit, A3-like assay", "controls per class (P/LP and B/LB)",
-               (0, None), ylabel="Mean |estimate − 0.25|")
-        _panel_letter(ax, _letter(8), x=-0.15, y=1.04)
-        lax = fig.add_subplot(gs[2, 2:])
+        # (I) bias and (J) SD of the ExCALIBR fit's prior when all samples are scarce together, on the same axes as
+        # rows A-D and E-H; A3's colour (one fully measured mechanism = A3-like), open markers (ExCALIBR fit, as in
+        # Figure S1), population/synonymous sizes by line style
+        a3 = COLORS[ASSAYS[2]]
+        sty = dict(colors=[a3] * 3, styles=[":", "--", "-"], open_markers=True, legend=False)
+        for k, (value, ylabel, ylim) in enumerate((("bias", "Bias (estimate − 0.25)", (-0.1, 0.32)),
+                                                    ("sd", "SD of the estimate", (0, 0.32)))):
+            ax = fig.add_subplot(gs[2, k])
+            if value == "bias":
+                ax.axhline(0, color=MUTED, ls="--", lw=0.8, zorder=1)
+            draw_prior_scarcity(ax, scarcity, value=value, **sty)
+            _style(ax, "All samples reduced" if k == 0 else "", "controls per class", ylim, ylabel=ylabel)
+            _panel_letter(ax, _letter(8 + k), x=-0.3, y=1.04)
+        sc_h = [plt.Line2D([], [], color=a3, ls=ls, marker="o", mfc="white", mew=1.0, ms=3.5, lw=1.2, label=lab)
+                for ls, lab in zip(sty["styles"], scarcity["level"].unique())]
+        fit_h = plt.Line2D([], [], marker="o", ls="", color=MUTED, mfc="white", ms=4.5, mew=1.0,
+                           label="ExCALIBR fit")
+        lax = fig.add_subplot(gs[2, 2])
         lax.axis("off")
-        lax.legend(handles=handles, loc="upper right", ncol=1, frameon=False, fontsize=6.3, handletextpad=0.4,
-                   title="Panels A–H", title_fontsize=6.3, alignment="left", bbox_to_anchor=(1.0, 1.08))
+        lax.legend(handles=sc_h, loc="upper left", frameon=False, fontsize=6.3, handlelength=2.6,
+                   title="I, J: A3-like assay,\npopulation, synonymous\nvariants", title_fontsize=6.3,
+                   alignment="left", bbox_to_anchor=(-0.22, 1.08))
+        lax2 = fig.add_subplot(gs[2, 3])
+        lax2.axis("off")
+        lax2.legend(handles=handles[:5] + [fit_h] + handles[5:], loc="upper left", ncol=1, frameon=False,
+                    fontsize=6.3, handletextpad=0.4, alignment="left", bbox_to_anchor=(-0.42, 1.08))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300)

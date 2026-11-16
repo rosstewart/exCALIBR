@@ -303,6 +303,19 @@ CALIBRATION_QUALITY_DIR = _env(
     # Yang-vs-truth columns; its 516 original settings reproduce hpc_grid_r8 (kept for comparison)
     "/data/ross/assay_calibration/calibration_quality/hpc_grid_r8_v2",
 )
+# Local rerun (2026-11-14) of the S3/S4 replicates adding the shares of held-out variants overshooting at all / by
+# > 5 / > 10 pp (run.py post_over_any/_5/_10): results.csv (ExCALIBR rows, same tasks as the grid; stored columns
+# reproduce) and acmg/acmgscaler_rows.csv (whole acmgscaler arm). Text-only shares; figures plot the mean overshoot.
+CALIBRATION_QUALITY_OVERSHOOT_DIR = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_OVERSHOOT_DIR",
+    "/data/ross/assay_calibration/calibration_quality/s3_overshoot_rerun",
+)
+# Local rerun (2026-11-15) adding evidence retention capped at the Tavtigian C of each setting's true prior
+# (run.py *_capc columns) for every replicate whose retention is shown or quoted (S3; mislabeled controls).
+CALIBRATION_QUALITY_CAPC_DIR = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_CAPC_DIR",
+    "/data/ross/assay_calibration/calibration_quality/retention_capc",
+)
 CALIBRATION_QUALITY_MISFIT_CSV = _env(
     "EXCALIBR_CALIBRATION_QUALITY_MISFIT_CSV",
     "/data/ross/assay_calibration/calibration_quality/misfit_results.csv",

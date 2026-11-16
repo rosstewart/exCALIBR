@@ -57,11 +57,14 @@ ASSAYS = ["A1 (M1 only)", "A2 (M2 only)", "A3 (M1+M2)"]
 CLASSES = ["B", "M1", "M2"]
 
 # (P/LP, B/LB, gnomAD, synonymous) counts.
-# sparse and very sparse: the rich composition scaled down 5- and 20-fold (only sample size changes)
+# 2026-11-14: the calibration-quality grid's sample sizes (Figures S3-S5), so the prior and calibration-quality
+# simulations share them: rich = 80 controls per class with 1000 population / 500 synonymous (the calibration-quality
+# one-factor baseline), sparse = 20 with 200/100, very sparse = 5 with 50/0 (no synonymous: B/LB alone is the benign
+# reference, as in production)
 REGIMES = {
-    "rich": (100, 100, 500, 200),
-    "sparse": (20, 20, 100, 40),
-    "very_sparse": (5, 5, 25, 10),
+    "rich": (80, 80, 1000, 500),
+    "sparse": (20, 20, 200, 100),
+    "very_sparse": (5, 5, 50, 0),
 }
 
 P_IDX, B_IDX, G_IDX, S_IDX = 0, 1, 2, 3
@@ -160,11 +163,16 @@ def oracle_prior(samples, gnomad, assay, delta, rho, weights=None, discard=True,
             d = np.vstack([class_density(s, c, assay, delta, rho) for c in CLASSES])
             weights.append(class_weights(d))
     dg = np.vstack([class_density(gnomad, c, assay, delta, rho) for c in CLASSES])
-    w_b = weights[S_IDX] if len(samples[B_IDX]) == 0 else (weights[B_IDX] + weights[S_IDX]) / 2
+    if len(samples[B_IDX]) == 0:
+        w_b = weights[S_IDX]
+    elif samples[S_IDX] is not None and len(samples[S_IDX]) == 0:  # no synonymous: B/LB alone (as in production)
+        w_b = weights[B_IDX]
+    else:
+        w_b = (weights[B_IDX] + weights[S_IDX]) / 2
     return prior_em(weights[P_IDX] @ dg, w_b @ dg, discard=discard, initial_prior=initial_prior)
 
 
-def expected_prior(assay, pi, delta, rho, eps_p, delta_b, lab_m1_frac, has_benign=True, seed=12345):
+def expected_prior(assay, pi, delta, rho, eps_p, delta_b, lab_m1_frac, has_benign=True, has_syn=True, seed=12345):
     """Infinite-control limit: true class weights, prior EM on a large gnomAD sample."""
     rng = np.random.default_rng(seed)
     gnomad = score(rng, draw_classes(rng, LARGE_N, pi, POP_M1_FRAC), assay, delta, rho)
@@ -174,7 +182,7 @@ def expected_prior(assay, pi, delta, rho, eps_p, delta_b, lab_m1_frac, has_benig
 
     weights = [comp(1 - eps_p, lab_m1_frac), comp(delta_b, POP_M1_FRAC),
                comp(pi, POP_M1_FRAC), comp(0.0, POP_M1_FRAC)]
-    samples = [None, np.zeros(1 if has_benign else 0), None, None]
+    samples = [None, np.zeros(1 if has_benign else 0), None, None if has_syn else np.zeros(0)]
     return oracle_prior(samples, gnomad, assay, delta, rho, weights=weights)
 
 
@@ -223,7 +231,8 @@ def fit_priors(samples, seeds, num_fits=1, return_raw=False):
         # (pipeline/visualize.py) shifts gnomAD/synonymous down one index and
         # switches benign_method from "avg" to "synonymous".
         if len(samples[B_IDX]):
-            idx = dict(benign_idx=B_IDX, gnomad_idx=G_IDX, synonymous_idx=S_IDX)
+            # no synonymous sample: B/LB alone is the benign reference (production: synonymous index absent)
+            idx = dict(benign_idx=B_IDX, gnomad_idx=G_IDX, synonymous_idx=S_IDX if len(samples[S_IDX]) else None)
             benign_method = "avg"
         else:
             idx = dict(benign_idx=None, gnomad_idx=G_IDX - 1, synonymous_idx=S_IDX - 1)
@@ -392,7 +401,8 @@ def main():
             "experiment": exp, "assay": assay, "regime": regime,
             "n_plp, n_blb, n_gnomad, n_syn": ", ".join(map(str, REGIMES[regime])),
             "true_prior": pi, **params,
-            "expected_prior": expected_prior(assay, pi, has_benign=REGIMES[regime][1] > 0, **params),
+            "expected_prior": expected_prior(assay, pi, has_benign=REGIMES[regime][1] > 0,
+                                             has_syn=REGIMES[regime][3] > 0, **params),
             "oracle_point_median": float(np.nanmedian([r["point"] for r in orc])),
             **_summ([b for r in orc for b in r["boots"]], "oracle_boot"),
         }

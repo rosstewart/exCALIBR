@@ -513,6 +513,52 @@ def overview_figure(tab, model, out):
     plt.close(fig)
 
 
+def model_checks(sim, model, n_boot=200):
+    """Supplement numbers for the prior reliability score (same rows and grouped CV as `train`): (1) what it adds
+    over the bootstrap prior SD alone (Spearman with the angular error; bootstrap CI over settings of the gain);
+    (2) overconfidence (mean overshoot, pp) and controls with evidence by reliability band; (3) the in-sample Yang
+    rule (> YANG_T) against the fitted-vs-true distance (> YANG_T) as the truth."""
+    from scipy.stats import spearmanr
+    from sklearn.model_selection import GroupKFold
+    s = sim[sim.experiment != "mech_bias"].dropna(subset=[f for f in FEATURES if f not in NULLABLE]).copy()
+    err, g = angular_err(s), s.cell_id.to_numpy()
+    X = s[["log_sd_ang"]].to_numpy(float)
+    sd_only = np.zeros(len(s))
+    for tr, te in GroupKFold(5).split(X, err, g):
+        sd_only[te] = _hgb().fit(X[tr], err[tr]).predict(X[te])
+    full = np.clip(model["cv"]["pred_err"].to_numpy(), 0, None)
+    sp = lambda p, i=slice(None): float(spearmanr(p[i], err[i]).correlation)
+    cells = np.unique(g)
+    idx = {c: np.where(g == c)[0] for c in cells}
+    rng = np.random.default_rng(0)
+    gain = []
+    for _ in range(n_boot):
+        pick = np.concatenate([idx[c] for c in rng.choice(cells, len(cells))])
+        gain.append(sp(full, pick) - sp(sd_only, pick))
+    out = dict(spearman_full=sp(full), spearman_sd_only=sp(sd_only), spearman_raw_sd=sp(s.fit_prior_sd.to_numpy()),
+               spearman_gain_ci=[float(q) for q in np.quantile(gain, [0.025, 0.5, 0.975])])
+    hi = (s.fit_prior > 0.5).to_numpy()
+    out["fitted_prior_gt_half"] = dict(obs_err=float(err[hi].mean()), pred_sd_only=float(sd_only[hi].mean()),
+                                       pred_full=float(full[hi].mean()))
+    R = np.clip(1 - full / ANG_REF, 0, 1)
+    over = 100 * (s.fit_pathogenic_post_over_mean + s.fit_benign_post_over_mean).to_numpy() / 2
+    share = 100 * (s.fit_pathogenic_post_over + s.fit_benign_post_over).to_numpy() / 2
+    evid = 100 * s.fit_ctrl_determinate.to_numpy()
+    bins = pd.cut(R, [-0.001, 0.5, 0.7, 0.8, 0.9, 1.0])
+    out["by_reliability"] = {str(b): dict(n=int((bins == b).sum()), over_mean=float(np.nanmean(over[bins == b])),
+                                          share_over1=float(np.nanmean(share[bins == b])),
+                                          evid_median=float(np.nanmedian(evid[bins == b])))
+                             for b in bins.categories if (bins == b).any()}
+    ytr = s[[c for c in s if c.startswith("yang_train_")]].max(axis=1)
+    ytrue = s[[c for c in s if c.startswith("yang_true_")]].max(axis=1)
+    ok = ytr.notna() & ytrue.notna()
+    flag, bad = (ytr[ok] > YANG_T).to_numpy(), (ytrue[ok] > YANG_T).to_numpy()
+    out["yang_in_sample"] = dict(n=int(ok.sum()), false_alarm=float(flag[~bad].mean()), catch=float(flag[bad].mean()),
+                                 ppv=float(bad[flag].mean()) if flag.any() else float("nan"),
+                                 bad_rate=float(bad.mean()))
+    return out
+
+
 def main():
     from joblib import Parallel, delayed
     from analysis import config as cfg
@@ -551,7 +597,10 @@ def main():
     summary.update(features=FEATURES, yang_rule=dict(threshold=YANG_T, min_heldout=YANG_MIN_HELDOUT,
                                                      simulation=yr, real_flagged=tab.loc[tab.yang_flag, "dataset"]
                                                      .tolist()))
+    summary["checks"] = model_checks(sim, model)
     (out / "model_summary.json").write_text(json.dumps(summary, indent=1, default=float))
+    import joblib  # the fitted model (incl. its CV predictions) for the supplement figure (figures_v3, S5)
+    joblib.dump(model, out / "model.joblib")
     overview_figure(tab, model, out / "overview.png")
     print(f"real calibrations: {len(tab)}; priors reproduced {int(tab.priors_reproduced.sum())}; with a prediction "
           f"{int(tab.prior_reliability.notna().sum())}; Yang-flagged {int(tab.yang_flag.sum())}")

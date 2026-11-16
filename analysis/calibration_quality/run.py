@@ -284,6 +284,12 @@ def posterior_rows(cal, ev, c, is_path_pop, arm):
         row[f"{arm}_{k}_llr_rep_abs_dir_cap"] = float(np.where(np.sign(rl) == np.sign(tl), np.minimum(np.abs(rl), cap),
                                                                0.0).mean())
         row[f"{arm}_{k}_llr_true_abs_cap"] = float(np.minimum(np.abs(tl), cap).mean())
+        # same, capped at the Tavtigian C of the setting's true prior (very strong evidence, 8 points, at that prior):
+        # evidence beyond it earns no more points, so retention counts only evidence that can change the points
+        cap_c = np.log(_tavtigian_c(c["pi"]))
+        row[f"{arm}_{k}_llr_rep_abs_dir_capc"] = float(np.where(np.sign(rl) == np.sign(tl),
+                                                                np.minimum(np.abs(rl), cap_c), 0.0).mean())
+        row[f"{arm}_{k}_llr_true_abs_capc"] = float(np.minimum(np.abs(tl), cap_c).mean())
         post_c = posterior(lr_c, prior)
         for m, v in posterior_metrics(post_c, true_post, lr_c, is_path_pop if k == "population" else None).items():
             row[f"{arm}_{k}_{m}"] = v
@@ -297,6 +303,12 @@ def posterior_rows(cal, ev, c, is_path_pop, arm):
 
 TRUE_DRAWS = 3000
 LLR_CAP = 350.0  # Tavtigian's very-strong odds (prior 0.10)
+
+
+def _tavtigian_c(pi):
+    """Tavtigian C (likelihood ratio for very strong evidence) at prior `pi`, as the pipeline computes it."""
+    from src.assay_calibration.fit_utils.evidence_thresholds import get_tavtigian_constant
+    return float(get_tavtigian_constant(float(pi)))
 
 
 def yang_true_per_sample(fits, seeds, splits, cols, c, rep):
