@@ -30,7 +30,7 @@ def build_functional_scoresets(
     df: pd.DataFrame,
     gene: str,
     datasets: List[str],
-    clinvar_release: str = "2026",
+    clinvar_release: str = "2025",
     population_type: str = "gnomAD",
     regularization_type: Optional[str] = None,
     tp53_build_kwargs: Optional[dict] = None,
@@ -269,6 +269,10 @@ def select_variants(ms, mask: np.ndarray) -> None:
     ms._keep_mask = new_keep_mask
 
     ms._variants_kept = [v for v, m in zip(ms._variants_kept, mask) if m]
+    if getattr(ms, "row_meta", None) is not None:
+        ms.row_meta = ms.row_meta.iloc[np.flatnonzero(mask)]
+    if getattr(ms, "_row_atoms", None) is not None:
+        ms._row_atoms = [a for a, m in zip(ms._row_atoms, mask) if m]
     ms._scores = ms._scores[mask]
     ms._missing = ms._missing[mask]
     ms._sample_assignments = ms._sample_assignments[mask]
@@ -334,6 +338,8 @@ def build_combined_multiscoreset(
     require_both_modalities: bool = True,
     predictor_transform: Optional[str] = None,
     predictor_label_copies: bool = True,
+    row_builder: Optional[str] = None,
+    df_integrated: Optional[pd.DataFrame] = None,
 ) -> Optional[MultiPredictorFunctionalScoreset]:
     """Join gene's predictor dimensions (REVEL/MP2/AM) with its functional
     dimensions into one MultiPredictorFunctionalScoreset.
@@ -369,8 +375,30 @@ def build_combined_multiscoreset(
     ``predictor_transform``: see predictors.df_to_basic_scoreset (default
     $MV_PREDICTOR_TRANSFORM, else "none"); functional dimensions are untouched.
 
+    ``row_builder`` (default $MV_ROW_BUILDER, else "v2"): "v2" builds rows with
+    rows.build_combined_rows (one row per protein change, SpliceAI <= 0.2,
+    one label source per row, predictors from the integrated dataframe with
+    training variants blanked; ``functionally_assayed_variants`` and
+    ``predictor_label_copies`` are then ignored -- v2 never copies labels).
+    "legacy" reproduces the protein-id join used by the fits before
+    2026-11-19. ``df_integrated``: the integrated dataframe (v2 only; read
+    from DEFAULT_INTEGRATED_DATAFRAME when None).
+
     Returns None if no predictor CSVs are available for ``gene``.
     """
+    import os
+    row_builder = row_builder or os.environ.get("MV_ROW_BUILDER", "v2")
+    if row_builder == "v2":
+        from .rows import build_combined_rows
+        if df_integrated is None:
+            df_integrated = pd.read_csv(DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
+        combined = build_combined_rows(gene, functional_scoresets, predictor_data_dir, df_integrated,
+                                       predictors=predictors, predictor_transform=predictor_transform)
+        if combined is not None and require_both_modalities:
+            restrict_to_both_modalities(combined)
+        return combined
+    if row_builder != "legacy":
+        raise ValueError(f"row_builder must be 'v2' or 'legacy', got {row_builder!r}")
     predictors = list(predictors) if predictors is not None else list(PREDICTORS)
 
     by_gene: Dict[str, Dict[str, pd.DataFrame]] = load_predictor_data(

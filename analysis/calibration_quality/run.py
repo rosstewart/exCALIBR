@@ -205,8 +205,8 @@ def _bin(post):
 
 
 def posterior_histograms(post, post_true=None, is_path=None):
-    """Compact per-replicate counts, ';'-joined: with `is_path` (population draws), variants and true pathogenic
-    variants per model-posterior bin (reliability curve); with `post_true`, the true x model posterior histogram,
+    """Compact per-replicate counts, ';'-joined: with `is_path` (population draws), variants, true pathogenic
+    variants and the sum of model posteriors per model-posterior bin (reliability curve); with `post_true`, the true x model posterior histogram,
     row-major over (true bin, model bin)."""
     out = {}
     b = _bin(post)
@@ -214,6 +214,8 @@ def posterior_histograms(post, post_true=None, is_path=None):
     if is_path is not None:
         out["rel_n"] = ";".join(map(str, np.bincount(b, minlength=K)))
         out["rel_path"] = ";".join(map(str, np.bincount(b, weights=is_path.astype(float), minlength=K).astype(int)))
+        # sum of model posteriors per bin, so the mean reported posterior of any group of bins is exact
+        out["rel_sum"] = ";".join(f"{v:.6g}" for v in np.bincount(b, weights=np.asarray(post, float), minlength=K))
     if post_true is not None:
         h = np.bincount(_bin(post_true) * K + b, minlength=K * K)
         out["hist2d"] = ";".join(map(str, h))

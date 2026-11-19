@@ -3155,6 +3155,48 @@ if not config.warn_if_missing(str(_ps_reps), "prior-simulation replicates"):
     _f3("SuppPriorSimTrueBiasMax", _psk["o_bias_max"], "rich clean: largest |mean bias|, true components")
     _f3("SuppPriorSimFitBiasMaxMulti", _psk["f23_bias_max"], "rich clean: largest |mean bias|, fit, A2/A3")
     _f3("SuppPriorSimFitBiasMaxMinority", _psk["fa1_max"], "rich clean: largest |mean bias|, fit, A1")
+    # Pathomechanism-aware joint prior P(Y=1, M=1) (Supplementary Section pathomechanism_prior) on the same simulated
+    # datasets (python -m analysis.prior_simulation.test_pathomech); fitted estimate vs true prior x detected fraction
+    _pm_csv = _ps_dir / "pathomech_tests.csv"
+    if not config.warn_if_missing(str(_pm_csv), "pathomechanism-prior simulation "
+                                  "(python -m analysis.prior_simulation.test_pathomech --n-jobs 120)"):
+        _pm = pd.read_csv(_pm_csv)
+        _pm_inp = dict(inputs=[_pm_csv])
+        _pm_a = lambda d, a: d[d.assay.str.startswith(a)]
+        _pm_c = _pm[(_pm.experiment == "1_clean") & (_pm.regime == "rich")]
+        _pm_n = lambda name, v, src, f=".3f": REG.num(name, v, fmt=f, source=src, **_pm_inp)
+        _pm_n("SuppPriorSimPathomechATwoBiasMax", _pm_a(_pm_c, "A2").fit_joint_bias.abs().max(),
+              "rich clean: largest |mean error| of the fitted P(Y=1,M=1), A2, true priors 0.05-0.40")
+        _pm_hi = _pm_a(_pm_c, "A1")[_pm_a(_pm_c, "A1").true_prior >= 0.25]
+        _pm_n("SuppPriorSimPathomechAOneHighBiasMax", _pm_hi.fit_joint_bias.abs().max(),
+              "rich clean: largest |mean error| of the fitted P(Y=1,M=1), A1, true priors 0.25-0.40")
+        _pm_lo = _pm_a(_pm_c, "A1")[np.isclose(_pm_a(_pm_c, "A1").true_prior, 0.05)].iloc[0]
+        _pm_n("SuppPriorSimPathomechAOneLowFit", _pm_lo.fit_joint_mean, "rich clean, A1, true prior 0.05: mean fitted "
+              "P(Y=1,M=1)")
+        _pm_n("SuppPriorSimPathomechAOneLowTrue", _pm_lo.true_joint, "rich clean, A1, true prior 0.05: true P(Y=1,M=1)")
+        for _a, _tag in (("A1", "AOne"), ("A2", "ATwo"), ("A3", "AThree")):
+            _r25 = _pm_a(_pm_c, _a)[np.isclose(_pm_a(_pm_c, _a).true_prior, 0.25)].iloc[0]
+            _pm_n(f"SuppPriorSimPathomechFit{_tag}", _r25.fit_joint_mean,
+                  f"rich clean, true prior 0.25, {_a}: mean fitted P(Y=1,M=1)")
+            _pm_n(f"SuppPriorSimPathomechTrue{_tag}", _r25.true_joint,
+                  f"rich clean, true prior 0.25, {_a}: true P(Y=1,M=1)")
+        _pm_rel = 100 * (1 - _pm_a(_pm_c, "A3").fit_joint_mean / _pm_a(_pm_c, "A3").true_joint)
+        _pm_n("SuppPriorSimPathomechAThreeRelLo", _pm_rel.min(), "rich clean, A3: smallest % underestimate of "
+              "P(Y=1,M=1) (fit) over true priors 0.05-0.40", ".0f")
+        _pm_n("SuppPriorSimPathomechAThreeRelHi", _pm_rel.max(), "same: largest %", ".0f")
+        REG.check("pathomech-a3-underestimates", bool((_pm_a(_pm_c, "A3").fit_joint_bias < 0).all()
+                                                      and (_pm_a(_pm_c, "A3").oracle_joint_bias < 0).all()),
+                  f"A3 rich clean joint-prior bias (fit / true components): "
+                  f"{_pm_a(_pm_c, 'A3')[['fit_joint_bias', 'oracle_joint_bias']].round(3).values.tolist()}",
+                  "supplement prior simulation (A3 joint prior underestimated, also with the true components)")
+        # mechanism mix: P/LP samples containing both mechanisms (lab M1 fraction strictly between 0 and 1)
+        _pm_m = _pm[(_pm.experiment == "3_mech_bias") & (_pm.lab_m1_frac > 0) & (_pm.lab_m1_frac < 1)]
+        _pm_m12 = _pm_m[~_pm_m.assay.str.startswith("A3")]
+        _pm_n("SuppPriorSimPathomechMixBiasMax", _pm_m12.fit_joint_bias.abs().max(), "mechanism mix (P/LP with both "
+              "mechanisms, 25-75% via M1): largest |mean error| of the fitted P(Y=1,M=1), A1 and A2")
+        _pm_x = _pm_a(_pm_m, "A1")[np.isclose(_pm_a(_pm_m, "A1").lab_m1_frac, 0.75)].iloc[0]
+        _pm_n("SuppPriorSimPathomechMixMechFrac", _pm_x.fit_mech_frac_mean, "mechanism mix, A1, 75% of P/LP via M1: "
+              "mean fitted P(M=1|Y=1) (true 0.25)", ".2f")
     for _a, _tag, _b in zip(_ps_sim.ASSAYS, ("AOne", "ATwo", "AThree"), ("b1", "b2", "b3")):
         _f2(f"SuppPriorSimFit{_tag}", _psk[_b]["f_m"], f"rich clean pi = 0.25: fit mean, {_a}")
         _f2(f"SuppPriorSimTrue{_tag}", _psk[_b]["o_m"], f"rich clean pi = 0.25: true-component mean, {_a}")
@@ -3603,6 +3645,49 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
                     source=f"simulation: in-sample Yang > 0.2 vs fitted-vs-true distance > 0.2: {_k} (%)", **_rd_inp)
         REG.num("SuppCalQualRealRelBelowHalf", int((_rd_real.prior_reliability < 0.5).sum()), fmt=".0f",
                 source="real calibrations with prior reliability < 0.5", **_rd_inp)
+        # Recommended thresholds (Methods, Quality metrics): < 0.75 unreliable, < 0.5 uninformative. Real counts and
+        # dataset names, and the simulated prior error (|fitted - true prior|, pp; grouped-CV predictions) by band
+        # dataset lists in ascending order of score, each name followed by its citation where the .bib has one
+        def _rd_cited(sel):
+            _r = _rd_real.loc[sel].sort_values("prior_reliability")
+            return ", ".join("\\texttt{" + _display_name(d).replace("_", "\\_\\allowbreak{}") + "}"
+                             + (f"~\\cite{{{config.DATASET_CITE_KEYS[_display_name(d)]}}}"
+                                if _display_name(d) in config.DATASET_CITE_KEYS else "")
+                             for d in _r.dataset)
+        _rd_named = {"Half": _rd_real.prior_reliability < 0.5,
+                     "HalfToThreeQuarter": _rd_real.prior_reliability.between(0.5, 0.75, inclusive="left")}
+        REG.num("SuppCalQualRealRelBelowThreeQuarter", int((_rd_real.prior_reliability < 0.75).sum()), fmt=".0f",
+                source="real calibrations with prior reliability < 0.75", **_rd_inp)
+        for _tt, _sel in _rd_named.items():
+            REG.text(f"SuppCalQualRealRel{'Below' if _tt == 'Half' else ''}{_tt}Datasets", _rd_cited(_sel),
+                     source=f"real calibrations, prior reliability {'< 0.5' if _tt == 'Half' else '0.5-0.75'}, "
+                            f"ascending score, cited via config.DATASET_CITE_KEYS", **_rd_inp)
+        REG.num("SuppCalQualRealRelBelowThreeQuarterNoEvid",
+                int(((_rd_real.prior_reliability < 0.75) & (_rd_real.no_evidence >= 1)).sum()), fmt=".0f",
+                source="real calibrations with prior reliability < 0.75 assigning no evidence to any control", **_rd_inp)
+        REG.check("prior-reliability-below-half-no-evidence",
+                  bool((_rd_real.loc[_rd_real.prior_reliability < 0.5, "no_evidence"] >= 1).all()),
+                  f"controls without evidence, reliability < 0.5: "
+                  f"{_rd_real.loc[_rd_real.prior_reliability < 0.5, ['dataset', 'no_evidence']].values.tolist()}",
+                  "main.tex Methods Quality metrics (all below 0.5 assigned no evidence)")
+        _rd_uncited = sorted(d for _sel in _rd_named.values() for d in _rd_real.loc[_sel, "dataset"]
+                             if _display_name(d) not in config.DATASET_CITE_KEYS)
+        REG.check("prior-reliability-named-datasets-cited", not _rd_uncited,
+                  f"datasets named below 0.75 without a BibTeX key in config.DATASET_CITE_KEYS: {_rd_uncited}",
+                  "main.tex Methods Quality metrics (dataset lists)")
+        _rd_mod = _joblib.load(_rd_model)
+        REG.num("SuppCalQualRelNTrain", int(_rd_mod["n"]), source="simulated calibrations the prior reliability "
+                "model was trained on (mechanism-mix settings excluded)", **_rd_inp)
+        REG.num("SuppCalQualRelNTrees", int(_rd_mod["mean_model"].n_iter_), fmt="d", source="boosting iterations "
+                "(trees) of the fitted prior reliability model after early stopping", **_rd_inp)
+        _rd_cv = _rd_mod["cv"]
+        _rd_cvR = np.clip(1 - np.clip(_rd_cv.pred_err.to_numpy(), 0, None) / (np.pi / 6), 0, 1)
+        _rd_pe = 100 * (_rd_cv.fit_prior - _rd_cv.pi).abs().to_numpy()
+        for _lo, _hi, _bt in ((-1, 0.5, "Low"), (0.5, 0.75, "Mid"), (0.75, 0.9, "High"), (0.9, 1.01, "Top")):
+            _sel = (_rd_cvR > _lo) & (_rd_cvR <= _hi) if _bt != "Top" else (_rd_cvR > _lo)
+            REG.num(f"SuppCalQualRelErrMed{_bt}", float(np.nanmedian(_rd_pe[_sel])), fmt=".0f",
+                    source=f"simulation (grouped CV): median |fitted - true prior| (pp), reliability in ({_lo}, {_hi}]",
+                    **_rd_inp)
         REG.num("SuppCalQualRealRelMedian", float(_rd_real.prior_reliability.median()), fmt=".2f",
                 source="real calibrations: median prior reliability", **_rd_inp)
         REG.num("SuppCalQualRealYangFlagged", int((_rd_real.yang_train_max > config.YANG_GOOD_FIT_THRESHOLD).sum()),
@@ -3696,8 +3781,37 @@ if not config.warn_if_missing(str(_cq_res), "calibration-quality simulation resu
                 & (_v3_m.richness == _cq_v3.MAIN_SIZE) & _v3_m.n_plp.isin(list(_cq_v3.S4_CONTROLS))]
     _s4o = {(_pre, _pi): _v3_mo(_d[_d.acmg_ok] if _pre == "acmg" else _d, _pre)
             for _pre in ("fit", "acmg") for _pi, _d in _s4.groupby("pi")}
-    _v3n("SuppCalQualExcOverMax", max(v for (p, _), v in _s4o.items() if p == "fit"), ".1f",
+    _v3n("SuppCalQualExcOverMax", max(v for (p, _), v in _s4o.items() if p == "fit"), ".2f",
          "S4B: ExCALIBR largest mean overshoot over true priors 0.01-0.60 (pp)")
+    _v3n("SuppCalQualAcmOverMin", min(v for (p, _), v in _s4o.items() if p == "acmg"), ".1f",
+         "S4B: acmgscaler smallest mean overshoot over true priors 0.01-0.60 (pp)")
+    _v3n("SuppCalQualAcmOverMax", max(v for (p, _), v in _s4o.items() if p == "acmg"), ".1f",
+         "S4B: acmgscaler largest mean overshoot over true priors 0.01-0.60 (pp)")
+    REG.check("calqual-acmg-more-overconfident-every-prior",
+              all(_s4o[("acmg", _k)] > _s4o[("fit", _k)] for (_p, _k) in _s4o if _p == "fit"),
+              f"mean overshoot by true prior (acmgscaler vs ExCALIBR): "
+              f"{ {_k: (round(_s4o[('acmg', _k)], 2), round(_s4o[('fit', _k)], 2)) for (_p, _k) in _s4o if _p == 'fit'} }",
+              "main.tex Results acmgscaler paragraph (more overconfident at every true prior tested)")
+    # Mean reported posterior among population variants with posterior >= 0.9 at a true prior of 0.01, exact from the
+    # per-bin posterior sums (rel_sum) of the relsum rerun (same seeds as the stored S4 cells)
+    _rs_dir = Path(config.CALIBRATION_QUALITY_OVERSHOOT_DIR) / "relsum"
+    if not config.warn_if_missing(str(_rs_dir / "results.csv"), "calibration-quality posterior-sum rerun (prior 0.01)"):
+        from analysis.calibration_quality.figures import _counts as _cq_counts
+        from analysis.calibration_quality.run import POST_EDGES as _cq_edges
+        _i9 = list(_cq_edges).index(0.9)
+        _rs_inp = dict(inputs=[_rs_dir / "results.csv", _rs_dir / "acmg_rows.csv"])
+        for _pre, _mt, _rsd in (("fit", "Exc", pd.read_csv(_rs_dir / "results.csv")),
+                                ("acmg", "Acm", pd.read_csv(_rs_dir / "acmg_rows.csv"))):
+            if _pre == "acmg":
+                _rsd = _rsd[_rsd["acmg_status"] == "ok"]
+            _n = _cq_counts(_rsd[f"{_pre}_population_rel_n"])[_i9:]
+            _sm = _cq_counts(_rsd[f"{_pre}_population_rel_sum"])[_i9:]
+            _ph = _cq_counts(_rsd[f"{_pre}_population_rel_path"])[_i9:]
+            REG.num(f"SuppCalQual{_mt}MeanPostPiOne", 100 * _sm.sum() / _n.sum(), fmt=".0f",
+                    source=f"S4, true prior 0.01, 10/80 controls: mean reported posterior (%) of population variants "
+                           f"with posterior >= 0.9 ({_mt}; exact, rel_sum rerun)", **_rs_inp)
+            REG.num(f"SuppCalQual{_mt}PrecRelsumPiOne", 100 * _ph.sum() / _n.sum(), fmt=".0f",
+                    source=f"same variants: % pathogenic (rerun; should equal {_mt}PrecFinalPiOne)", **_rs_inp)
     for _pi, _pt in ((0.01, "PiOne"), (0.10, "PiTen"), (0.60, "PiSixty")):
         _k = min(_s4o, key=lambda k: abs(k[1] - _pi))[1]
         _v3n(f"SuppCalQualAcmOver{_pt}", _s4o[("acmg", _k)], ".1f", f"S4B: acmgscaler mean overshoot, true prior {_pi} (pp)")

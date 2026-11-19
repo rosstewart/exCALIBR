@@ -35,6 +35,26 @@ _LOG2   = np.log(2.0)
 # Helpers
 # ──────────────────────────────────────────────
 
+
+from scipy.special import log_ndtr as _log_ndtr  # = scipy.stats.norm.logcdf, without per-call overhead
+
+def pattern_groups(obs_mask):
+    """``np.unique(obs_mask, axis=0, return_inverse=True)`` for a boolean
+    (N, p) missingness mask, without sorting whole rows: each row is packed
+    into one integer with column 0 as the most significant bit, so integer
+    order equals np.unique's lexicographic row order. Same patterns, same
+    order, same inverse -- a drop-in that leaves every downstream result
+    bitwise unchanged (it is called on every E/M-step)."""
+    obs_mask = np.asarray(obs_mask, dtype=bool)
+    if obs_mask.ndim != 2 or obs_mask.shape[1] > 62:
+        return np.unique(obs_mask, axis=0, return_inverse=True)
+    p = obs_mask.shape[1]
+    weights = (np.int64(1) << np.arange(p - 1, -1, -1, dtype=np.int64))
+    codes = obs_mask.astype(np.int64) @ weights
+    uniq, inverse = np.unique(codes, return_inverse=True)
+    patterns = ((uniq[:, None] & weights[None, :]) != 0)
+    return patterns, inverse.reshape(-1)
+
 def _delta_ndim(Delta):
     """Return the latent dimension q from Delta."""
     Delta = np.asarray(Delta)
@@ -182,7 +202,7 @@ def _mvn_logcdf(upper, mean, cov):
     q = len(upper)
     if q == 1:
         sigma = np.sqrt(np.asarray(cov).ravel()[0]) if np.asarray(cov).ndim > 0 else np.sqrt(float(cov))
-        return norm.logcdf((upper[0] - mean[0]) / max(sigma, 1e-15))
+        return _log_ndtr((upper[0] - mean[0]) / max(sigma, 1e-15))
     # For q >= 2, use scipy's mvn CDF (not log, so take log after)
     try:
         val = mvn(mean=mean, cov=cov, allow_singular=True).cdf(upper)
@@ -206,7 +226,7 @@ def _mvn_logcdf_batch(uppers, mean, cov):
     N, q = uppers.shape
     if q == 1:
         s = np.sqrt(max(float(np.asarray(cov).ravel()[0]), 1e-15))
-        return norm.logcdf((uppers[:, 0] - mean[0]) / s)
+        return _log_ndtr((uppers[:, 0] - mean[0]) / s)
     if q == 2:
         # Use the SAME Phi_2 as the E-step's truncated-normal moments.
         #
@@ -340,7 +360,7 @@ def cfusn_logpdf_alternate_missing(x, mu, Delta, Gamma):
 
     # Vectorised pattern partition (was a per-row Python dict loop).
     obs_mask = ~np.isnan(x)
-    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
+    patterns, inverse = pattern_groups(obs_mask)
 
     for pi, pattern in enumerate(patterns):
         obs_dims = np.where(pattern)[0]
@@ -404,7 +424,7 @@ def msn_logpdf_alternate(x, mu, Delta, Gamma):
     Omega_inv_Delta = cho_solve(cf, Delta, check_finite=False)
     eta             = residuals @ Omega_inv_Delta
     sigma_sq        = max(1.0 - Delta @ Omega_inv_Delta, 1e-12)
-    log_Phi         = norm.logcdf(eta / np.sqrt(sigma_sq))
+    log_Phi         = _log_ndtr(eta / np.sqrt(sigma_sq))
 
     result = np.asarray(_LOG2 + log_phi + log_Phi, dtype=float).ravel()
     result[~np.isfinite(result)] = -np.inf
@@ -422,7 +442,7 @@ def msn_logpdf_alternate_missing(x, mu, Delta, Gamma):
 
     # Vectorised pattern partition (was a per-row Python dict loop).
     obs_mask = ~np.isnan(x)
-    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
+    patterns, inverse = pattern_groups(obs_mask)
 
     for pi, pattern in enumerate(patterns):
         obs_dims = np.where(pattern)[0]

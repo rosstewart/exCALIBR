@@ -235,6 +235,43 @@ if not _PLC:
 if _PLC.lower() not in ("", "true", "false"):
     raise ValueError(f"MV_PREDICTOR_LABEL_COPIES must be true or false, not {_PLC!r}")
 PREDICTOR_LABEL_COPIES = _PLC.lower() != "false"
+def _marker(name):
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        _m = os.path.join(_d, name)
+        if os.path.exists(_m):
+            with open(_m) as _f:
+                return _f.read().strip()
+    return None
+
+
+# Runs prepared from 2026-11-19 on carry row_builder.txt ("v2": rows.py's
+# combined rows, averaged merged functional rows) and clinvar_release.txt
+# ("2025"); both are exported so the builders in src/ rebuild the same rows
+# and labels. A fits directory WITHOUT these markers predates them: it was
+# built with the legacy rows and ClinVar 2026 labels, so it is re-scored that
+# way (legacy reproduction only -- every new run is 2025/v2). $MV_ROW_BUILDER
+# and $MV_CLINVAR_DEFAULT_RELEASE win.
+ROW_BUILDER = os.environ.get("MV_ROW_BUILDER") or _marker("row_builder.txt") or "legacy"
+CLINVAR_DEFAULT_RELEASE = (os.environ.get("MV_CLINVAR_DEFAULT_RELEASE") or _marker("clinvar_release.txt")
+                           or "2026")
+if ROW_BUILDER not in ("v2", "legacy"):
+    raise ValueError(f"MV_ROW_BUILDER must be v2 or legacy, not {ROW_BUILDER!r}")
+os.environ["MV_ROW_BUILDER"] = ROW_BUILDER
+os.environ["MV_CLINVAR_DEFAULT_RELEASE"] = CLINVAR_DEFAULT_RELEASE
+# Consequence-stratified runs (hpc/prepare.py --strata) carry strata.txt and a
+# strata/ directory of per-dataset layouts; scoring composes the stratum
+# weights into the arm's composite samples (gene_set_analysis.stratify_for_scoring).
+STRATA = (os.environ.get("MV_STRATA") or _marker("strata.txt") or "false").lower() == "true"
+os.environ["MV_STRATA"] = "true" if STRATA else "false"
+if STRATA and "MV_STRATA_DIR" not in os.environ:
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        if os.path.isdir(os.path.join(_d, "strata")):
+            os.environ["MV_STRATA_DIR"] = os.path.join(_d, "strata")
+            break
+if CLINVAR_DEFAULT_RELEASE != "2025" or ROW_BUILDER != "v2":
+    print(f"[mv_analysis.config] {PAPER_FITS_DIR}: legacy run (rows={ROW_BUILDER}, "
+          f"ClinVar default release {CLINVAR_DEFAULT_RELEASE}); re-scoring it as it was fit.")
+
 if COMBINED_POPULATION not in ("union", "intersection"):
     raise ValueError(f"MV_COMBINED_POPULATION must be union or intersection, not {COMBINED_POPULATION!r}")
 
@@ -722,7 +759,8 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
                 # shape, same issue seen for TP53/BRCA2's role-count
                 # mismatch warnings this session).
                 require_both_modalities=COMBINED_POPULATION == "intersection",
-                predictor_label_copies=PREDICTOR_LABEL_COPIES)
+                predictor_label_copies=PREDICTOR_LABEL_COPIES,
+                row_builder=ROW_BUILDER, df_integrated=df_integrated)
             if ms is None:
                 print(f"  [{gene}] could not build combined ms, skipping")
                 continue

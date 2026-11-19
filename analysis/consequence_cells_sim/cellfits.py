@@ -17,13 +17,20 @@ from pathlib import Path
 import numpy as np
 
 
-def _cells():
-    from analysis.consequence_cells_sim.generate import design, n_components
-    return [c for c in design() if n_components(c) >= 3]
+def fit_k(c):
+    from analysis.consequence_cells_sim.generate import n_components
+    return int(c.get("fit_K") or n_components(c))
 
 
-def make(out_dir, reps, B, R):
-    tasks = [dict(cell=c, rep=r, B=B, R=R) for r in range(reps) for c in _cells()]
+def _cells(experiment=None):
+    from analysis.consequence_cells_sim.generate import design
+    if experiment:
+        return [c for c in design() if c["experiment"] == experiment]
+    return [c for c in design() if fit_k(c) >= 3 and c["experiment"] != "ptvtv"]   # the 2026-11-15 set
+
+
+def make(out_dir, reps, B, R, experiment=None):
+    tasks = [dict(cell=c, rep=r, B=B, R=R) for r in range(reps) for c in _cells(experiment)]
     out = Path(out_dir)
     (out / "fits").mkdir(parents=True, exist_ok=True)
     (out / "tasks.json").write_text(json.dumps(tasks))
@@ -45,7 +52,7 @@ def _run_one(out_dir, t):
     names, cell_of_row = cell_keys(d, c["assay"])
     onehot = np.zeros((len(sc), len(names)), bool)
     onehot[np.arange(len(sc)), cell_of_row] = True
-    K = G.n_components(c)
+    K = fit_k(c)
     fits, seeds = fit_arm(BasicScoreset(sc, onehot, sample_names=names), K, t["B"], t["R"],
                           c.get("shape", "gauss") == "gauss")
     W = np.array([np.asarray(x["fit"]["weights"], float) for x in fits]).reshape(len(fits), len(names), K)
@@ -73,6 +80,7 @@ def main():
     m.add_argument("--reps", type=int, default=20)
     m.add_argument("--B", type=int, default=50)
     m.add_argument("--R", type=int, default=8)
+    m.add_argument("--experiment", default=None, help="only cells of this experiment (e.g. ptvtv)")
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("--index", type=int, required=True)
@@ -80,7 +88,7 @@ def main():
     r.add_argument("--workers", type=int, default=16)
     a = ap.parse_args()
     if a.cmd == "make":
-        make(a.out_dir, a.reps, a.B, a.R)
+        make(a.out_dir, a.reps, a.B, a.R, a.experiment)
     else:
         run(a.out_dir, a.index, a.per_index, a.workers)
 

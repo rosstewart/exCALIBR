@@ -449,6 +449,39 @@ def stage_vus(args):
         pd.DataFrame(rows).to_csv(OUT / "vus" / "pknn_vus_points.csv", index=False)
 
 
+def job_pickle_oob_splits(dataset_name, seeds, fits_dir=None):
+    """{bootstrap seed: out-of-bag row indices} read from the run's job
+    pickles (shared_data["val_variant_indices"], already scoreset-row
+    indices) -- the only option for consequence-stratified runs, whose
+    resampling cannot be regenerated from the multiscoreset alone. Looks in
+    <fits_dir>/jobs and its parent's jobs/."""
+    import json as _json
+    import pickle as _pickle
+    from pathlib import Path as _P
+    from mv_analysis import config as _cfg
+    base = _P(fits_dir or _cfg.PAPER_FITS_DIR)
+    for jd in (base / "jobs", base.parent / "jobs"):
+        if (jd / "job_index.json").exists() and any(jd.glob("array_*.pkl")):
+            break
+    else:
+        raise FileNotFoundError(f"no job pickles under {base} or its parent")
+    idx = _json.load(open(jd / "job_index.json"))["job_index"]
+    want = {int(b) for b in seeds}
+    out, cache = {}, {}
+    for e in idx:
+        if e["dataset_name"] != dataset_name or int(e["bootstrap_seed"]) not in want:
+            continue
+        a = e["array_idx"]
+        if a not in cache:
+            cache = {a: _pickle.load(open(jd / f"array_{a:04d}.pkl", "rb"))}
+        job = cache[a][e["local_idx"]]
+        out[int(job["bootstrap_seed"])] = np.asarray(job["shared_data"]["val_variant_indices"], int)
+    missing = want - set(out)
+    if missing:
+        raise KeyError(f"{dataset_name}: no job pickle for bootstrap seeds {sorted(missing)[:5]}")
+    return out
+
+
 def _paper_oob_splits(ms, seeds, K):
     """{bootstrap seed: out-of-bag row indices} for the paper fits, regenerated
     with the same job generator and seeds (Fit.generate_fit_jobs, master seed

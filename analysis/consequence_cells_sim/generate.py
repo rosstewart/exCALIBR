@@ -157,6 +157,14 @@ def design():
         cells.append(make_cell("ptvloc", size, "realistic", kappa=kap, assay=assay, ptv_loc=loc))
     sl_mis = make_cell("misfit", "mid", "realistic", assay="fitness", shape="skew")
     cells.append(sl_mis)
+    # Density-TV calibration cells (2026-11-19), cells-only refits (cellfits.py): PTV LoF at 1.0x (identical detected
+    # densities; fitted at K = 3, fit_K, as production usually does), 1.1x and 1.25x the missense abnormal location
+    # (true detected-density TV ~0, 0.14, 0.34); kappa 3.5, mid and large, both assays.
+    for loc, size, assay in itertools.product((1.0, 1.1, 1.25), ("mid", "large"), ("fitness", "abundance")):
+        over = dict(kappa=3.5, assay=assay, ptv_loc=loc)
+        if loc == 1.0:
+            over["fit_K"] = 3
+        cells.append(make_cell("ptvtv", size, "realistic", **over))
     seen, out = set(), []
     for c in cells:
         if c["cell_id"] not in seen:

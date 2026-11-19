@@ -428,7 +428,7 @@ def _composition_sample_weights(df_ds, kw, ds, plp_weight, extra_sample_pull, da
 
 def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type,
-                              force_gaussian=False, default_release="2026",
+                              force_gaussian=False, default_release="2025",
                               master_seed=DEFAULT_MASTER_SEED,
                               spliceai_threshold=0.2, vep_splice_filter=True,
                               missense_controls_only=False, extra_sample=None,
@@ -583,8 +583,8 @@ def run_default(args):
 
     # "default" mode. "pillar_project" mode. (see main()) reuses this same
     # function with clinvar_default_release="2025" instead -- every dataset
-    # that isn't forced to 2018 uses this release, rather than 2026.
-    default_release = getattr(args, "clinvar_default_release", "2026")
+    # that isn't forced to 2018 uses this release (2025 in both modes).
+    default_release = getattr(args, "clinvar_default_release", "2025")
 
     df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
@@ -925,6 +925,19 @@ def _cluster_suffixed_label(dataset_label: str, cluster_idx: int) -> str:
     return f"{dataset_label[:pos]}_cluster{cluster_idx + 1}{dataset_label[pos:]}"
 
 
+_INTEGRATED_DF_CACHE = {}
+
+
+def _integrated_df_cached(path=None):
+    """The integrated dataframe, read once per process (strata annotation of
+    functional MultiScoreset rows)."""
+    from src.assay_calibration.multivariate_data.combined import DEFAULT_INTEGRATED_DATAFRAME
+    path = path or DEFAULT_INTEGRATED_DATAFRAME
+    if path not in _INTEGRATED_DF_CACHE:
+        _INTEGRATED_DF_CACHE[path] = pd.read_csv(path, sep="\t", low_memory=False)
+    return _INTEGRATED_DF_CACHE[path]
+
+
 def sample_roles(ms):
     """Role of each column of ``ms.sample_assignments`` (empty samples are
     dropped there, so positions shift: a gene with no P/LP starts at B/LB, and
@@ -933,6 +946,8 @@ def sample_roles(ms):
     phenotype sub-model's phenotype group), "pathogenic" (auxiliary pathogenic
     samples: phenotype groups, TP53 RPV), "benign", "population", "synonymous".
     """
+    if getattr(ms, "strata_roles", None) is not None:  # fit_utils/strata.StrataView
+        return list(ms.strata_roles)
     roles = []
     for name in ms.sample_names:
         n = str(name).lower()
@@ -1137,10 +1152,33 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             ))
         return all_jobs
 
-    proportions, path_factor = pathogenic_share_proportions(ms, pathogenic_share)
+    fit_options = fit_options or {}
+    # Consequence-stratified mixture (fit_options["strata"]): the fitter's
+    # samples are the strata (fit_utils/strata.py); composites are rebuilt at
+    # scoring time. The stratum layout is written next to the jobs so scoring
+    # can check it rebuilt the same strata.
+    ms_fit, strata = ms, None
+    if fit_options.get("strata"):
+        from src.assay_calibration.fit_utils.strata import row_annotations, build_strata, StrataView
+        if fit_options.get("tied_population"):
+            raise NotImplementedError("tied_population is not defined for a stratified fit")
+        ann = row_annotations(ms, _integrated_df_cached() if getattr(ms, "_row_atoms", None) is not None
+                              and getattr(ms, "row_meta", None) is None else None, gene=gene)
+        strata = build_strata(ms, ann, min_stratum=int(fit_options.get("strata_min", 5)))
+        ms_fit = StrataView(ms, strata)
+        print(f"  {dataset_label}: {len(strata.names)} strata: "
+              + ", ".join(f"{n}={c}" for n, c in zip(strata.names, strata.counts)))
+        for m in strata.merges:
+            print(f"  {dataset_label}:   {m}")
+        sdir = os.path.join(os.path.dirname(save_dir.rstrip("/")), "strata")
+        os.makedirs(sdir, exist_ok=True)
+        with open(os.path.join(sdir, f"{dataset_label}.json"), "w") as f:
+            json.dump(dict(strata.to_dict(), bootstrap_scheme=fit_options.get("bootstrap_scheme", "stratum_pattern"),
+                           bootstrap_min_cell=int(fit_options.get("bootstrap_min_cell", 5)),
+                           bootstrap_n_minus_one=bool(fit_options.get("bootstrap_n_minus_one", False))), f, indent=1)
+    proportions, path_factor = pathogenic_share_proportions(ms_fit, pathogenic_share)
     if pathogenic_share:
         print(f"  {dataset_label}: pathogenic share {pathogenic_share:g} -> factor {path_factor:.2f}")
-    fit_options = fit_options or {}
     tied_spec = None
     if fit_options.get("tied_population"):
         from src.assay_calibration.fit_utils.cfusn.tied_population import spec_from_roles
@@ -1163,7 +1201,17 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
     if "unc" in constraint_modes:
         constrained_flags.append(False)
 
-    fitter = Fit(ms)
+    fitter = Fit(ms_fit)
+    boot_kwargs = {}
+    if fit_options.get("bootstrap_scheme") or strata is not None:
+        scheme = fit_options.get("bootstrap_scheme") or "stratum_pattern"
+        if scheme == "composite_pattern":  # resample composite samples x pattern while fitting strata
+            boot_kwargs = dict(bootstrap_scheme="pattern",
+                               bootstrap_assignments=np.asarray(ms._sample_assignments, dtype=bool))
+        else:
+            boot_kwargs = dict(bootstrap_scheme=scheme,
+                               bootstrap_min_cell=int(fit_options.get("bootstrap_min_cell", 5)),
+                               bootstrap_n_minus_one=bool(fit_options.get("bootstrap_n_minus_one", False)))
     all_jobs = []
     for bs in range(N_BOOTSTRAPS):
         jobs_by_key = {}
@@ -1191,6 +1239,7 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                     fit_kwargs["tied_population"] = tied_spec
                 if noise_floor is not None:
                     fit_kwargs["gamma_noise_floor"] = noise_floor
+                fit_kwargs.update(boot_kwargs)
                 if greedy_restarts:
                     fit_kwargs["greedy_restarts"] = True
                 elif NUM_FITS is not None:
@@ -1226,6 +1275,9 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             "multivariate": True,
             "num_fits_total": sum(_count_eventual_fits(v) for v in jobs_by_key.values()),
         }
+        if strata is not None:
+            cjob["strata"] = dict(names=list(strata.names), counts=strata.counts.tolist(),
+                                  bootstrap=dict((k, v) for k, v in boot_kwargs.items() if k != "bootstrap_assignments"))
         if (fit_options.get("tied_population") or fit_options.get("noise_floor")
                 or fit_options.get("weight_neff", "weighted") != "weighted"):
             cjob["fit_options"] = dict(fit_options, tied_population_spec=tied_spec, noise_floor_var=noise_floor)
@@ -1247,7 +1299,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
                                 greedy_restarts=False, pathogenic_share=None, fit_options=None):
     from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
 
-    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
+    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release not in ('2025', '2026') else ''}"
     save_dir = os.path.join(output_dir, gene_label)
 
     scoreset_kwargs = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
@@ -1378,6 +1430,7 @@ def _build_gene_set_ms_map(gene_set, args):
                 require_both_modalities=getattr(args, "combined_population", "union") == "intersection",
                 predictor_transform=getattr(args, "predictor_transform_value", None),
                 predictor_label_copies=getattr(args, "predictor_label_copies", True),
+                row_builder=getattr(args, "row_builder", "v2"), df_integrated=df,
             )
             if ms is None:
                 print(f"  {gene}: no predictor CSVs under {args.predictor_data_dir}, skipping")
@@ -1926,6 +1979,24 @@ def _add_pathogenic_share_arg(p):
                         "pi * W[P/LP] + (1 - pi) * W[B/LB + synonymous] during the fit "
                         "(cfusn/tied_population.py: population containment). Datasets "
                         "without P/LP, a benign reference or a population sample fit free.")
+    p.add_argument("--strata", action="store_true",
+                   help="Consequence-stratified mixture: fit with every variant in one stratum "
+                        "(membership x consequence x splice flag; fit_utils/strata.py) as the "
+                        "samples, composites rebuilt at scoring. Writes strata/<dataset>.json "
+                        "and a strata.txt marker that mv_analysis/config.py reads.")
+    p.add_argument("--strata-min", type=int, default=5,
+                   help="--strata: strata with fewer rows merge into a same-role sibling (default 5).")
+    p.add_argument("--bootstrap-scheme", default=None,
+                   choices=["pattern", "stratum", "stratum_pattern", "composite_pattern"],
+                   help="MV bootstrap stratification: 'pattern' (fit samples x exact readout "
+                        "pattern; the default without --strata), 'stratum' (fit samples only), "
+                        "'stratum_pattern' (fit samples x pattern, thin cells collapsed into the "
+                        "nearest cell; the default with --strata), 'composite_pattern' (--strata "
+                        "only: resample the standard samples x pattern while fitting strata).")
+    p.add_argument("--bootstrap-min-cell", type=int, default=5,
+                   help="'stratum_pattern': minimum resampling cell size (default 5).")
+    p.add_argument("--bootstrap-n-minus-one", action="store_true",
+                   help="'stratum_pattern': draw n-1 rows per cell (McCarthy-Snowden).")
     p.add_argument("--noise-floor", action="store_true",
                    help="Floor every component's covariance at the per-readout measurement "
                         "noise, estimated from synonymous (else B/LB) variants "
@@ -1947,7 +2018,12 @@ def _fit_options(args):
     return {"weight_neff": getattr(args, "weight_neff", "weighted"),
             "tied_population": bool(getattr(args, "tied_population", False)),
             "noise_floor": bool(getattr(args, "noise_floor", False)),
-            "noise_floor_shape": getattr(args, "noise_floor_shape", "full")}
+            "noise_floor_shape": getattr(args, "noise_floor_shape", "full"),
+            "strata": bool(getattr(args, "strata", False)),
+            "strata_min": getattr(args, "strata_min", 5),
+            "bootstrap_scheme": getattr(args, "bootstrap_scheme", None),
+            "bootstrap_min_cell": getattr(args, "bootstrap_min_cell", 5),
+            "bootstrap_n_minus_one": bool(getattr(args, "bootstrap_n_minus_one", False))}
 
 
 def _merge_condition_manifests(output_root: str, condition_labels: list, target_array_size: int) -> None:
@@ -2151,13 +2227,13 @@ def main():
 
     p_def = sub.add_parser("default", help="Univariate Scoreset from integrated TSV")
     _add_default_mode_args(p_def)
-    p_def.set_defaults(func=run_default, clinvar_default_release="2026",
+    p_def.set_defaults(func=run_default, clinvar_default_release="2025",
                        tavtigian_posterior_decimals="none")
 
     p_pillar = sub.add_parser(
         "pillar_project",
-        help="Same as 'default', but ClinVar 2025 in place of ClinVar 2026 "
-             "everywhere (datasets forced to 2018 are unaffected), and Tavtigian c "
+        help="Same as 'default' (ClinVar 2025; datasets forced to 2018 are "
+             "unaffected), with Tavtigian c "
              "computed with rule posteriors rounded to 3 decimals at calibration, "
              "as in the ExCALIBR manuscript",
     )
@@ -2471,8 +2547,33 @@ def main():
                             "cleared, no __predictor_dup copy); every other variant keeps its "
                             "predictor-CSV label. Writes a predictor_label_copies.txt marker "
                             "(\"false\") that mv_analysis/config.py reads.")
+        p.add_argument("--row-builder", choices=["v2", "legacy"], default="v2",
+                       help="[MV] Row construction. 'v2' (default): combined rows from "
+                            "multivariate_data/rows.py (one row per protein change, SpliceAI "
+                            "<= 0.2, one label source per row, predictors from the integrated "
+                            "dataframe, training variants blanked) and averaged merged rows in "
+                            "functional MultiScoresets. 'legacy': the pre-2026-11-19 rows. "
+                            "Writes row_builder.txt and clinvar_release.txt markers that "
+                            "mv_analysis/config.py reads.")
 
     args = parser.parse_args()
+    # Pin the ClinVar default release for job generation before anything can
+    # import mv_analysis.config, whose legacy-run fallback would otherwise set
+    # it to 2026 for the whole process. An explicit environment value wins.
+    os.environ.setdefault("MV_CLINVAR_DEFAULT_RELEASE", "2025")
+    if getattr(args, "strata", False) and getattr(args, "output_dir", None):
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "strata.txt"), "w") as f:
+            f.write("true\n")
+    if hasattr(args, "row_builder"):
+        os.environ["MV_ROW_BUILDER"] = args.row_builder
+        if getattr(args, "output_dir", None):
+            from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, "row_builder.txt"), "w") as f:
+                f.write(args.row_builder + "\n")
+            with open(os.path.join(args.output_dir, "clinvar_release.txt"), "w") as f:
+                f.write(resolve_clinvar_release("__default__") + "\n")
     if getattr(args, "combined_population", "union") != "union":
         os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "combined_population.txt"), "w") as f:

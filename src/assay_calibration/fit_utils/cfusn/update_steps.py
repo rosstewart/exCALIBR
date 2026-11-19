@@ -35,6 +35,15 @@ from scipy.stats import truncnorm
 from scipy.special import logsumexp, owens_t, log_ndtr, erfcx, roots_legendre
 from scipy.linalg import cho_factor, cho_solve
 from scipy.stats import norm
+from scipy.special import ndtr as _ndtr
+# Standard-normal cdf/pdf exactly as scipy.stats.norm evaluates them (ndtr, and
+# the same pdf formula and constant), called directly to skip rv_continuous's
+# per-call argument handling on every E/M-step. Values are bitwise identical.
+_NORM_PDF_C = np.sqrt(2 * np.pi)
+
+
+def _std_norm_pdf(x):
+    return np.exp(-x**2/2.0) / _NORM_PDF_C
 
 
 def _bvn_cdf_owens(h, k, rho):
@@ -69,7 +78,7 @@ def _bvn_cdf_owens(h, k, rho):
 
     hk = h * k
     delta = np.where((hk > 0) | ((hk == 0) & (h + k >= 0)), 0.0, 0.5)
-    return 0.5 * (norm.cdf(h) + norm.cdf(k)) - T1 - T2 - delta
+    return 0.5 * (_ndtr(h) + _ndtr(k)) - T1 - T2 - delta
 
 
 # ── Cancellation-free tail companions to _bvn_cdf_owens ────────────────────
@@ -376,8 +385,8 @@ def _psd_floor_or_reject(Gamma_cand, floor=1e-8, reject_rel=1e-8):
 def trunc_norm_moments(mu, sigma):
     """Moments of TN(mu, sigma^2, R+). mu, sigma are arrays (N,)."""
     ratio = mu / sigma
-    cdf = sps.norm.cdf(ratio)
-    pdf = sps.norm.pdf(ratio)
+    cdf = _ndtr(ratio)
+    pdf = _std_norm_pdf(ratio)
     safe = cdf > 1e-300
     p = np.zeros_like(pdf)
     p[safe] = pdf[safe] / cdf[safe]
@@ -422,7 +431,7 @@ def get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma):
     w = np.zeros(N)
 
     obs_mask = ~np.isnan(observations)
-    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
+    patterns, inverse = density_utils.pattern_groups(obs_mask)
 
     for pi, pattern in enumerate(patterns):
         obs_dims = np.where(pattern)[0]
@@ -810,7 +819,7 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
     prior_Psi = np.eye(q)  # E[TT'] for standard half-normal
 
     obs_mask = ~np.isnan(observations)
-    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
+    patterns, inverse = density_utils.pattern_groups(obs_mask)
 
     for pi, pattern in enumerate(patterns):
         obs_dims = np.where(pattern)[0]
@@ -966,7 +975,7 @@ def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
     q_idx = np.arange(q)
 
     obs_mask = ~np.isnan(observations)
-    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
+    patterns, inverse = density_utils.pattern_groups(obs_mask)
     for pi, pattern in enumerate(patterns):
         idx = np.where(inverse == pi)[0]
         o = np.where(pattern)[0]
@@ -987,13 +996,24 @@ def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
         C_mm = Gamma[np.ix_(m, m)] - K @ Gamma[np.ix_(o, m)]
         C[np.ix_(idx, m, m)] = 0.5 * (C_mm + C_mm.T)
 
-    B_eta = np.einsum('npq,nq->np', B, eta)
+    # B (and C) are exactly zero on fully observed rows, so the B-terms are
+    # computed only where a readout is missing; the other rows' terms are the
+    # same exact zeros, so the results are unchanged.
+    miss = ~obs_mask.all(axis=1)
+    B_eta = np.zeros((N, p))
+    BPsi = np.zeros((N, p, q))
+    BPsiB = np.zeros((N, p, p))
+    if miss.any():
+        Bm, Pm = B[miss], Psi[miss]
+        B_eta[miss] = np.einsum('npq,nq->np', Bm, eta[miss])
+        BPsi[miss] = np.einsum('npi,nij->npj', Bm, Pm)
+        BPsiB[miss] = np.einsum('npi,nij,nqj->npq', Bm, Pm, Bm)
     Ex = a + B_eta
-    Ext = a[:, :, None] * eta[:, None, :] + np.einsum('npi,nij->npj', B, Psi)
+    Ext = a[:, :, None] * eta[:, None, :] + BPsi
     Exx = (a[:, :, None] * a[:, None, :]
            + a[:, :, None] * B_eta[:, None, :]
            + B_eta[:, :, None] * a[:, None, :]
-           + np.einsum('npi,nij,nqj->npq', B, Psi, B)
+           + BPsiB
            + C)
     return Ex, Ext, Exx
 

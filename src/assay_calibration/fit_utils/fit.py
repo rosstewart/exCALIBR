@@ -342,6 +342,85 @@ def pattern_stratified_bootstrap(observations, sample_assignments, bootstrap_see
     return train_out, eval_out
 
 
+def collapse_pattern_cells(obs_mask, n_min=5):
+    """Resampling cells for one stratum: its rows grouped by exact readout
+    pattern, then thin cells (fewer than ``n_min`` rows) merged
+    agglomeratively -- smallest first -- into their nearest cell, where the
+    distance between two cells is the smallest scarcity-weighted Hamming
+    distance between any of their patterns: a readout observed in a fraction
+    c of the stratum's rows weighs 1/c, so cells that differ only in a
+    well-covered readout merge before cells that differ in a scarce one.
+    ``obs_mask``: (n, D) bool for the stratum's rows. Returns a list of index
+    arrays (positions within ``obs_mask``) covering every row once."""
+    obs_mask = np.asarray(obs_mask, dtype=bool)
+    n = obs_mask.shape[0]
+    if n == 0:
+        return []
+    cov = obs_mask.mean(axis=0)
+    w = 1.0 / np.maximum(cov, 1.0 / n)
+    cells = {}
+    for i, row in enumerate(obs_mask):
+        cells.setdefault(tuple(row.tolist()), []).append(i)
+    groups = [dict(patterns={p}, rows=list(r)) for p, r in cells.items()]
+
+    def dist(a, b):
+        return min(float(np.sum(w * (np.array(pa) != np.array(pb)))) for pa in a["patterns"] for pb in b["patterns"])
+
+    while len(groups) > 1:
+        small = [g for g in groups if len(g["rows"]) < n_min]
+        if not small:
+            break
+        g = min(small, key=lambda x: (len(x["rows"]), sorted(x["patterns"])))
+        others = [h for h in groups if h is not g]
+        h = min(others, key=lambda x: (dist(g, x), -len(x["rows"]), sorted(x["patterns"])))
+        h["patterns"] |= g["patterns"]
+        h["rows"].extend(g["rows"])
+        groups.remove(g)
+    return [np.array(sorted(g["rows"]), dtype=int) for g in groups]
+
+
+def stratum_pattern_bootstrap(observations, sample_assignments, bootstrap_seed=None, n_min=5,
+                              n_minus_one=False, return_cells=False):
+    """Bootstrap within stratum x readout-pattern cells (strata = the one-hot
+    columns of ``sample_assignments``), thin cells collapsed into their
+    nearest cell within the same stratum (collapse_pattern_cells). Each cell
+    is resampled with replacement to its own size (``n_minus_one``: size - 1,
+    McCarthy-Snowden), requiring at least one out-of-bag row per cell when
+    possible, as pattern_stratified_bootstrap. ``return_cells`` also returns
+    the cell label of every row (for logging)."""
+    rng = np.random.RandomState(bootstrap_seed)
+    obs = ~np.isnan(np.asarray(observations, dtype=float))
+    sa = np.asarray(sample_assignments, dtype=bool)
+    train, evals = [], []
+    cell_of = np.full(len(obs), -1, dtype=int)
+    c_id = 0
+    for s in range(sa.shape[1]):
+        rows = np.flatnonzero(sa[:, s])
+        for cell in collapse_pattern_cells(obs[rows], n_min=n_min):
+            group = rows[cell]
+            cell_of[group] = c_id
+            c_id += 1
+            size = len(group) - 1 if (n_minus_one and len(group) > 1) else len(group)
+            if len(group) == 1:
+                train.append(group)
+                continue
+            for _ in range(100):
+                g_train = rng.choice(group, size=size, replace=True)
+                g_eval = np.setdiff1d(group, g_train)
+                if len(g_eval):
+                    break
+            else:
+                g_train, g_eval = group, np.array([], dtype=int)
+            train.append(g_train)
+            if len(g_eval):
+                evals.append(g_eval)
+    train_out = np.concatenate(train) if train else np.array([], dtype=int)
+    eval_out = np.concatenate(evals) if evals else np.array([], dtype=int)
+    if return_cells:
+        return train_out, eval_out, cell_of
+    return train_out, eval_out
+
+
 def _weighted_val_ll(val_observations, val_sample_assignments, params, weights, mv, fit_kwargs,
                      cat_fit=None):
     """Validation log-likelihood with optional per-sample weighting.
@@ -1034,10 +1113,33 @@ class Fit:
         train_indices = np.arange(len(observations))
         val_indices = np.array([], dtype=int)
         if kwargs.get("bootstrap", True):
-            if mv:
+            # bootstrap_scheme (multivariate): "pattern" (default) = sample x
+            # exact pattern; "stratum" = within each sample only;
+            # "stratum_pattern" = sample x pattern with thin cells collapsed
+            # (stratum_pattern_bootstrap, bootstrap_min_cell, bootstrap_n_minus_one).
+            # bootstrap_assignments: an (N_scoreset, S') membership used ONLY
+            # for resampling (e.g. composite samples while the fit's samples
+            # are strata); rows follow the same filtering as the observations.
+            scheme = kwargs.get("bootstrap_scheme", "pattern")
+            strat = sample_assignments
+            if kwargs.get("bootstrap_assignments") is not None:
+                ba = np.asarray(kwargs["bootstrap_assignments"], dtype=bool)[original_indices]
+                strat = makeOneHot(ba[:, ba.any(axis=0)], rng=np.random.RandomState(composition_seed))
+            kwargs.pop("bootstrap_assignments", None)  # resampling only; never shipped in jobs
+            if mv and scheme == "pattern":
                 train_indices, val_indices = pattern_stratified_bootstrap(
-                    observations, sample_assignments, composition_seed
+                    observations, strat, composition_seed
                 )
+            elif mv and scheme == "stratum_pattern":
+                train_indices, val_indices = stratum_pattern_bootstrap(
+                    observations, strat, composition_seed,
+                    n_min=int(kwargs.get("bootstrap_min_cell", 5)),
+                    n_minus_one=bool(kwargs.get("bootstrap_n_minus_one", False)),
+                )
+            elif mv and scheme == "stratum":
+                train_indices, val_indices = sample_specific_bootstrap(strat, composition_seed)
+            elif mv:
+                raise ValueError(f"unknown bootstrap_scheme {scheme!r}")
             else:
                 train_indices, val_indices = sample_specific_bootstrap(
                     sample_assignments, composition_seed

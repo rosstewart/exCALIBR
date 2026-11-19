@@ -132,7 +132,8 @@ def _mv_one(key):
         full[np.nanpercentile(L, 95, axis=0) <= r["tau_b_log"][pv - 1]] = -pv
     assert np.array_equal(full, np.asarray(r["points"], int)), "log LR+ matrix does not reproduce production points"
     K = int(cfg.split("c")[0])
-    splits = RP._paper_oob_splits(ms, kept, K)
+    splits = (RP.job_pickle_oob_splits(meta["dataset_name"], kept) if config.STRATA
+              else RP._paper_oob_splits(ms, kept, K))
     oob = np.zeros((len(kept), L.shape[1]), bool)
     for i, b in enumerate(kept):
         oob[i, splits[b]] = True

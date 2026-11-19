@@ -79,6 +79,11 @@ def build_labelseq_dataframe(
             df.loc[activity_mask, "auth_reported_score"])
     df["clinvar_sig_2026"] = df["clinvar.202601.clinical_significance"]
     df["clinvar_star_2026"] = df["clinvar.202601.review_status"]
+    # Controls use ClinVar 2025 (the release default); keep the 2026 columns
+    # only for provenance.
+    if "clinvar.202501.clinical_significance" in df.columns:
+        df["clinvar_sig_2025"] = df["clinvar.202501.clinical_significance"]
+        df["clinvar_star_2025"] = df["clinvar.202501.review_status"]
     df["Gene"] = df["protein"]
     df["splice_measure"] = "No"
     df["hgvs_p"] = df["mapped_hgvs_p"]

@@ -128,10 +128,10 @@ def _get_variant_aa_fields(scoreset) -> Optional[List[Dict]]:
 def _get_variant_is_vus(scoreset) -> Optional[List[bool]]:
     """Per-kept-variant VUS flag, aligned 1:1 with _get_variant_ids's output.
 
-    Always ClinVar-2026-based, regardless of the Scoreset's own
+    Always ClinVar-2025-based, regardless of the Scoreset's own
     clinvar_release (used only for that variant's own P/LP/B/LB
     classification) -- see Variant.is_vus in data_utils/dataset.py, which is
-    hardcoded to clinvar_sig_2026 ("VUS ALWAYS 2026 SINCE NOT CONTROL") even
+    hardcoded to clinvar_sig_2025 ("VUS ALWAYS 2025") even
     for clinvar_2018-mode datasets (BRCA1/MSH2/PTEN/TP53). Deriving VUS by
     negation from the `sample` column instead (not P/LP, not B/LB, not
     gnomAD, not Synonymous) would silently use whichever release the dataset

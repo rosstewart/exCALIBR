@@ -322,7 +322,7 @@ class PipelineConfig:
     acmg_bayes_floor_at_neutral: bool = False
 
     # ClinVar parameters
-    clinvar_release: str = "2026"
+    clinvar_release: str = "2025"
     min_clinvar_star: int = 1
     synonymous_exclusive: bool = False
     # Sample-composition knobs, forwarded to Scoreset by load_dataset_from_df; must

@@ -822,7 +822,8 @@ class MVCalibrationAnalysis:
                  gnomad_idx=2, synonymous_idx=3,
                  auxiliary_pathogenic_indices=None,
                  benign_method='benign',
-                 dataset_name=None, dataset_suffix='_mv', gene_set=None):
+                 dataset_name=None, dataset_suffix='_mv', gene_set=None,
+                 strata=None, strata_arm=None):
         """
         Parameters
         ----------
@@ -912,6 +913,9 @@ class MVCalibrationAnalysis:
             )
         self.raw_boots = raw[self.dataset_name]
         print(f"  Using gene key: {self.dataset_name}")
+        self.strata, self.strata_arm = strata, strata_arm
+        if strata is not None:
+            self.raw_boots = self._compose_strata_weights(self.raw_boots, strata, strata_arm)
 
         sample_boot = next(iter(self.raw_boots.values()))
         self.configs = sorted([k for k in sample_boot.keys() if sample_boot[k] is not None])
@@ -923,6 +927,37 @@ class MVCalibrationAnalysis:
         self._validate_fit_shape()
 
         self.results = {}
+
+    def _compose_strata_weights(self, raw_boots, strata, arm):
+        """Consequence-stratified fits store one weight row per stratum.
+        Replace them by the arm's composite weights (fit_utils/strata.py:
+        W_r = sum_c M[r, c] W_c / sum_c M[r, c]), keeping the composite rows
+        present in ``self.ms`` (apply_arm already set its columns), so every
+        downstream step sees standard sample roles. Copies; the cached raw
+        results are not mutated."""
+        from ..fit_utils.strata import compose_weights
+        M = strata.composition(arm)
+        present = np.where(np.asarray(self.ms.sample_counts)[:M.shape[0]] > 0)[0]
+        out = {}
+        for seed, bd in raw_boots.items():
+            nb = {}
+            for cfg, fr in bd.items():
+                if fr is None:
+                    nb[cfg] = None
+                    continue
+                inner = fr.get('fit', fr)
+                if inner is None or 'weights' not in inner:
+                    nb[cfg] = fr
+                    continue
+                W = np.asarray(inner['weights'], dtype=float)
+                if W.shape[0] != len(strata.names):
+                    raise ValueError(f"{self.dataset_name}/{cfg}: {W.shape[0]} weight rows but "
+                                     f"{len(strata.names)} strata rebuilt -- data or strata rules changed")
+                new_inner = dict(inner, weights=compose_weights(W, M)[present].tolist(),
+                                 strata_weights=W.tolist())
+                nb[cfg] = dict(fr, fit=new_inner) if 'fit' in fr else new_inner
+            out[seed] = nb
+        return out
 
     def _validate_fit_shape(self):
         """Compare the first valid stored fit's dimensionality/role-count

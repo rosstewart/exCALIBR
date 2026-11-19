@@ -496,3 +496,22 @@ def warn_if_missing(path: str, what: str) -> bool:
         print(f"  SKIP {what}: path not found ({path})")
         return True
     return False
+
+
+# BibTeX keys (ExCALIBR_latex_src/references.bib), by display name (plot_common.display_name), for datasets named in the text by a generated list macro; a dataset
+# without a key is listed uncited and flagged by a claim check. Add the key here once its entry is in the .bib.
+DATASET_CITE_KEYS = {
+    "SCN5A_Glazer_2020": "glazer2020deep",
+    "OTC_Lo_2023": "lo2023functional",
+    "CRX_Shepherdson_2024": "shepherdson2024CRX",
+    "TARDBP_Bolognesi_Faure_2019": "bolognesi2019mutational",
+    "ASPA_Grønbæk-Thygesen_2024_abundance": "gronbaek2024deep",
+    "ASPA_Grønbæk-Thygesen_2024_toxicity": "gronbaek2024deep",
+    "TPK1_Weile_2017": "weile2017framework",
+    "KCNQ4_Zheng_2022_v12_homozygous": "zheng2022proactive",
+    "PAX6_McDonnell_2024_LE9_geneticin": "mcdonnell2024deep",
+    "BRCA2_Sahu_2025_SGE": "sahu2025saturation",
+    "BRCA1_Findlay_2018": "findlay2018accurate",
+    "MSH2_Jia_2021": "jia2021massively",
+    "TP53_Giacomelli_2018_combined_score": "giacomelli2018mutational",
+}

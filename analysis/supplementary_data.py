@@ -35,7 +35,7 @@ SD1_COLUMNS = [
     "range_1", "range_2", "range_3", "range_4", "range_5", "range_6", "range_7", "range_8",
     "prior", "yang_dist_plp", "yang_dist_blb", "yang_dist_gnomad", "yang_dist_synonymous",
     "yang_dist_heldout_plp", "yang_dist_heldout_blb", "yang_dist_heldout_gnomad", "yang_dist_heldout_synonymous",
-    "relax", "n_c", "benign_method", "clinvar_2018", "scoreset_flipped", "new_functional_classifications_created",
+    "n_c", "benign_method", "clinvar_2018", "scoreset_flipped", "new_functional_classifications_created",
 ]
 SD3_COLUMNS = [
     "Dataset", "Total Controls", "OddsNormal", "OddsAbnormal", "Pathogenic Controls", "Benign Controls",
@@ -222,7 +222,9 @@ def fit_sample_counts(dataset: str, dataset_tsv=None) -> Dict[str, int]:
     # zipping it with `sample_counts` (all samples) misaligns the counts whenever an empty sample precedes a
     # non-empty one (e.g. no B/LB: the population count was reported as B/LB's 0).
     counts = dict(zip(scoreset.sample_names, (int(c) for c in scoreset.sample_counts)))
-    return {f"{k}_fit": counts.get(v, counts.get("gnomAD", 0) if k == "n_gnomad" else 0) for k, v in _SAMPLES.items()}
+    out = {f"{k}_fit": counts.get(v, counts.get("gnomAD", 0) if k == "n_gnomad" else 0) for k, v in _SAMPLES.items()}
+    out["n_snv"] = int(len(scoreset.snv_scores))  # SNVs the assay measured, as loaded for fitting
+    return out
 
 
 def build_sd1(datasets: List[str], tree, model_selections, dataset_configs, df_variants: pd.DataFrame,
@@ -260,9 +262,6 @@ def build_sd1(datasets: List[str], tree, model_selections, dataset_configs, df_v
         for col, cat in _SAMPLES.items():
             row[col] = int(sample_matches(sub, cat).sum())
         row["n_vus"] = int(sub["is_vus"].fillna(False).astype(bool).sum()) if "is_vus" in sub else 0
-        src = df_all_groups[df_all_groups["dataset"] == ds] if df_all_groups is not None else sub
-        snv_col = "is_snv" if "is_snv" in src.columns else None
-        row["n_snv"] = int(src[snv_col].fillna(False).astype(bool).sum()) if snv_col else ""
         auth = sub["auth_label"].astype(str) if "auth_label" in sub else pd.Series(dtype=str)
         row["author_assignments_provided"] = bool(auth.str.upper().isin(["NORMAL", "ABNORMAL"]).any())
         try:
@@ -276,7 +275,6 @@ def build_sd1(datasets: List[str], tree, model_selections, dataset_configs, df_v
         for i in [*range(-8, 0), *range(1, 9)]:
             row[f"range_{i}"] = _fmt_ranges(pr.get(str(i), []))
         row["prior"] = cal.get("prior")
-        row["relax"] = bool(cal.get("relax"))
         row["n_c"] = str(cal.get("n_c", "")).split("_", 1)[0]
         row["benign_method"] = cal.get("benign_method")
         row["clinvar_2018"] = bool(cal.get("clinvar_2018"))
@@ -378,8 +376,11 @@ SD4_OR_COLUMN_DEFINITIONS = [
     ("OR_LI", "The lower bound of the 95% confidence interval of the odds ratio estimate."),
     ("OR_UI", "The upper bound of the 95% confidence interval of the odds ratio estimate."),
     ("p-value", "The Wald test p-value for the OR estimate."),
-    ("Cases with variants", "Number of case participants carrying one or more variants in the set. All of Us "
-                            "reports counts of 20 or fewer only as \u201c\u2264 20\u201d."),
+    ("Total Cases", "Total number of case participants in the cohort analyzed for the gene-associated phenotype."),
+    ("Total Controls", "Total number of control participants in the cohort analyzed for the gene-associated "
+                       "phenotype."),
+    ("Cases with variants", "Number of case participants carrying one or more variants in the set. We report "
+                            "counts of 20 or fewer as \u201c\u2264 20\u201d due to All of Us reporting policies."),
     ("Controls with variants", "Number of control participants carrying one or more variants in the set "
                                "(\u201c\u2264 20\u201d as above)."),
     ("significant", "True if the 95% confidence interval of the odds ratio excludes 1."),

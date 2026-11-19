@@ -74,7 +74,7 @@ def snv_splice_flag(df: pd.DataFrame, spliceai_threshold: Optional[float] = 0.2)
 
 def protein_labels_from_integrated(
     df_integrated: pd.DataFrame,
-    clinvar_release: str = "2026",
+    clinvar_release: str = "2025",
     min_clinvar_star: int = 1,
     spliceai_threshold: Optional[float] = 0.2,
 ) -> pd.DataFrame:
@@ -105,7 +105,7 @@ def protein_labels_from_integrated(
 def build_tsc2_dataframe(
     mave_csv: str = DEFAULT_MAVE_CSV,
     df_integrated: Optional[pd.DataFrame] = None,
-    clinvar_release: str = "2026",
+    clinvar_release: str = "2025",
     min_clinvar_star: int = 1,
     spliceai_threshold: Optional[float] = 0.2,
     verbose: bool = False,

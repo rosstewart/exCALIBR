@@ -23,6 +23,7 @@ Two recurring shapes cover every gene-set in this package:
 """
 
 import contextlib
+import os
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -89,7 +90,11 @@ def functional_datasets_for_gene(df: pd.DataFrame, gene: str) -> List[str]:
 
 
 def resolve_clinvar_release(gene: str) -> str:
-    return "2018" if gene in GENES_2018 else "2026"
+    """ClinVar release for a gene's controls: 2018 for the four genes whose
+    assays may have shaped their own classifications, else ClinVar 2025 (the
+    release of the predictor calibrations and the ExCALIBR manuscript).
+    MV_CLINVAR_DEFAULT_RELEASE overrides 2025 only to re-score legacy fits."""
+    return "2018" if gene in GENES_2018 else os.environ.get("MV_CLINVAR_DEFAULT_RELEASE", "2025")
 
 
 def gene_set_dataset_label(gene: str, gene_set: str) -> str:

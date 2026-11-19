@@ -179,10 +179,9 @@ def plot_comparison_boxplots(
     per-dataset median (same array the violin itself is drawn from) and
     the pooled/aggregate value from
     analysis.manuscript_stats.compute_aggregate_metrics_multi (the same
-    number section 3b's LaTeX tables report). Each method's own
-    "(own_count/n_total)" calibratable count is a second tick-label line
-    (rotation_mode="anchor" -- fixes matplotlib's usual overlapping-line
-    bug for multi-line rotated tick labels).
+    number section 3b's LaTeX tables report). Tick labels give the method
+    name only (rotation_mode="anchor"); the calibratable dataset counts
+    are stated in the caption.
 
     DOR is frequently infinite for a single dataset (dor_standard is inf
     whenever that dataset's FP or FN count is 0), or a NaN sentinel from
@@ -336,7 +335,7 @@ def plot_comparison_boxplots(
 
         ax.set_xticks(positions_flat)
         ax.set_xticklabels(
-            [f"{_display_name(m)}\n({groups[gi]['own_counts'][m]}/{n_total_datasets})" for gi, m in all_methods_flat],
+            [_display_name(m) for gi, m in all_methods_flat],  # dataset counts are given in the caption
             rotation=20, ha="right", rotation_mode="anchor", fontsize=7.5,
         )
         ax.set_ylabel(ylabel, fontsize=10)

@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import os
 from pathlib import Path
 from fire import Fire
 from functools import reduce
@@ -461,7 +462,7 @@ class Scoreset:
 
         Optional Arg:
         - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-        - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
+        - clinvar_release : str in {'2025','2026','2018'} (default '2025') : Clinvar release to use
         """
         self._init_kwargs = dict(kwargs)
         self._init_dataframe(dataframe, **kwargs)
@@ -808,7 +809,7 @@ class Scoreset:
 
         Optional Arg:
             - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-            - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
+            - clinvar_release : str in {'2025','2026','2018'} (default '2025') : Clinvar release to use
         Returns
         -------
         None
@@ -856,7 +857,7 @@ class Scoreset:
         self.filter_invalid()
         self.splicing_filter(**kwargs)
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
-        clinvar_release = kwargs.get("clinvar_release",'2026')
+        clinvar_release = kwargs.get("clinvar_release", '2025')
         n_jobs = kwargs.get("n_jobs", 1)
         rows = self.dataframe.to_dict('records')
         if n_jobs == 1:
@@ -2287,6 +2288,18 @@ class MultiScoreset:
         raw_fc_matrix = np.empty((n_variants, self.d), dtype=object)
         raw_fc_matrix[:] = ''
 
+        # Several entries of ONE assay can land in the same merged row, e.g.
+        # every SGE SNV of a protein change that a protein-level assay also
+        # measures (union-find links them through the protein-level group).
+        # row_merge="mean" (the v2 row builder, MV_ROW_BUILDER != "legacy")
+        # averages them -- replicate measurements of one protein effect --
+        # instead of keeping whichever entry came last ("last", legacy).
+        row_merge = self._init_kwargs.get(
+            "row_merge", "last" if os.environ.get("MV_ROW_BUILDER", "v2") == "legacy" else "mean")
+        if row_merge not in ("last", "mean"):
+            raise ValueError(f"row_merge must be 'last' or 'mean', got {row_merge!r}")
+        score_sum = np.zeros((n_variants, self.d))
+        score_n = np.zeros((n_variants, self.d), dtype=int)
         for assay_i in range(self.d):
             row_indices = assay_row_idx[assay_i]
             scores = scores_list[assay_i]
@@ -2295,7 +2308,11 @@ class MultiScoreset:
             al = getattr(s, '_auth_labels', None)
             rfc = getattr(s, '_raw_func_classes', None)
             for k, idx in enumerate(row_indices):
-                scores_matrix[idx, assay_i] = scores[k]
+                if row_merge == "mean" and np.isfinite(scores[k]):
+                    score_sum[idx, assay_i] += scores[k]
+                    score_n[idx, assay_i] += 1
+                else:
+                    scores_matrix[idx, assay_i] = scores[k]
                 sample_assignments[idx] |= samples[k]
                 if al is not None and k < len(al) and al[k]:
                     label = al[k]
@@ -2306,15 +2323,31 @@ class MultiScoreset:
                 if rfc is not None and k < len(rfc):
                     raw_fc_matrix[idx, assay_i] = rfc[k] or ''
 
+        if row_merge == "mean":
+            filled = score_n > 0
+            scores_matrix[filled] = score_sum[filled] / score_n[filled]
+        self._row_merge_counts = score_n
+
         # ── Keep only variants with at least one observed score ────────────────
         missing_mask = np.isnan(scores_matrix)
         keep_mask = ~np.all(missing_mask, axis=1)
+
+        # Every genomic atom (gene, chrom, pos, ref, alt) of each merged row,
+        # aligned with the kept rows -- the row's member SNVs, used to assign
+        # consequence / SpliceAI strata (fit_utils/strata.py).
+        _members: dict = {}
+        for assay_keys in variant_keys:
+            for fset in assay_keys:
+                for a in fset:
+                    _members.setdefault(uf.find(a), set()).add(a)
 
         # Build _variants_kept: one representative group_col tuple per variant
         # (the canonical atom chosen by union-find).  Stored as a tuple matching
         # group_cols so downstream code (e.g. align_variants) can unpack it.
         all_canonical = canonical   # list of group_col tuples, one per variant
         self._variants_kept = [all_canonical[i] for i in range(n_variants) if keep_mask[i]]
+        self._row_atoms = [sorted(_members.get(uf.find(all_canonical[i]), {all_canonical[i]}), key=lambda a: tuple(map(str, a)))
+                           for i in range(n_variants) if keep_mask[i]]
 
         self._scores_matrix = scores_matrix
         self._missing_mask = missing_mask

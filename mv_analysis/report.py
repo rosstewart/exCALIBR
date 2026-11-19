@@ -81,6 +81,11 @@ def _eval_labels(ms, p_idx, b_idx, gene_set=None):
     n = sa.shape[0]
     plp_mask = sa[:, p_idx].astype(bool) if p_idx is not None else np.zeros(n, dtype=bool)
     blb_mask = sa[:, b_idx].astype(bool) if b_idx is not None else np.zeros(n, dtype=bool)
+    # Consequence-stratified fits: controls come from the evaluation arm
+    # (fit_utils/strata.apply_arm), identical across sensitivity arms.
+    if getattr(ms, "_eval_plp", None) is not None:
+        plp_mask = np.asarray(ms._eval_plp, dtype=bool)
+        blb_mask = np.asarray(ms._eval_blb, dtype=bool)
     eval_mask = plp_mask | blb_mask
     # Evaluate (MV and UV alike) only on variants the MV model calibrates --
     # those measured in at least one of its dimensions. A dimension-restricted
