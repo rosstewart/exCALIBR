@@ -113,7 +113,56 @@ def build_sd5(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path, s
     sd5, problems = build_sd1(datasets, tree, model_selections, dataset_configs, df_primary,
                               df_all_groups=df_all_groups, yang_df=yang_df, yang_heldout_df=yang_heldout_df,
                               curated_csv=str(METADATA_CSV), output_dir=output_dir, dataset_tsv=dataset_tsv)
+    # prior reliability score, placed after the prior as in SD1 (the model trained for the manuscript calibrations)
+    rel = prior_reliability(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path, yang_df, yang_heldout_df,
+                            n_jobs=n_jobs)
+    sd5 = sd5.drop(columns=["prior_reliability"], errors="ignore").merge(rel, on="dataset", how="left")
+    cols = list(sd5.columns)
+    cols.insert(cols.index("prior") + 1, cols.pop(cols.index("prior_reliability")))
+    sd5 = sd5[cols]
+    missing = sd5.loc[sd5["prior_reliability"].isna(), "dataset"].tolist()
+    if missing:
+        problems.append(f"no prior reliability score for {missing}")
     return sd5.sort_values("dataset").reset_index(drop=True), problems
+
+
+def prior_reliability(output_dir, dataset_tsv, precomputed_fits, dataset_configs_path, yang_df, yang_heldout_df,
+                      n_jobs=-1):
+    """Prior reliability score (analysis.calibration_quality.diagnostics, Supplementary Section calqual) for the
+    Domainome calibrations: per-bootstrap priors recomputed with production code (recompute_priors, cached in
+    BASE/real_diagnostics_domainome/recomputed_priors.json), features from this calibration set's own outputs and
+    Yang tables, and the saved model of the manuscript calibrations. Returns dataset (display name),
+    prior_reliability."""
+    import joblib
+    from joblib import Parallel, delayed
+    from analysis.calibration_quality.diagnostics import predict, real_datasets, real_features
+    from analysis.calibration_quality.recompute_priors import recompute
+    from analysis.plot_common import display_name
+
+    cals = real_datasets(output_dir=output_dir, dataset_configs_path=dataset_configs_path)
+    cache = BASE / "real_diagnostics_domainome" / "recomputed_priors.json"
+    rp = json.loads(cache.read_text()) if cache.exists() else {}
+    todo = [d for d in cals if not rp.get(d, {}).get("match")]
+    if todo:
+        kw = dict(output_dir=str(output_dir), dataset_tsv=str(dataset_tsv), precomputed_fits=str(precomputed_fits),
+                  dataset_configs_path=str(dataset_configs_path))
+
+        def one(d):
+            try:
+                return recompute(d, cals[d], inner_jobs=4, **kw)
+            except Exception as e:  # reported via the missing-score problem
+                return dict(dataset=d, match=False, error=f"{type(e).__name__}: {e}"[:300])
+        for r in Parallel(n_jobs=min(len(todo), 7) if n_jobs == -1 else n_jobs)(delayed(one)(d) for d in todo):
+            rp[r["dataset"]] = r
+            if not r["match"]:
+                print(f"  prior reliability: {r['dataset']} priors not reproduced ({r.get('error') or r['checks']})")
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(rp, default=float))
+    feats = real_features(cals, rp, output_dir=output_dir, yang_df=yang_df, yang_heldout_df=yang_heldout_df)
+    model = joblib.load(Path(cfg.CALIBRATION_QUALITY_DIR).parent / "real_diagnostics" / "model.joblib")
+    out = pd.concat([feats[["dataset"]], predict(model, feats)[["prior_reliability"]]], axis=1)
+    out["dataset"] = out["dataset"].map(display_name)
+    return out
 
 
 def build_sd6(out_path, output_dir, dataset_tsv, precomputed_fits, dataset_configs_path, n_jobs=7):

@@ -35,7 +35,10 @@ def _ranges_equal(a, b):
     return True
 
 
-def recompute(dataset, cal, inner_jobs=8):
+def recompute(dataset, cal, inner_jobs=8, output_dir=None, dataset_tsv=None, precomputed_fits=None,
+              dataset_configs_path=None):
+    """`output_dir`/`dataset_tsv`/`precomputed_fits`/`dataset_configs_path` default to the manuscript run (cfg);
+    another calibration set (e.g. Domainome, Supplementary Data 5) passes its own."""
     from analysis import config as cfg
     from analysis.legacy_fits import load_scoreset_and_fits
     from src.assay_calibration.pipeline.config import PipelineConfig
@@ -45,7 +48,9 @@ def recompute(dataset, cal, inner_jobs=8):
     # run on a dataset without a synonymous sample is saved under the avg name with benign_method "benign").
     n_c, _, file_bm = str(cal["n_c"]).partition("_")
     bm = cal["benign_method"]
-    scoreset, _, fits, _, _, _, _ = load_scoreset_and_fits(dataset, n_c=n_c, benign_method=file_bm or bm)
+    paths = {k: v for k, v in dict(output_dir=output_dir, dataset_tsv=dataset_tsv, precomputed_fits=precomputed_fits,
+                                   dataset_configs_path=dataset_configs_path).items() if v is not None}
+    scoreset, _, fits, _, _, _, _ = load_scoreset_and_fits(dataset, n_c=n_c, benign_method=file_bm or bm, **paths)
     with tempfile.TemporaryDirectory() as tmp:
         pc = PipelineConfig(dataset_csv="", dataset_name=dataset, output_dir=tmp, components=[int(n_c[0])],
                             use_median_prior=True, use_2c_equation=False, benign_method=bm,
@@ -56,7 +61,7 @@ def recompute(dataset, cal, inner_jobs=8):
         lg.setLevel(logging.ERROR)
         new = process_component_fits(fits=list(fits), scoreset=scoreset, config=pc, n_c=int(n_c[0]), logger=lg,
                                      bootstrap_seeds=np.asarray(fits.seeds))
-    with gzip.open(Path(cfg.OUTPUT_DIR) / dataset / f"{dataset}_{cal['n_c']}_lr_values.json.gz", "rt") as fh:
+    with gzip.open(Path(output_dir or cfg.OUTPUT_DIR) / dataset / f"{dataset}_{cal['n_c']}_lr_values.json.gz", "rt") as fh:
         saved_pct = json.load(fh).get("priors_pct")
     pri = np.asarray(new["priors"], float)
     deg = np.asarray(new.get("prior_degenerate") if new.get("prior_degenerate") is not None

@@ -228,7 +228,23 @@ def tryToFit(observations, sample_indicators, num_components, constrained,
             likelihoods=[-np.inf],
             xlims=None,
             times_submerged=[],
+            n_em_iters=None,
+            stop_reason="failed",
         )
+
+
+def _fit_run_stats(result, t0):
+    """Per-fit run statistics lifted to the top level of an execute_fit_job
+    result: EM iterations, why EM stopped, and wall time of the whole job.
+    Diagnostics only; readers must tolerate their absence (older results)."""
+    import time
+    stop = result.get("stop_reason")
+    return {
+        "n_em_iters": result.get("n_em_iters"),
+        "stop_reason": stop,
+        "fit_seconds": time.perf_counter() - t0,
+        "hit_cap": stop == "cap",
+    }
 
 
 def get_bootstrap_indices(dataset_size):
@@ -1126,7 +1142,35 @@ class Fit:
                 ba = np.asarray(kwargs["bootstrap_assignments"], dtype=bool)[original_indices]
                 strat = makeOneHot(ba[:, ba.any(axis=0)], rng=np.random.RandomState(composition_seed))
             kwargs.pop("bootstrap_assignments", None)  # resampling only; never shipped in jobs
-            if mv and scheme == "pattern":
+            # uni_bootstrap_scheme (univariate only, opt-in; unset = the historical
+            # sample-specific bootstrap on the fit's own samples, unchanged):
+            #   "composite": resample within the (re-one-hot) bootstrap_assignments
+            #                samples, e.g. the standard composites while the fit's
+            #                samples are consequence strata (ExCALIBR-equivalent);
+            #   "groups":    resample within caller-supplied row groups
+            #                (bootstrap_groups: (N_scoreset,) int labels, e.g. thin
+            #                strata merged into a same-role sibling); rows with a
+            #                negative label fall back to their own fit sample.
+            uni_scheme = kwargs.pop("uni_bootstrap_scheme", None)
+            groups = kwargs.pop("bootstrap_groups", None)
+            if not mv and uni_scheme is not None:
+                if uni_scheme == "composite":
+                    if strat is sample_assignments:          # no bootstrap_assignments given
+                        raise ValueError("uni_bootstrap_scheme='composite' needs bootstrap_assignments")
+                    uni_strat = strat
+                elif uni_scheme == "groups":
+                    if groups is None:
+                        raise ValueError("uni_bootstrap_scheme='groups' needs bootstrap_groups")
+                    g = np.asarray(groups, dtype=int)[original_indices]
+                    own = np.argmax(np.asarray(sample_assignments, bool), axis=1)
+                    g = np.where(g >= 0, g, -1 - own)          # unlabeled rows: own-sample groups
+                    _, inv = np.unique(g, return_inverse=True)
+                    uni_strat = np.zeros((len(g), inv.max() + 1), dtype=bool)
+                    uni_strat[np.arange(len(g)), inv] = True
+                else:
+                    raise ValueError(f"unknown uni_bootstrap_scheme {uni_scheme!r}")
+                train_indices, val_indices = sample_specific_bootstrap(uni_strat, composition_seed)
+            elif mv and scheme == "pattern":
                 train_indices, val_indices = pattern_stratified_bootstrap(
                     observations, strat, composition_seed
                 )
@@ -1331,6 +1375,8 @@ class Fit:
 
     @staticmethod
     def execute_fit_job(job):
+        import time
+        _t0 = time.perf_counter()
         try:
             mv = job.get("multivariate", False)
             result = tryToFit(
@@ -1367,6 +1413,7 @@ class Fit:
                     "fit": result,
                     "val_ll": -np.inf,
                     "calibrated_dims": job.get("calibrated_dims"),
+                    **_fit_run_stats(result, _t0),
                 }
 
             # Guard: EM can occasionally run away to a self-consistent but
@@ -1421,6 +1468,7 @@ class Fit:
                     "fit": result,
                     "val_ll": -np.inf,
                     "calibrated_dims": job.get("calibrated_dims"),
+                    **_fit_run_stats(result, _t0),
                 }
 
             # Mixed q=1/q=2 restarts (see generate_fit_jobs): if this
@@ -1475,6 +1523,7 @@ class Fit:
                 "fit": result,
                 "val_ll": val_ll,
                 "calibrated_dims": job.get("calibrated_dims"),
+                **_fit_run_stats(result, _t0),
             }
         except Exception as e:
             print(f"Failed: b{job['bootstrap_seed']} c{job['num_components']} f{job['fit_idx']}: {e}")

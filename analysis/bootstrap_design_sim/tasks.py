@@ -5,9 +5,9 @@ analysis.calibration_quality.tasks).
     python -m analysis.bootstrap_design_sim.tasks run <out_dir> --index 0 --per-index 4 --workers 16
     python -m analysis.bootstrap_design_sim.tasks collect <out_dir>
 
-Each task (one design cell x replicate, every scheme on the same data) writes
-<out_dir>/runs/<cell id>__rep<r>.csv; finished tasks are skipped. Submit on the
-cluster with hpc/submit_calibration_quality.sh's pattern (SIM_MODULE below).
+Each task (one design cell x replicate x scheme; every scheme sees the same data) writes
+<out_dir>/runs/<cell id>__rep<r>__<scheme>.csv; finished tasks are skipped. Submit on the
+cluster with hpc/submit_bootstrap_design_sim.sh <out_dir>.
 """
 from __future__ import annotations
 
@@ -20,16 +20,19 @@ import pandas as pd
 
 
 def _task_id(t):
-    return f"{t['cell']['cell_id']}__rep{t['rep']}"
+    return f"{t['cell']['cell_id']}__rep{t['rep']}__{t['scheme']}"
 
 
 def make(out_dir, reps, B, R):
     from analysis.bootstrap_design_sim.generate import design
-    tasks = [dict(cell=c, rep=r, B=B, R=R) for r in range(reps) for c in design()]
+    from analysis.bootstrap_design_sim.run import SCHEMES
+    # one task per cell x replicate x scheme (a scheme is ~B fits, so a task
+    # stays well inside the SLURM time limit); same data across schemes
+    tasks = [dict(cell=c, rep=r, B=B, R=R, scheme=k) for r in range(reps) for c in design() for k in SCHEMES]
     out = Path(out_dir)
     (out / "runs").mkdir(parents=True, exist_ok=True)
     (out / "tasks.json").write_text(json.dumps(tasks))
-    print(f"{len(tasks)} tasks ({len(tasks) // reps} cells x {reps} reps) -> {out / 'tasks.json'}")
+    print(f"{len(tasks)} tasks (cells x {reps} reps x schemes) -> {out / 'tasks.json'}")
 
 
 def _run_one(out_dir, t):
@@ -38,8 +41,8 @@ def _run_one(out_dir, t):
     f = Path(out_dir) / "runs" / f"{_task_id(t)}.csv"
     if f.exists():
         return
-    from analysis.bootstrap_design_sim.run import run_cell
-    rows = run_cell(t["cell"], t["rep"], t["B"], t["R"])
+    from analysis.bootstrap_design_sim.run import run_cell, SCHEMES
+    rows = run_cell(t["cell"], t["rep"], t["B"], t["R"], schemes={t["scheme"]: SCHEMES[t["scheme"]]})
     tmp = f.with_suffix(".tmp")
     pd.DataFrame(rows).to_csv(tmp, index=False)
     tmp.rename(f)

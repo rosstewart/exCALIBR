@@ -44,6 +44,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+import json
 import pickle
 import argparse
 import concurrent.futures
@@ -87,6 +88,42 @@ def _run_one_fit(fit_spec):
         print(f"  ✗ fit failed (bootstrap={bootstrap_seed}, label={label}): {e}")
         result = None
     return bootstrap_seed, label, save_dir, fit_idx, result
+
+
+def _restart_stat(label, fit_idx, result):
+    """JSON-safe per-restart run statistics (absent fields -> None)."""
+    def _f(x):
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        return x if np.isfinite(x) else None
+    res = result or {}
+    fit = res.get("fit") or {}
+    ck = fit.get("objective_checkpoints") or {}
+    return dict(
+        label=label, fit_idx=fit_idx,
+        val_ll=_f(res.get("val_ll")),
+        n_em_iters=res.get("n_em_iters"),
+        stop_reason=res.get("stop_reason") if result else "worker_failed",
+        fit_seconds=_f(res.get("fit_seconds")),
+        latent_q=fit.get("latent_q"),
+        final_objective=_f(fit.get("final_objective")),
+        objective_checkpoints={str(k): _f(v) for k, v in ck.items()},
+    )
+
+
+def _write_restart_stats(path, rows):
+    """Append this run's restart rows to any earlier ones (resumed tasks)."""
+    import json as _json
+    old = []
+    if path.exists():
+        try:
+            old = _json.loads(path.read_text())
+        except Exception:
+            old = []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(old + list(rows)))
 
 
 # ---------------------------------------------------------------------------
@@ -196,18 +233,40 @@ def _load_skip_datasets(output_dir: Path) -> set:
     return skip
 
 
+def _load_layout_task(jobs_dir: Path, layout_path: str, task_idx: int) -> list:
+    """Compact jobs of task `task_idx` of a hpc/make_layout.py layout, read
+    from their storage array files (each file opened once)."""
+    with open(layout_path) as f:
+        layout = json.load(f)
+    if not 0 <= task_idx < len(layout["tasks"]):
+        print(f"Error: task {task_idx} not in layout {layout_path} ({len(layout['tasks'])} tasks)")
+        sys.exit(1)
+    cache: dict = {}
+    jobs = []
+    for a, local in layout["tasks"][task_idx]:
+        if a not in cache:
+            with open(jobs_dir / f"array_{a:04d}.pkl", "rb") as f:
+                cache[a] = pickle.load(f)
+        jobs.append(cache[a][local])
+    return jobs
+
+
 def run_array_task(output_dir: str, array_idx: int, device: str = "cpu",
-                   gpu_init: str = "cpu") -> None:
+                   gpu_init: str = "cpu", layout: str | None = None) -> None:
     output_dir = Path(output_dir).resolve()
     jobs_dir = output_dir / "jobs"
-    array_file = jobs_dir / f"array_{array_idx:04d}.pkl"
 
-    if not array_file.exists():
-        print(f"Error: {array_file} not found")
-        sys.exit(1)
-
-    with open(array_file, "rb") as f:
-        jobs = pickle.load(f)
+    if layout is not None:
+        # Submission-time layout (hpc/make_layout.py): array_idx indexes its
+        # tasks; the compact jobs are read from the storage array files.
+        jobs = _load_layout_task(jobs_dir, layout, array_idx)
+    else:
+        array_file = jobs_dir / f"array_{array_idx:04d}.pkl"
+        if not array_file.exists():
+            print(f"Error: {array_file} not found")
+            sys.exit(1)
+        with open(array_file, "rb") as f:
+            jobs = pickle.load(f)
 
     skip_datasets = _load_skip_datasets(output_dir)
     n_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
@@ -299,6 +358,25 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu",
         print("All fits already completed — nothing to do.")
         return
 
+    if device == "cpu":
+        # Longest-first submission (LPT): the pool starts the slowest fits
+        # (q2 restarts, large K, big datasets; a greedy seed counts as its
+        # whole candidate chain) first, so short fits fill in around them
+        # instead of a long fit starting last and setting the task's wall
+        # time. Scheduling only: each fit is seeded by its own job kwargs and
+        # best-fit selection breaks val_ll ties on fit_idx, so results are
+        # bitwise unchanged. Stable sort: equal estimates keep job order.
+        from hpc.packing import fit_cost
+
+        def _est(spec):
+            job = spec[0]
+            x = job.get("train_observations")
+            shp = np.shape(x) if x is not None else (1, 1)
+            return fit_cost(job, shp[0] if len(shp) else 1, shp[1] if len(shp) > 1 else 1,
+                            bool(job.get("multivariate", False)))
+
+        fit_specs.sort(key=_est, reverse=True)
+
     is_greedy_run = len(units) > 0
     total_fits = sum(fits_per_bootstrap.values())
     print(f"Array task {array_idx}: {len(jobs)} bootstraps, {total_fits} fits "
@@ -328,9 +406,15 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu",
     # bootstrap_<seed>_restart_val_ll.json, for restart-saturation studies.
     save_all_ll = os.environ.get("EXCALIBR_SAVE_RESTART_LL") == "1"
     all_ll: dict = defaultdict(list)             # (bs_seed, save_dir) -> [{label, fit_idx, val_ll}]
+    # Always on: every restart's run statistics (EM iterations, stop reason,
+    # wall time, objective checkpoints), written as
+    # bootstrap_<seed>_restart_stats.json. Small; used for the iteration
+    # distribution / cap-rate / scheduling analyses (docs/fit_speed_report.md).
+    restart_stats: dict = defaultdict(list)      # (bs_seed, save_dir) -> [dict]
 
     def _finalize(bs_seed, label, save_dir, fit_idx, result):
         val_ll = (result.get("val_ll", -np.inf) if result else -np.inf)
+        restart_stats[(bs_seed, save_dir)].append(_restart_stat(label, fit_idx, result))
         if save_all_ll:
             all_ll[(bs_seed, save_dir)].append(dict(label=label, fit_idx=fit_idx,
                                                     val_ll=float(val_ll) if np.isfinite(val_ll) else None))
@@ -359,6 +443,8 @@ def run_array_task(output_dir: str, array_idx: int, device: str = "cpu",
                 import json as _json
                 (Path(save_dir) / f"bootstrap_{bs_seed}_restart_val_ll.json").write_text(
                     _json.dumps(all_ll.pop(bs_key, [])))
+            _write_restart_stats(Path(save_dir) / f"bootstrap_{bs_seed}_restart_stats.json",
+                                 restart_stats.pop(bs_key, []))
             new_results = {}
             for (b, lbl, sd), (vl, _, res) in best.items():
                 if b == bs_seed and sd == save_dir:
@@ -513,9 +599,15 @@ if __name__ == "__main__":
                              "path's own kmeans init per fit, so results match the CPU "
                              "path. gpu: jax_batch's batched init (faster, but a different "
                              "algorithm with different, sometimes failing, starts).")
+    parser.add_argument("--layout", default=None,
+                        help="Task layout JSON from hpc/make_layout.py (submit_array.sh passes "
+                             "it when TASKS is set): array_idx then indexes the layout's tasks. "
+                             "Default: the array files' own layout.")
     args = parser.parse_args()
     if args.end is not None:
         for idx in range(args.array_idx, args.end + 1):
-            run_array_task(args.output_dir, idx, device=args.device, gpu_init=args.gpu_init)
+            run_array_task(args.output_dir, idx, device=args.device, gpu_init=args.gpu_init,
+                           layout=args.layout)
     else:
-        run_array_task(args.output_dir, args.array_idx, device=args.device, gpu_init=args.gpu_init)
+        run_array_task(args.output_dir, args.array_idx, device=args.device, gpu_init=args.gpu_init,
+                       layout=args.layout)

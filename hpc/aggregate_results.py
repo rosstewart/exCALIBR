@@ -160,6 +160,24 @@ def aggregate_results(output_dir: Path, output_file: Path) -> None:
     size_mb = output_file.stat().st_size / 1e6
     print(f"Saved → {output_file}  ({size_mb:.1f} MB)")
 
+    # Per-restart run statistics (n_em_iters, stop_reason, fit_seconds, ...),
+    # written by run_array_task.py since 2026-11-19. Kept in a separate file so
+    # bootstrap_results.json.gz keeps its label-keyed layout; older runs simply
+    # have none.
+    stats_files = sorted(output_dir.rglob("bootstrap_*_restart_stats.json"))
+    if stats_files:
+        stats: dict = defaultdict(dict)
+        for sf in stats_files:
+            try:
+                seed = int(sf.stem.split("_")[1])
+                stats[sf.parent.name][seed] = json.loads(sf.read_text())
+            except Exception as e:
+                print(f"  Warning: failed to load {sf}: {e}")
+        stats_out = output_file.parent / "restart_stats.json.gz"
+        with gzip.open(stats_out, "wt", encoding="utf-8") as f:
+            json.dump(stats, f)
+        print(f"Saved restart stats → {stats_out}  ({len(stats_files)} files)")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Aggregate ExCALIBR bootstrap results")

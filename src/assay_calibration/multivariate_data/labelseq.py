@@ -20,8 +20,11 @@ DEFAULT_DATA_PATH = "/data/ross/assay_calibration/labelseq/labelseq-annotated-20
 
 def _labelseq_ms_cache_dir(data_path: str, log10_activity: bool,
                             regularization_type: Optional[str] = None) -> Path:
+    import os
+    rel = os.environ.get("MV_CLINVAR_DEFAULT_RELEASE", "2025")
+    tag = "" if rel == "2026" else f"_cv{rel}"  # pre-2026-11-19 caches hold 2026 labels
     return Path(data_path).parent / (
-        f".labelseq_ms_cache_log10act{log10_activity}_reg{regularization_type}"
+        f".labelseq_ms_cache_log10act{log10_activity}_reg{regularization_type}{tag}"
     )
 
 

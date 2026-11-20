@@ -190,32 +190,54 @@ def _tp53_default_kawoligo_mode():
     return DEFAULT_KAWOLIGO_MODE
 
 
-def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
-                   n_bootstraps: int, extra_index_fields: dict | None = None) -> tuple[int, int]:
+# Set from --packing in main(); read by _save_manifest (module-level so the
+# many existing _save_manifest call sites need no change).
+_PACK_OPTS = {"packing": "balanced"}
+
+
+def _save_manifest(output_dir: str, all_jobs: list, target_array_size, n_bootstraps: int,
+                   extra_index_fields: dict | None = None) -> tuple[int, int]:
+    """Write jobs/array_NNNN.pkl, jobs/job_index.json and jobs/costs.json.
+
+    target_array_size N gives ceil(total / ceil(total / N)) array files as
+    before. Which compact jobs share a file (--packing): "balanced"
+    (default) evens out estimated work (hpc/packing.py), heaviest first;
+    "contiguous" is the legacy consecutive slicing. This is only the default
+    layout: submit_array.sh TASKS=<n|auto> builds a layout for the machine
+    at submission (hpc/make_layout.py) from jobs/costs.json. Placement is
+    scheduling only: CPU-path fit results are bitwise unchanged. global_idx
+    is always a job's position in all_jobs (so condition job_index_range
+    fields keep their meaning under any layout).
+    """
     jobs_dir = os.path.join(output_dir, "jobs")
     os.makedirs(jobs_dir, exist_ok=True)
 
     total_jobs = len(all_jobs)
-    jobs_per_array = max(1, -(-total_jobs // target_array_size))
-    num_arrays = (total_jobs + jobs_per_array - 1) // jobs_per_array
-
-    print(f"\nOptimal arrangement:")
-    print(f"  Jobs per array task : {jobs_per_array}")
+    from hpc import packing as _packing
+    costs = [_packing.cjob_fit_costs(c) for c in all_jobs]
+    jobs_per_array = max(1, -(-total_jobs // int(target_array_size)))
+    n_tasks = (total_jobs + jobs_per_array - 1) // jobs_per_array
+    mode = _PACK_OPTS["packing"]
+    if mode == "contiguous":
+        bins = _packing.contiguous(total_jobs, jobs_per_array)
+    else:
+        bins = _packing.assign(costs, n_tasks)
+    print(f"\nDefault array layout ({mode}; submit_array.sh TASKS=... re-lays it out at submission):")
+    print(f"  Jobs per array task : up to {max((len(b) for b in bins), default=1)}")
+    num_arrays = len(bins)
     print(f"  Number of array tasks: {num_arrays}")
 
     job_index = []
     print("\nSaving job files...")
-    for array_idx in range(num_arrays):
-        start = array_idx * jobs_per_array
-        end = min(start + jobs_per_array, total_jobs)
-        array_jobs = all_jobs[start:end]
+    for array_idx, members in enumerate(bins):
+        array_jobs = [all_jobs[i] for i in members]
         with open(os.path.join(jobs_dir, f"array_{array_idx:04d}.pkl"), "wb") as f:
             pickle.dump(array_jobs, f)
-        for local_idx, job in enumerate(array_jobs):
+        for local_idx, (gidx, job) in enumerate(zip(members, array_jobs)):
             entry = {
                 "array_idx": array_idx,
                 "local_idx": local_idx,
-                "global_idx": start + local_idx,
+                "global_idx": gidx,
                 "dataset_name": job["dataset_name"],
                 "bootstrap_seed": job["bootstrap_seed"],
                 "num_fits_total": job["num_fits_total"],
@@ -233,6 +255,7 @@ def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
         "n_bootstraps": n_bootstraps,
         "job_index": job_index,
     }
+    index["packing"] = mode
     if extra_index_fields:
         index.update(extra_index_fields)
 
@@ -240,6 +263,14 @@ def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
     with open(index_file, "w") as f:
         json.dump(index, f, indent=2)
     print(f"Job index saved to   : {index_file}")
+    # Per-compact-job fit-cost estimates (hpc/packing.py), so hpc/make_layout.py
+    # can lay the tasks out at submission time (task count, CPUs, concurrency
+    # are machine choices) without loading any job pickle.
+    loc = {e["global_idx"]: (e["array_idx"], e["local_idx"]) for e in job_index}
+    with open(os.path.join(jobs_dir, "costs.json"), "w") as f:
+        json.dump({"model": "hpc/packing.py v1",
+                   "jobs": [{"global_idx": g, "array_idx": loc[g][0], "local_idx": loc[g][1],
+                             "fit_costs": [round(c, 3) for c in costs[g]]} for g in range(total_jobs)]}, f)
 
     dataset_names = sorted({e["dataset_name"] for e in job_index})
     datasets_file = os.path.join(output_dir, "datasets.txt")
@@ -1153,6 +1184,12 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
         return all_jobs
 
     fit_options = fit_options or {}
+    by_ds = fit_options.get("components_by_dataset") or {}
+    for key in (dataset_label, gene, str(gene).upper()):
+        if key in by_ds:
+            component_range = [int(k) for k in by_ds[key]]
+            print(f"  {dataset_label}: components {component_range} (from --components-file, key {key!r})")
+            break
     # Consequence-stratified mixture (fit_options["strata"]): the fitter's
     # samples are the strata (fit_utils/strata.py); composites are rebuilt at
     # scoring time. The stratum layout is written next to the jobs so scoring
@@ -1239,6 +1276,12 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                     fit_kwargs["tied_population"] = tied_spec
                 if noise_floor is not None:
                     fit_kwargs["gamma_noise_floor"] = noise_floor
+                # Opt-in, approximate speed options: only added when set, so
+                # default job kwargs stay byte-identical.
+                if fit_options.get("em_accelerator", "none") != "none":
+                    fit_kwargs["em_accelerator"] = fit_options["em_accelerator"]
+                if fit_options.get("completed_moments_einsum", "exact") != "exact":
+                    fit_kwargs["completed_moments_einsum"] = fit_options["completed_moments_einsum"]
                 fit_kwargs.update(boot_kwargs)
                 if greedy_restarts:
                     fit_kwargs["greedy_restarts"] = True
@@ -1279,7 +1322,9 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             cjob["strata"] = dict(names=list(strata.names), counts=strata.counts.tolist(),
                                   bootstrap=dict((k, v) for k, v in boot_kwargs.items() if k != "bootstrap_assignments"))
         if (fit_options.get("tied_population") or fit_options.get("noise_floor")
-                or fit_options.get("weight_neff", "weighted") != "weighted"):
+                or fit_options.get("weight_neff", "weighted") != "weighted"
+                or fit_options.get("em_accelerator", "none") != "none"
+                or fit_options.get("completed_moments_einsum", "exact") != "exact"):
             cjob["fit_options"] = dict(fit_options, tied_population_spec=tied_spec, noise_floor_var=noise_floor)
         if pathogenic_share:
             cjob["pathogenic_share"] = pathogenic_share
@@ -1979,6 +2024,13 @@ def _add_pathogenic_share_arg(p):
                         "pi * W[P/LP] + (1 - pi) * W[B/LB + synonymous] during the fit "
                         "(cfusn/tied_population.py: population containment). Datasets "
                         "without P/LP, a benign reference or a population sample fit free.")
+    p.add_argument("--components-file", default=None,
+                   help="JSON mapping a dataset label (e.g. BRCA2_combined_mv, "
+                        "BRCA2_combined_cluster2_mv) or a gene to its component counts, "
+                        "e.g. {\"BRCA2_combined_mv\": [3, 4], \"TP53\": [4]}. Datasets it "
+                        "doesn't name use --components. The user writes it after "
+                        "inspecting the component diagnostic (mv_analysis/k_advisor.py); "
+                        "nothing fills it automatically.")
     p.add_argument("--strata", action="store_true",
                    help="Consequence-stratified mixture: fit with every variant in one stratum "
                         "(membership x consequence x splice flag; fit_utils/strata.py) as the "
@@ -2011,6 +2063,16 @@ def _add_pathogenic_share_arg(p):
                         "count as extra observations); 'kish' = Kish effective sample size "
                         "(upweighting moves components but adds no information). No effect "
                         "on unweighted (TAU=0) jobs.")
+    p.add_argument("--em-accelerator", choices=["none", "squarem"], default="none",
+                   help="EXPERIMENTAL, opt-in: accelerate the multivariate EM with SQUAREM "
+                        "(cfusn/squarem.py; Varadhan & Roland 2008). Not bitwise identical "
+                        "to plain EM; see docs/fit_speed_report.md before using it. CPU only. "
+                        "Default none: job kwargs unchanged.")
+    p.add_argument("--completed-moments-einsum", choices=["exact", "two_stage"], default="exact",
+                   help="EXPERIMENTAL, opt-in: 'two_stage' evaluates the completed-data "
+                        "B Psi B' term as a batched matmul (faster, not bitwise identical; "
+                        "see docs/fit_speed_report.md). CPU only. Default exact: job kwargs "
+                        "unchanged.")
 
 
 def _fit_options(args):
@@ -2019,11 +2081,15 @@ def _fit_options(args):
             "tied_population": bool(getattr(args, "tied_population", False)),
             "noise_floor": bool(getattr(args, "noise_floor", False)),
             "noise_floor_shape": getattr(args, "noise_floor_shape", "full"),
+            "components_by_dataset": (json.load(open(args.components_file))
+                                      if getattr(args, "components_file", None) else None),
             "strata": bool(getattr(args, "strata", False)),
             "strata_min": getattr(args, "strata_min", 5),
             "bootstrap_scheme": getattr(args, "bootstrap_scheme", None),
             "bootstrap_min_cell": getattr(args, "bootstrap_min_cell", 5),
-            "bootstrap_n_minus_one": bool(getattr(args, "bootstrap_n_minus_one", False))}
+            "bootstrap_n_minus_one": bool(getattr(args, "bootstrap_n_minus_one", False)),
+            "em_accelerator": getattr(args, "em_accelerator", "none"),
+            "completed_moments_einsum": getattr(args, "completed_moments_einsum", "exact")}
 
 
 def _merge_condition_manifests(output_root: str, condition_labels: list, target_array_size: int) -> None:
@@ -2049,7 +2115,7 @@ def _merge_condition_manifests(output_root: str, condition_labels: list, target_
             array_file.unlink()  # superseded by the merged copy below
         conditions[label] = {"job_index_range": [start, len(all_jobs)],
                              **{k: v for k, v in index.items() if k not in
-                                ("total_jobs", "num_arrays", "jobs_per_array", "job_index")}}
+                                ("total_jobs", "num_arrays", "jobs_per_array", "job_index", "packing")}}
     print(f"\nMerging {len(all_jobs)} jobs from {len(condition_labels)} condition(s) "
           f"{condition_labels} into one job array under {output_root}/jobs/")
     total_jobs, num_arrays = _save_manifest(output_root, all_jobs, target_array_size, n_bootstraps,
@@ -2113,7 +2179,14 @@ def run_predictor_transform_conditions(args):
 def _add_common_args(p):
     p.add_argument("--output-dir", required=True, help="Directory for jobs and results")
     p.add_argument("--target-array-size", type=int, default=1000,
-                   help="Target SLURM array size (default: 1000)")
+                   help="Target SLURM array size of the default layout (default: 1000). "
+                        "submit_array.sh TASKS=<n|auto> can re-lay the tasks out for the "
+                        "machine at submission without re-running prepare.py.")
+    p.add_argument("--packing", choices=["balanced", "contiguous"], default="balanced",
+                   help="Which compact jobs share an array file: 'balanced' (default) evens "
+                        "out estimated work (hpc/packing.py); 'contiguous' is the legacy "
+                        "consecutive slicing. Scheduling only: CPU-path fit results are "
+                        "bitwise unchanged.")
     p.add_argument("--n-jobs", type=int, default=30,
                    help="Parallel workers for job generation (default: 30)")
     p.add_argument("--seed", type=_parse_seed, default=DEFAULT_MASTER_SEED,
@@ -2557,6 +2630,8 @@ def main():
                             "mv_analysis/config.py reads.")
 
     args = parser.parse_args()
+    if hasattr(args, "packing"):
+        _PACK_OPTS["packing"] = args.packing
     # Pin the ClinVar default release for job generation before anything can
     # import mv_analysis.config, whose legacy-run fallback would otherwise set
     # it to 2026 for the whole process. An explicit environment value wins.

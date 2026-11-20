@@ -29,6 +29,7 @@ from .constraints import (
     _adjacent_pair_violated,
 )
 from typing import List, Tuple, Any
+import functools
 import numpy as np
 import scipy.stats as sps
 from scipy.stats import truncnorm
@@ -127,6 +128,19 @@ _BVN_QUAD_LOG_RANGE = 140.0
 _F1_1_ASYMPTOTIC_T = 25.0
 
 
+@functools.lru_cache(maxsize=None)
+def _legendre_nodes(n_nodes, n_panels):
+    """Gauss-Legendre nodes/weights and panel edges for _log_bvn_orthant_quad.
+    Data-independent, so computed once per (n_nodes, n_panels) instead of on
+    every call (roots_legendre solves a banded eigenproblem each time). The
+    arrays are made read-only so the cached values can never be altered."""
+    x, w = roots_legendre(n_nodes)
+    edges = np.linspace(0.0, 1.0, n_panels + 1)
+    for a in (x, w, edges):
+        a.setflags(write=False)
+    return x, w, edges
+
+
 def _log_bvn_orthant_quad(h, k, rho, n_nodes=_BVN_QUAD_NODES,
                           n_panels=_BVN_QUAD_PANELS,
                           log_range=_BVN_QUAD_LOG_RANGE):
@@ -155,8 +169,7 @@ def _log_bvn_orthant_quad(h, k, rho, n_nodes=_BVN_QUAD_NODES,
     U = np.maximum(U, 1e-3)
     U = np.where(lo_v > 0, np.maximum(U, 12.0), U)
 
-    x, w = roots_legendre(n_nodes)
-    edges = np.linspace(0.0, 1.0, n_panels + 1)
+    x, w, edges = _legendre_nodes(n_nodes, n_panels)
 
     parts = []
     for e0, e1 in zip(edges[:-1], edges[1:]):
@@ -420,9 +433,10 @@ def get_truncated_normal_moments_mv(observations, mu, Delta, Gamma):
     return trunc_norm_moments(eta, sigma)
 
 
-def get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma):
+def get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma, layout=None):
     """Restricted MSN (q=1) with NaN handling. Delta is (p,) vector.
-    Returns v: (N,), w: (N,).
+    Returns v: (N,), w: (N,). ``layout``: optional density_utils.ObsLayout of
+    ``observations`` (precomputed pattern structure; same values).
     """
     Delta = np.asarray(Delta).ravel()
     observations = np.atleast_2d(observations)
@@ -430,21 +444,14 @@ def get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma):
     v = np.zeros(N)
     w = np.zeros(N)
 
-    obs_mask = ~np.isnan(observations)
-    patterns, inverse = density_utils.pattern_groups(obs_mask)
-
-    for pi, pattern in enumerate(patterns):
-        obs_dims = np.where(pattern)[0]
+    for _pattern, idx, obs_dims, _m, x_s in density_utils._layout_groups(observations, layout):
         if len(obs_dims) == 0:
-            idx = np.where(inverse == pi)[0]
             v[idx] = np.sqrt(2 / np.pi)
             w[idx] = 1.0
             continue
-        idx = np.where(inverse == pi)[0]
         mu_s = mu[obs_dims]
         Delta_s = Delta[obs_dims]
         Gamma_s = Gamma[np.ix_(obs_dims, obs_dims)]
-        x_s = observations[np.ix_(idx, obs_dims)]
         v[idx], w[idx] = get_truncated_normal_moments_mv(x_s, mu_s, Delta_s, Gamma_s)
 
     return v, w
@@ -747,7 +754,8 @@ def _mc_truncated_mvn_moments(means, cov, n_mc=500, rng=None):
     return eta, Psi
 
 
-def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500, rng=None):
+def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500, rng=None,
+                                      layout=None):
     """Compute truncated normal moments for CFUSN (q >= 1).
 
     T | X=x ~ TN_q(m, S, R^q_+)
@@ -780,7 +788,7 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
     if rng is None:
         rng = np.random.RandomState()
 
-    has_missing = np.isnan(observations).any()
+    has_missing = layout.any_missing if layout is not None else np.isnan(observations).any()
 
     if not has_missing:
         # All dimensions observed — single covariance S shared across obs
@@ -818,13 +826,7 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
     prior_eta = np.full(q, np.sqrt(2 / np.pi))
     prior_Psi = np.eye(q)  # E[TT'] for standard half-normal
 
-    obs_mask = ~np.isnan(observations)
-    patterns, inverse = density_utils.pattern_groups(obs_mask)
-
-    for pi, pattern in enumerate(patterns):
-        obs_dims = np.where(pattern)[0]
-        idx = np.where(inverse == pi)[0]
-
+    for _pattern, idx, obs_dims, _m, x_s in density_utils._layout_groups(observations, layout):
         if len(obs_dims) == 0:
             eta[idx] = prior_eta
             Psi[idx] = prior_Psi
@@ -834,7 +836,6 @@ def get_truncated_normal_moments_cfusn(observations, mu, Delta, Gamma, n_mc=500,
         mu_s = mu[obs_dims]
         Delta_s = Delta[obs_dims, :]  # (|S|, q)
         Gamma_s = Gamma[np.ix_(obs_dims, obs_dims)]
-        x_s = observations[np.ix_(idx, obs_dims)]
 
         Omega_s = Gamma_s + Delta_s @ Delta_s.T
         Omega_s = 0.5 * (Omega_s + Omega_s.T)
@@ -933,7 +934,71 @@ def _regularized_spd(A, floor=1e-10):
     return A
 
 
-def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
+# ── Explicit forms of the small-q einsums in _completed_data_moments ────────
+#
+# np.einsum (no `optimize`) evaluates these with its generic sum-of-products
+# loops, which are slow for a contraction over only q <= 2 latent indices. The
+# functions below spell out the same arithmetic as whole-array numpy ops, in
+# the order einsum performs it: output initialised to +0.0, then each term
+# added in turn, reduction indices in C order (i outer, j inner), and each
+# 3-operand term multiplied left to right, (B * Psi) * B. Verified bitwise
+# identical to np.einsum, including the sign of zeros, on 400 random cases per
+# form (q = 1, 2; N = 1..700; p = 1..14; exact and signed zeros) and by the
+# full-fit bitwise matrix (test/fit_speed/bitid_compare.py). numpy compiles
+# einsum's sum-of-products loops for the baseline instruction set only (no
+# runtime dispatch, no FMA contraction), so its order does not depend on the
+# CPU. Inputs that are not C-contiguous float64 (the iteration order of
+# einsum could then differ) fall back to np.einsum itself.
+
+def _einsum_exact_ok(*arrays):
+    return all(a.dtype == np.float64 and a.flags.c_contiguous for a in arrays)
+
+
+def _einsum_npq_nq(B, e):
+    """np.einsum('npq,nq->np', B, e), bitwise."""
+    if not _einsum_exact_ok(B, e):
+        return np.einsum('npq,nq->np', B, e)
+    acc = B[:, :, 0] * e[:, None, 0] + 0.0
+    for i in range(1, B.shape[2]):
+        acc = acc + B[:, :, i] * e[:, None, i]
+    return acc
+
+
+def _einsum_npi_nij(B, P):
+    """np.einsum('npi,nij->npj', B, P), bitwise."""
+    if not _einsum_exact_ok(B, P):
+        return np.einsum('npi,nij->npj', B, P)
+    acc = B[:, :, 0, None] * P[:, 0, None, :] + 0.0
+    for i in range(1, B.shape[2]):
+        acc = acc + B[:, :, i, None] * P[:, i, None, :]
+    return acc
+
+
+def _einsum_npi_nij_nqj(B, P):
+    """np.einsum('npi,nij,nqj->npq', B, P, B), bitwise."""
+    if not _einsum_exact_ok(B, P):
+        return np.einsum('npi,nij,nqj->npq', B, P, B)
+    # (B_i * P_ij) is formed once per (i, j) as an (n, p) array -- the same
+    # products the broadcast (n, p, 1) * (n, 1, 1) would give -- and each term
+    # is accumulated in place; values identical, fewer full (n, p, p) passes.
+    q = B.shape[2]
+    acc, tmp = None, None
+    for i in range(q):
+        for j in range(q):
+            U = B[:, :, i] * P[:, i, j, None]
+            if acc is None:
+                acc = U[:, :, None] * B[:, None, :, j]
+                acc += 0.0
+            else:
+                if tmp is None:
+                    tmp = np.empty_like(acc)
+                np.multiply(U[:, :, None], B[:, None, :, j], out=tmp)
+                acc += tmp
+    return acc
+
+
+def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi, layout=None,
+                            einsum_mode="exact"):
     """Posterior moments of the COMPLETE data vector x under missingness.
 
     The M-step maximises Q = E[log p(x, T) | x_obs], so when entries are
@@ -960,6 +1025,11 @@ def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
     where the available-case M-step decreased the likelihood at iteration 1,
     forcing Gamma diagonal restored monotone convergence.
 
+    ``einsum_mode`` (EXPERIMENTAL, opt-in): "exact" (default) evaluates
+    B Psi B' exactly as np.einsum does; "two_stage" forms it as the batched
+    matmul (B Psi) @ B', reusing B Psi -- faster, but a different summation
+    order (relative differences ~1e-16), so results are not bitwise identical.
+
     Returns (Ex, Ext, Exx) with shapes (N, p), (N, p, q), (N, p, p).
     """
     observations = np.atleast_2d(np.asarray(observations, dtype=float))
@@ -974,12 +1044,8 @@ def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
     C = np.zeros((N, p, p))
     q_idx = np.arange(q)
 
-    obs_mask = ~np.isnan(observations)
-    patterns, inverse = density_utils.pattern_groups(obs_mask)
-    for pi, pattern in enumerate(patterns):
-        idx = np.where(inverse == pi)[0]
-        o = np.where(pattern)[0]
-        m = np.where(~pattern)[0]
+    groups = density_utils._layout_groups(observations, layout)
+    for _pattern, idx, o, m, x_o in groups:
         if len(m) == 0:
             continue                       # fully observed: a = x, B = 0, C = 0
         if len(o) == 0:
@@ -991,7 +1057,7 @@ def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
 
         G_oo = _regularized_spd(Gamma[np.ix_(o, o)])
         K = np.linalg.solve(G_oo, Gamma[np.ix_(m, o)].T).T        # (|m|, |o|)
-        a[np.ix_(idx, m)] = mu[m] + (observations[np.ix_(idx, o)] - mu[o]) @ K.T
+        a[np.ix_(idx, m)] = mu[m] + (x_o - mu[o]) @ K.T
         B[np.ix_(idx, m, q_idx)] = Delta[m] - K @ Delta[o]
         C_mm = Gamma[np.ix_(m, m)] - K @ Gamma[np.ix_(o, m)]
         C[np.ix_(idx, m, m)] = 0.5 * (C_mm + C_mm.T)
@@ -999,28 +1065,35 @@ def _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi):
     # B (and C) are exactly zero on fully observed rows, so the B-terms are
     # computed only where a readout is missing; the other rows' terms are the
     # same exact zeros, so the results are unchanged.
-    miss = ~obs_mask.all(axis=1)
+    miss = layout.miss_rows if layout is not None else ~(~np.isnan(observations)).all(axis=1)
     B_eta = np.zeros((N, p))
     BPsi = np.zeros((N, p, q))
     BPsiB = np.zeros((N, p, p))
     if miss.any():
         Bm, Pm = B[miss], Psi[miss]
-        B_eta[miss] = np.einsum('npq,nq->np', Bm, eta[miss])
-        BPsi[miss] = np.einsum('npi,nij->npj', Bm, Pm)
-        BPsiB[miss] = np.einsum('npi,nij,nqj->npq', Bm, Pm, Bm)
+        B_eta[miss] = _einsum_npq_nq(Bm, eta[miss])
+        BPsi[miss] = _einsum_npi_nij(Bm, Pm)
+        if einsum_mode == "two_stage":
+            BPsiB[miss] = np.matmul(BPsi[miss], Bm.transpose(0, 2, 1))
+        else:
+            BPsiB[miss] = _einsum_npi_nij_nqj(Bm, Pm)
     Ex = a + B_eta
     Ext = a[:, :, None] * eta[:, None, :] + BPsi
-    Exx = (a[:, :, None] * a[:, None, :]
-           + a[:, :, None] * B_eta[:, None, :]
-           + B_eta[:, :, None] * a[:, None, :]
-           + BPsiB
-           + C)
+    # Exx = a a' + a B_eta' + B_eta a' + BPsiB + C, summed left to right as
+    # before but accumulated in place (identical values, fewer temporaries).
+    Exx = a[:, :, None] * a[:, None, :]
+    tmp = a[:, :, None] * B_eta[:, None, :]
+    Exx += tmp
+    np.multiply(B_eta[:, :, None], a[:, None, :], out=tmp)
+    Exx += tmp
+    Exx += BPsiB
+    Exx += C
     return Ex, Ext, Exx
 
 
 def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
                                n_mc=500, rng=None, sample_weights=None,
-                               return_completed=False):
+                               return_completed=False, layout=None, einsum_mode="exact"):
     """CFUSN location M-step. Returns (mu_new, eta, Psi) — moments reused downstream.
 
     With ``return_completed=True`` also returns the completed-data moments
@@ -1029,7 +1102,7 @@ def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
     """
     Delta      = density_utils._ensure_matrix_delta(Delta)
     eta, Psi   = get_truncated_normal_moments_cfusn(
-        observations, mu, Delta, Gamma, n_mc=n_mc, rng=rng
+        observations, mu, Delta, Gamma, n_mc=n_mc, rng=rng, layout=layout
     )
     obs    = ~np.isnan(observations)                 # (N, p)
     x_fill = np.where(obs, observations, 0.0)
@@ -1049,7 +1122,8 @@ def get_location_update_cfusn(observations, responsibilities, mu, Delta, Gamma,
         mu_new    = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12), mu)
         completed = None
     else:
-        completed = _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi)
+        completed = _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi,
+                                            layout=layout, einsum_mode=einsum_mode)
         Ex = completed[0]
         # mu maximising Q is the full-vector weighted mean of E[x] - Delta E[T]
         # (Gamma^-1 cancels for an unconstrained mu, exactly as in the complete
@@ -1693,7 +1767,7 @@ def get_Gamma_update_cfusn(mu_new, Delta_new, observations, responsibilities, et
 # Restricted MSN (q=1) multivariate update rules (kept for backward compat)
 # ══════════════════════════════════════════════
 
-def _mv_completed_moments(observations, mu, Delta, Gamma):
+def _mv_completed_moments(observations, mu, Delta, Gamma, layout=None):
     """q=1 wrapper around _completed_data_moments.
 
     The restricted MSN is just the CFUSN with q=1, so the same completed-data
@@ -1702,22 +1776,38 @@ def _mv_completed_moments(observations, mu, Delta, Gamma):
     M-step whenever Gamma is non-diagonal -- that flaw was present in this q=1
     path exactly as it was in the CFUSN one.
     """
-    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
+    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma, layout=layout)
     eta = v[:, None]                                  # (N, 1)
     Psi = w[:, None, None]                            # (N, 1, 1)
-    completed = _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi)
+    completed = _completed_data_moments(observations, mu, Delta, Gamma, eta, Psi, layout=layout)
     return v, w, eta, Psi, completed
 
 
+def _mv_moments(observations, mu, Delta, Gamma, layout=None):
+    """The E-step moments every q=1 M-step piece needs, which depend only on
+    the data and the component's CURRENT (mu, Delta, Gamma): the
+    _mv_completed_moments tuple when anything is missing, else (v, w).
+    _em_update_multivariate computes this once per component and passes it to
+    the location, Delta and Gamma updates (each used to recompute it from the
+    same inputs, i.e. three identical passes)."""
+    if not (~np.isnan(observations)).all():
+        return _mv_completed_moments(observations, mu, Delta, Gamma, layout=layout)
+    return get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma, layout=layout)
+
+
 def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma,
-                           sample_weights=None):
-    """mu update for q=1 restricted MSN. Delta is (p,) vector."""
+                           sample_weights=None, moments=None):
+    """mu update for q=1 restricted MSN. Delta is (p,) vector.
+
+    ``moments``: optional precomputed ``_mv_moments(observations, mu, Delta,
+    Gamma)`` (identical values; saves recomputing them)."""
     obs = ~np.isnan(observations)
     r = responsibilities if sample_weights is None else responsibilities * sample_weights
     Delta_vec = np.asarray(Delta).ravel()
 
     if not obs.all():
-        v, w, eta, Psi, completed = _mv_completed_moments(observations, mu, Delta, Gamma)
+        v, w, eta, Psi, completed = (moments if moments is not None
+                                     else _mv_completed_moments(observations, mu, Delta, Gamma))
         Ex = completed[0]
         denom = float(r.sum())
         if denom <= 1e-12:
@@ -1725,7 +1815,8 @@ def get_location_update_mv(observations, responsibilities, mu, Delta, Gamma,
         return (r[:, None] * (Ex - v[:, None] * Delta_vec[None, :])).sum(0) / denom
 
     # Complete data: available-case masking is exact.
-    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
+    v, w = (moments if moments is not None
+            else get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma))
     x_fill = np.where(obs, observations, 0.0)
     m = x_fill - v[:, None] * Delta_vec[None, :]
     z = r[:, None]
@@ -1765,7 +1856,7 @@ def _mv_capped(Delta_new, weighted_var_d, Delta_prev, observations, dim_weights=
 
 
 def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, Gamma,
-                       sample_weights=None, dim_weights=None):
+                       sample_weights=None, dim_weights=None, moments=None):
     """Delta update for q=1 restricted MSN. Returns (p,) vector.
 
     ``dim_weights`` (EXPERIMENTAL, opt-in -- see cfusn/fit.py's
@@ -1785,7 +1876,8 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
     z = responsibilities if sample_weights is None else responsibilities * sample_weights
 
     if not obs.all():
-        v, w, eta, Psi, completed = _mv_completed_moments(observations, mu, Delta, Gamma)
+        v, w, eta, Psi, completed = (moments if moments is not None
+                                     else _mv_completed_moments(observations, mu, Delta, Gamma))
         Ex, Ext, Exx = completed
         # Delta_d = sum_n z (E[x_d t] - mu_d E[t]) / sum_n z E[t^2]; with the
         # completed moments every row informs every dimension, so the
@@ -1809,7 +1901,8 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
         return _mv_capped(Delta_new, weighted_var_d, Delta, observations, dim_weights=dim_weights)
 
     # Complete data: available-case masking is exact.
-    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
+    v, w = (moments if moments is not None
+            else get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma))
     x_fill = np.where(obs, observations, 0.0)
     residuals = x_fill - updated_mu[None, :]
     numer = (z[:, None] * v[:, None] * residuals * obs).sum(axis=0)
@@ -1827,7 +1920,7 @@ def get_Delta_update_mv(updated_mu, observations, responsibilities, mu, Delta, G
 
 
 def get_Gamma_update_mv(updated_mu, updated_Delta, observations, responsibilities, mu, Delta, Gamma,
-                        sample_weights=None):
+                        sample_weights=None, moments=None):
     """Gamma update for q=1 restricted MSN. Returns (p, p)."""
     N, K = observations.shape
     obs = ~np.isnan(observations)
@@ -1835,12 +1928,14 @@ def get_Gamma_update_mv(updated_mu, updated_Delta, observations, responsibilitie
     updated_Delta = np.asarray(updated_Delta).ravel()
 
     if not obs.all():
-        v, w, eta, Psi, completed = _mv_completed_moments(observations, mu, Delta, Gamma)
+        v, w, eta, Psi, completed = (moments if moments is not None
+                                     else _mv_completed_moments(observations, mu, Delta, Gamma))
         return _gamma_update_completed(updated_mu, updated_Delta.reshape(-1, 1),
                                        z, eta, Psi, completed)
 
     # Complete data: available-case masking is exact -- original path, unchanged.
-    v, w = get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma)
+    v, w = (moments if moments is not None
+            else get_truncated_normal_moments_mv_missing(observations, mu, Delta, Gamma))
     x_fill = np.where(obs, observations, 0.0)
     residuals = x_fill - updated_mu[None, :]
     Gamma_new = np.zeros((K, K))
@@ -1938,8 +2033,12 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
                                current_weights, multivariate=False,
                                return_log_pdfs=False, sample_weights=None,
                                extra_log_pdfs=None, weight_divergence=None,
-                               tied_population=None):
+                               tied_population=None, sample_layouts=None):
     """Compute updated weights AND normalised log-likelihood in a single density pass.
+
+    ``sample_layouts``: optional per-sample density_utils.ObsLayout of
+    ``observations[sample_indicators[:, i]]`` (built once per fit by
+    single_fit); same values, without re-slicing and re-grouping each call.
 
     ``tied_population``: optional resolved spec (cfusn/tied_population.py,
     EXPERIMENTAL). When given, the W step ties the population row to
@@ -1985,7 +2084,8 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
 
     for i in range(S):
         mask = sample_indicators[:, i]
-        X    = observations[mask]
+        lay  = None if sample_layouts is None else sample_layouts[i]
+        X    = observations[mask] if lay is None else lay.x
         N_s  = X.shape[0]
 
         if not multivariate:
@@ -1996,7 +2096,8 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
             X_2d = np.atleast_2d(X)
             lp_list = []
             for p in updated_params:
-                lp = density_utils._single_component_logpdf(X_2d, p, multivariate=True)
+                lp = density_utils._single_component_logpdf(X_2d, p, multivariate=True,
+                                                            layout=lay)
                 lp = np.atleast_1d(np.asarray(lp, dtype=float)).ravel()
                 if len(lp) != N_s:
                     lp = np.full(N_s, -np.inf)
@@ -2061,6 +2162,40 @@ def get_sample_weights_and_ll(observations, sample_indicators, updated_params,
     if return_log_pdfs:
         return upd_w, ll / N, cache
     return upd_w, ll / N
+
+
+def log_pdf_cache_and_ll(observations, sample_indicators, params, weights,
+                         sample_weights=None, extra_log_pdfs=None, sample_layouts=None):
+    """Per-sample continuous log-pdf cache at ``params`` (the
+    ``cached_log_pdfs`` em_iteration takes) and the normalised log-likelihood
+    at (params, weights) -- the multivariate density pass of
+    get_sample_weights_and_ll without its weight update. Used by the opt-in
+    SQUAREM accelerator (cfusn/squarem.py) at extrapolated parameters."""
+    sample_indicators = validate_indicators(sample_indicators)
+    S = sample_indicators.shape[1]
+    N = observations.shape[0]
+    sw = None if sample_weights is None else np.asarray(sample_weights)
+    cache = [None] * S
+    ll = 0.0
+    for i in range(S):
+        mask = sample_indicators[:, i]
+        lay = None if sample_layouts is None else sample_layouts[i]
+        X = np.atleast_2d(observations[mask] if lay is None else lay.x)
+        lp_list = []
+        for p in params:
+            lp = density_utils._single_component_logpdf(X, p, multivariate=True, layout=lay)
+            lp = np.atleast_1d(np.asarray(lp, dtype=float)).ravel()
+            if len(lp) != X.shape[0]:
+                lp = np.full(X.shape[0], -np.inf)
+            lp[~np.isfinite(lp)] = -np.inf
+            lp_list.append(lp)
+        cache[i] = np.stack(lp_list, axis=0)
+        full = cache[i] if extra_log_pdfs is None else cache[i] + extra_log_pdfs[:, mask]
+        with np.errstate(divide='ignore'):
+            log_w = np.where(weights[i] > 0, np.log(weights[i]), -np.inf)
+        log_mix = logsumexp(full + log_w[:, None], axis=0)
+        ll += float(np.sum(sw[mask] * log_mix)) if sw is not None else float(log_mix.sum())
+    return cache, ll / N
 
 
 # ══════════════════════════════════════════════
@@ -2364,6 +2499,36 @@ def resolve_separation_config(constrained, multivariate, constraint_mode):
     return separation.resolve_constraint_mode(constraint_mode)
 
 
+class FitLayout:
+    """Per-fit precomputed data structure passed to em_iteration as
+    ``_fit_layout`` (multivariate fits). Holds:
+
+      m                 ObsLayout of the M-step observations (all rows, or the
+                        rows with a continuous readout when categorical dims
+                        are present -- em_iteration's ``obs_m``);
+      m_sample_weights  sample_weights restricted to those rows (or None);
+      samples           per-sample ObsLayout of observations[mask_i], used by
+                        the weight/LL pass.
+
+    Everything is a function of the data only, so it is built once instead of
+    on every iteration; results are bitwise identical to recomputing it.
+    """
+
+    __slots__ = ("m", "m_sample_weights", "samples")
+
+    def __init__(self, observations, sample_indicators, has_cont=None, sample_weights=None):
+        observations = np.asarray(observations, dtype=float)
+        S = validate_indicators(np.asarray(sample_indicators))
+        if has_cont is not None and not np.all(has_cont):
+            self.m = density_utils.ObsLayout(observations[has_cont])
+            self.m_sample_weights = (None if sample_weights is None
+                                     else np.asarray(sample_weights)[has_cont])
+        else:
+            self.m = density_utils.ObsLayout(observations)
+            self.m_sample_weights = None
+        self.samples = [density_utils.ObsLayout(observations[S[:, i]]) for i in range(S.shape[1])]
+
+
 def em_iteration(observations, sample_indicators, current_component_params,
                  current_weights, constrained, xlims, multivariate=False,
                  cached_log_pdfs=None, return_log_pdfs=False, **kwargs):
@@ -2395,6 +2560,10 @@ def em_iteration(observations, sample_indicators, current_component_params,
         probs are appended to the return tuple.
     """
     cat_state = kwargs.pop("cat_state", None)
+    # Optional per-fit precomputed data layout (single_fit's _FitLayout): the
+    # M-step observations and their ObsLayout, plus per-sample layouts for the
+    # weight/LL pass. Same values as recomputing them; None = original path.
+    fit_layout = kwargs.pop("_fit_layout", None)
     weight_divergence = kwargs.pop("weight_divergence", None)
     tied_population = kwargs.pop("tied_population", None)
     mv = multivariate
@@ -2454,11 +2623,15 @@ def em_iteration(observations, sample_indicators, current_component_params,
     obs_m, resp_m, kw_m = observations, responsibilities, kwargs
     if cat_state is not None and not np.all(cat_state["has_cont"]):
         hc = cat_state["has_cont"]
-        obs_m = observations[hc]
+        obs_m = observations[hc] if fit_layout is None else fit_layout.m.x
         resp_m = responsibilities[:, hc]
         if kwargs.get("sample_weights") is not None:
             kw_m = dict(kwargs)
-            kw_m["sample_weights"] = np.asarray(kwargs["sample_weights"])[hc]
+            kw_m["sample_weights"] = (np.asarray(kwargs["sample_weights"])[hc]
+                                      if fit_layout is None else fit_layout.m_sample_weights)
+    if fit_layout is not None:
+        kw_m = dict(kw_m)
+        kw_m["_obs_layout"] = fit_layout.m
 
     if not mv:
         updated_params = _em_update_univariate(
@@ -2505,6 +2678,7 @@ def em_iteration(observations, sample_indicators, current_component_params,
             multivariate=mv, return_log_pdfs=True, sample_weights=sw,
             extra_log_pdfs=new_extra, weight_divergence=weight_divergence,
             tied_population=tied_population,
+            sample_layouts=None if fit_layout is None else fit_layout.samples,
         )
         if cat_state is not None:
             return updated_params, updated_weights, ll, new_log_pdfs, new_probs
@@ -2514,6 +2688,7 @@ def em_iteration(observations, sample_indicators, current_component_params,
         observations, sample_indicators, updated_params, current_weights,
         multivariate=mv, sample_weights=sw, extra_log_pdfs=new_extra,
         weight_divergence=weight_divergence, tied_population=tied_population,
+        sample_layouts=None if fit_layout is None else fit_layout.samples,
     )
     if cat_state is not None:
         return updated_params, updated_weights, ll, new_probs
@@ -2620,17 +2795,20 @@ def _em_update_multivariate(
                 updated[c] = (mu_old, Delta_old, Gamma_old)
                 continue
 
+        # E-step moments at the current params, shared by all three updates.
+        mom = _mv_moments(observations, mu_old, Delta_old, Gamma_old,
+                          layout=kwargs.get("_obs_layout"))
         mu_cand = get_location_update_mv(observations, z, mu_old, Delta_old, Gamma_old,
-                                         sample_weights=sample_weights)
+                                         sample_weights=sample_weights, moments=mom)
         if kwargs.get("force_gaussian") or c in (kwargs.get("gaussian_components") or ()):
             Delta_cand = np.zeros_like(Delta_old)
         else:
             Delta_cand = get_Delta_update_mv(mu_cand, observations, z, mu_old, Delta_old, Gamma_old,
                                              sample_weights=sample_weights,
-                                             dim_weights=dim_weights)
+                                             dim_weights=dim_weights, moments=mom)
         Gamma_cand = get_Gamma_update_mv(
             mu_cand, Delta_cand, observations, z, mu_old, Delta_old, Gamma_old,
-            sample_weights=sample_weights,
+            sample_weights=sample_weights, moments=mom,
         )
 
         # Same covariance-collapse regularisation as the CFUSN path.
@@ -2758,6 +2936,8 @@ def _em_update_cfusn(
         mu_cand, eta, Psi, completed = get_location_update_cfusn(
             observations, z, mu_old, Delta_old, Gamma_old, n_mc=n_mc, rng=rng,
             sample_weights=sample_weights, return_completed=True,
+            layout=kwargs.get("_obs_layout"),
+            einsum_mode=kwargs.get("completed_moments_einsum", "exact"),
         )
 
         # Step 2: Delta (p, q). force_gaussian: pin Delta at zero every

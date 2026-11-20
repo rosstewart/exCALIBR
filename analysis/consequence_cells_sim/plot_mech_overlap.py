@@ -218,7 +218,7 @@ def ptv_counts(ds, K, arm):
     return f"{int((pts < 0).sum())}/{int((pts == 0).sum())}/{int((pts > 0).sum())}"
 
 
-def main():
+def main(out=None):
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     d = load().set_index("dataset", drop=False)
@@ -242,7 +242,7 @@ def main():
                      title_fontsize=8, bbox_to_anchor=(1.0, 0.7))
     leg._legend_box.align = "left"
     fig.get_layout_engine().set(rect=(0, 0.02, 1, 1))
-    out = MO.OUT_REAL / "mech_overlap_examples_real.png"
+    out = out or MO.OUT_REAL / "mech_overlap_examples_real.png"
     fig.savefig(out, dpi=150)
     print(out)
 

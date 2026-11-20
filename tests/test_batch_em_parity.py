@@ -499,3 +499,58 @@ def test_cfusn_gpu_rejects_cpu_only_options():
            "kwargs": {**jobs[0]["kwargs"], "tied_population": {"population": 2}}}
     with pytest.raises(NotImplementedError, match="tied_population"):
         run_gpu([(job, job["bootstrap_seed"], "3c", "")])
+
+
+def _categorical_jobs(max_em_iters):
+    """Synthetic 2 continuous + 1 categorical (KawOligo-like) jobs with missing
+    values, built as tests/test_categorical_cfusn.py does."""
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_categorical_cfusn import _make
+    obs, S, _, _ = _make(seed=11)
+    obs = obs.copy()
+    obs[:20, :2] = np.nan                        # categorical-only rows
+    obs[20:60, 1] = np.nan                       # partially observed continuous rows
+    ss = SimpleNamespace(scores=obs, sample_assignments=S, dataset_names=["cont_a", "cont_b", "kaw"],
+                         categorical_dims={"kaw": ["Tetramer", "Dimer", "Monomer"]})
+    return Fit(ss).generate_fit_jobs([2], num_fits=3, bootstrap=True, check_monotonic=False,
+                                     master_seed=0, bootstrap_seed=0, latent_q=2,
+                                     max_em_iters=max_em_iters)
+
+
+@pytest.mark.parametrize("max_em_iters", [3, 60])
+def test_cfusn_parity_categorical(max_em_iters):
+    """GPU path with a categorical readout (cfusn/categorical.py) vs the CPU
+    path from the identical init: continuous params, weights, categorical
+    probabilities and val_ll agree to floating-point noise."""
+    jobs = _categorical_jobs(max_em_iters)
+    assert jobs and jobs[0]["kwargs"].get("cat_spec")
+    cpu = _run_cpu(jobs)
+    gpu = _run_gpu(jobs, label="2c")
+    n = 0
+    for fit_idx, c in cpu.items():
+        g = gpu[fit_idx]
+        if c["val_ll"] == -np.inf or g["val_ll"] == -np.inf:
+            continue
+        n += 1
+        for (m1, D1, G1), (m2, D2, G2) in zip(c["fit"]["component_params"], g["fit"]["component_params"]):
+            np.testing.assert_allclose(m1, m2, rtol=1e-8, atol=1e-8)
+            np.testing.assert_allclose(np.asarray(D1).reshape(len(m1), -1),
+                                       np.asarray(D2).reshape(len(m2), -1), rtol=1e-8, atol=1e-8)
+            np.testing.assert_allclose(G1, G2, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(c["fit"]["weights"], g["fit"]["weights"], rtol=1e-8, atol=1e-8)
+        for P1, P2 in zip(c["fit"]["cat_probs"], g["fit"]["cat_probs"]):
+            np.testing.assert_allclose(P1, P2, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(c["val_ll"], g["val_ll"], rtol=1e-9)
+    assert n > 0
+
+
+def test_cfusn_gpu_rejects_cpu_only_speed_options():
+    jobs = _weighted_floored_jobs()
+    for kw, msg in (({"em_accelerator": "squarem"}, "em_accelerator"),
+                    ({"completed_moments_einsum": "two_stage"}, "two_stage")):
+        job = {**jobs[0], "dataset_name": "test", "kwargs": {**jobs[0]["kwargs"], **kw}}
+        with pytest.raises(NotImplementedError, match=msg):
+            run_gpu([(job, job["bootstrap_seed"], "3c", "")])

@@ -15,6 +15,7 @@ import pickle
 from collections import Counter
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from .mv_calibration import MVCalibrationAnalysis, _PARTIAL_PATTERN_MODES
@@ -212,6 +213,13 @@ def run_gene_set_analysis_cached(
         "auxiliary_pathogenic_indices": auxiliary_pathogenic_indices,
         "benign_method": analysis.benign_method,
         "run_kwargs": sorted(run_kwargs.items()),
+        # the data the fits are scored on (rows, labels: release, row builder,
+        # strata arm) and the strata arm itself
+        "ms_digest": hashlib.sha1(np.ascontiguousarray(np.asarray(ms.scores, dtype=float)).tobytes()
+                                  + np.ascontiguousarray(np.asarray(ms._sample_assignments, dtype=bool)).tobytes()
+                                  ).hexdigest(),
+        "strata_arm": getattr(analysis, "strata_arm", None),
+        "eval_arm": os.environ.get("MV_STRATA_EVAL_ARM"),
     })
     key = hashlib.sha1(key_material.encode()).hexdigest()[:16]
     cache_path = os.path.join(cache_dir, f"{gene}_run_{key}.pkl")

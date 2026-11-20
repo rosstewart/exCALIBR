@@ -449,36 +449,63 @@ def stage_vus(args):
         pd.DataFrame(rows).to_csv(OUT / "vus" / "pknn_vus_points.csv", index=False)
 
 
+_OOB_SPLIT_CACHE = {}
+
+
+def _job_dir_splits(jd):
+    """{(condition or None, dataset_name, seed): out-of-bag indices} for every
+    job pickle in one jobs directory, read once per process."""
+    import pickle as _pickle
+    key = str(jd)
+    if key not in _OOB_SPLIT_CACHE:
+        out = {}
+        for a in sorted(jd.glob("array_*.pkl")):
+            with open(a, "rb") as f:
+                for job in _pickle.load(f):
+                    out[(job.get("condition"), job["dataset_name"], int(job["bootstrap_seed"]))] = np.asarray(
+                        job["shared_data"]["val_variant_indices"], int)
+        _OOB_SPLIT_CACHE[key] = out
+    return _OOB_SPLIT_CACHE[key]
+
+
 def job_pickle_oob_splits(dataset_name, seeds, fits_dir=None):
     """{bootstrap seed: out-of-bag row indices} read from the run's job
     pickles (shared_data["val_variant_indices"], already scoreset-row
     indices) -- the only option for consequence-stratified runs, whose
-    resampling cannot be regenerated from the multiscoreset alone. Looks in
-    <fits_dir>/jobs and its parent's jobs/."""
-    import json as _json
-    import pickle as _pickle
+    resampling cannot be regenerated from the multiscoreset alone.
+
+    Looks for a jobs/ directory holding array pickles in <fits_dir> and its
+    ancestors (up to three levels: a bundle built by
+    hpc/build_v2_bundles.py merges every condition's jobs into
+    <bundle root>/jobs). When the jobs directory is above <fits_dir>, only
+    jobs whose "condition" tag equals <fits_dir>'s path relative to it are
+    used (e.g. "S0/tp53/tau_0.1"), so conditions sharing a dataset name and
+    seeds never mix."""
     from pathlib import Path as _P
     from mv_analysis import config as _cfg
-    base = _P(fits_dir or _cfg.PAPER_FITS_DIR)
-    for jd in (base / "jobs", base.parent / "jobs"):
+    base = _P(fits_dir or _cfg.PAPER_FITS_DIR).resolve()
+    for anc in [base, *list(base.parents)[:3]]:
+        jd = anc / "jobs"
         if (jd / "job_index.json").exists() and any(jd.glob("array_*.pkl")):
+            rel = base.relative_to(anc).as_posix()
             break
     else:
-        raise FileNotFoundError(f"no job pickles under {base} or its parent")
-    idx = _json.load(open(jd / "job_index.json"))["job_index"]
+        raise FileNotFoundError(f"no job pickles under {base} or its ancestors")
+    allsp = _job_dir_splits(jd)
     want = {int(b) for b in seeds}
-    out, cache = {}, {}
-    for e in idx:
-        if e["dataset_name"] != dataset_name or int(e["bootstrap_seed"]) not in want:
+    out = {}
+    for (cond, ds, seed), v in allsp.items():
+        if ds != dataset_name or seed not in want:
             continue
-        a = e["array_idx"]
-        if a not in cache:
-            cache = {a: _pickle.load(open(jd / f"array_{a:04d}.pkl", "rb"))}
-        job = cache[a][e["local_idx"]]
-        out[int(job["bootstrap_seed"])] = np.asarray(job["shared_data"]["val_variant_indices"], int)
+        if rel != "." and cond is not None and cond != rel:
+            continue
+        if seed in out and not np.array_equal(out[seed], v):
+            raise ValueError(f"{dataset_name} seed {seed}: different splits under {jd} for condition {rel!r}")
+        out[seed] = v
     missing = want - set(out)
     if missing:
-        raise KeyError(f"{dataset_name}: no job pickle for bootstrap seeds {sorted(missing)[:5]}")
+        raise KeyError(f"{dataset_name}: no job pickle for bootstrap seeds {sorted(missing)[:5]} "
+                       f"(condition {rel!r} under {jd})")
     return out
 
 

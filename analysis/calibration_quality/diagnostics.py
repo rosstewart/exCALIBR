@@ -235,7 +235,7 @@ def yang_rule_summary(sim):
 
 # ── real calibrations ───────────────────────────────────────────────────────────────────────────────────────────
 
-def real_datasets(output_dir=None):
+def real_datasets(output_dir=None, dataset_configs_path=None):
     """The calibrated datasets and their selected calibration, as in analyze_pipeline_output (section A1): every
     dataset in the pipeline output except discovery.DEFAULT_EXCLUDED_DATASETS, with its component resolved by
     supplementary_data._resolved_calibration."""
@@ -244,7 +244,7 @@ def real_datasets(output_dir=None):
     from analysis.supplementary_data import _resolved_calibration
     output_dir = Path(output_dir or cfg.OUTPUT_DIR)
     tree, model_selections, _ = discover_outputs(output_dir)
-    with open(cfg.DATASET_CONFIGS) as f:
+    with open(dataset_configs_path or cfg.DATASET_CONFIGS) as f:
         dataset_configs = json.load(f)
     cals = {}
     for d in sorted(set(tree) - set(DEFAULT_EXCLUDED_DATASETS)):
@@ -255,13 +255,16 @@ def real_datasets(output_dir=None):
     return cals
 
 
-def real_features(cals, priors_json, output_dir=None):
+def real_features(cals, priors_json, output_dir=None, yang_df=None, yang_heldout_df=None):
+    """Features of the real calibrations `cals`. `priors_json` is the recompute_priors output (path or dict);
+    `yang_df`/`yang_heldout_df` default to the manuscript's Yang tables (another calibration set passes its own,
+    e.g. domainome.build_domainome_supplementary_data.yang_tables)."""
     from analysis import config as cfg
     from analysis.yang_distance import heldout_yang_table
     output_dir = Path(output_dir or cfg.OUTPUT_DIR)
-    rp = json.loads(Path(priors_json).read_text())
-    yt = pd.read_csv(cfg.EXCALIBR_DATASETS_TABLE_CSV)
-    yh = heldout_yang_table()
+    rp = priors_json if isinstance(priors_json, dict) else json.loads(Path(priors_json).read_text())
+    yt = yang_df if yang_df is not None else pd.read_csv(cfg.EXCALIBR_DATASETS_TABLE_CSV)
+    yh = yang_heldout_df if yang_heldout_df is not None else heldout_yang_table()
     rows = []
     for d, c in cals.items():
         n_c = c.get("n_c")
@@ -293,7 +296,7 @@ def real_features(cals, priors_json, output_dir=None):
             sc = v["score"].to_numpy(float)
             r["sep_auc"], r["is_pu"] = separation(sc[is_p & ~is_b], sc[is_b & ~is_p], sc[is_s & ~is_p],
                                                   sc[is_g & ~is_p])
-        y = yt[(yt.dataset == d) & (yt.n_c.astype(str) == str(n_c))]
+        y = yt[(yt.dataset == d) & (yt.n_c.astype(str) == str(n_c))] if "n_c" in yt else yt.iloc[:0]
         y = y if len(y) else yt[yt.dataset == d]
         h = yh[yh.dataset == d]
         for k in SAMPLES:

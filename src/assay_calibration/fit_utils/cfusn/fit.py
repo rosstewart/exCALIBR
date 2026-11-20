@@ -1,6 +1,6 @@
 from .update_steps import (
     em_iteration, get_sample_weights, gamma_log_prior_total,
-    sample_specific_responsibilities,
+    sample_specific_responsibilities, FitLayout,
 )
 from .density_utils import get_likelihood, get_q, _ensure_matrix_delta
 from .initializations import (
@@ -12,9 +12,12 @@ from . import separation
 from . import categorical as _cat
 from . import weight_divergence as _wdiv
 from . import tied_population as _tied
+from . import squarem as _sq
+from .update_steps import log_pdf_cache_and_ll
 
 import numpy as np
 import logging
+import time as _time
 from tqdm.auto import tqdm
 import warnings
 
@@ -219,6 +222,13 @@ def _cat_pool_rows(sample_indicators, kwargs):
     if idx is None or S.ndim != 2 or idx >= S.shape[1] or not S[:, idx].any():
         return None
     return S[:, idx].astype(bool)
+
+
+# Iteration numbers at which single_fit records the objective
+# (``objective_checkpoints`` in the result). Diagnostics only: used offline to
+# ask whether a restart's early objective predicts whether it ends up selected
+# (docs/fit_speed_report.md, early abandoning).
+OBJECTIVE_CHECKPOINTS = (10, 50, 200, 1000, 5000, 20000)
 
 
 def single_fit(
@@ -462,6 +472,8 @@ def single_fit(
                     likelihoods=[-np.inf],
                     xlims=xlims,
                     times_submerged=[],
+                    n_em_iters=0,
+                    stop_reason="init_failed",
                 )
 
         if mv and latent_q > 1:
@@ -592,10 +604,53 @@ def single_fit(
         # explicitly.
         em_kwargs["frozen_components"] = set(kwargs["frozen_components"])
 
+    # Data-only structure (missingness patterns, per-pattern row indices and
+    # observed blocks, per-sample slices) computed once for the whole fit
+    # instead of on every E/M-step; bitwise identical (update_steps.FitLayout).
+    if mv and kwargs.get("precompute_layout", True):
+        em_kwargs["_fit_layout"] = FitLayout(
+            observations, sample_indicators,
+            has_cont=None if cat is None else cat["has_cont"],
+            sample_weights=em_kwargs.get("sample_weights"),
+        )
+
+    # EXPERIMENTAL, opt-in: evaluate the completed-data B Psi B' term as a
+    # batched matmul instead of einsum's order (update_steps.
+    # _completed_data_moments). Not bitwise identical; default "exact".
+    _cme = kwargs.get("completed_moments_einsum", "exact")
+    if _cme not in ("exact", "two_stage"):
+        raise ValueError(f"completed_moments_einsum must be 'exact' or 'two_stage', got {_cme!r}")
+    if _cme != "exact":
+        em_kwargs["completed_moments_einsum"] = _cme
+
+    # EXPERIMENTAL, opt-in EM acceleration (cfusn/squarem.py). None (default)
+    # runs the plain EM loop below, unchanged.
+    accel = _sq.resolve(kwargs)
+    squarem_stats = None
+    if accel == "squarem":
+        _sq.check_supported(mv, latent_q if mv else None, separation_active,
+                            dim_weighted_active, wdiv, tied)
+
     # Set when the EM loop stopped on a real (non-plateau) overshoot and rolled
     # back to the previous iterate; surfaced in the result dict so a rolled-back
     # fit is visibly different from one that converged normally.
     overshoot_stopped = None
+
+    # Run statistics (diagnostics only; nothing below reads them back):
+    # number of em_iteration calls, why the loop stopped, wall time of the EM
+    # phase, and the objective at OBJECTIVE_CHECKPOINTS iterations.
+    n_em_iters = 0
+    stop_reason = "cap"
+    objective_checkpoints = {}
+    _em_t0 = _time.perf_counter()
+
+    def _run_stats():
+        return dict(
+            n_em_iters=n_em_iters,
+            stop_reason=stop_reason,
+            em_seconds=_time.perf_counter() - _em_t0,
+            objective_checkpoints=dict(objective_checkpoints),
+        )
 
     cat_probs = None if cat is None else cat["probs"]
 
@@ -650,14 +705,17 @@ def single_fit(
             updated_component_params, updated_weights, ll, cached_log_pdfs, cat_probs = _res
         else:
             updated_component_params, updated_weights, ll, cached_log_pdfs = _res
+        n_em_iters = 1
     except ZeroDivisionError as e:
         if kwargs.get("raise_on_error", True):
             raise
         print(f"[FIRST EM ITER FAILED] ZeroDivisionError: {e}")
+        stop_reason = "failed"
         out = dict(
             component_params=initial_params, weights=W,
             likelihoods=[*likelihoods, -np.inf],
-            kmeans=kmeans, xlims=xlims, times_submerged=[]
+            kmeans=kmeans, xlims=xlims, times_submerged=[],
+            **_run_stats(),
         )
         if cat is not None:
             out.update(cat_probs=cat_probs, cat_spec=cat_spec.to_dict(), cat_alpha=cat["alpha"])
@@ -674,6 +732,8 @@ def single_fit(
         ) / len(sample_indicators)
     likelihoods = np.append(likelihoods, ll)
     objectives = np.append(objectives, ll + _penalty(updated_component_params, cat_probs, updated_weights))
+    if n_em_iters in OBJECTIVE_CHECKPOINTS:
+        objective_checkpoints[n_em_iters] = float(objectives[-1])
 
     # Best-iterate tracking. EM is monotone in `objectives`, so for a healthy
     # fit the best iterate IS the last one and this is a no-op. It matters on
@@ -700,7 +760,74 @@ def single_fit(
             if is_underwater:
                 underwater_time += 1
 
-        for it in range(MAX_EM_ITERS):
+        _plain_iters = MAX_EM_ITERS
+        if accel == "squarem":
+            # SQUAREM replaces the plain loop below (which then runs zero
+            # iterations); same budget of em_iteration calls, same stop rules
+            # on consecutive EM steps, same best-iterate return afterwards.
+            _plain_iters = 0
+            _sq_iter = [n_em_iters]
+            _fl = em_kwargs.get("_fit_layout")
+
+            def _sq_F(theta, cache):
+                _sq_iter[0] += 1
+                _r = em_iteration(
+                    observations, sample_indicators, theta[0], theta[1],
+                    constrained, xlims, multivariate=mv, iterNum=_sq_iter[0],
+                    cached_log_pdfs=cache, return_log_pdfs=True,
+                    **em_kwargs, **_cat_kw(theta[2]),
+                )
+                if cat is not None:
+                    _p, _w, _ll, _c, _pr = _r
+                else:
+                    (_p, _w, _ll, _c), _pr = _r, None
+                return (_p, _w, _pr), _ll, _c
+
+            def _sq_objective(theta, ll):
+                return ll + _penalty(theta[0], theta[2], theta[1])
+
+            def _sq_density(theta):
+                return log_pdf_cache_and_ll(
+                    observations, sample_indicators, theta[0], theta[1],
+                    sample_weights=em_kwargs.get("sample_weights"),
+                    extra_log_pdfs=_cat_extra(theta[2]),
+                    sample_layouts=None if _fl is None else _fl.samples,
+                )
+
+            def _sq_record(theta, ll, obj):
+                nonlocal likelihoods, objectives, best_obj, best_state, n_em_iters
+                history.append(_hist(*theta))
+                n_em_iters += 1
+                likelihoods = np.append(likelihoods, ll)
+                objectives = np.append(objectives, obj)
+                if n_em_iters in OBJECTIVE_CHECKPOINTS:
+                    objective_checkpoints[n_em_iters] = float(obj)
+                if obj > best_obj:
+                    best_obj = obj
+                    best_state = (theta[0], theta[1], len(objectives), theta[2])
+
+            def _sq_count_only():
+                nonlocal n_em_iters
+                n_em_iters += 1
+
+            # Same history alignment as the plain loop (history[k] holds the
+            # iterate whose likelihood is likelihoods[k]).
+            history.append(_hist(updated_component_params, updated_weights, cat_probs))
+            _theta_fin, stop_reason, squarem_stats = _sq.run(
+                (updated_component_params, updated_weights, cat_probs), cached_log_pdfs,
+                objectives[-1], _sq_F, _sq_objective, _sq_density, _sq_record, _sq_count_only,
+                budget_left=lambda: MAX_EM_ITERS + 1 - n_em_iters,
+                guard_stats=guard_stats, plateau_rel_tol=PLATEAU_REL_TOL,
+                overshoot_rel_tol=OVERSHOOT_REL_TOL, catastrophic_rel_tol=CATASTROPHIC_REL_TOL,
+                early_stopping=kwargs.get("early_stopping", True),
+                warmup_rel_tol=float(kwargs.get("squarem_warmup_rel_tol", _sq.DEFAULT_WARMUP_REL_TOL)),
+                step_max_cap=float(kwargs.get("squarem_step_max", np.inf)),
+            )
+            updated_component_params, updated_weights, cat_probs = _theta_fin
+            if stop_reason == "overshoot":
+                overshoot_stopped = (n_em_iters, float("nan"), float("nan"))
+
+        for it in range(_plain_iters):
             history.append(_hist(updated_component_params, updated_weights, cat_probs))
             if np.isnan(likelihoods).any():
                 raise ValueError("NaN in likelihoods")
@@ -722,6 +849,7 @@ def single_fit(
                 updated_component_params, updated_weights, ll, cached_log_pdfs, cat_probs = _res
             else:
                 updated_component_params, updated_weights, ll, cached_log_pdfs = _res
+            n_em_iters += 1
 
             if dim_weighted_active:
                 # See the first-iteration block above for why this
@@ -754,6 +882,8 @@ def single_fit(
 
             likelihoods = np.append(likelihoods, ll)
             objectives = np.append(objectives, ll + _penalty(updated_component_params, cat_probs, updated_weights))
+            if n_em_iters in OBJECTIVE_CHECKPOINTS:
+                objective_checkpoints[n_em_iters] = float(objectives[-1])
 
             if objectives[-1] > best_obj:
                 best_obj = objectives[-1]
@@ -833,6 +963,7 @@ def single_fit(
                         )
                     overshoot_stopped = (it, float(decrease), float(rel_decrease))
                 if rel_decrease > PLATEAU_REL_TOL:
+                    stop_reason = "overshoot" if overshoot_stopped is not None else "revert"
                     # history[-1] was appended at the top of this iteration and
                     # holds the params whose LL is likelihoods[-2] -- i.e. the
                     # better of the two iterates.
@@ -863,6 +994,7 @@ def single_fit(
                         / abs(objectives[-2])
                     )
                 if rel_change < 1e-8:
+                    stop_reason = "converged"
                     break
 
         # Return the best iterate rather than the last. These agree for a
@@ -899,11 +1031,13 @@ def single_fit(
             raise
         import traceback
         warnings.warn(f"Failed fit: {e}\n{traceback.format_exc()}")
+        stop_reason = "failed"
         out = dict(
             component_params=updated_component_params,
             weights=updated_weights,
             likelihoods=[*likelihoods, -np.inf],
-            kmeans=kmeans, xlims=xlims, times_submerged=[]
+            kmeans=kmeans, xlims=xlims, times_submerged=[],
+            **_run_stats(),
         )
         if cat is not None:
             out.update(cat_probs=cat_probs, cat_spec=cat_spec.to_dict(), cat_alpha=cat["alpha"])
@@ -930,7 +1064,11 @@ def single_fit(
         times_submerged=times_submerged,
         initial_params=initial_params,
         latent_q=latent_q,
+        final_objective=float(objectives[-1]),
+        **_run_stats(),
     )
+    if accel is not None:
+        out.update(em_accelerator=accel, squarem_stats=squarem_stats)
     if cat is not None:
         out.update(cat_probs=cat_probs, cat_spec=cat_spec.to_dict(), cat_alpha=cat["alpha"])
     if wdiv is not None:

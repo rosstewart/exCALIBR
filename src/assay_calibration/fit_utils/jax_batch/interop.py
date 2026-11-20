@@ -109,7 +109,6 @@ def _init_univariate(full_job):
 # JAX counterpart. Checked for every spec of every chunk, whichever init path
 # runs: an ignored option would silently fit a different model.
 _CPU_ONLY_CFUSN_OPTIONS = {
-    "cat_spec": "categorical dims (cfusn/categorical.py); the JAX batch EM has no categorical term",
     "weight_divergence": "weight_divergence (cfusn/weight_divergence.py); the JAX batch EM has no penalised W step",
     "tied_population": "tied_population (cfusn/tied_population.py); the JAX batch EM has no tied W step",
     "gaussian_components": "per-component gaussian_components; the JAX batch EM masks Delta per fit, not per component",
@@ -135,6 +134,10 @@ def _check_cfusn_supported(full_job):
         )
     if not kwargs.get("early_stopping", True):
         raise NotImplementedError("early_stopping=False is CPU-only -- run with --device cpu")
+    if kwargs.get("em_accelerator") not in (None, "none", "em", False):
+        raise NotImplementedError("em_accelerator (cfusn/squarem.py) is CPU-only -- run with --device cpu")
+    if kwargs.get("completed_moments_einsum", "exact") != "exact":
+        raise NotImplementedError("completed_moments_einsum='two_stage' is CPU-only -- run with --device cpu")
     if kwargs.get("weight_neff", "weighted") not in ("weighted", "kish"):
         raise ValueError(f"unknown weight_neff {kwargs['weight_neff']!r}")
 
@@ -189,6 +192,41 @@ def _init_cfusn(full_job):
     W = np.ones((sample_assignments.shape[1], K)) / K
     W = get_sample_weights(observations, sample_assignments, initial_params, W, multivariate=True)
     return initial_params, W
+
+
+def _init_cfusn_cat(full_job):
+    """CPU init for a job with categorical readouts, taken from single_fit
+    itself (max_em_iters=0: init plus one EM step, of which only the init,
+    history[0], is used), so the continuous params, W, the categorical
+    probabilities and the Dirichlet alpha are exactly the CPU path's. Returns
+    (params, W, cat_probs, cat_alpha, X_cont, labels, has_cont) or None."""
+    from ..cfusn.fit import single_fit
+    from ..cfusn import categorical as _cat
+    kw = dict(full_job.get("kwargs", {}))
+    kw.update(max_em_iters=0, verbose=False)
+    obs = np.asarray(full_job["train_observations"], dtype=float)
+    S = full_job["train_sample_assignments"]
+    K = full_job["num_components"]
+    res = single_fit(obs, S, K, full_job["constrained"], full_job["init_method"],
+                     full_job["init_constraint_adjustment"], multivariate=True, **kw)
+    hist = res.get("history") or []
+    if not hist or res.get("cat_alpha") is None:
+        return None
+    h0 = hist[0]
+    params = h0["component_params"]
+    if not params or any(len(p) == 0 for p in params):
+        return None
+    latent_q = kw.get("latent_q", 2)
+    nominal_q = full_job.get("nominal_latent_q") or latent_q
+    params = [(np.asarray(m, float), np.asarray(D, float).reshape(len(m), -1), np.asarray(G, float))
+              for m, D, G in params]
+    if nominal_q > params[0][1].shape[1]:
+        from ..fit import _pad_component_params_to_q
+        params = _pad_component_params_to_q(params, nominal_q)
+    spec = _cat.CatSpec.from_dict(kw["cat_spec"]) if not isinstance(kw["cat_spec"], _cat.CatSpec) else kw["cat_spec"]
+    X_cont, labels, has_cont = _cat.split_observations(obs, spec)
+    return (params, np.asarray(h0["weights"], float), [np.asarray(P, float) for P in h0["cat_probs"]],
+            [np.asarray(a, float) for a in res["cat_alpha"]], X_cont, labels, has_cont)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +433,12 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
     K = specs[0][0]["num_components"]
     S = specs[0][0]["train_sample_assignments"].shape[1]
 
+    has_cat = [bool(s[0].get("kwargs", {}).get("cat_spec")) for s in specs]
+    if any(has_cat):
+        if not all(has_cat):
+            raise ValueError("chunk mixes jobs with and without categorical dims")
+        return _run_cfusn_cat_chunk(specs, max_em_iters=max_em_iters)
+
     obs_raw = np.stack([np.asarray(s[0]["train_observations"], dtype=float) for s in specs])
     obs_mask_np = ~np.isnan(obs_raw)
     obs_np = np.where(obs_mask_np, obs_raw, 0.0)
@@ -506,14 +550,14 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
         cfusn_kw["noise_L"] = jnp.asarray(np.stack([L for L, _ in factors]))
         cfusn_kw["floor_mask"] = jnp.asarray(np.stack([f for _, f in factors]))
     (mu, Delta, Gamma, W, failed, it_final, done, hit_cap,
-     n_rejected, rejected_mass) = batch_em_cfusn.fit_batch_cfusn(
+     n_rejected, rejected_mass, n_it, stop_code) = batch_em_cfusn.fit_batch_cfusn(
         obs, obs_mask, sample_idx, S,
         mu0, Delta0, Gamma0, W0,
         mode=jnp.asarray(mode_np),
         **cfusn_kw,
     )
-    mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass = map(
-        np.asarray, (mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass))
+    mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass, n_it, stop_code = map(
+        np.asarray, (mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass, n_it, stop_code))
     it_final_np = int(np.asarray(it_final))
     n_hit_cap = int(hit_cap.sum())
     print(f"  [batch_em_cfusn] iterations: {it_final_np} (batch={len(specs)}, cap_hits={n_hit_cap})", flush=True)
@@ -579,16 +623,134 @@ def _run_cfusn_chunk(specs, use_gpu_init=True, max_em_iters=None):
             "val_ll": val_ll if val_ll is not None else -np.inf,
             "calibrated_dims": full_job.get("calibrated_dims"),
             "hit_cap": bool(hit_cap[i]),
+            **_jax_run_stats(n_it[i], stop_code[i], hit_cap[i]),
         }))
     return results
 
 
-def _val_ll_cfusn(full_job, component_params, weights):
+_STOP_NAMES = {0: "cap", 1: "converged", 2: "revert", 3: "failed"}
+
+
+def _jax_run_stats(n_it, code, hit_cap):
+    """CPU-compatible run statistics (Fit.execute_fit_job's n_em_iters /
+    stop_reason) for one JAX row; fit_seconds is not per fit on a batch."""
+    return {"n_em_iters": int(n_it), "stop_reason": "cap" if hit_cap else _STOP_NAMES.get(int(code), "cap"),
+            "fit_seconds": None}
+
+
+def _val_ll_cfusn(full_job, component_params, weights, cat_fit=None):
     from ..fit import _weighted_val_ll
     return _weighted_val_ll(
         full_job["val_observations"], full_job["val_sample_assignments"],
         component_params, weights, True, full_job.get("kwargs", {}),
+        cat_fit=cat_fit,
     )
+
+
+def _run_cfusn_cat_chunk(specs, max_em_iters=None):
+    """CFUSN chunk whose jobs carry categorical readouts (cfusn/categorical.py):
+    CPU init via single_fit (_init_cfusn_cat), then the batched EM with the
+    categorical term; results shaped as Fit.execute_fit_job returns them
+    (cat_probs / cat_spec / cat_alpha in the fit, val_ll scored with the
+    categorical term, continuous params unstandardised on their columns)."""
+    from ..cfusn import categorical as _cat
+    results, inits, valid = [], [], []
+    for spec in specs:
+        try:
+            init = _init_cfusn_cat(spec[0])
+        except Exception as e:
+            print(f"  [init] fit {spec[0].get('fit_idx')} (bootstrap {spec[1]}) failed: {e}", flush=True)
+            init = None
+        if init is None:
+            results.append(_failed_result(spec))
+            continue
+        inits.append(init)
+        valid.append(spec)
+    if not valid:
+        return results
+    specs = valid
+    K = specs[0][0]["num_components"]
+    S = specs[0][0]["train_sample_assignments"].shape[1]
+    X = np.stack([i[4] for i in inits])
+    obs_mask_np = ~np.isnan(X)
+    obs = jnp.asarray(np.where(obs_mask_np, X, 0.0))
+    obs_mask = jnp.asarray(obs_mask_np)
+    sample_idx = jnp.asarray(np.stack([np.argmax(s[0]["train_sample_assignments"], axis=1) for s in specs]))
+    per_kw = [s[0].get("kwargs", {}) for s in specs]
+    nominal_q = int(specs[0][0].get("nominal_latent_q") or max(int(kw.get("latent_q", 2)) for kw in per_kw))
+    mode_np = np.array([2 if kw.get("force_gaussian") else (1 if int(kw.get("latent_q", 2)) < nominal_q else 0)
+                        for kw in per_kw], dtype=np.int32)
+    mu0 = jnp.asarray(np.stack([[p_[0] for p_ in i[0]] for i in inits]))
+    Delta0 = jnp.asarray(np.stack([[p_[1] for p_ in i[0]] for i in inits]))
+    Gamma0 = jnp.asarray(np.stack([[p_[2] for p_ in i[0]] for i in inits]))
+    W0 = jnp.asarray(np.stack([i[1] for i in inits]))
+    n_cat = len(inits[0][2])
+    probs0 = tuple(jnp.asarray(np.stack([i[2][c] for i in inits])) for c in range(n_cat))
+    alpha = tuple(jnp.asarray(np.stack([i[3][c] for i in inits])) for c in range(n_cat))
+    labels = jnp.asarray(np.stack([i[5] for i in inits]).astype(np.int32))
+    has_cont = jnp.asarray(np.stack([i[6] for i in inits]))
+    caps = {int(kw.get("max_em_iters", batch_em_cfusn.MV_MAX_EM_ITERS)) for kw in per_kw}
+    if len(caps) > 1:
+        raise ValueError(f"chunk mixes max_em_iters settings {sorted(caps)}")
+    cfusn_kw = {"max_em_iters": max_em_iters if max_em_iters is not None else caps.pop()}
+    sw_list = [compute_sample_weights(s[0]["train_sample_assignments"], **s[0].get("kwargs", {})) for s in specs]
+    if any(w is not None for w in sw_list):
+        N = obs.shape[1]
+        cfusn_kw["sample_w"] = jnp.asarray(np.stack([np.ones(N) if w is None else np.asarray(w, float)
+                                                     for w in sw_list]))
+        cfusn_kw["neff_kish"] = {kw.get("weight_neff", "weighted") for kw in per_kw} == {"kish"}
+    floors = [kw.get("gamma_noise_floor") for kw in per_kw]
+    if any(nf is not None for nf in floors):
+        p = obs.shape[2]
+        factors = [batch_em_cfusn.noise_floor_factors(nf, p) for nf in floors]
+        cfusn_kw["noise_L"] = jnp.asarray(np.stack([L for L, _ in factors]))
+        cfusn_kw["floor_mask"] = jnp.asarray(np.stack([f for _, f in factors]))
+    (mu, Delta, Gamma, W, failed, it_final, done, hit_cap, n_rejected, rejected_mass,
+     n_it, stop_code, probs) = batch_em_cfusn.fit_batch_cfusn(
+        obs, obs_mask, sample_idx, S, mu0, Delta0, Gamma0, W0, mode=jnp.asarray(mode_np),
+        cat_labels=labels, cat_alpha=alpha, cat_probs0=probs0, has_cont=has_cont, **cfusn_kw)
+    mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass, n_it, stop_code = map(
+        np.asarray, (mu, Delta, Gamma, W, failed, hit_cap, n_rejected, rejected_mass, n_it, stop_code))
+    probs = [np.asarray(P) for P in probs]
+    print(f"  [batch_em_cfusn+cat] iterations: {int(np.asarray(it_final))} (batch={len(specs)}, "
+          f"cap_hits={int(hit_cap.sum())})", flush=True)
+    for i, spec in enumerate(specs):
+        full_job, bs_seed, label, save_dir = spec
+        if failed[i]:
+            results.append(_failed_result(spec))
+            continue
+        kw = full_job.get("kwargs", {})
+        cat_spec = kw["cat_spec"] if isinstance(kw["cat_spec"], dict) else kw["cat_spec"].to_dict()
+        component_params = [(mu[i, k], Delta[i, k], Gamma[i, k]) for k in range(K)]
+        Xc = inits[i][4]
+        xlims = tuple((float(np.nanmin(Xc[:, d])), float(np.nanmax(Xc[:, d]))) for d in range(Xc.shape[1]))
+        guard_stats = {}
+        if n_rejected[i] > 0:
+            guard_stats = {"gamma_rejected": int(n_rejected[i]),
+                           "gamma_rejected_max_mass": float(rejected_mass[i])}
+        result = {"component_params": component_params, "weights": W[i], "xlims": xlims,
+                  "times_submerged": [], "guard_stats": guard_stats,
+                  "cat_probs": [P[i] for P in probs], "cat_spec": cat_spec,
+                  "cat_alpha": [np.asarray(a[i]) for a in alpha]}
+        n_train = len(Xc)
+        frozen_dominant = (n_rejected[i] > 0 and n_train > 0 and rejected_mass[i] >= 0.05 * n_train)
+        val_ll = None
+        if frozen_dominant or _mv_fit_is_degenerate(component_params):
+            val_ll = -np.inf
+        elif full_job.get("val_observations") is not None:
+            val_ll = _val_ll_cfusn(full_job, component_params, W[i], cat_fit=result)
+        if kw.get("_scale_mean") is not None and kw.get("_scale_std") is not None:
+            cont = cat_spec["cont_positions"]
+            result["component_params"] = _unstandardize_component_params(
+                component_params, np.asarray(kw["_scale_mean"])[cont], np.asarray(kw["_scale_std"])[cont])
+        results.append((bs_seed, label, save_dir, full_job.get("fit_idx"), {
+            "dataset_name": full_job.get("dataset_name"), "bootstrap_seed": bs_seed,
+            "num_components": K, "fit_idx": full_job.get("fit_idx"), "fit": result,
+            "val_ll": val_ll if val_ll is not None else -np.inf,
+            "calibrated_dims": full_job.get("calibrated_dims"), "hit_cap": bool(hit_cap[i]),
+            **_jax_run_stats(n_it[i], stop_code[i], hit_cap[i]),
+        }))
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -805,15 +805,54 @@ def _gamma_log_prior(Gamma, data_var, n_obs):
     return jnp.where(ok, total, 0.0) / n_obs
 
 
+# ── Categorical readouts (port of cfusn/categorical.py, location model) ─────
+
+def _cat_extra(labels, probs):
+    """(batch,K,N) categorical log-pmf, summed over categorical dims; 0 where
+    a value is missing (labels -1). labels: (batch,N,C) int; probs: tuple of
+    (batch,K,L_c). Mirrors categorical.cat_log_pdfs."""
+    out = None
+    for c, P in enumerate(probs):
+        lab = labels[:, :, c]                                            # (batch,N)
+        obs = lab >= 0
+        idx = jnp.where(obs, lab, 0)
+        lp = jnp.log(P)                                                  # (batch,K,L)
+        g = jnp.take_along_axis(lp, jnp.broadcast_to(idx[:, None, :], (P.shape[0], P.shape[1], idx.shape[1])),
+                                axis=2)
+        term = jnp.where(obs[:, None, :], g, 0.0)
+        out = term if out is None else out + term
+    return out
+
+
+def _cat_mstep(labels, resp, alpha, sample_w=None):
+    """Closed-form MAP update (categorical.cat_mstep): resp (batch,K,N),
+    alpha tuple of (batch,L_c). Returns tuple of (batch,K,L_c)."""
+    z = resp if sample_w is None else resp * sample_w[:, None, :]
+    new = []
+    for c, a in enumerate(alpha):
+        L = a.shape[-1]
+        lab = labels[:, :, c]
+        onehot = ((lab[:, :, None] == jnp.arange(L)[None, None, :]) & (lab[:, :, None] >= 0)).astype(z.dtype)
+        counts = jnp.einsum('bkn,bnl->bkl', z, onehot)
+        new.append((a[:, None, :] + counts) / (a.sum(-1)[:, None, None] + counts.sum(-1, keepdims=True)))
+    return tuple(new)
+
+
+def _cat_log_prior(probs, alpha):
+    """(batch,) sum_{k,c,l} alpha_cl log pi_kcl (categorical.cat_log_prior)."""
+    return sum(jnp.sum(a[:, None, :] * jnp.log(P), axis=(1, 2)) for P, a in zip(probs, alpha))
+
+
 @functools.partial(
     jax.jit,
     static_argnums=(3,),
     static_argnames=("max_em_iters", "neff_kish"),
 )
 def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
-                     mu0, Delta0, Gamma0, W0, mode=None,
-                     sample_w=None, noise_L=None, floor_mask=None, neff_kish=False,
-                     max_em_iters=MV_MAX_EM_ITERS):
+                    mu0, Delta0, Gamma0, W0, mode=None,
+                    sample_w=None, noise_L=None, floor_mask=None, neff_kish=False,
+                    max_em_iters=MV_MAX_EM_ITERS, cat_labels=None, cat_alpha=None,
+                    cat_probs0=None, has_cont=None):
     """Batched, unconstrained CFUSN EM fit, run exactly as cfusn/fit.py's
     single_fit runs a multivariate fit.
 
@@ -832,6 +871,16 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
     neff_kish : static; weight_neff="kish" for the ridge's n_eff.
     max_em_iters : static; single_fit's MAX_EM_ITERS (multivariate default
         50000) -- the loop runs one initial EM step plus up to this many more.
+    cat_labels, cat_alpha, cat_probs0, has_cont : categorical readouts
+        (cfusn/categorical.py), or None. cat_labels (batch,N,C) int codes,
+        -1 = missing; cat_alpha tuple of (batch,L_c) Dirichlet pseudo-counts;
+        cat_probs0 tuple of (batch,K,L_c) initial probabilities; has_cont
+        (batch,N) rows with >= 1 continuous value. As on the CPU (em_iteration
+        with cat_state): the log-pmf joins every density, the continuous
+        M-step uses only rows with a continuous value, the categorical MAP
+        step runs on the same responsibilities before the W/LL pass, and the
+        Dirichlet log-prior joins the objective. The final categorical
+        probabilities are then appended to the return tuple.
 
     Loop control mirrors single_fit: the objective is the (weighted)
     likelihood plus the Gamma IW log-prior; no decrease check on the first
@@ -841,9 +890,11 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
     is worse. NaN weights fail immediately, NaN likelihoods at the next step.
 
     Returns mu, Delta, Gamma, W, failed, it_final, done, hit_cap, n_rejected,
-    rejected_max_mass -- `failed`, `hit_cap` (loop ran out of iterations),
-    `n_rejected` and `rejected_max_mass` per row (batch,); it_final the
-    number of EM steps taken by the slowest row.
+    rejected_max_mass, n_em_iters, stop_code -- `failed`, `hit_cap` (loop ran
+    out of iterations), `n_rejected`, `rejected_max_mass`, `n_em_iters`
+    (em_step calls) and `stop_code` (0 cap, 1 converged, 2 revert, 3 failed)
+    per row (batch,); it_final the number of EM steps taken by the slowest
+    row.
     """
     batch, K = mu0.shape[:2]
     N = observations.shape[1]
@@ -860,23 +911,37 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
     var_d = jnp.where(cnt > 0, var_d, jnp.nan)
     data_var = jnp.nanmean(var_d, axis=-1)                               # (batch,)
 
+    use_cat = cat_labels is not None
+    probs0 = tuple(cat_probs0) if use_cat else ()
+    alpha = tuple(cat_alpha) if use_cat else ()
+    if use_cat and has_cont is not None:
+        cont_f = has_cont.astype(observations.dtype)                      # (batch,N)
+
     def estep(mu, Delta, Gamma):
         return _densities_all_components(observations, obs_mask, mu, Delta, Gamma, mode, has_missing)
 
-    def em_step(mu, Delta, Gamma, W, log_pdfs, etas, psis):
+    def em_step(mu, Delta, Gamma, W, probs, log_pdfs, etas, psis):
         """One em_iteration: E-step at the current params (its densities and
         moments carried from the previous step), M-step, then the W update
         and LL at the new params. Returns the new iterate, its objective,
         E-step quantities for the next step and the guard counts."""
-        resp = jnp.moveaxis(_responsibilities_from_logpdfs(log_pdfs, sample_idx, W), 2, 1)
+        full = log_pdfs + _cat_extra(cat_labels, probs) if use_cat else log_pdfs
+        resp = jnp.moveaxis(_responsibilities_from_logpdfs(full, sample_idx, W), 2, 1)
+        # Rows without a continuous value carry no continuous information
+        # (em_iteration drops them from the continuous M-step).
+        resp_m = resp * cont_f[:, None, :] if (use_cat and has_cont is not None) else resp
         mu2, Delta2, Gamma2, n_rej, rej_mass = _m_step(
-            observations, obs_mask, resp, mu, Delta, Gamma, etas, psis, mode, data_var,
+            observations, obs_mask, resp_m, mu, Delta, Gamma, etas, psis, mode, data_var,
             sample_w=sample_w, neff_kish=neff_kish, noise_L=noise_L, floor_mask=floor_mask)
+        probs2 = _cat_mstep(cat_labels, resp, alpha, sample_w) if use_cat else ()
         log_pdfs2, etas2, psis2 = estep(mu2, Delta2, Gamma2)
-        W2, ll2 = _weights_and_ll(log_pdfs2, sample_idx, W, n_samples, sample_w)
+        full2 = log_pdfs2 + _cat_extra(cat_labels, probs2) if use_cat else log_pdfs2
+        W2, ll2 = _weights_and_ll(full2, sample_idx, W, n_samples, sample_w)
         obj2 = ll2 + _gamma_log_prior(Gamma2, data_var, N)
+        if use_cat:
+            obj2 = obj2 + _cat_log_prior(probs2, alpha) / N
         nan_w = jnp.any(jnp.isnan(W2), axis=(1, 2))
-        return (mu2, Delta2, Gamma2, W2), ll2, obj2, (log_pdfs2, etas2, psis2), n_rej, rej_mass, nan_w
+        return (mu2, Delta2, Gamma2, W2, probs2), ll2, obj2, (log_pdfs2, etas2, psis2), n_rej, rej_mass, nan_w
 
     def where_rows(m, new, old):
         return jax.tree_util.tree_map(
@@ -886,14 +951,15 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
     cache0 = estep(mu0, Delta0, Gamma0)
     batch_ix = jnp.arange(batch)[:, None]
     lw0 = W0[batch_ix, sample_idx, :]
-    log_mix0 = logsumexp(jnp.moveaxis(cache0[0], 1, 2)
+    full0 = cache0[0] + _cat_extra(cat_labels, probs0) if use_cat else cache0[0]
+    log_mix0 = logsumexp(jnp.moveaxis(full0, 1, 2)
                          + jnp.where(lw0 > 0, jnp.log(jnp.where(lw0 > 0, lw0, 1.0)), -jnp.inf), axis=-1)
     if sample_w is not None:
         log_mix0 = sample_w * log_mix0
     ll_nan = jnp.isnan(log_mix0.sum(-1))
 
     # First EM step: no checks; it seeds the best-iterate tracking.
-    params1, ll1, obj1, cache1, n_rej1, mass1, nan_w1 = em_step(mu0, Delta0, Gamma0, W0, *cache0)
+    params1, ll1, obj1, cache1, n_rej1, mass1, nan_w1 = em_step(mu0, Delta0, Gamma0, W0, probs0, *cache0)
     ll_nan = ll_nan | jnp.isnan(ll1)
 
     init_state = dict(
@@ -902,6 +968,11 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
         ll_nan=ll_nan, failed=nan_w1, done=nan_w1,
         hit_cap=jnp.zeros((batch,), dtype=bool),
         n_rej=n_rej1, rej_mass=mass1,
+        # Diagnostics (single_fit's n_em_iters / stop_reason): em_step calls
+        # per row and why it stopped (0 running/cap, 1 converged, 2 revert,
+        # 3 failed).
+        n_it=jnp.ones((batch,), dtype=jnp.int32),
+        stop_code=jnp.where(nan_w1, 3, 0).astype(jnp.int32),
     )
 
     def cond(st):
@@ -937,7 +1008,11 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
         stopped = nan_fail | catastrophic | revert | converged
         last = it == max_em_iters - 1
         hit_cap = st["hit_cap"] | (active & jnp.logical_not(stopped) & last)
+        code = jnp.where(nan_fail | catastrophic, 3,
+                         jnp.where(revert, 2, jnp.where(converged, 1, st["stop_code"])))
         return dict(
+            n_it=st["n_it"] + (active | nan_fail).astype(jnp.int32),
+            stop_code=code.astype(jnp.int32),
             it=it + 1, cur=cur, cache=cache, obj=obj, best=best, best_obj=best_obj,
             ll_nan=st["ll_nan"] | (advance & jnp.isnan(ll2)),
             failed=failed, done=st["done"] | stopped, hit_cap=hit_cap,
@@ -949,6 +1024,7 @@ def fit_batch_cfusn(observations, obs_mask, sample_idx, n_samples,
     # Return the best iterate when the last one is worse (single_fit's
     # best_state rule).
     use_best = st["obj"] < st["best_obj"]
-    mu, Delta, Gamma, W = where_rows(use_best, st["best"], st["cur"])
-    return (mu, Delta, Gamma, W, st["failed"], st["it"] + 1, st["done"] | st["hit_cap"],
-            st["hit_cap"], st["n_rej"], st["rej_mass"])
+    mu, Delta, Gamma, W, probs = where_rows(use_best, st["best"], st["cur"])
+    out = (mu, Delta, Gamma, W, st["failed"], st["it"] + 1, st["done"] | st["hit_cap"],
+           st["hit_cap"], st["n_rej"], st["rej_mass"], st["n_it"], st["stop_code"])
+    return out + (probs,) if use_cat else out

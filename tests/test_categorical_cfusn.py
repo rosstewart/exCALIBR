@@ -437,11 +437,13 @@ def test_dim_weights_with_categorical_raises():
                    max_em_iters=5, **FIT_COMMON)
 
 
-def test_jax_path_refuses_categorical():
+def test_jax_path_accepts_categorical():
+    # The JAX batch EM has carried the categorical term since 2026-11-19
+    # (batch_em_cfusn._cat_extra/_cat_mstep; parity: tests/test_batch_em_parity.py
+    # ::test_cfusn_parity_categorical); it used to refuse it.
     pytest.importorskip("jax")
     from src.assay_calibration.fit_utils.jax_batch import interop
-    with pytest.raises(NotImplementedError):
-        interop._init_cfusn({"kwargs": {"cat_spec": {"names": ["x"]}}})
+    interop._check_cfusn_supported({"constrained": False, "kwargs": {"cat_spec": {"names": ["x"]}}})
 
 
 # ── Phase 3: downstream (analysis-side) evaluation ──────────────────────────

@@ -140,6 +140,19 @@ class Strata:
                     compositions={a: self.composition(a).tolist() for a in ARMS})
 
 
+def _atom_key(a):
+    """(gene, chrom, pos, ref, alt) normalised so the same SNV matches however
+    the dataframe was read (chromosome 17 / "17" / 17.0 / "chr17", position
+    as int or float)."""
+    g, c, pos, ref, alt = a
+    c = str(c)
+    if c.endswith(".0"):
+        c = c[:-2]
+    if c.lower().startswith("chr"):
+        c = c[3:]
+    return (str(g), c, int(float(pos)), str(ref), str(alt))
+
+
 def row_annotations(ms, df_integrated: Optional[pd.DataFrame] = None, gene: Optional[str] = None,
                     spliceai_threshold: float = 0.2) -> pd.DataFrame:
     """Per kept row of ``ms``: consequence class and splice flag.
@@ -158,10 +171,10 @@ def row_annotations(ms, df_integrated: Optional[pd.DataFrame] = None, gene: Opti
                              "splice": np.nan_to_num(sai, nan=0.0) > spliceai_threshold})
     atoms = getattr(ms, "_row_atoms", None)
     if atoms is not None and df_integrated is not None:
-        d = df_integrated if gene is None else df_integrated[df_integrated["Gene"] == gene]
+        d = (df_integrated if gene is None
+             else df_integrated[df_integrated["Gene"].astype(str).str.upper() == str(gene).upper()])
         d = d[d["hg38_start"].notna()]
-        key = list(zip(d["Gene"].astype(str), d["Chrom"].astype(str), d["hg38_start"].astype(float).astype(int),
-                       d["ref_allele"].astype(str), d["alt_allele"].astype(str)))
+        key = [_atom_key(a) for a in zip(d["Gene"], d["Chrom"], d["hg38_start"], d["ref_allele"], d["alt_allele"])]
         sai = d[[c for c in SPLICEAI_COLS if c in d.columns]].max(axis=1).to_numpy()
         csq = d["simplified_consequence"].to_numpy()
         info = {}
@@ -172,8 +185,7 @@ def row_annotations(ms, df_integrated: Optional[pd.DataFrame] = None, gene: Opti
         for row in atoms:
             cs, ss = [], []
             for a in row:
-                a = tuple(a)
-                a = (str(a[0]), str(a[1]), int(float(a[2])), str(a[3]), str(a[4])) if len(a) == 5 else a
+                a = _atom_key(tuple(a)) if len(a) == 5 else tuple(a)
                 if a in info:
                     ss.append(info[a][0]); cs.append(info[a][1])
             classes = [consequence_class(None, c) if c == c else "other" for c in cs] or ["other"]

@@ -7,7 +7,11 @@ results in tau_0.1/). Aggregate each condition first:
 
     python -m mv_analysis.bootscheme_compare score <condition dir>   # one condition (own process)
     python -m mv_analysis.bootscheme_compare all <root> [--workers 4]
-    python -m mv_analysis.bootscheme_compare compare <root>
+    python -m mv_analysis.bootscheme_compare compare <root> [<root2> ...]
+
+``compare`` takes several bundle roots, e.g. the Phase 2a bundle and the
+standard-model companion (jobs_v2_standard_*, scheme label "standard"), and
+writes its tables to the first root.
 
 ``score`` writes <condition>/bootscheme_oob.csv: one row per evaluated control
 and config with its out-of-bag points, the median and 5th/95th percentile of
@@ -139,9 +143,10 @@ def _summ(d):
                           withheld_spread=(d.withheld == "spread").mean()))
 
 
-def compare(root):
+def compare(*roots):
+    root = roots[0]
     frames = []
-    for c in _conditions(root):
+    for c in [c for r in roots for c in _conditions(r)]:
         f = c / "bootscheme_oob.csv"
         if f.exists():
             d = pd.read_csv(f)
@@ -159,8 +164,10 @@ def compare(root):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["score", "all", "compare"])
-    ap.add_argument("path")
+    ap.add_argument("path", nargs="+")
     ap.add_argument("--workers", type=int, default=4)
     a = ap.parse_args()
-    {"score": lambda: score(a.path), "all": lambda: all_(a.path, a.workers),
-     "compare": lambda: compare(a.path)}[a.cmd]()
+    if a.cmd != "compare" and len(a.path) != 1:
+        ap.error(f"{a.cmd} takes one path")
+    {"score": lambda: score(a.path[0]), "all": lambda: all_(a.path[0], a.workers),
+     "compare": lambda: compare(*a.path)}[a.cmd]()
