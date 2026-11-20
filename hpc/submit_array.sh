@@ -62,6 +62,7 @@ else
     NUM_ARRAYS=$(python3 -c "import json; print(json.load(open('$JOB_INDEX'))['num_arrays'])")
 fi
 MAX_IDX=$((NUM_ARRAYS - 1))
+ARRAY_SPEC="${ARRAY_SPEC:-0-${MAX_IDX}}"      # e.g. "3,7,10-20" to (re)run only some tasks (indices of the layout in use)
 
 JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 #!/bin/bash
@@ -69,7 +70,7 @@ JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 #SBATCH --job-name=${JOB_NAME}
 #SBATCH --output=${OUTPUT_DIR}/logs/array_%A_%a.out
 #SBATCH --error=${OUTPUT_DIR}/logs/array_%A_%a.err
-#SBATCH --array=0-${MAX_IDX}%${MAX_CONCURRENT}
+#SBATCH --array=${ARRAY_SPEC}%${MAX_CONCURRENT}
 #SBATCH --time=${TIME}
 #SBATCH --mem=${MEM}
 #SBATCH --cpus-per-task=${CPUS}
@@ -83,13 +84,15 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+${EXCALIBR_SAVE_RESTART_LL:+export EXCALIBR_SAVE_RESTART_LL=${EXCALIBR_SAVE_RESTART_LL}}
+${PYTHONUNBUFFERED:+export PYTHONUNBUFFERED=${PYTHONUNBUFFERED}}
 
 ${PYTHON} ${SCRIPT_DIR}/run_array_task.py ${OUTPUT_DIR} \${SLURM_ARRAY_TASK_ID} ${LAYOUT_ARG}
 SBATCH_SCRIPT
 )
 
 echo "Submitted job array ${JOB_ID}"
-echo "  Tasks      : ${NUM_ARRAYS}  (indices 0–${MAX_IDX}, max ${MAX_CONCURRENT} concurrent)"
+echo "  Tasks      : ${NUM_ARRAYS} in run; submitted indices ${ARRAY_SPEC} (max ${MAX_CONCURRENT} concurrent)"
 if [ -n "$LAYOUT_ARG" ]; then echo "  Layout     : ${LAYOUT_FILE}"; fi
 echo "  mem / cpus : ${MEM} / ${CPUS}"
 echo "  Partition  : ${PARTITION}   time limit: ${TIME}"
