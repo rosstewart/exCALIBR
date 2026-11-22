@@ -1,7 +1,7 @@
 """Build the v2 cluster bundles (data only; the user submits).
 
-    nice -n 19 python hpc/build_v2_bundles.py {bootscheme|kdiag|standard} <root>
-    nice -n 19 python hpc/build_v2_bundles.py production <root> <components.json> "<scheme args>"
+    nice -n 19 python hpc/build_v2_bundles.py {bootscheme|standard|standard_n5|kdiag|kdiag_standard} <root>
+    nice -n 19 python hpc/build_v2_bundles.py {production|production_standard} <root> <components.json> "<scheme args>"
 
   bootscheme  Phase 2a: bootstrap-scheme comparison on real data.
               Conditions <root>/<scheme>/<subrun>/tau_0.1; schemes S0 (composite
@@ -12,6 +12,11 @@
               4 composite samples, sample x pattern resampling (the default
               scheme), v2 rows, ClinVar 2025. Condition <root>/standard/<subrun>.
               Same seeds and rows as Phase 2a, so its resamples match S0's.
+  standard_n5 Standard model, sample x pattern with patterns < 5 rows merged
+              (S2n5's rule on the 4 samples). Condition <root>/standard_n5/<subrun>.
+  kdiag_standard  K diagnostic for the standard model (4 samples, sample x pattern),
+              plus a strata refit of PALB2 and GCK (<root>/integrated_strata_refit).
+  production_standard  Phase 6 for the standard model (same arguments as production).
   production  Phase 6: python hpc/build_v2_bundles.py production <root> <components.json> "<scheme args>"
   kdiag       Phase 3: component diagnostic. Every MV gene set of the paper
               (integrated, tp53, fgfr, tsc2, predictor-mv, combined) at K = 2..6,
@@ -85,36 +90,56 @@ def bootscheme(root):
     merge(root, labels, 100)
 
 
-def standard(root):
+def standard(root, label="standard", extra=()):
     labels = []
     for sub, (pipes, genes) in BOOTSCHEME_SUBRUNS.items():
-        prep(root / "standard" / sub, pipes, genes, [4], 100, [], strata=False)
-        labels.append(f"standard/{sub}")
+        prep(root / label / sub, pipes, genes, [4], 100, list(extra), strata=False)
+        labels.append(f"{label}/{sub}")
     merge(root, labels, 100)
 
 
-def kdiag(root):
-    subruns = {"integrated": ["integrated"], "tp53": ["tp53"], "fgfr": ["fgfr"], "tsc2": ["tsc2"],
+def standard_n5(root):
+    """Standard model, sample x pattern resampling with patterns of fewer than
+    5 rows merged into the most similar pattern of the same sample (the S2n5
+    rule applied to the 4 samples). Condition <root>/standard_n5/<subrun>."""
+    standard(root, "standard_n5", ["--bootstrap-scheme", "stratum_pattern", "--bootstrap-min-cell", "5"])
+
+
+ALL_SUBRUNS = {"integrated": ["integrated"], "tp53": ["tp53"], "fgfr": ["fgfr"], "tsc2": ["tsc2"],
                "predictor": ["predictor-mv"], "combined": ["combined"]}
+
+
+def kdiag(root, strata=True, refit_strata=None):
+    """K = 2..6, 10 bootstraps. Strata: stratum x pattern (n_min 5). Standard
+    (strata=False): 4 samples, sample x pattern (the default scheme).
+    refit_strata: {label: (pipelines, genes)} strata conditions added to the
+    same bundle (e.g. genes whose earlier strata K-grid fits were wrong)."""
+    s_extra = ["--bootstrap-scheme", "stratum_pattern", "--bootstrap-min-cell", "5"]
     labels = []
-    for sub, pipes in subruns.items():
-        prep(root / sub, pipes, None, [2, 3, 4, 5, 6], 10,
-             ["--bootstrap-scheme", "stratum_pattern", "--bootstrap-min-cell", "5"])
+    for sub, pipes in ALL_SUBRUNS.items():
+        prep(root / sub, pipes, None, [2, 3, 4, 5, 6], 10, s_extra if strata else [], strata=strata)
         labels.append(sub)
+    for lab, (pipes, genes) in (refit_strata or {}).items():
+        prep(root / lab, pipes, genes, [2, 3, 4, 5, 6], 10, s_extra, strata=True)
+        labels.append(lab)
     merge(root, labels, 10)
 
 
-def production(root, components_file, scheme_args):
-    """Phase 6: every MV gene set of the paper, stratified, at the per-dataset
-    component grids the user chose (components_file) and the bootstrap
-    scheme Phase 2a selected (scheme_args, e.g. "--bootstrap-scheme
-    stratum_pattern --bootstrap-min-cell 5"). 100 bootstraps, 3 fits, tau 0.1."""
-    subruns = {"integrated": ["integrated"], "tp53": ["tp53"], "fgfr": ["fgfr"], "tsc2": ["tsc2"],
-               "predictor": ["predictor-mv"], "combined": ["combined"]}
+# PALB2 and GCK: the 2026-11-19 strata K grid was prepared with chunked type
+# inference (Chrom int/str mixed), leaving a variant's assays in separate rows.
+KDIAG_STRATA_REFIT = {"integrated_strata_refit": (["integrated"], ["PALB2", "GCK"])}
+
+
+def production(root, components_file, scheme_args, strata=True):
+    """Phase 6: every MV gene set of the paper at the per-dataset component
+    grids the user chose (components_file) and the bootstrap scheme chosen for
+    the model (scheme_args, e.g. "--bootstrap-scheme stratum_pattern
+    --bootstrap-min-cell 5", or "" for sample x pattern). strata=False builds
+    the standard 4-sample model. 100 bootstraps, 3 fits, tau 0.1."""
     labels = []
-    for sub, pipes in subruns.items():
+    for sub, pipes in ALL_SUBRUNS.items():
         prep(root / sub, pipes, None, [3, 4], 100,
-             ["--components-file", str(components_file), *scheme_args.split()])
+             ["--components-file", str(components_file), *scheme_args.split()], strata=strata)
         labels.append(sub)
     merge(root, labels, 100)
 
@@ -122,7 +147,8 @@ def production(root, components_file, scheme_args):
 if __name__ == "__main__":
     which = sys.argv[1]
     root = Path(sys.argv[2])
-    if which == "production":
-        production(root, Path(sys.argv[3]), sys.argv[4])
+    if which in ("production", "production_standard"):
+        production(root, Path(sys.argv[3]), sys.argv[4], strata=which == "production")
     else:
-        {"bootscheme": bootscheme, "kdiag": kdiag, "standard": standard}[which](root)
+        {"bootscheme": bootscheme, "kdiag": kdiag, "kdiag_standard": lambda r: kdiag(r, strata=False, refit_strata=KDIAG_STRATA_REFIT),
+         "standard": standard, "standard_n5": standard_n5}[which](root)

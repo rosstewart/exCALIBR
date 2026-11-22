@@ -43,8 +43,8 @@ ARMS_BY_SET = {"combined": ["missense"],
 def _parse_key(ds):
     gene = ds.split("_")[0]
     rest = ds[len(gene) + 1:]
-    gs = ("predictor" if rest.startswith("predictors") else "integrated" if rest.startswith("mv")
-          else rest.split("_")[0])
+    gs = ("fgfr" if "_fgfr_" in ds else "predictor" if rest.startswith("predictors")
+          else "integrated" if rest.startswith(("mv", "cluster")) else rest.split("_")[0])
     cl = int(rest.split("_cluster")[1].split("_")[0]) - 1 if "_cluster" in rest else 0
     return gene, gs, cl
 

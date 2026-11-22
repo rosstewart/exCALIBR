@@ -1170,6 +1170,16 @@ class Fit:
                 else:
                     raise ValueError(f"unknown uni_bootstrap_scheme {uni_scheme!r}")
                 train_indices, val_indices = sample_specific_bootstrap(uni_strat, composition_seed)
+                # resampling coarser than the fit's samples can leave a fit sample (e.g. a thin stratum)
+                # with no training row, whose mixing weights are then undefined: move one of its rows,
+                # chosen with a seeded draw, from out-of-bag into the training set
+                fsa = np.asarray(sample_assignments, dtype=bool)
+                fix_rng = np.random.RandomState(None if composition_seed is None else int(composition_seed) + 104729)
+                covered = fsa[train_indices].any(axis=0)
+                for s_col in np.flatnonzero(fsa.any(axis=0) & ~covered):
+                    pick = int(fix_rng.choice(np.flatnonzero(fsa[:, s_col])))
+                    train_indices = np.append(train_indices, pick)
+                    val_indices = val_indices[val_indices != pick]
             elif mv and scheme == "pattern":
                 train_indices, val_indices = pattern_stratified_bootstrap(
                     observations, strat, composition_seed

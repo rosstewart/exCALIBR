@@ -28,6 +28,8 @@ from ..fit_utils.point_ranges import (
     compute_single_fit_log_densities,
     compute_pathomechanism_lr_curves,
     resolve_pathomechanism_anchor,
+    resolve_subtraction_grid,
+    mechanism_match_frac_per_fit,
     _compute_log_fp_only,
     is_bidirectional_by_weights,
     resolve_bidirectional_weight_vectors,
@@ -389,6 +391,26 @@ def process_component_fits(
         if config.manual_prior is not None:
             logger.warning("  pathomechanism_method is ignored because manual_prior is set")
 
+    # "subtraction_grid": subtraction unless the benign reference has fewer than
+    # pathomechanism_ref_min_n variants, else the grid boundary over the
+    # reference's score range (resolve_subtraction_grid). The same rule drives the
+    # always-on gamma_hat_diagnostic below.
+    pathomechanism_method_requested = pathomechanism_method
+    pm_boundary_points = None
+    pm_ref_n = None
+    diag_rule = None
+    if pathogenic_idx is not None and gnomad_idx is not None:
+        diag_rule = resolve_subtraction_grid(
+            np.asarray(scoreset.scores), np.asarray(scoreset.sample_assignments), config.benign_method,
+            benign_idx, synonymous_idx, ref_min_n=getattr(config, "pathomechanism_ref_min_n", 10),
+            n_grid=getattr(config, "pathomechanism_grid_points", 2000))
+    if pathomechanism_method == "subtraction_grid":
+        if diag_rule is None:
+            pathomechanism_method = "subtraction"
+        else:
+            pathomechanism_method, pm_boundary_points, pm_ref_n = diag_rule
+        logger.info(f"  subtraction_grid -> {pathomechanism_method} (benign reference n = {pm_ref_n})")
+
     # True unmixing (PU/NU) mode, per get_fit_prior's own mode selection --
     # pathogenic XOR benign/synonymous present. Used below to flag prior
     # instability specific to that estimator (its saturation floor).
@@ -458,6 +480,7 @@ def process_component_fits(
                         sample_assignments=sa_arr,
                         pathogenic_row_mask=pathogenic_row_mask,
                         pathomechanism_method=method,
+                        pathomechanism_boundary_points=(pm_boundary_points if method == "boundary" else None),
                         pathomechanism_boundary_joint_prior=getattr(
                             config, "pathomechanism_boundary_joint_prior", "product"
                         ),
@@ -722,7 +745,8 @@ def process_component_fits(
         # computed once via scoreset directly rather than scores_arr/sa_arr,
         # which are only defined in the (non-manual-prior) branch above.
         lr_curve_labeled_scores = (
-            scoreset.scores[np.asarray(scoreset.sample_assignments)[:, pathogenic_idx].astype(bool)]
+            (pm_boundary_points if pm_boundary_points is not None else
+             scoreset.scores[np.asarray(scoreset.sample_assignments)[:, pathogenic_idx].astype(bool)])
             if pathomechanism_method == "boundary" else None
         )
         results_dual_curves = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
@@ -1227,6 +1251,40 @@ def process_component_fits(
 
     logger.info(f"  Final ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
     
+    # Always-on diagnostic (PipelineConfig.pathomechanism_diagnostic): P(M=1|Y=1)
+    # under the subtraction_grid rule on the kept fits, whether or not the
+    # pathomechanism correction is applied. Evidence is unaffected.
+    gamma_diag = None
+    if getattr(config, "pathomechanism_diagnostic", True) and diag_rule is not None:
+        d_method, d_points, d_ref_n = diag_rule
+        if (mechanism_flag and pathomechanism_method_requested == "subtraction_grid"
+                and config.manual_prior is None):
+            g = np.asarray(fit_mechanism_match_fracs, dtype=float)
+        else:
+            try:
+                g = np.asarray(Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+                    delayed(mechanism_match_frac_per_fit)(
+                        fit, np.asarray(scoreset.scores), np.asarray(scoreset.sample_assignments),
+                        config.benign_method, pathogenic_idx, benign_idx, gnomad_idx, synonymous_idx,
+                        d_method, d_points)
+                    for fit in fits), dtype=float)
+            except Exception as e:  # diagnostic only: never fail a calibration over it
+                logger.warning(f"  gamma_hat_diagnostic failed: {e!r}")
+                g = np.array([], dtype=float)
+        gf = g[np.isfinite(g)]
+        gamma_diag = {
+            'gamma_hat_diagnostic': float(np.median(gf)) if len(gf) else None,
+            'gamma_hat_diagnostic_p5': float(np.percentile(gf, 5)) if len(gf) else None,
+            'gamma_hat_diagnostic_p95': float(np.percentile(gf, 95)) if len(gf) else None,
+            'gamma_hat_diagnostic_n_fits': int(len(gf)),
+            'gamma_hat_diagnostic_estimator': ("subtraction" if d_method == "subtraction" else "grid_boundary"),
+            'gamma_hat_diagnostic_ref_n': (None if not np.isfinite(d_ref_n) else int(d_ref_n)),
+        }
+        if gamma_diag['gamma_hat_diagnostic'] is not None:
+            logger.info(f"  gamma_hat_diagnostic: {gamma_diag['gamma_hat_diagnostic']:.4f} "
+                        f"({gamma_diag['gamma_hat_diagnostic_estimator']}, benign reference n = "
+                        f"{gamma_diag['gamma_hat_diagnostic_ref_n']})")
+
     # Serialize and return
     result = {
         # 'prior' (P(Y=1)) and every legacy field below stay benign-direction /
@@ -1238,7 +1296,10 @@ def process_component_fits(
         'prior_unstable': bool(prior_unstable),
         'pathomechanism_prior': prior_pathogenic if mechanism_flag else None,
         'pathomechanism_prior_unstable': bool(prior_pathogenic_unstable) if mechanism_flag else False,
-        'pathomechanism_method': pathomechanism_method,
+        'pathomechanism_method': pathomechanism_method_requested,
+        'pathomechanism_estimator_used': pathomechanism_method,
+        'pathomechanism_ref_n': (None if pm_ref_n is None or not np.isfinite(pm_ref_n) else int(pm_ref_n)),
+        **(gamma_diag or {}),
         # PLP_frac_pathomechanism_measured (a.k.a. mechanism_match_frac_hat): estimated fraction
         # of PLP-labeled variants whose disease mechanism this assay actually
         # measures (a 0-1 fraction, median over bootstrap fits).

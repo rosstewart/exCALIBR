@@ -1,7 +1,7 @@
 """Pre-fit component diagnostic (advisory only -- nothing reads its output).
 
-Input: a small K-grid run prepared like production (same rows, strata and
-bootstrap scheme) with ``--components 2 3 4 5 6`` and ~10 bootstraps
+Input: a small K-grid run prepared like production (same rows, strata or
+standard samples, and bootstrap scheme) with ``--components 2 3 4 5 6`` and ~10 bootstraps
 (hpc/prepare.py mv_all ...). Every bootstrap fit records ``val_ll``, the
 held-out log-likelihood of its out-of-bag rows, and a given bootstrap seed
 has the same split at every K, so K is compared on identical held-out rows.
@@ -168,6 +168,11 @@ def gene_page(gene, gene_set, dataset, out_dir, pdf):
         tot_p = M[0].sum(); tot_b = M[1].sum()
         k_cap = int(max(2, min(tot_p, tot_b) // 10))
         cap_note = f"P/LP composite {int(tot_p)}, B/LB composite {int(tot_b)}; smallest calibration stratum {int(nmin)}"
+    else:  # standard model: the same cap from the P/LP and B/LB samples
+        SA = np.asarray(ms._sample_assignments, bool)
+        tot_p, tot_b = int(SA[:, 0].sum()), int(SA[:, 1].sum())
+        k_cap = int(max(2, min(tot_p, tot_b) // 10))
+        cap_note = f"P/LP sample {tot_p}, B/LB sample {tot_b} (standard model)"
     within = ho[(ho.diff_to_best >= -ho.diff_se.where(ho.diff_se > 0, ho.heldout_se))]
     k_star = int(min(within.K.min(), k_cap)) if len(within) else k_best
 
@@ -196,6 +201,13 @@ def gene_page(gene, gene_set, dataset, out_dir, pdf):
         ax.set_yticks(range(len(order))); ax.set_yticklabels([strata.names[i] for i in order], fontsize=7)
         ax.set_xscale("log"); ax.invert_yaxis()
         ax.set_title(f"(d) rows per stratum (red = calibration, arm {an.strata_arm})\n{cap_note}", fontsize=9, loc="left")
+    else:
+        SA = np.asarray(ms._sample_assignments, bool)
+        sn = list(getattr(ms, "sample_names", None) or [f"sample {i}" for i in range(SA.shape[1])])
+        ax.barh(range(SA.shape[1]), SA.sum(0), color=["#c0392b" if i < 2 else "#aaa" for i in range(SA.shape[1])])
+        ax.set_yticks(range(SA.shape[1])); ax.set_yticklabels(sn[:SA.shape[1]], fontsize=7)
+        ax.set_xscale("log"); ax.invert_yaxis()
+        ax.set_title(f"(d) rows per sample (standard model; overlapping)\n{cap_note}", fontsize=9, loc="left")
     # (e) components on two readouts
     pred = [i for i, n in enumerate(names) if n == "AlphaMissense"]
     func = [i for i, n in enumerate(names) if n not in ("REVEL", "MutPred2", "AlphaMissense")]
@@ -254,8 +266,8 @@ def main():
         for ds in keys:
             gene = ds.split("_")[0]
             rest = ds[len(gene) + 1:]
-            gs = ("predictor" if rest.startswith("predictors") else
-                  "integrated" if rest.startswith("mv") else rest.split("_")[0])
+            gs = ("fgfr" if "_fgfr_" in ds else "predictor" if rest.startswith("predictors") else
+                  "integrated" if rest.startswith(("mv", "cluster")) else rest.split("_")[0])
             if args.gene_sets and gs not in args.gene_sets:
                 continue
             try:

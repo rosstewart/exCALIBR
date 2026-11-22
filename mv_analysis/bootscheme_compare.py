@@ -57,7 +57,8 @@ def score(cond):
     for ds in keys:
         gene = ds.split("_")[0]
         rest = ds[len(gene) + 1:]
-        gs = "integrated" if rest.startswith("mv") else rest.split("_")[0]
+        gs = ("fgfr" if "_fgfr_" in ds else "predictor" if rest.startswith("predictors")
+              else "integrated" if rest.startswith(("mv", "cluster")) else rest.split("_")[0])
         cl = int(rest.split("_cluster")[1].split("_")[0]) - 1 if "_cluster" in rest else 0
         with contextlib.redirect_stdout(io.StringIO()):
             ms = config.build_ms_for_gene_cluster(gs, gene, cluster_idx=cl, results_json=rj)
@@ -153,6 +154,18 @@ def compare(*roots):
             d["scheme"] = c.parent.parent.name
             frames.append(d)
     D = pd.concat(frames, ignore_index=True)
+    # Score every scheme on the same controls: rows evaluated, with the same
+    # label, in every scheme of the dataset (strata runs exclude rows labelled
+    # both P/LP and B/LB, which the standard model evaluates as P/LP).
+    n_sch = D.groupby("dataset").scheme.nunique()
+    g = D.groupby(["dataset", "row"]).agg(n=("scheme", "nunique"), nl=("label", "nunique")).reset_index()
+    g = g[(g.n == g.dataset.map(n_sch)) & (g.nl == 1)]
+    keep = D.set_index(["dataset", "row"]).index.isin(g.set_index(["dataset", "row"]).index)
+    dropped = D[~keep].groupby(["dataset", "scheme"]).row.nunique()
+    if len(dropped):
+        print("controls not common to every scheme (excluded):")
+        print(dropped.to_string())
+    D = D[keep]
     pd.set_option("display.width", 250)
     per = D.groupby(["scheme", "dataset", "config"]).apply(_summ).round(3)
     pooled = D.groupby(["scheme", "config"]).apply(_summ).round(3)

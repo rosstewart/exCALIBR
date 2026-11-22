@@ -917,8 +917,10 @@ class MVCalibrationAnalysis:
         if strata is not None:
             self.raw_boots = self._compose_strata_weights(self.raw_boots, strata, strata_arm)
 
-        sample_boot = next(iter(self.raw_boots.values()))
-        self.configs = sorted([k for k in sample_boot.keys() if sample_boot[k] is not None])
+        # Configs present in any bootstrap (the first one may have failed, e.g.
+        # an empty stratum, leaving it without fits).
+        self.configs = sorted({k for b in self.raw_boots.values() if isinstance(b, dict)
+                               for k, v in b.items() if v is not None})
         print(f"  Configs found: {self.configs}")
         print(f"  Bootstraps: {len(self.raw_boots)}")
 

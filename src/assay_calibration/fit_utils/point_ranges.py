@@ -1359,6 +1359,66 @@ def compute_pathomechanism_lr_curves(fit, score_range, w_P_raw, w_N_anchor,
     return log_fD, log_fN_benign, log_fP_raw, log_fN_pathogenic
 
 
+def resolve_subtraction_grid(scores, sample_assignments, benign_method, benign_idx, synonymous_idx,
+                             ref_min_n=10, n_grid=2000):
+    """Per-dataset resolution of pathomechanism_method="subtraction_grid".
+
+    The anchor's reference sample is B/LB, synonymous, or both, per the
+    (already validated) benign_method; PU mode (neither present) anchors on
+    the raw population and always uses subtraction. Reference size follows
+    gamma_benign_cap/FINDINGS.md section 12c: avg -> n_B/LB + n_syn; benign ->
+    n_B/LB (n_syn if no B/LB); synonymous -> n_syn (n_B/LB if no synonymous).
+
+    Returns (method, boundary_points, n_ref): ("subtraction", None, n_ref)
+    when n_ref >= ref_min_n, else ("boundary", grid over the reference
+    sample's score range, n_ref)."""
+    scores = np.asarray(scores, dtype=float)
+    sa = np.asarray(sample_assignments, dtype=bool)
+    nb = int(sa[:, benign_idx].sum()) if benign_idx is not None else 0
+    ns = int(sa[:, synonymous_idx].sum()) if synonymous_idx is not None else 0
+    if nb == 0 and ns == 0:
+        return "subtraction", None, float("inf")
+    if benign_method == "avg":
+        cols, n_ref = [benign_idx, synonymous_idx], nb + ns
+    elif benign_method == "benign":
+        cols, n_ref = ([benign_idx], nb) if nb > 0 else ([synonymous_idx], ns)
+    else:
+        cols, n_ref = ([synonymous_idx], ns) if ns > 0 else ([benign_idx], nb)
+    if n_ref >= ref_min_n:
+        return "subtraction", None, n_ref
+    cols = [c for c in cols if c is not None]
+    ref = scores[sa[:, cols].any(axis=1)]
+    ref = ref[np.isfinite(ref)]
+    if len(ref) == 0:
+        return "subtraction", None, n_ref
+    # a single reference score gives a one-point "grid" (the min-ratio at that score), as in the
+    # gamma_benign_cap grid_ref estimate (PTEN_Mighell_2018: 1 B/LB -> 0.90)
+    return "boundary", np.linspace(ref.min(), ref.max(), int(n_grid) if ref.max() > ref.min() else 1), n_ref
+
+
+def mechanism_match_frac_per_fit(fit, scores, sample_assignments, benign_method, pathogenic_idx, benign_idx,
+                                 gnomad_idx, synonymous_idx, method, boundary_points=None):
+    """P(M=1|Y=1) of one bootstrap fit under `method` ("subtraction" or "boundary", the latter optionally over
+    `boundary_points`), without the prior EM: the diagnostic behind gamma_hat_diagnostic. np.nan if undefined."""
+    scores = np.asarray(scores, dtype=float)
+    sa = np.asarray(sample_assignments, dtype=bool)
+    weights = [np.asarray(w, dtype=float) for w in fit["fit"]["weights"]]
+    params = fit["fit"]["component_params"]
+    if pathogenic_idx is None or gnomad_idx is None:
+        return np.nan
+    w_N, _ = resolve_pathomechanism_anchor(weights, benign_method, benign_idx, synonymous_idx, gnomad_idx)
+    labeled = scores[sa[:, pathogenic_idx]]
+    if method == "boundary" and boundary_points is not None:
+        labeled = np.asarray(boundary_points, dtype=float)
+    population = scores[sa[:, gnomad_idx]]
+    try:
+        _, frac = apply_pathomechanism_correction(method, labeled, population, params, weights[pathogenic_idx],
+                                                  np.asarray(w_N, dtype=float))
+    except Exception:
+        return np.nan
+    return float(frac) if frac is not None and np.isfinite(frac) else np.nan
+
+
 def apply_pathomechanism_correction(pathomechanism_method, labeled_scores, population,
                                      params, w_P_raw, w_N, multivariate=False, **kwargs):
     """Shared method-dispatch entry point for the pathomechanism prior
@@ -1490,6 +1550,10 @@ def get_fit_prior(fit, scoreset_or_scores, benign_method, pathogenic_idx=0, beni
         is_pu = len(benign_density) == 0
         w_N_anchor = weights[gnomad_idx] if is_pu else w_b
         labeled_scores = scores[sa[:, pathogenic_idx].astype(bool)]
+        if pathomechanism_method == "boundary" and kwargs.get("pathomechanism_boundary_points") is not None:
+            # grid fallback of "subtraction_grid" (resolve_subtraction_grid):
+            # min-ratio over a grid spanning the benign reference's scores
+            labeled_scores = np.asarray(kwargs["pathomechanism_boundary_points"], dtype=float)
         pathomechanism_kwargs = {}
         if pathomechanism_method != "boundary":
             # 'boundary' is closed-form -- no EM init/steps/tolerance to pass.

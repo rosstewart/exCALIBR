@@ -132,8 +132,15 @@ def _mv_one(key):
         full[np.nanpercentile(L, 95, axis=0) <= r["tau_b_log"][pv - 1]] = -pv
     assert np.array_equal(full, np.asarray(r["points"], int)), "log LR+ matrix does not reproduce production points"
     K = int(cfg.split("c")[0])
-    splits = (RP.job_pickle_oob_splits(meta["dataset_name"], kept) if config.STRATA
-              else RP._paper_oob_splits(ms, kept, K))
+    # The run's own job pickles when present (exact for any bootstrap scheme);
+    # otherwise regenerate (valid only for the default sample x pattern
+    # scheme, i.e. the paper fits, whose pickles are not kept locally).
+    try:
+        splits = RP.job_pickle_oob_splits(meta["dataset_name"], kept)
+    except (FileNotFoundError, KeyError):
+        if config.STRATA:
+            raise
+        splits = RP._paper_oob_splits(ms, kept, K)
     oob = np.zeros((len(kept), L.shape[1]), bool)
     for i, b in enumerate(kept):
         oob[i, splits[b]] = True

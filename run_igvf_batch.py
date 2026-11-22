@@ -1346,7 +1346,7 @@ def main():
     # constructions) are kept only for dev/debugging comparison against
     # 'boundary', not a top-level user-facing choice. Global, batch-wide.
     parser.add_argument("--pathomechanism-method",
-                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary"],
+                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary", "subtraction_grid"],
                        default=None,
                        help=argparse.SUPPRESS)
     parser.add_argument("--no-postprocess", action="store_true",
@@ -1439,9 +1439,11 @@ def main():
 
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode
-    # expects, defaulting the sub-choice to "boundary" when enabled.
+    # expects, defaulting the sub-choice to "subtraction_grid" when enabled
+    # (subtraction, grid-boundary fallback for a benign reference < 10 variants;
+    # see PipelineConfig.pathomechanism_method).
     if args.pathomechanism_prior_enabled:
-        pm_flag = args.pathomechanism_method or "boundary"
+        pm_flag = args.pathomechanism_method or "subtraction_grid"
     elif args.pathomechanism_prior_enabled is False:
         pm_flag = "off"
     else:

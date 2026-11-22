@@ -214,7 +214,24 @@ class PipelineConfig:
     # raw single LR+/prior) is the default; pass pathomechanism_method=
     # "subtraction" (CLI --pathomechanism-prior) to opt into the dual-prior
     # correction, or "masking"/"boundary" for the alternative constructions.
-    pathomechanism_method: Optional[Literal["subtraction", "masking", "boundary"]] = None
+    #
+    # "subtraction_grid" (CLI --pathomechanism-prior default since 2026-11-20):
+    # "subtraction" unless the anchor's benign reference sample (B/LB,
+    # synonymous, or both per benign_method) has fewer than
+    # pathomechanism_ref_min_n variants, in which case "boundary" with the
+    # min-ratio taken over a grid spanning the reference sample's scores (not
+    # the P/LP points, which bias P(M=1|Y=1) low). Subtraction needs the
+    # reference to identify the benign component(s); with a tiny reference
+    # (e.g. PTEN_Mighell_2018, 1 B/LB) it can call a normal-located component
+    # "disease-specific". Evidence: calibration_quality/gamma_benign_cap/
+    # FINDINGS.md sections 11-15. Resolved per dataset in process_component_fits.
+    pathomechanism_method: Optional[Literal["subtraction", "masking", "boundary", "subtraction_grid"]] = None
+    pathomechanism_ref_min_n: int = 10
+    pathomechanism_grid_points: int = 2000
+    # Always-on diagnostic: report P(M=1|Y=1) under the subtraction_grid rule in
+    # every calibration JSON (keys gamma_hat_diagnostic*), computed on the raw
+    # fits even when pathomechanism_method is None. Evidence is unaffected.
+    pathomechanism_diagnostic: bool = True
 
     # Only meaningful when pathomechanism_method == "boundary" (ignored for
     # "subtraction"/"masking", which keep their own direct re-derivation
@@ -407,7 +424,7 @@ class PipelineConfig:
             )
 
         # Validate pathomechanism_method
-        valid_pm_methods = {None, "subtraction", "masking", "boundary"}
+        valid_pm_methods = {None, "subtraction", "masking", "boundary", "subtraction_grid"}
         if self.pathomechanism_method not in valid_pm_methods:
             raise ValueError(
                 f"pathomechanism_method must be one of {valid_pm_methods}, "
@@ -455,7 +472,7 @@ def resolve_prior_mode(filter_flag, pathomechanism_method_flag):
     """Resolve the two mutually-exclusive pathogenic-sample-cleaning flags.
 
     ``filter_flag`` (bool|None) is the experimental LR-row-filter flag.
-    ``pathomechanism_method_flag`` (None|"off"|"subtraction"|"masking"|"boundary")
+    ``pathomechanism_method_flag`` (None|"off"|"subtraction"|"masking"|"boundary"|"subtraction_grid")
     is the already-resolved pathomechanism-method selection (the caller
     combines its own visible on/off toggle with the hidden
     subtraction/masking/boundary sub-choice before calling this function --

@@ -107,6 +107,12 @@ def save_results(
                 'PLP_frac_pathomechanism_measured', None),
             'PLP_frac_pathomechanism_measured_unstable': calibration.get(
                 'PLP_frac_pathomechanism_measured_unstable', False),
+            'pathomechanism_estimator_used': calibration.get('pathomechanism_estimator_used', None),
+            'pathomechanism_ref_n': calibration.get('pathomechanism_ref_n', None),
+            # always-on P(M=1|Y=1) diagnostic (subtraction, grid boundary if benign reference < 10)
+            **{k: calibration.get(k, None) for k in (
+                'gamma_hat_diagnostic', 'gamma_hat_diagnostic_p5', 'gamma_hat_diagnostic_p95',
+                'gamma_hat_diagnostic_n_fits', 'gamma_hat_diagnostic_estimator', 'gamma_hat_diagnostic_ref_n')},
             'pct_bootstraps_kept': calibration.get('pct_bootstraps_kept', None),
             'pct_pathogenic_rows_kept': calibration.get('pct_pathogenic_rows_kept', None),
             'point_ranges': calibration['point_ranges'],

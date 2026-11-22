@@ -268,6 +268,16 @@ if STRATA and "MV_STRATA_DIR" not in os.environ:
         if os.path.isdir(os.path.join(_d, "strata")):
             os.environ["MV_STRATA_DIR"] = os.path.join(_d, "strata")
             break
+# Univariate baselines with the run's ClinVar release: 2025 runs use the 2025
+# refits (2026-11-20, same settings as before), legacy runs the earlier ones.
+# $MV_TSC2_UV_CALIB / $MV_FGFR_UV_CALIB win.
+if CLINVAR_DEFAULT_RELEASE == "2025":
+    if "MV_TSC2_UV_CALIB" not in os.environ:
+        TSC2_UV_CALIB_DIR = "/data/ross/assay_calibration/TSC2/results_clinvar2025_111926/calibration_results"
+    FGFR_UV_CALIB_DIR = os.environ.get(
+        "MV_FGFR_UV_CALIB", "/data/ross/assay_calibration/FGFR/uv_1000b_clinvar2025_111926/calibration")
+else:
+    FGFR_UV_CALIB_DIR = os.environ.get("MV_FGFR_UV_CALIB", FGFR_UV_CALIB_DIR)
 if CLINVAR_DEFAULT_RELEASE != "2025" or ROW_BUILDER != "v2":
     print(f"[mv_analysis.config] {PAPER_FITS_DIR}: legacy run (rows={ROW_BUILDER}, "
           f"ClinVar default release {CLINVAR_DEFAULT_RELEASE}); re-scoring it as it was fit.")
@@ -709,7 +719,7 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
         # confirmed via a real ValueError ("assayed_variant_level must be
         # constant across rows; got []"). Treat that specific case as "no
         # filter" (every paralog, default combine_genes=True behavior).
-        fgfr_genes = None if genes in (None, ["FGFR_combined"]) else genes
+        fgfr_genes = None if genes in (None, ["FGFR_combined"], ["FGFR"]) else genes  # "FGFR": dataset-name prefix
         ms_map = build_fgfr_multiscoresets(genes=fgfr_genes)
     elif gene_set == "predictor":
         from src.assay_calibration.multivariate_data.predictors import load_predictor_ms, DEFAULT_GENES

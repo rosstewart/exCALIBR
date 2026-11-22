@@ -619,7 +619,7 @@ def run_default(args):
 
     df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
-    df = pd.read_csv(df_path, sep=sep)
+    df = pd.read_csv(df_path, sep=sep, low_memory=False)
 
     if args.complement_components and args.components is not None:
         raise SystemExit("--complement-components cannot be combined with --components")
@@ -729,7 +729,7 @@ def run_mavedb(args):
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
 
     sep = "\t" if args.dataframe.endswith((".tsv.gz", ".tsv")) else ","
-    df = pd.read_csv(args.dataframe, sep=sep)
+    df = pd.read_csv(args.dataframe, sep=sep, low_memory=False)
 
     genes = df[args.dataset_col].unique()
     combinations = [(gene, sc) for gene in sorted(genes) for sc in args.score_cols]
@@ -880,7 +880,7 @@ def run_basicscoreset(args):
         print(f"Found {len(partitions)} CSV files in {args.data_dir}")
     else:
         sep = "\t" if args.dataframe.endswith((".tsv.gz", ".tsv")) else ","
-        df = pd.read_csv(args.dataframe, sep=sep)
+        df = pd.read_csv(args.dataframe, sep=sep, low_memory=False)
         if "Dataset" not in df.columns:
             raise ValueError("--dataframe must have a 'Dataset' column or use --data-dir")
         partitions = {ds: df[df["Dataset"] == ds] for ds in df["Dataset"].unique()}
@@ -1201,7 +1201,14 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             raise NotImplementedError("tied_population is not defined for a stratified fit")
         ann = row_annotations(ms, _integrated_df_cached() if getattr(ms, "_row_atoms", None) is not None
                               and getattr(ms, "row_meta", None) is None else None, gene=gene)
-        strata = build_strata(ms, ann, min_stratum=int(fit_options.get("strata_min", 5)))
+        # Rows the fit will use: observed in its calibrated dimensions (a
+        # single calibration cluster may drop a poorly connected assay; the
+        # fitter then drops rows measured only there). Scoring rebuilds the
+        # strata on the ms restricted to those dimensions, so both agree.
+        _row_mask = None
+        if len(clusters) == 1 and len(clusters[0]) < observations.shape[1]:
+            _row_mask = ~np.isnan(observations[:, list(clusters[0])]).all(axis=1)
+        strata = build_strata(ms, ann, min_stratum=int(fit_options.get("strata_min", 5)), row_mask=_row_mask)
         ms_fit = StrataView(ms, strata)
         print(f"  {dataset_label}: {len(strata.names)} strata: "
               + ", ".join(f"{n}={c}" for n, c in zip(strata.names, strata.counts)))
@@ -1727,7 +1734,11 @@ def _load_and_filter_gene_groups(args):
     """
     df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
-    df = pd.read_csv(df_path, sep=sep)
+    # low_memory=False: chunked type inference gave Chrom / hg38_start mixed
+    # int and str within a gene (PALB2, GCK), so the same variant measured by
+    # two assays was not recognised as one row; scoring
+    # (mv_analysis/integrated_gene_data.py) reads it this way too.
+    df = pd.read_csv(df_path, sep=sep, low_memory=False)
 
     max_dim = args.max_dimensions  # may be None
     gene_groups = _discover_gene_groups(df, max_dimensions=max_dim)
@@ -2664,7 +2675,7 @@ def main():
     if df_path and os.path.exists(df_path):
         try:
             sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
-            _df_peek = pd.read_csv(df_path, sep=sep)
+            _df_peek = pd.read_csv(df_path, sep=sep, low_memory=False)
             if "Dataset" in _df_peek.columns:
                 first_ds = _df_peek["Dataset"].iloc[0]
                 _sample_slice = _df_peek[_df_peek["Dataset"] == first_ds]
