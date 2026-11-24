@@ -81,7 +81,7 @@ Three formats are supported — see [docs/input-formats.md](docs/input-formats.m
 
 1. **BasicScoreset** (start here) — just a `score` column and a `sample_assignments` column you fill in yourself, marking which variants are Pathogenic/Benign/gnomAD/Synonymous controls. No ClinVar metadata needed. Example: `example/brca_findlay_example.csv`. PU/NU-mode examples: `example/brca_findlay_PU_example.csv`, `example/brca_findlay_NU_example.csv`.
 2. **IGVF / PillarProject format** ([Tejura et al. 2026](https://doi.org/10.64898/2026.02.14.705848)) — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
-3. **MaveDB format** — MaveDB-style CSV with functional classification columns (see [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation)).
+3. **MaveDB format** — the output format of [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation), which is used to annotate score sets in MaveDB.
 
 **Experimental:** the code also includes multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.). These are unpublished, may change without notice and are not yet supported. See the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
 

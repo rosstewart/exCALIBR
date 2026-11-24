@@ -62,7 +62,7 @@ Which mode a dataset runs in is determined automatically by which control sample
 
 ### 3. MaveDB format
 
-MaveDB-style CSV with functional classification columns (see [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation)); used via `hpc/prepare.py mavedb`.
+The output format of [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation), which is used to annotate score sets in MaveDB; used via `hpc/prepare.py mavedb`.
 
 Implementation: `src/assay_calibration/data_utils/dataset.py` — `BasicScoreset`, `Scoreset`, `MultiScoreset`, `BasicMultiScoreset`.
 
