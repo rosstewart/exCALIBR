@@ -26,7 +26,7 @@ python run_pipeline.py \
 
 ### 2. IGVF / PillarProject format
 
-Per-variant metadata table matching the IGVF Coding Variants Focus Group schema (Tejura et al. 2026, bioRxiv 2026.02.14.705848). Example: `example/MSH2_Jia_2021.csv`; exact columns in `Scoreset`/`Variant` (`src/assay_calibration/data_utils/dataset.py`).
+Per-variant metadata table matching the IGVF Coding Variants Focus Group schema ([Tejura et al. 2026](https://doi.org/10.64898/2026.02.14.705848), bioRxiv 2026.02.14.705848). Example: `example/MSH2_Jia_2021.csv`; exact columns in `Scoreset`/`Variant` (`src/assay_calibration/data_utils/dataset.py`).
 
 ```bash
 python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021
@@ -62,7 +62,7 @@ Which mode a dataset runs in is determined automatically by which control sample
 
 ### 3. MaveDB format
 
-MaveDB-style CSV with functional classification columns; used via `hpc/prepare.py mavedb`.
+MaveDB-style CSV with functional classification columns (see [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation)); used via `hpc/prepare.py mavedb`.
 
 Implementation: `src/assay_calibration/data_utils/dataset.py` — `BasicScoreset`, `Scoreset`, `MultiScoreset`, `BasicMultiScoreset`.
 

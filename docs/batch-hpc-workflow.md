@@ -12,7 +12,7 @@ python hpc/prepare.py default \
     --dataframe variants.tsv.gz
 
 # Other subcommands:
-#   pillar_project  — same as default, with the latest ExCALIBR manuscript's Tavtigian rounding (3 decimals)
+#   pillar_project  — same as default, with the Tavtigian rounding of releases up to v1.1.x (3 decimals)
 #   mavedb          — MaveDB-formatted CSV input
 #   basicscoreset   — bare-bones CSV with sample_assignments column
 #   multivariate    — multi-assay per-gene fitting (MultiScoreset)

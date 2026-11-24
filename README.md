@@ -11,17 +11,11 @@ A pipeline for calibrating functional assays to clinical variant interpretation 
 
 ## Which version should I use?
 
-| If you want to… | Use |
+| To… | Use |
 |---|---|
-| Calibrate your own data | The [**latest release**](https://github.com/rosstewart/exCALIBR/releases/latest). The `main` branch, and therefore a plain `git clone`, always matches it. |
-| Reproduce the latest ExCALIBR manuscript | [**v1.1.0**](https://github.com/rosstewart/exCALIBR/releases/tag/v1.1.0) |
-
-- The `dev` branch is active development. It contains unpublished, experimental features, changes without notice and is not supported.
-- v1.0.0 is an early PU/NU prototype, superseded by v1.1.x.
-- What changed in each version, and whether it affects results, is on the [Releases](https://github.com/rosstewart/exCALIBR/releases) page.
-- To use a specific release: `git clone --branch v1.1.0 https://github.com/rosstewart/exCALIBR`. In an existing clone, run `git fetch --tags && git checkout v1.1.0`.
-- To check which version you have, run `git describe --tags` inside your clone. Please report it in your methods.
-- Questions, or want us to look at your calibrations? See [Questions, help and collaboration](#questions-help-and-collaboration).
+| Calibrate your own data | [Latest release](https://github.com/rosstewart/exCALIBR/releases/latest) |
+| Reproduce the revised ExCALIBR manuscript (not yet public) | [v1.1.0](https://github.com/rosstewart/exCALIBR/releases/tag/v1.1.0) |
+| Reproduce the bioRxiv preprint ([v2](https://www.biorxiv.org/content/10.1101/2025.04.29.651326v2)) | [v1.0.0](https://github.com/rosstewart/exCALIBR/releases/tag/v1.0.0) |
 
 ## Installation
 
@@ -75,7 +69,7 @@ Writes a calibration JSON, score-distribution plot, and per-variant evidence tab
 
 Full flag reference: [docs/script-reference.md](docs/script-reference.md).
 
-### Production batch (many datasets)
+### Batch runs (many datasets)
 
 See the [Batch HPC Workflow](docs/batch-hpc-workflow.md).
 
@@ -84,8 +78,8 @@ See the [Batch HPC Workflow](docs/batch-hpc-workflow.md).
 Three formats are supported — see [docs/input-formats.md](docs/input-formats.md) for full details and example commands:
 
 1. **BasicScoreset** (start here) — just a `score` column and a `sample_assignments` column you fill in yourself, marking which variants are Pathogenic/Benign/gnomAD/Synonymous controls. No ClinVar metadata needed. Example: `example/brca_findlay_example.csv`. PU/NU-mode examples: `example/brca_findlay_PU_example.csv`, `example/brca_findlay_NU_example.csv`.
-2. **IGVF / PillarProject format** — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
-3. **MaveDB format** — MaveDB-style CSV with functional classification columns.
+2. **IGVF / PillarProject format** ([Tejura et al. 2026](https://doi.org/10.64898/2026.02.14.705848)) — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
+3. **MaveDB format** — MaveDB-style CSV with functional classification columns (see [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation)).
 
 **Experimental:** the code also includes multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.). These are unpublished, may change without notice and are not yet supported. See the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
 
