@@ -11,7 +11,7 @@ A pipeline for calibrating functional assays to clinical variant interpretation 
 
 ## Web server
 
-No installation needed: upload your data at **[excalibr.org](https://excalibr.org/)**, in any of the [supported input formats](#input-data-formats), and we'll run the calibration on our servers (up to the `large` [preset](docs/configuration.md#quality-vs-speed-presets)). For bigger jobs, such as many datasets or the `xl` and `finest` presets, [email us](#questions-help-and-collaboration).
+No installation needed: upload your data at **[excalibr.org](https://excalibr.org/)**, in any of the [supported input formats](#input-data-formats), and the calibration runs on the web server (up to the `large` [preset](docs/configuration.md#quality-vs-speed-presets)). For bigger jobs, such as many datasets or the `xl` and `finest` presets, [email us](#questions-help-and-collaboration) and we can run them on our HPC cluster.
 
 ## Which version should I use?
 
@@ -132,6 +132,6 @@ Questions about the core pipeline or the experimental features are welcome. Plea
 
 - advise on how to set up and run ExCALIBR for your assay;
 - look over your calibration results;
-- run calibrations for you on our servers, including jobs beyond what the [web server](https://excalibr.org/) handles, such as many datasets or the `xl` and `finest` presets.
+- run calibrations for you on our HPC cluster, including jobs beyond what the [web server](https://excalibr.org/) handles, such as many datasets or the `xl` and `finest` presets.
 
 If we run calibrations for your project, an acknowledgement in whatever form you think appropriate is always appreciated.
