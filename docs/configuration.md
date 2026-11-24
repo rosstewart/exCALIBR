@@ -140,7 +140,7 @@ The likelihood-ratio thresholds for each evidence strength come from the Tavtigi
 
 ```bash
 python run_pipeline.py --dataset my.csv --name MyGene                                     # default: exact (c = 351 at prior 0.1)
-python run_pipeline.py --dataset my.csv --name MyGene --tavtigian-posterior-decimals 3    # rule posteriors rounded to 3 decimals, as in the ExCALIBR manuscript (c = 348 at prior 0.1)
+python run_pipeline.py --dataset my.csv --name MyGene --tavtigian-posterior-decimals 3    # rule posteriors rounded to 3 decimals, as in the latest ExCALIBR manuscript (c = 348 at prior 0.1)
 ```
 
 The default can also be set with the `EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS` environment variable (`none` or `3`). The setting used is recorded as `tavtigian_posterior_decimals` in the output JSON (`null` = exact). Releases up to v1.1.x always used the 3-decimal rounding.

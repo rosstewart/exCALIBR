@@ -14,7 +14,7 @@ A pipeline for calibrating functional assays to clinical variant interpretation 
 | If you want to… | Use |
 |---|---|
 | Calibrate your own data | The [**latest release**](https://github.com/rosstewart/exCALIBR/releases/latest). The `main` branch, and therefore a plain `git clone`, always matches it. |
-| Reproduce the ExCALIBR manuscript | [**v1.1.0**](https://github.com/rosstewart/exCALIBR/releases/tag/v1.1.0) |
+| Reproduce the latest ExCALIBR manuscript | [**v1.1.0**](https://github.com/rosstewart/exCALIBR/releases/tag/v1.1.0) |
 
 - The `dev` branch is active development. It contains unpublished, experimental features, changes without notice and is not supported.
 - v1.0.0 is an early PU/NU prototype, superseded by v1.1.x.
@@ -87,7 +87,7 @@ Three formats are supported — see [docs/input-formats.md](docs/input-formats.m
 2. **IGVF / PillarProject format** — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
 3. **MaveDB format** — MaveDB-style CSV with functional classification columns.
 
-**Experimental:** the code also includes multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.). These are unpublished, not described in the ExCALIBR manuscript, may change without notice and are not yet supported. See the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
+**Experimental:** the code also includes multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.). These are unpublished, may change without notice and are not yet supported. See the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
 
 ## Documentation
 

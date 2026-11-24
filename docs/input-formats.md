@@ -66,4 +66,4 @@ MaveDB-style CSV with functional classification columns; used via `hpc/prepare.p
 
 Implementation: `src/assay_calibration/data_utils/dataset.py` — `BasicScoreset`, `Scoreset`, `MultiScoreset`, `BasicMultiScoreset`.
 
-> **Experimental, unpublished:** the code also includes multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `hpc/prepare.py multivariate`) and calibration of computational predictor scores like REVEL/AlphaMissense (`hpc/prepare.py predictor-mv`, `predictor_mv_utils.py`). Neither is described in the ExCALIBR manuscript, documented here or supported yet, and both may change without notice. Ask in the repo/issues if you want to use either.
+> **Experimental, unpublished:** the code also includes multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `hpc/prepare.py multivariate`) and calibration of computational predictor scores like REVEL/AlphaMissense (`hpc/prepare.py predictor-mv`, `predictor_mv_utils.py`). Neither is documented here or supported yet, and both may change without notice. Ask in the repo/issues if you want to use either.
