@@ -17,6 +17,8 @@ A pipeline for calibrating functional assays to clinical variant interpretation 
 | Reproduce the revised ExCALIBR manuscript (not yet public) | [v1.1.0](https://github.com/rosstewart/exCALIBR/releases/tag/v1.1.0) |
 | Reproduce the bioRxiv preprint ([v2](https://www.biorxiv.org/content/10.1101/2025.04.29.651326v2)) | [v1.0.0](https://github.com/rosstewart/exCALIBR/releases/tag/v1.0.0) |
 
+What changed in each version: [release notes](https://github.com/rosstewart/exCALIBR/releases).
+
 ## Installation
 
 ```bash
@@ -128,4 +130,4 @@ Questions about the core pipeline or the experimental features are welcome. Open
 - look over your calibration results;
 - run large-scale calibrations on our servers, whether many datasets or the higher-quality presets (`large`, `xl`, `finest`; see [presets](docs/configuration.md#quality-vs-speed-presets)).
 
-Running calibrations for you takes manual work on our side, so we ask that it be acknowledged in any resulting publication, for example in the acknowledgements.
+If we run calibrations for your project, a mention in your acknowledgements is always appreciated.
