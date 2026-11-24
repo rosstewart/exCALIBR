@@ -9,6 +9,10 @@
 
 A pipeline for calibrating functional assays to clinical variant interpretation scales (ACMG/AMP evidence levels) using bootstrap skew-normal mixture model fitting and Bayesian calibration.
 
+## Web server
+
+No installation needed: upload your data at **[excalibr.org](https://excalibr.org/)**, in any of the [supported input formats](#input-data-formats), and we'll run the calibration on our servers (up to the `large` [preset](docs/configuration.md#quality-vs-speed-presets)). For bigger jobs, such as many datasets or the `xl` and `finest` presets, [email us](#questions-help-and-collaboration).
+
 ## Which version should I use?
 
 | To… | Use |
@@ -106,7 +110,7 @@ Daniel Zeiberg, Ross Stewart, et al.
 bioRxiv 2025.04.29.651326; doi: https://doi.org/10.1101/2025.04.29.651326
 ```
 
-For the IGVF dataset and format:
+If you use the IGVF variant effect data from Tejura et al., please also cite:
 
 ```
 A scalable approach to resolving variants of uncertain significance.
@@ -124,10 +128,10 @@ Software developed by Ross Stewart and Daniel Zeiberg.
 
 ## Questions, help and collaboration
 
-Questions about the core pipeline or the experimental features are welcome. Open a [GitHub issue](https://github.com/rosstewart/exCALIBR/issues) or email [stewart.ro@northeastern.edu](mailto:stewart.ro@northeastern.edu). We're happy to:
+Questions about the core pipeline or the experimental features are welcome. Please email [stewart.ro@northeastern.edu](mailto:stewart.ro@northeastern.edu). We're happy to:
 
 - advise on how to set up and run ExCALIBR for your assay;
 - look over your calibration results;
-- run large-scale calibrations on our servers, whether many datasets or the higher-quality presets (`large`, `xl`, `finest`; see [presets](docs/configuration.md#quality-vs-speed-presets)).
+- run calibrations for you on our servers, including jobs beyond what the [web server](https://excalibr.org/) handles, such as many datasets or the `xl` and `finest` presets.
 
-If we run calibrations for your project, a mention in your acknowledgements is always appreciated.
+If we run calibrations for your project, an acknowledgement in whatever form you think appropriate is always appreciated.
