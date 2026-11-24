@@ -132,12 +132,26 @@ python run_pipeline.py --dataset my.csv --name MyGene --no-postprocess         #
 python run_pipeline.py --dataset my.csv --name MyGene --conservative-monotonicity  # stricter monotonicity enforcement
 ```
 
+Standard (single-direction) postprocessing also removes pathogenic evidence on the wrong side of the benign reference (since v1.2.0). Before monotonicity is enforced, each raw pathogenic interval is assigned to a side of the benign reference mean score. If pathogenic intervals appear on both sides, and the expected side holds at least as many P/LP variants (gnomAD variants in NU mode), the intervals on the other side are dropped. This stops a spurious rise in LR+ in the far benign tail from becoming pathogenic evidence across the whole score range. If the unexpected side holds more support, or is the only side with pathogenic intervals, nothing is changed and a `REVIEW` warning is logged: check whether the score direction is correct. The outcome is recorded as `pathogenic_side_rule` in the output JSON.
+
+### Evidence-strength thresholds (Tavtigian constant)
+
+The likelihood-ratio thresholds for each evidence strength come from the Tavtigian et al. (2018) constant `c`, solved for the dataset's prior so that the ACMG/AMP combining rules hold.
+
+```bash
+python run_pipeline.py --dataset my.csv --name MyGene                                     # default: exact (c = 351 at prior 0.1)
+python run_pipeline.py --dataset my.csv --name MyGene --tavtigian-posterior-decimals 3    # rule posteriors rounded to 3 decimals, as in the ExCALIBR manuscript (c = 348 at prior 0.1)
+```
+
+The default can also be set with the `EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS` environment variable (`none` or `3`). The setting used is recorded as `tavtigian_posterior_decimals` in the output JSON (`null` = exact). Releases up to v1.1.x always used the 3-decimal rounding.
+
 ### Bidirectional assay auto-detection
 
 Some assays (e.g. LoF/GoF) show pathogenic-leaning evidence on both sides of a benign region, breaking the standard single-direction postprocessing. Auto-detected by default (`n_c >= 3` only) — `--no-postprocess` above is not needed for this case.
 
 - Per bootstrap fit: mixture components are sorted by score and labeled pathogenic-like/benign-like by comparing pathogenic vs. benign sample weights (PU/NU modes fall back to gnomAD). Flagged if a benign-like component has a pathogenic-like component on each side.
 - If a majority of fits are flagged: pathogenic tiers are re-nested and extended independently on each side of the benign region. Benign tiers are cleaned up (fragmentation merged) but never extended to the axis limit.
+- Benign island postprocessing (since v1.1.1): on this path, any contiguous benign-evidence block holding less than 1% of the population (gnomAD) sample is removed and left indeterminate, so tiny isolated benign slivers don't survive. Removed blocks are recorded as `pruned_benign_islands` in the output JSON.
 - Otherwise: standard postprocessing runs unchanged.
 
 ```bash

@@ -9,10 +9,24 @@
 
 A pipeline for calibrating functional assays to clinical variant interpretation scales (ACMG/AMP evidence levels) using bootstrap skew-normal mixture model fitting and Bayesian calibration.
 
+## Which version should I use?
+
+| If you want to… | Use |
+|---|---|
+| Calibrate your own data | The [**latest release**](https://github.com/rosstewart/exCALIBR/releases/latest). The `main` branch, and therefore a plain `git clone`, always matches it. |
+| Reproduce the ExCALIBR manuscript | [**v1.1.0**](https://github.com/rosstewart/exCALIBR/releases/tag/v1.1.0) |
+
+- The `dev` branch is active development. It contains unpublished, experimental features, changes without notice and is not supported.
+- v1.0.0 is an early PU/NU prototype, superseded by v1.1.x.
+- What changed in each version, and whether it affects results, is on the [Releases](https://github.com/rosstewart/exCALIBR/releases) page.
+- To use a specific release: `git clone --branch v1.1.0 https://github.com/rosstewart/exCALIBR`. In an existing clone, run `git fetch --tags && git checkout v1.1.0`.
+- To check which version you have, run `git describe --tags` inside your clone. Please report it in your methods.
+- Questions, or want us to look at your calibrations? See [Questions, help and collaboration](#questions-help-and-collaboration).
+
 ## Installation
 
 ```bash
-git clone https://github.com/rosstewart/exCALIBR
+git clone https://github.com/rosstewart/exCALIBR   # latest release; add --branch vX.Y.Z to pin a version
 cd exCALIBR
 
 # CPU-only environment (standard runs)
@@ -73,10 +87,11 @@ Three formats are supported — see [docs/input-formats.md](docs/input-formats.m
 2. **IGVF / PillarProject format** — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
 3. **MaveDB format** — MaveDB-style CSV with functional classification columns.
 
-Multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.) are also supported — see the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
+**Experimental:** the code also includes multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.). These are unpublished, not described in the ExCALIBR manuscript, may change without notice and are not yet supported. See the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
 
 ## Documentation
 
+- [Releases](https://github.com/rosstewart/exCALIBR/releases) — all versions, with release notes
 - [Input Data Formats](docs/input-formats.md) — the three supported input formats, in detail
 - [Batch HPC Workflow](docs/batch-hpc-workflow.md) — calibrating many datasets across a SLURM cluster
 - [Script Reference](docs/script-reference.md) — every script and its key flags
@@ -111,6 +126,12 @@ Software developed by Ross Stewart and Daniel Zeiberg.
 
 [MIT License](LICENSE)
 
-## Contact
+## Questions, help and collaboration
 
-[stewart.ro@northeastern.edu](mailto:stewart.ro@northeastern.edu)
+Questions about the core pipeline or the experimental features are welcome. Open a [GitHub issue](https://github.com/rosstewart/exCALIBR/issues) or email [stewart.ro@northeastern.edu](mailto:stewart.ro@northeastern.edu). We're happy to:
+
+- advise on how to set up and run ExCALIBR for your assay;
+- look over your calibration results;
+- run large-scale calibrations on our servers, whether many datasets or the higher-quality presets (`large`, `xl`, `finest`; see [presets](docs/configuration.md#quality-vs-speed-presets)).
+
+Running calibrations for you takes manual work on our side, so we ask that it be acknowledged in any resulting publication, for example in the acknowledgements.

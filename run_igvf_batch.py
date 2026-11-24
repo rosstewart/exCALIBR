@@ -152,7 +152,7 @@ def run_single_dataset(
     elif "clinvar_2018" in dataset_name and "not_clinvar_2018" not in dataset_name:
         clinvar_release = "2018"
     else:
-        clinvar_release = getattr(args, "clinvar_release", None) or "2026"
+        clinvar_release = getattr(args, "clinvar_release", None) or "2025"
 
     # Build component list
     if n_c == "all":
@@ -606,7 +606,7 @@ def _detect_benign_sample_availability(dataset_df: pd.DataFrame, dataset_name: s
         output_dir=args.output_dir,
         components=[2],
         benign_method="avg",
-        clinvar_release=getattr(args, "clinvar_release", None) or "2026",
+        clinvar_release=getattr(args, "clinvar_release", None) or "2025",
         min_clinvar_star=args.min_clinvar_star,
         population_type=args.population_type,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
@@ -660,7 +660,7 @@ def run_all_configs_for_dataset(
         print(f"  SKIP {dataset_name}: no rows in CSV")
         return
 
-    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2026")
+    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2025")
 
     # Extract fits by n_c once in the parent process
     fits_by_nc: Dict[str, list] = {}
@@ -872,7 +872,7 @@ def generate_all_configs_viz(
     output_dir = Path(args.output_dir) / dataset_name
     logger = setup_logging(str(output_dir), dataset_name)
 
-    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2026")
+    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2025")
 
     csv_name = dataset_name.replace("_clinvar_2018", "")
     dataset_df = df[df["Dataset"] == csv_name].copy()

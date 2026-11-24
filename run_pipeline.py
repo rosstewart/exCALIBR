@@ -291,7 +291,7 @@ Examples:
                        help="Use p-value test instead of conservative 5th percentile")
 
     # ClinVar / ACMG-mapping options
-    parser.add_argument("--clinvar-release", choices=["2026", "2025", "2018"], default="2026", help="ClinVar release year")
+    parser.add_argument("--clinvar-release", choices=["2026", "2025", "2018"], default="2025", help="ClinVar release year (IGVF/PillarProject-format input only)")
     parser.add_argument("--min-clinvar-star", type=int, default=1,
                        help="Minimum ClinVar review stars (default: 1)")
     parser.add_argument("--acmg-mapping-method",

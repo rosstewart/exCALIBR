@@ -36,7 +36,7 @@ Sample groups are derived automatically (not assigned by hand) from:
 
 - `Dataset` — dataset name; `--name` selects which one in a multi-dataset file.
 - `auth_reported_score` — the functional score.
-- `clinvar_sig_2026`/`clinvar_star_2026` (or `_2025`/`_2018`, via `--clinvar-release`) — determines Pathogenic/LP vs. Benign/LB; `--min-clinvar-star` sets the trust threshold (default 1).
+- `clinvar_sig_2025`/`clinvar_star_2025` by default (or `_2026`/`_2018`, via `--clinvar-release`) — determines Pathogenic/LP vs. Benign/LB; `--min-clinvar-star` sets the trust threshold (default 1).
 - `gnomad_MAF` — non-missing ⇒ gnomAD/population member.
 - `simplified_consequence` — identifies synonymous variants; also drives splice filtering.
 - `splice_measure` (`Yes`/`No`) — if `No`, splice-consequence and SpliceAI-flagged rows are dropped.
@@ -66,4 +66,4 @@ MaveDB-style CSV with functional classification columns; used via `hpc/prepare.p
 
 Implementation: `src/assay_calibration/data_utils/dataset.py` — `BasicScoreset`, `Scoreset`, `MultiScoreset`, `BasicMultiScoreset`.
 
-> Multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `hpc/prepare.py multivariate`) and calibration of computational predictor scores like REVEL/AlphaMissense (`hpc/prepare.py predictor-mv`, `predictor_mv_utils.py`) are also supported but not yet documented here. Ask in the repo/issues if you want to use either.
+> **Experimental, unpublished:** the code also includes multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `hpc/prepare.py multivariate`) and calibration of computational predictor scores like REVEL/AlphaMissense (`hpc/prepare.py predictor-mv`, `predictor_mv_utils.py`). Neither is described in the ExCALIBR manuscript, documented here or supported yet, and both may change without notice. Ask in the repo/issues if you want to use either.
