@@ -203,7 +203,8 @@ def gene_page(gene, gene_set, dataset, out_dir, pdf):
         ax.set_title(f"(d) rows per stratum (red = calibration, arm {an.strata_arm})\n{cap_note}", fontsize=9, loc="left")
     else:
         SA = np.asarray(ms._sample_assignments, bool)
-        sn = list(getattr(ms, "sample_names", None) or [f"sample {i}" for i in range(SA.shape[1])])
+        sn = list(getattr(ms, "sample_names", None) or [])
+        sn += [f"sample {i}" for i in range(len(sn), SA.shape[1])]  # e.g. no name for an empty synonymous sample
         ax.barh(range(SA.shape[1]), SA.sum(0), color=["#c0392b" if i < 2 else "#aaa" for i in range(SA.shape[1])])
         ax.set_yticks(range(SA.shape[1])); ax.set_yticklabels(sn[:SA.shape[1]], fontsize=7)
         ax.set_xscale("log"); ax.invert_yaxis()

@@ -39,7 +39,7 @@ sys.path.insert(0, str(_THIS.parents[1]))
 sys.path.insert(0, str(_THIS.parent))
 
 from src.assay_calibration.fit_utils.fit import Fit
-from predictor_mv_utils import (
+from src.assay_calibration.multivariate_data.predictors import (
     PREDICTORS, PREDICTOR_DATASET_NAMES,
     load_predictor_data, df_to_basic_scoreset,
 )

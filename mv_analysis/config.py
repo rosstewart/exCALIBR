@@ -495,6 +495,23 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
     if gene_set == "combined" and getattr(ms, "combined_population", None) == "intersection":
         from src.assay_calibration.multivariate_data.combined import restrict_to_both_modalities
         restrict_to_both_modalities(ms)
+    return with_fitted_phenotype_samples(ms, gene, gene_set, cluster_idx, results_json)
+
+
+def with_fitted_phenotype_samples(ms, gene, gene_set, cluster_idx=0, results_json=None):
+    """Genes with phenotype-specific groups (phenotype_samples.
+    PHENOTYPE_SAMPLE_GROUPS, e.g. RET's MEN2 / Hirschsprung) are fit with
+    them as extra samples (hpc/prepare.py). Rebuild them whenever the stored
+    fit has those sample rows (older post hoc runs do not), so the data --
+    and any bootstrap split regenerated from it -- is the fit's. Pathogenic
+    evidence is unaffected: it uses the P/LP sample only."""
+    from mv_analysis.phenotype_samples import phenotype_roles, with_phenotype_samples
+    roles = phenotype_roles(gene_set, gene)
+    if not roles:
+        return ms
+    n_fit = _stored_fit_n_samples(gene, gene_set, cluster_idx, results_json)
+    if n_fit is not None and n_fit > max(roles.values()) and len(ms.sample_assignments[0]) < n_fit:
+        ms = with_phenotype_samples(ms, gene_set, gene)
     return ms
 
 
@@ -594,9 +611,29 @@ def _restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 
     return ms
 
 
+def _stored_fit_n_samples(gene, gene_set, cluster_idx, results_json=None):
+    """Number of sample weight rows of the stored fit for this gene/cluster
+    (the samples it was fit with), or None if absent."""
+    entry = _stored_fit_entry(gene, gene_set, cluster_idx, results_json)
+    return None if entry is None else len(entry["fit"]["weights"])
+
+
 def _stored_fit_dims(gene, gene_set, cluster_idx, results_json=None):
     """(assay_datasets or None, n_dims) of the stored fit for this gene/
     cluster in `results_json` (default PAPER_RESULTS_JSON), or None if absent."""
+    entry = _stored_fit_entry(gene, gene_set, cluster_idx, results_json)
+    if entry is None:
+        return None
+    fit = entry["fit"]
+    # + categorical dims (experimental location-model fits keep them out of
+    # the continuous component_params)
+    n_cat = len((fit.get("cat_spec") or {}).get("positions", []))
+    return entry.get("assay_datasets"), len(fit["component_params"][0][0]) + n_cat
+
+
+def _stored_fit_entry(gene, gene_set, cluster_idx, results_json=None):
+    """The first stored bootstrap entry with a fit for this gene/cluster in
+    `results_json` (default PAPER_RESULTS_JSON), or None if absent."""
     results_json = results_json or PAPER_RESULTS_JSON
     try:
         from mv_analysis.gene_performance_scatter import _load_raw
@@ -613,10 +650,7 @@ def _stored_fit_dims(gene, gene_set, cluster_idx, results_json=None):
         for entry in (b or {}).values():
             fit = (entry or {}).get("fit") if isinstance(entry, dict) else None
             if fit and fit.get("component_params"):
-                # + categorical dims (experimental location-model fits keep
-                # them out of the continuous component_params)
-                n_cat = len((fit.get("cat_spec") or {}).get("positions", []))
-                return entry.get("assay_datasets"), len(fit["component_params"][0][0]) + n_cat
+                return entry
     return None
 
 

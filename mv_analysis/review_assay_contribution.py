@@ -75,23 +75,31 @@ def _ms(key):
     return ms
 
 
-def score_masked(key, masked=()):
-    """(L, priors, seeds) with readouts `masked` marginalized out."""
+def score_masked(key, masked=(), ms=None, rows_tag=None):
+    """(L, priors, seeds) with readouts `masked` marginalized out.
+
+    ms / rows_tag: score this MultiScoreset instead of the model's own (e.g.
+    the model's rows plus every other measured variant,
+    variant_tables._ExtendedMS; rows outside the samples change no estimate),
+    cached separately under `rows_tag`. With nothing masked it is then scored
+    too, rather than read from the model's mv.npz."""
     from mv_analysis.gene_performance_scatter import fast_results_json
     from mv_analysis.mv_cockpit import DEFAULT_RUN_KWARGS
     from src.assay_calibration.multivariate_analysis import mv_calibration as mvc
     from src.assay_calibration.multivariate_analysis.gene_set_analysis import build_gene_set_analysis
     masked = tuple(sorted(masked))
-    if not masked:
+    if ms is not None and not rows_tag:
+        raise ValueError("score_masked: a custom ms needs its own rows_tag (cache key)")
+    if not masked and ms is None:
         mv = R.mv_npz(key)
         return mv["L"], mv["priors"], mv["seeds"]
     tag = hashlib.md5("|".join(masked).encode()).hexdigest()[:12]
-    f = CACHE / key / f"{tag}.npz"
+    f = CACHE / key / (f"{tag}.npz" if ms is None else f"{rows_tag}_{tag}.npz")
     if f.exists():
         z = np.load(f)
         return z["L"], z["priors"], z["seeds"]
     _, m = R.prep(key)
-    ms = _MaskedMS(_ms(key), masked)
+    ms = _MaskedMS(_ms(key) if ms is None else ms, masked)
     rj = config.PAPER_RESULTS_JSON
     an = build_gene_set_analysis(ms, m["gene"].lower(), rj, dataset_name=m["dataset_name"], gene_set=m["gene_set"])
     an.configs = [m["config"]]

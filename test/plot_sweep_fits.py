@@ -39,8 +39,8 @@ _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parent))
 sys.path.insert(0, str(_THIS.parents[1]))
 
-from visualize_fit import _sn_logpdf
-from predictor_mv_utils import (
+from src.assay_calibration.multivariate_analysis.visualize_fit import _sn_logpdf
+from src.assay_calibration.multivariate_data.predictors import (
     load_predictor_ms, load_predictor_data, df_to_basic_scoreset,
 )
 

@@ -1384,7 +1384,26 @@ def _build_gene_set_ms_map(gene_set, args):
     ``--gene-set`` values other than "integrated" (the pre-existing,
     untouched BRCA1/PTEN/MSH2/pillar-project path in run_multivariate).
     Returns {gene: MultiScoreset/BasicMultiScoreset}.
+
+    Genes with phenotype-specific groups (mv_analysis.phenotype_samples.
+    PHENOTYPE_SAMPLE_GROUPS, e.g. RET's MEN2 / Hirschsprung) get each group as
+    its own sample after the four standard ones, as CARD11's BENTA / CADINS.
+    The variants also stay in P/LP, so each bootstrap's one-hot resolution
+    puts a variant in one of its samples; P/LP evaluation is unchanged and
+    mv_analysis.phenotype_evidence reads the fitted rows. args.posthoc_phenotypes
+    skips this (groups then estimated post hoc on the frozen components).
     """
+    ms_map = _build_gene_set_ms_map_base(gene_set, args)
+    if not getattr(args, "posthoc_phenotypes", False):
+        from mv_analysis.phenotype_samples import phenotype_roles, with_phenotype_samples
+        for gene in list(ms_map):
+            if phenotype_roles(gene_set, gene):
+                ms_map[gene] = with_phenotype_samples(ms_map[gene], gene_set, gene)
+    return ms_map
+
+
+def _build_gene_set_ms_map_base(gene_set, args):
+    """_build_gene_set_ms_map before the phenotype-specific samples."""
     if gene_set == "fgfr":
         from src.assay_calibration.multivariate_data.fgfr import build_fgfr_multiscoresets
         return build_fgfr_multiscoresets(
@@ -1403,19 +1422,8 @@ def _build_gene_set_ms_map(gene_set, args):
 
     if gene_set == "labelseq":
         from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
-        ms_map = build_labelseq_multiscoresets(
+        return build_labelseq_multiscoresets(
             regularization_type=getattr(args, "regularization_type", None))
-        if "ret" in ms_map and not getattr(args, "ret_posthoc_phenotypes", False):
-            # RET's MEN2 / Hirschsprung groups enter the fit as their own
-            # samples (roles 4, 5), as CARD11's BENTA / CADINS do. The variants
-            # also stay in role 0 (P/LP), so each bootstrap's one-hot
-            # resolution puts a variant in one of its samples; P/LP evaluation
-            # is unchanged. mv_analysis.phenotype_evidence reads the fitted rows.
-            from mv_analysis.phenotype_evidence import (
-                _with_phenotype_samples, ret_phenotype_masks, RET_PHENOTYPE_ROLES)
-            ms_map["ret"] = _with_phenotype_samples(
-                ms_map["ret"], ret_phenotype_masks(ms_map["ret"]), RET_PHENOTYPE_ROLES)
-        return ms_map
 
     if gene_set == "card11":
         from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset

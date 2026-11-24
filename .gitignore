@@ -35,3 +35,8 @@ analysis/oddspath_computation/igvf-scalable-vus-resolution
 analysis/oddspath_computation/output
 tests/cfusn_simulations/results
 mv_analysis/comparison_methods/P-KNN
+
+analysis/prior_simulation/manuscript_edits.py
+analysis/prior_simulation/supp_prior_theory.tex
+
+docs/prompts

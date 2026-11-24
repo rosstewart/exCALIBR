@@ -39,7 +39,7 @@ sys.path.insert(0, str(_THIS.parents[1]))
 sys.path.insert(0, str(_THIS.parent))
 
 from src.assay_calibration.fit_utils.fit import Fit
-from predictor_mv_utils import load_predictor_ms
+from src.assay_calibration.multivariate_data.predictors import load_predictor_ms
 
 
 def fit_for_config(beta, init_strategy, ms, K=3, latent_q=2, num_fits=None,

@@ -67,7 +67,9 @@ sys.path.insert(0, str(REPO))
 from mv_analysis import config  # noqa: E402
 from mv_analysis.comparison_methods import pknn_runs as RP  # noqa: E402
 
-OUT = Path(config.PKNN_DIR) / "production_oob"
+# $MV_PRODUCTION_OOB_DIR: another output directory (the LABEL-seq report keeps
+# its own, mv_analysis/labelseq_report.py)
+OUT = Path(os.environ.get("MV_PRODUCTION_OOB_DIR") or Path(config.PKNN_DIR) / "production_oob")
 N_CAL = 10
 
 
@@ -78,17 +80,24 @@ def _single_threaded():
     threadpool_limits(1)
 
 
-def keys_with_both_classes(keys=None):
+def keys_with_both_classes(keys=None, include_nu=False):
+    """Prep keys with both control classes (the paper's evaluation); with
+    include_nu, also models with no P/LP controls (negative-unlabelled), whose
+    joint-model out-of-bag points (_mv_one) are still defined."""
     out = []
     for p in sorted((Path(config.PKNN_DIR) / "prep").glob("*.json")):
         m = json.load(open(p))
-        if (keys is None or m["key"] in keys) and m["eval_P"] > 0 and m["eval_B"] > 0 and config.paper_includes(m["key"]):
+        if (keys is None or m["key"] in keys) and (m["eval_P"] > 0 or include_nu) and m["eval_B"] > 0 \
+                and config.paper_includes(m["key"]):
             out.append(m["key"])
     return out
 
 
-def _mv_one(key):
-    """MV per-split log LR+, per-split priors and OOB masks -> <key>/mv.npz."""
+def _mv_one(key, split_fits_dir=None):
+    """MV per-split log LR+, per-split priors and OOB masks -> <key>/mv.npz.
+    split_fits_dir: the condition directory the model's fits came from (e.g.
+    <run>/tau_0), whose job pickles give the exact bootstrap splits; by
+    default the paper fits directory, falling back to regenerating them."""
     _single_threaded()
     from mv_analysis.gene_performance_scatter import fast_results_json
     from mv_analysis.mv_cockpit import DEFAULT_RUN_KWARGS
@@ -136,9 +145,9 @@ def _mv_one(key):
     # otherwise regenerate (valid only for the default sample x pattern
     # scheme, i.e. the paper fits, whose pickles are not kept locally).
     try:
-        splits = RP.job_pickle_oob_splits(meta["dataset_name"], kept)
+        splits = RP.job_pickle_oob_splits(meta["dataset_name"], kept, fits_dir=split_fits_dir)
     except (FileNotFoundError, KeyError):
-        if config.STRATA:
+        if config.STRATA or split_fits_dir is not None:
             raise
         splits = RP._paper_oob_splits(ms, kept, K)
     oob = np.zeros((len(kept), L.shape[1]), bool)

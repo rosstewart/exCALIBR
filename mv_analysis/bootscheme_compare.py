@@ -8,6 +8,7 @@ results in tau_0.1/). Aggregate each condition first:
     python -m mv_analysis.bootscheme_compare score <condition dir>   # one condition (own process)
     python -m mv_analysis.bootscheme_compare all <root> [--workers 4]
     python -m mv_analysis.bootscheme_compare compare <root> [<root2> ...]
+    python -m mv_analysis.bootscheme_compare annotate <condition dir>   # add consequence columns to an old CSV
 
 ``compare`` takes several bundle roots, e.g. the Phase 2a bundle and the
 standard-model companion (jobs_v2_standard_*, scheme label "standard"), and
@@ -35,6 +36,57 @@ import numpy as np
 import pandas as pd
 
 
+def _ds_parse(ds):
+    """(gene, gene set, cluster index) of a fitted dataset name."""
+    gene = ds.split("_")[0]
+    rest = ds[len(gene) + 1:]
+    gs = ("fgfr" if "_fgfr_" in ds else "predictor" if rest.startswith("predictors")
+          else "integrated" if rest.startswith(("mv", "cluster")) else rest.split("_")[0])
+    cl = int(rest.split("_cluster")[1].split("_")[0]) - 1 if "_cluster" in rest else 0
+    return gene, gs, cl
+
+
+_DF_CACHE = {}
+
+
+def _row_classes(ms, gene):
+    """Per ms row: consequence class (missense / PTV / synonymous / other) and
+    splice flag (SpliceAI > 0.2, only possible in splice-detecting assays),
+    from the same function the strata are built with."""
+    import pandas as _pd
+    from src.assay_calibration.fit_utils.strata import row_annotations
+    df = None
+    if getattr(ms, "_row_atoms", None) is not None and getattr(ms, "row_meta", None) is None:
+        from src.assay_calibration.multivariate_data.combined import DEFAULT_INTEGRATED_DATAFRAME as P
+        if P not in _DF_CACHE:
+            _DF_CACHE[P] = _pd.read_csv(P, sep="\t", low_memory=False)
+        df = _DF_CACHE[P]
+    return row_annotations(ms, df, gene=gene)
+
+
+def annotate(cond):
+    """Add consequence / splice columns to an existing <cond>/bootscheme_oob.csv
+    (rows were scored before score() wrote them); no rescoring."""
+    os.environ["MV_PAPER_FITS_DIR"] = str(cond)
+    warnings.filterwarnings("ignore")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from mv_analysis import config
+    f = Path(cond) / "bootscheme_oob.csv"
+    d = pd.read_csv(f)
+    cons, spl = np.empty(len(d), object), np.zeros(len(d), bool)
+    for ds, idx in d.groupby("dataset").groups.items():
+        gene, gs, cl = _ds_parse(ds)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ms = config.build_ms_for_gene_cluster(gs, gene, cluster_idx=cl, results_json=config.PAPER_RESULTS_JSON)
+        a = _row_classes(ms, gene)
+        r = d.loc[idx, "row"].to_numpy()
+        cons[idx] = a["consequence"].to_numpy()[r]
+        spl[idx] = a["splice"].to_numpy()[r]
+    d["consequence"], d["splice"] = cons, spl
+    d.to_csv(f, index=False)
+    print(f"{cond}: annotated {len(d)} rows")
+
+
 def score(cond):
     os.environ["MV_PAPER_FITS_DIR"] = str(cond)
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -53,15 +105,22 @@ def score(cond):
     rj = config.PAPER_RESULTS_JSON
     with gzip.open(rj, "rt") as f:
         keys = sorted(json.load(f).keys())
+    # MV_SCORE_TAG=<tag>: write bootscheme_oob_<tag>.csv (e.g. a consequence-
+    # specific arm scored with MV_STRATA_ARM=<arm> MV_STRATA_EVAL_ARM=pooled).
+    # MV_PRIOR_FROM_CSV=<csv>: take each control's prior threshold from that
+    # earlier scoring (e.g. the pooled arm's bootscheme_oob.csv) instead of
+    # this arm's own prior.
+    tag = os.environ.get("MV_SCORE_TAG")
+    prior_thr = None
+    if os.environ.get("MV_PRIOR_FROM_CSV"):
+        pc = pd.read_csv(os.environ["MV_PRIOR_FROM_CSV"])
+        prior_thr = {(r.dataset, r.config, int(r.row)): float(r.thr1) for r in pc.itertuples()}
     rows = []
     for ds in keys:
-        gene = ds.split("_")[0]
-        rest = ds[len(gene) + 1:]
-        gs = ("fgfr" if "_fgfr_" in ds else "predictor" if rest.startswith("predictors")
-              else "integrated" if rest.startswith(("mv", "cluster")) else rest.split("_")[0])
-        cl = int(rest.split("_cluster")[1].split("_")[0]) - 1 if "_cluster" in rest else 0
+        gene, gs, cl = _ds_parse(ds)
         with contextlib.redirect_stdout(io.StringIO()):
             ms = config.build_ms_for_gene_cluster(gs, gene, cluster_idx=cl, results_json=rj)
+            ann = _row_classes(ms, gene)
             an = build_gene_set_analysis(ms, gene.lower(), rj, dataset_name=ds, gene_set=gs)
         seeds = [int(k) for k in an.raw_boots]
         valid, orig = [], mvc._bootstrap_job
@@ -99,6 +158,10 @@ def score(cond):
                     continue
                 lv = L[o, j]
                 lc = _log_c(round(float(np.median(priors[o])), 4))
+                if prior_thr is not None:
+                    if (ds, cfg, int(j)) not in prior_thr:
+                        continue
+                    lc = 8 * prior_thr[(ds, cfg, int(j))]
                 lo, hi, med = np.nanpercentile(lv, 5), np.nanpercentile(lv, 95), np.nanmedian(lv)
                 pts = 0
                 for pv in an.point_values:
@@ -111,8 +174,9 @@ def score(cond):
                 if pts == 0:
                     why = "spread" if abs(med) >= lc / 8 else "median"
                 rows.append(dict(dataset=ds, gene_set=gs, config=cfg, row=int(j), label=int(y), n_oob=int(o.sum()),
-                                 points=pts, med_log_lr=med, p5=lo, p95=hi, thr1=lc / 8, withheld=why))
-    out = Path(cond) / "bootscheme_oob.csv"
+                                 points=pts, med_log_lr=med, p5=lo, p95=hi, thr1=lc / 8, withheld=why,
+                                 consequence=ann["consequence"].iat[j], splice=bool(ann["splice"].iat[j])))
+    out = Path(cond) / (f"bootscheme_oob_{tag}.csv" if tag else "bootscheme_oob.csv")
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"{cond}: {len(rows)} rows -> {out}")
 
@@ -144,6 +208,17 @@ def _summ(d):
                           withheld_spread=(d.withheld == "spread").mean()))
 
 
+def _summ_conf(d):
+    """_summ plus the full confusion table: P/LP and B/LB controls by call
+    (pathogenic evidence / none / benign evidence)."""
+    s = _summ(d)
+    P, B = d[d.label == 1], d[d.label == 0]
+    s["n_plp"], s["n_blb"] = len(P), len(B)
+    s["plp_path"], s["plp_none"], s["plp_ben"] = (P.points > 0).sum(), (P.points == 0).sum(), (P.points < 0).sum()
+    s["blb_path"], s["blb_none"], s["blb_ben"] = (B.points > 0).sum(), (B.points == 0).sum(), (B.points < 0).sum()
+    return s
+
+
 def compare(*roots):
     root = roots[0]
     frames = []
@@ -172,15 +247,24 @@ def compare(*roots):
     print(per.to_string()); print(); print(pooled.to_string())
     per.to_csv(Path(root) / "bootscheme_per_dataset.csv")
     pooled.to_csv(Path(root) / "bootscheme_pooled.csv")
+    if "consequence" in D.columns and D["consequence"].notna().all():
+        D = D.assign(cclass=D["consequence"].astype(str) + np.where(D["splice"].astype(bool), " (splice)", ""))
+        byc = D.groupby(["scheme", "config", "cclass"]).apply(_summ_conf).round(3)
+        byc_ds = D.groupby(["scheme", "config", "dataset", "cclass"]).apply(_summ_conf).round(3)
+        print(); print(byc.to_string())
+        byc.to_csv(Path(root) / "bootscheme_by_consequence.csv")
+        byc_ds.to_csv(Path(root) / "bootscheme_by_consequence_per_dataset.csv")
+    else:
+        print("no consequence columns (run `annotate` on each condition): consequence breakdown skipped")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["score", "all", "compare"])
+    ap.add_argument("cmd", choices=["score", "annotate", "all", "compare"])
     ap.add_argument("path", nargs="+")
     ap.add_argument("--workers", type=int, default=4)
     a = ap.parse_args()
     if a.cmd != "compare" and len(a.path) != 1:
         ap.error(f"{a.cmd} takes one path")
-    {"score": lambda: score(a.path[0]), "all": lambda: all_(a.path[0], a.workers),
+    {"score": lambda: score(a.path[0]), "annotate": lambda: annotate(a.path[0]), "all": lambda: all_(a.path[0], a.workers),
      "compare": lambda: compare(*a.path)}[a.cmd]()

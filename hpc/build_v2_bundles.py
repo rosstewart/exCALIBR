@@ -1,6 +1,6 @@
 """Build the v2 cluster bundles (data only; the user submits).
 
-    nice -n 19 python hpc/build_v2_bundles.py {bootscheme|standard|standard_n5|kdiag|kdiag_standard} <root>
+    nice -n 19 python hpc/build_v2_bundles.py {bootscheme|standard|standard_n5|standard_sample|kdiag|kdiag_standard} <root>
     nice -n 19 python hpc/build_v2_bundles.py {production|production_standard} <root> <components.json> "<scheme args>"
 
   bootscheme  Phase 2a: bootstrap-scheme comparison on real data.
@@ -14,9 +14,13 @@
               Same seeds and rows as Phase 2a, so its resamples match S0's.
   standard_n5 Standard model, sample x pattern with patterns < 5 rows merged
               (S2n5's rule on the 4 samples). Condition <root>/standard_n5/<subrun>.
+  standard_sample  Standard model, resampling within each sample only (no pattern).
+              Condition <root>/standard_sample/<subrun>.
   kdiag_standard  K diagnostic for the standard model (4 samples, sample x pattern),
               plus a strata refit of PALB2 and GCK (<root>/integrated_strata_refit).
   production_standard  Phase 6 for the standard model (same arguments as production).
+  combine     Merge built bundles into one job array:
+              python hpc/build_v2_bundles.py combine <root> <prefix>=<bundle> ...
   production  Phase 6: python hpc/build_v2_bundles.py production <root> <components.json> "<scheme args>"
   kdiag       Phase 3: component diagnostic. Every MV gene set of the paper
               (integrated, tp53, fgfr, tsc2, predictor-mv, combined) at K = 2..6,
@@ -105,6 +109,13 @@ def standard_n5(root):
     standard(root, "standard_n5", ["--bootstrap-scheme", "stratum_pattern", "--bootstrap-min-cell", "5"])
 
 
+def standard_sample(root):
+    """Standard model, resampling within each of the 4 samples only (no
+    readout-pattern stratification; the analogue of the strata model's S1).
+    Condition <root>/standard_sample/<subrun>."""
+    standard(root, "standard_sample", ["--bootstrap-scheme", "stratum"])
+
+
 ALL_SUBRUNS = {"integrated": ["integrated"], "tp53": ["tp53"], "fgfr": ["fgfr"], "tsc2": ["tsc2"],
                "predictor": ["predictor-mv"], "combined": ["combined"]}
 
@@ -144,11 +155,53 @@ def production(root, components_file, scheme_args, strata=True):
     merge(root, labels, 100)
 
 
+def combine(root, sources):
+    """Copy already-built bundles into one bundle with a single job array.
+    sources: [(prefix, bundle root)]; each bundle's condition directories are
+    copied to <root>/<prefix>/ and its jobs re-tagged "<prefix>/<condition>"
+    (prefix "" keeps the tags, e.g. "standard/tp53/tau_0.1"). Results then
+    land in <root>/<prefix>/<condition>/<dataset>/. The source bundles are
+    left untouched. n_bootstraps in the index is the largest of the sources'."""
+    import json
+    import shutil
+    import prepare as P
+    all_jobs, order, n_boot = [], [], 0
+    for prefix, src in sources:
+        src = Path(src)
+        with open(src / "jobs" / "job_index.json") as f:
+            idx = json.load(f)
+        n_boot = max(n_boot, idx["n_bootstraps"])
+        tag = (lambda c: f"{prefix}/{c}") if prefix else (lambda c: c)
+        order += [tag(c) for c in idx["condition_order"]]
+        for a in sorted((src / "jobs").glob("array_*.pkl")):
+            with open(a, "rb") as f:
+                cj = pickle.load(f)
+            for j in cj:
+                j["condition"] = tag(j["condition"])
+            all_jobs.extend(cj)
+        for p in src.iterdir():
+            if p.name in ("jobs", "datasets.txt") or p.suffix == ".log":
+                continue
+            dst = root / prefix / p.name
+            if p.is_dir():
+                shutil.copytree(p, dst)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, dst)
+    if len({j["condition"] for j in all_jobs}) != len(set(order)):
+        raise SystemExit("condition tags collide or are missing from condition_order")
+    P._save_manifest(str(root), all_jobs, 50, n_boot, {"condition_order": order})
+    print(f"{root}: {len(all_jobs)} jobs")
+
+
 if __name__ == "__main__":
     which = sys.argv[1]
     root = Path(sys.argv[2])
-    if which in ("production", "production_standard"):
+    if which == "combine":
+        # combine <root> <prefix>=<bundle root> ... (use "=<bundle root>" for no prefix)
+        combine(root, [tuple(a.split("=", 1)) for a in sys.argv[3:]])
+    elif which in ("production", "production_standard"):
         production(root, Path(sys.argv[3]), sys.argv[4], strata=which == "production")
     else:
         {"bootscheme": bootscheme, "kdiag": kdiag, "kdiag_standard": lambda r: kdiag(r, strata=False, refit_strata=KDIAG_STRATA_REFIT),
-         "standard": standard, "standard_n5": standard_n5}[which](root)
+         "standard": standard, "standard_n5": standard_n5, "standard_sample": standard_sample}[which](root)

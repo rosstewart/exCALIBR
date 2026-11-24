@@ -33,60 +33,17 @@ from mv_analysis.gene_3d_evidence import (
 from mv_analysis.gene_performance_scatter import fast_results_json, RUN_KWARGS
 from src.assay_calibration.multivariate_analysis.gene_set_analysis import build_gene_set_analysis
 
-# ---------------------------------------------------------------------------
-# RET: MEN2A/MEN2B (activating, pathway-activity-increasing) vs Hirschsprung
-# (loss-of-function, pathway-activity-decreasing) germline variants --
-# hand-curated variant lists (ported from this session's exploratory RET
-# temp-fit script), matched against ms.kept_variants via the same
-# protein-HGVS-suffix convention analysis/vus_reclassification.py's
-# build_hgvs3_index uses for LABEL-seq genes without genomic-coordinate
-# hgvs_c parsing.
-# ---------------------------------------------------------------------------
-_AA_1TO3 = {
-    "A": "Ala", "R": "Arg", "N": "Asn", "D": "Asp", "C": "Cys", "Q": "Gln", "E": "Glu",
-    "G": "Gly", "H": "His", "I": "Ile", "L": "Leu", "K": "Lys", "M": "Met", "F": "Phe",
-    "P": "Pro", "S": "Ser", "T": "Thr", "W": "Trp", "Y": "Tyr", "V": "Val", "*": "Ter",
-}
-
-RET_MEN2B_VARIANTS = ["M918T", "A883F"]
-RET_MEN2A_VARIANTS = ["S891A", "E768D", "L790F", "V804L", "K666E", "V804M", "M918V"]
-RET_HIRSCHSPRUNG_VARIANTS = ["L963P", "T946I", "R969W", "A877P", "R972G", "R873W", "S891L"]
-
-
-def _short_to_hgvs3(v: str) -> str:
-    ref, pos, alt = v[0], v[1:-1], v[-1]
-    return f"p.{_AA_1TO3[ref]}{pos}{_AA_1TO3[alt]}"
-
-
-def build_hgvs3_index(ms) -> Dict[str, int]:
-    """{protein-HGVS suffix -> row index}, matching
-    analysis.vus_reclassification.build_hgvs3_index's convention for
-    LABEL-seq genes without genomic coordinates."""
-    idx = {}
-    for i, kv in enumerate(ms.kept_variants):
-        s = kv[0] if isinstance(kv, tuple) else kv
-        idx[s.split(":", 1)[1] if ":" in s else s] = i
-    return idx
+# Phenotype groups fit as their own samples (RET's MEN2 / Hirschsprung, ...):
+# defined in mv_analysis.phenotype_samples, re-exported here.
+from mv_analysis.phenotype_samples import (  # noqa: E402,F401
+    RET_HIRSCHSPRUNG_VARIANTS, RET_MEN2A_VARIANTS, RET_MEN2B_VARIANTS, PHENOTYPE_SAMPLE_GROUPS,
+    _short_to_hgvs3, _with_phenotype_samples, build_hgvs3_index, phenotype_masks, phenotype_roles,
+    phenotype_sample_groups, with_phenotype_samples)
 
 
 def ret_phenotype_masks(ms) -> Dict[str, np.ndarray]:
-    """{"MEN2": mask, "Hirschsprung": mask} over ms's rows, from the
-    hand-curated variant lists above."""
-    hgvs3_index = build_hgvs3_index(ms)
-    n = ms.scores.shape[0]
-
-    def _mask(variants):
-        mask = np.zeros(n, dtype=bool)
-        for v in variants:
-            idx = hgvs3_index.get(_short_to_hgvs3(v))
-            if idx is not None:
-                mask[idx] = True
-        return mask
-
-    return {
-        "MEN2": _mask(RET_MEN2A_VARIANTS + RET_MEN2B_VARIANTS),
-        "Hirschsprung": _mask(RET_HIRSCHSPRUNG_VARIANTS),
-    }
+    """{"MEN2": mask, "Hirschsprung": mask} over ms's rows."""
+    return phenotype_masks(ms, "labelseq", "ret")
 
 
 def card11_phenotype_masks(ms, benta_role: int = 4, cadins_role: int = 5) -> Dict[str, np.ndarray]:
@@ -230,34 +187,11 @@ def plot_phenotype_evidence(
 # ret_stagedinit_men2_hirschsprung_combined_evidence.html) but computed from
 # the paper's canonical RET fit instead of that pre-fix staged-init K=6 fit.
 # ---------------------------------------------------------------------------
-RET_PHENOTYPE_ROLES = {"MEN2": 4, "Hirschsprung": 5}
+RET_PHENOTYPE_ROLES = phenotype_roles("labelseq", "ret")  # {"MEN2": 4, "Hirschsprung": 5}
 RET_PHENOTYPE_COLORS = {"MEN2": "#8B0000", "Hirschsprung": "#800080"}
 RET_AXIS_LABELS = {"ret_abundance_HSP90i": "Abundance (HSP90i)",
                    "ret_abundance_No_treatment": "Abundance",
                    "ret_activity_No_treatment": "Activity"}
-
-
-def _with_phenotype_samples(ms, masks: Dict[str, np.ndarray], roles: Dict[str, int]):
-    """Shallow copy of `ms` with one extra sample-assignment column per
-    phenotype group, at the fixed role index given in `roles` (4, 5, ...),
-    so MVCalibrationAnalysis's auxiliary-pathogenic path can address them.
-    The phenotype variants also stay in role 0 (P/LP), exactly as in the
-    fit itself."""
-    import copy
-    new = copy.copy(ms)
-    n_roles = max(roles.values()) + 1
-    sa = np.zeros((ms.scores.shape[0], max(n_roles, ms._sample_assignments.shape[1])), dtype=bool)
-    sa[:, :ms._sample_assignments.shape[1]] = ms._sample_assignments.astype(bool)
-    for name, role in roles.items():
-        sa[:, role] = masks[name]
-    new._sample_assignments = sa
-    new.sample_counts = sa.sum(axis=0)
-    names = list(getattr(ms, "_sample_names", []))
-    names += [""] * (sa.shape[1] - len(names))
-    for name, role in roles.items():
-        names[role] = name
-    new._sample_names = names
-    return new
 
 
 def _posthoc_phenotype_weights(fit_inner, X_by_group, n_iter: int = 500, tol: float = 1e-10):

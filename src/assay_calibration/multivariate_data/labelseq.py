@@ -13,19 +13,59 @@ import numpy as np
 import pandas as pd
 
 from ..data_utils.dataset import MultiScoreset
-from .common import build_multiscoreset_from_long_dataframe
+from .common import build_multiscoreset_from_long_dataframe, resolve_clinvar_release
 
 DEFAULT_DATA_PATH = "/data/ross/assay_calibration/labelseq/labelseq-annotated-20260529.flat.tsv.gz"
 
 
 def _labelseq_ms_cache_dir(data_path: str, log10_activity: bool,
-                            regularization_type: Optional[str] = None) -> Path:
+                            regularization_type: Optional[str] = None,
+                            fill_annotation: bool = False) -> Path:
     import os
     rel = os.environ.get("MV_CLINVAR_DEFAULT_RELEASE", "2025")
     tag = "" if rel == "2026" else f"_cv{rel}"  # pre-2026-11-19 caches hold 2026 labels
+    if fill_annotation:
+        tag += "_annfill"  # unfilled (legacy) caches keep their old names
     return Path(data_path).parent / (
         f".labelseq_ms_cache_log10act{log10_activity}_reg{regularization_type}{tag}"
     )
+
+
+# Nucleotide-level annotation joined per row in the annotated input. Some rows
+# miss it (their dna_clingen_allele_id is missing), so one nucleotide variant
+# can carry a ClinVar label in some assay rows and none in others (1,817 of
+# 8,768 ClinVar-2026-labelled nucleotide variants in the 20260529 file); the
+# per-readout scoresets then drop those rows from the labelled samples, and a
+# control loses that readout. Present values never conflict within a
+# nucleotide variant.
+_NUCLEOTIDE_ANNOTATION_PREFIXES = ("clinvar.", "clingen_evidence_repository.", "gnomad.")
+_NUCLEOTIDE_ANNOTATION_COLUMNS = ("dna_clingen_allele_id",)
+
+
+def fill_annotation_default() -> bool:
+    """Fill missing nucleotide annotation (fill_nucleotide_annotation) for
+    every run except legacy ones: $MV_ROW_BUILDER == "legacy" (set by
+    mv_analysis.config for runs without a row_builder.txt marker, e.g. the
+    archived LABEL-seq run) keeps the rows those fits were trained on."""
+    import os
+    return os.environ.get("MV_ROW_BUILDER", "v2") != "legacy"
+
+
+def fill_nucleotide_annotation(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy each nucleotide variant's annotation (ClinVar, ClinGen evidence,
+    gnomAD, allele ID) to all of its rows: within a gene, rows with the same
+    mapped_hgvs_c get the value present on any of them. Raises if two rows of
+    one nucleotide variant hold different values."""
+    cols = [c for c in df.columns
+            if c.startswith(_NUCLEOTIDE_ANNOTATION_PREFIXES) or c in _NUCLEOTIDE_ANNOTATION_COLUMNS]
+    key = ["protein", "mapped_hgvs_c"]
+    g = df.groupby(key, dropna=True)[cols]
+    n = g.nunique(dropna=True)
+    conflict = [c for c in cols if (n[c] > 1).any()]
+    if conflict:
+        raise ValueError(f"nucleotide variants with conflicting annotation in {conflict[:5]}")
+    df[cols] = df[cols].fillna(g.transform("first"))
+    return df
 
 
 def _labelseq_gene_cache_path(cache_dir: Path, gene: str) -> Path:
@@ -60,6 +100,7 @@ def _parse_first_hgvs_c(x):
 
 def build_labelseq_dataframe(
     data_path: str = DEFAULT_DATA_PATH, log10_activity: bool = True,
+    fill_annotation: Optional[bool] = None,
 ) -> pd.DataFrame:
     """Build the processed LABEL-seq variant dataframe, one row per
     (variant, assay, assay_treatment), with a per-row ``Dataset`` column
@@ -70,10 +111,16 @@ def build_labelseq_dataframe(
     0.03-45.5), unlike "abundance"/"interaction". When True (default),
     log10-transforms `auth_reported_score` in place for activity rows only
     -- before this, MV bootstrap fits used the raw linear scale.
+
+    ``fill_annotation``: copy each nucleotide variant's ClinVar / gnomAD
+    annotation to all of its rows (fill_nucleotide_annotation); default
+    fill_annotation_default() (every run but legacy ones).
     """
     df = pd.read_csv(data_path, sep="\t")
 
     df = df[(df["Mutation"] != "standard") & (df["variant"] != "WT")].copy()
+    if fill_annotation_default() if fill_annotation is None else fill_annotation:
+        df = fill_nucleotide_annotation(df)
 
     df["auth_reported_score"] = df["average score"]
     if log10_activity:
@@ -175,7 +222,8 @@ def build_labelseq_multiscoresets(
     to the ingestion logic itself, which the mtime check can't detect).
     """
     explicit_df = df_labelseq is not None
-    cache_dir = _labelseq_ms_cache_dir(data_path, log10_activity, regularization_type)
+    fill = fill_annotation_default()
+    cache_dir = _labelseq_ms_cache_dir(data_path, log10_activity, regularization_type, fill)
 
     def _cache_fresh(gene: str) -> bool:
         p = _labelseq_gene_cache_path(cache_dir, gene)
@@ -200,7 +248,7 @@ def build_labelseq_multiscoresets(
             return gene_ms
 
     if df_labelseq is None:
-        df_labelseq = build_labelseq_dataframe(data_path, log10_activity=log10_activity)
+        df_labelseq = build_labelseq_dataframe(data_path, log10_activity=log10_activity, fill_annotation=fill)
 
     gene_to_datasets: Dict[str, list] = {}
     for assay in df_labelseq.Dataset.unique():
@@ -218,10 +266,15 @@ def build_labelseq_multiscoresets(
         # every assay (however few sample classes) and every gene (even a
         # single assay) was kept, unlike the integrated-dataframe pipeline's
         # default (min_samples=2, min_dims=2).
+        # controls from the run's ClinVar release ($MV_CLINVAR_DEFAULT_RELEASE,
+        # default 2025; the cache directory is keyed by it). Scoreset's own
+        # default is always 2025, so without this a fresh build ignored the
+        # setting and only an old cache gave 2026 labels.
+        kw = {"clinvar_release": resolve_clinvar_release(gene)}
+        if regularization_type:
+            kw["regularization_type"] = regularization_type
         ms = build_multiscoreset_from_long_dataframe(
-            df_labelseq, gene, datasets, min_samples=1, min_dims=1,
-            scoreset_kwargs={"regularization_type": regularization_type}
-            if regularization_type else None,
+            df_labelseq, gene, datasets, min_samples=1, min_dims=1, scoreset_kwargs=kw,
         )
         if ms is not None:
             gene_ms[gene] = ms

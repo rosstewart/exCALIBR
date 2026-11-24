@@ -9,6 +9,11 @@ A consequence arm is used only where its calibration succeeded and the dataset h
 consequence; otherwise the strategy's default arm scores the variant. Counts are per measurement.
 
     python -m csq_analysis.metrics <fit_dir> --config S1_m5_R20 --mapping lp_anchored [--min 3] [--oob]
+
+--std <calib_dir> scores the separate-sample standard refits instead (in-bag only), on the same rows: calib_dir holds
+run_igvf_batch outputs <arm>_<mapping>/<dataset>/ for arm in std_pool / std_mis / std_misctl, and the strategies are
+pool (std_pool everywhere), mis:std_mis and mis:std_misctl (missense -> that refit, else std_pool).
+    python -m csq_analysis.metrics <fit_dir> --std <calib_dir> --mapping lp_anchored
 """
 from __future__ import annotations
 
@@ -33,17 +38,38 @@ def strategies():
     return s
 
 
+STD_STRATS = {"pool": {}, "mis:std_mis": {"missense": "std_mis"}, "mis:std_misctl": {"missense": "std_misctl"},
+              "mis:std_misctl_bref": {"missense": "std_misctl_bref"}}   # bref: --force-benign-reference (B/LB missense only)
+
+
+def std_loader(calib_dir, mapping):
+    """loader(arm, ds) for points() on run_igvf_batch outputs; arm "pool" is std_pool."""
+    import json
+    from pathlib import Path
+
+    def load(arm, ds):
+        d = Path(calib_dir) / f"{'std_pool' if arm == 'pool' else arm}_{mapping}" / ds
+        f = sorted(d.glob("*_calibration.json")) if d.exists() else []
+        if not f:
+            return None
+        c = json.loads(f[0].read_text())
+        ok = any(c.get("point_ranges", {}).values())
+        return dict(c, status="ok" if ok else "empty")   # empty: calibrated, but no score earns evidence
+    return load
+
+
 def _ranges(cal):
     if not cal or cal.get("status") != "ok":
         return None
     return {int(k): [(float(a), float(b)) for a, b in v] for k, v in cal["point_ranges"].items() if v}
 
 
-def points(fit_dir, cfgname, mapping, rows, min_n=3, strats=None, oob=False):
+def points(fit_dir, cfgname, mapping, rows, min_n=3, strats=None, oob=False, loader=None):
     """Long table, one row per scored variant (controls and VUS) of every dataset in rows, with one points column
     per strategy, plus csq / plp / blb / vus / dataset. rows must be the fit dir's rows.pkl (row order within a
     dataset = strata row positions). oob: controls take their out-of-bag points where the arm's calibration has
-    them (calibrate --oob), else in-bag; VUS are never fitted, so they always take the full calibration's points."""
+    them (calibrate --oob), else in-bag; VUS are never fitted, so they always take the full calibration's points.
+    loader(arm, ds) -> calibration dict replaces the strata calibration lookup (std_loader)."""
     from src.assay_calibration.fit_utils.fit import assign_points
     from csq_analysis.calibrate import load
     strats = strats or strategies()
@@ -51,10 +77,12 @@ def points(fit_dir, cfgname, mapping, rows, min_n=3, strats=None, oob=False):
     out = []
     n_missing_oob = 0
     for ds, r in rows.groupby("dataset", sort=False):
-        cals = {a: load(fit_dir, cfgname, a, mapping, ds) for a in arms}
+        cals = {a: (loader(a, ds) if loader else load(fit_dir, cfgname, a, mapping, ds)) for a in arms}
         rng = {a: _ranges(c) for a, c in cals.items()}
         if rng["pool"] is None:
-            continue
+            if (cals["pool"] or {}).get("status") != "empty":
+                continue
+            rng["pool"] = {}   # uncalibratable dataset: every control counted with 0 points
         x = r.score.to_numpy(float)
         pts = {}
         for a, v in rng.items():
@@ -93,6 +121,7 @@ def summarise(t, strats):
     rows = []
     sets = {"all": t.plp | t.blb, "missense": (t.plp | t.blb) & t.csq.eq("missense"),
             "PTV": t.plp & t.csq.eq("PTV"), "non-missense": (t.plp | t.blb) & t.csq.ne("missense")}
+    vsets = {"all": t.vus, "missense": t.csq.eq("missense"), "PTV": t.csq.eq("PTV"), "non-missense": t.csq.ne("missense")}
     for sname, sel in sets.items():
         sub = t[sel]
         for s in strats:
@@ -104,7 +133,7 @@ def summarise(t, strats):
             rows.append(dict(controls=sname, strategy=s, n_plp=len(v_p), n_blb=len(v_b), TP=int((v_p > 0).sum()),
                              FN=int((v_p < 0).sum()), FP=int((v_b > 0).sum()), TN=int((v_b < 0).sum()),
                              mcc=m.get("mcc"), dor=m.get("dor_standard"), determinate=m.get("coverage")))
-        vus = t[t.vus & sel.reindex(t.index, fill_value=False)] if sname != "all" else t[t.vus]
+        vus = t[t.vus & vsets[sname]]
         for s in strats:
             rows.append(dict(controls=f"VUS ({sname})", strategy=s, n_vus=len(vus),
                              vus_benign=int((vus[s] < 0).sum()), vus_pathogenic=int((vus[s] > 0).sum())))
@@ -118,6 +147,7 @@ def main():
     ap.add_argument("--mapping", default="lp_anchored")
     ap.add_argument("--min", type=int, default=3)
     ap.add_argument("--oob", action="store_true")
+    ap.add_argument("--std", default=None, help="run_igvf_batch output root of the standard refits")
     a = ap.parse_args()
     from pathlib import Path
     import json
@@ -125,8 +155,12 @@ def main():
     dss = json.loads((Path(a.fit_dir) / "bundle.json").read_text())["datasets"]
     rows = pd.read_pickle(Path(a.fit_dir) / ROWS_FILE)
     rows = rows[rows.dataset.isin(dss)]
-    st = strategies()
-    t = points(a.fit_dir, a.config, a.mapping, rows, a.min, st, oob=a.oob)
+    if a.std:
+        st, a.config, a.oob = STD_STRATS, "std", False
+        t = points(None, None, a.mapping, rows, a.min, st, loader=std_loader(a.std, a.mapping))
+    else:
+        st = strategies()
+        t = points(a.fit_dir, a.config, a.mapping, rows, a.min, st, oob=a.oob)
     s = summarise(t, st)
     out = Path(a.fit_dir) / "metrics"
     out.mkdir(exist_ok=True)

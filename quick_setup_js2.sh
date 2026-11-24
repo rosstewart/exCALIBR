@@ -26,7 +26,7 @@
 #   bash quick_setup_js2.sh my_run --dataframe ../data.csv.gz --components 3
 #
 # After setup, launch GPU fits (fill in START END for this instance's range):
-#   CUDA_VISIBLE_DEVICES=0 nohup bash exCALIBR/slurm/run_local_array_gpu.sh \
+#   CUDA_VISIBLE_DEVICES=0 nohup bash exCALIBR/hpc/run_local_array_gpu.sh \
 #       <abs_output_dir> START END > <abs_output_dir>/logs/runner_START_END.log 2>&1 &
 
 set -euo pipefail
@@ -112,7 +112,7 @@ elif [ -n "$DATAFRAME" ]; then
     DATAFRAME_ABS="$(realpath "$DATAFRAME")"
     echo "  running prepare.py with dataframe: ${DATAFRAME_ABS}"
     # shellcheck disable=SC2086
-    "$PYTHON" slurm/prepare.py \
+    "$PYTHON" hpc/prepare.py \
         --dataframe "$DATAFRAME_ABS" \
         --output-dir "$OUTPUT_ABS" \
         --n-bootstraps 1000 \
@@ -138,10 +138,10 @@ echo "Launch GPU fits — split the task range across instances (fill in START E
 echo ""
 echo "  mkdir -p ${OUTPUT_ABS}/logs"
 echo "  PYTHON=${PYTHON} CUDA_VISIBLE_DEVICES=0 nohup \\"
-echo "      bash ${REPO_ABS}/slurm/run_local_array_gpu.sh \\"
+echo "      bash ${REPO_ABS}/hpc/run_local_array_gpu.sh \\"
 echo "      ${OUTPUT_ABS} START END \\"
 echo "      > ${OUTPUT_ABS}/logs/runner_START_END.log 2>&1 &"
 echo "  disown"
 echo ""
-echo "Monitor : ${PYTHON} ${REPO_ABS}/slurm/count_bootstraps.py ${OUTPUT_ABS}"
-echo "Aggregate: ${PYTHON} ${REPO_ABS}/slurm/aggregate_results.py ${OUTPUT_ABS}"
+echo "Monitor : ${PYTHON} ${REPO_ABS}/hpc/count_bootstraps.py ${OUTPUT_ABS}"
+echo "Aggregate: ${PYTHON} ${REPO_ABS}/hpc/aggregate_results.py ${OUTPUT_ABS}"

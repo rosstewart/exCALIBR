@@ -54,6 +54,23 @@ def _incl_missense(role, memb, csq, splice):
     return memb[ROLES.index(role)] and csq == "missense"
 
 
+def _incl_missense_pg(role, memb, csq, splice):
+    # missense-specific evidence with the pooled benign reference: P/LP and
+    # population restricted to missense; B/LB and synonymous as pooled
+    if role in ("P", "g"):
+        return memb[ROLES.index(role)] and csq == "missense"
+    return _incl_pooled(role, memb, csq, splice)
+
+
+def _incl_ptv_p(role, memb, csq, splice):
+    # PTV-specific LR: P/LP restricted to PTV, everything else pooled. Its
+    # prior is not interpretable (population is pooled); score it with the
+    # pooled arm's prior.
+    if role == "P":
+        return memb[0] and csq == "PTV"
+    return _incl_pooled(role, memb, csq, splice)
+
+
 def _incl_pooled_no_splice_blb(role, memb, csq, splice):
     if role == "B" and splice:
         return False
@@ -91,6 +108,8 @@ def _no_conflict(fn):
 ARMS = {
     "pooled": _incl_pooled,                                # functional main
     "missense": _incl_missense,                            # combined main; functional consequence-specific
+    "missense_pg": _incl_missense_pg,                      # functional: missense P/LP + gnomAD, pooled benign
+    "ptv_p": _incl_ptv_p,                                  # functional: PTV P/LP, pooled rest (pooled prior)
     "pooled_no_splice_blb": _incl_pooled_no_splice_blb,    # functional sensitivity
     "pooled_no_splice_syn_blb": _incl_pooled_no_splice_syn_blb,  # low-priority S2
     "pooled_benign_pool": _incl_pooled_benign_pool,        # low-priority S3

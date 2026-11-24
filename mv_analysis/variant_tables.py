@@ -59,6 +59,7 @@ import contextlib
 import functools
 import io
 import json
+import os
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -176,7 +177,11 @@ def _all_rows_ms(m, names):
     gs, gene, cl, rj = m["gene_set"], m["gene"], m["cluster_idx"], config.PAPER_RESULTS_JSON
     if gs == "tp53":
         return None
-    if gs == "integrated":
+    if gs == "labelseq":
+        def build():
+            return config.build_multiscoresets_for_gene_set("labelseq", genes=[gene],
+                                                            regularization_type="all_assayed").get(gene.lower())
+    elif gs == "integrated":
         def build():
             return config.build_multiscoresets_for_gene_set("integrated", genes=[gene],
                                                             regularization_type="all_assayed").get(gene)
@@ -302,17 +307,39 @@ def _extra_rows(m, ms):
     return [ids[i] for i in keep], X[keep]
 
 
-def _score_extended(ms, m):
-    """(per-fit log LR+, points) over all rows of `ms`, from the paper's run."""
+def _score_extended(ms, m, cache_dir=None):
+    """(per-fit log LR+, points) over all rows of `ms`, from the paper's run,
+    scoring only the model's own configuration. With `cache_dir`, the result
+    is kept there, keyed by the stored fits (results file, size and time),
+    the model and every row's id and scores, so re-running a table only
+    re-scores when one of those changed."""
+    import hashlib
     from mv_analysis.gene_performance_scatter import fast_results_json
     from mv_analysis.mv_cockpit import DEFAULT_RUN_KWARGS
     from src.assay_calibration.multivariate_analysis.gene_set_analysis import build_gene_set_analysis
     rj = config.PAPER_RESULTS_JSON
+    f = None
+    if cache_dir is not None:
+        st = Path(rj).stat()
+        h = hashlib.md5(json.dumps([str(Path(rj).resolve()), st.st_size, st.st_mtime, m["dataset_name"],
+                                    m["config"], [str(v) for v in ms.kept_variants]]).encode())
+        h.update(np.ascontiguousarray(np.asarray(ms.scores, float)).tobytes())
+        f = Path(cache_dir) / f"extended_{h.hexdigest()}.npz"
+        if f.exists():
+            z = np.load(f)
+            return z["L"], z["points"]
     an = build_gene_set_analysis(ms, m["gene"].lower(), rj, dataset_name=m["dataset_name"], gene_set=m["gene_set"])
+    an.configs = [m["config"]]
     with fast_results_json(rj), contextlib.redirect_stdout(io.StringIO()):
         an.run(partial_pattern_mode="trust_global", n_jobs=4, **DEFAULT_RUN_KWARGS)
     r = an.results[m["config"]]
-    return np.asarray(r["lr_matrix"], float), np.asarray(r["points"], float)
+    L, pts = np.asarray(r["lr_matrix"], float), np.asarray(r["points"], float)
+    if f is not None:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f.stem + f".tmp{os.getpid()}.npz")
+        np.savez_compressed(tmp, L=L, points=pts)
+        os.replace(tmp, f)
+    return L, pts
 
 
 def _out_of_bag_points(mv, points, check=True):
@@ -334,9 +361,16 @@ def _out_of_bag_points(mv, points, check=True):
     return out, n
 
 
-def model_columns(key, meta):
+def model_columns(key, meta, extra=False):
     """Per-variant evidence of one model: DataFrame indexed by the model's
-    variant id, with columns named without the mv_<model>_ prefix."""
+    variant id, with columns named without the mv_<model>_ prefix.
+
+    extra (off for the paper tables): also log_lr_plus_p50 and
+    log_lr_combined (the directional log LR+ before it is kept inside the
+    band its points imply), and return (df, state) where state holds what
+    further per-variant analyses need: the scored MultiScoreset (`ms`, with
+    the extra rows) and per-fit log LR+ (`L`), both in the model's row order
+    before the reporting filter, and that filter (`keep`)."""
     from analysis.all_variant_evidence import (POINT_VALUES, _combine_directional_log_lr,
                                                _posterior_from_log_lr, _reconcile_log_lr_with_points)
     from mv_analysis.comparison_methods import pknn_runs as RP
@@ -359,7 +393,7 @@ def model_columns(key, meta):
     ids_x, X_x = _extra_rows(m, ms)
     if len(ids_x):
         ms = _ExtendedMS(ms, ids_x, X_x)
-        L_all, pts_all = _score_extended(ms, m)
+        L_all, pts_all = _score_extended(ms, m, cache_dir=OOB_DIR / key)
         n = len(variants)
         assert np.allclose(L_all[:, :n], L, equal_nan=True), f"{key}: extended scoring changes the model's LRs"
         assert np.array_equal(np.nan_to_num(pts_all[:n]), np.nan_to_num(points)), f"{key}: extended scoring changes points"
@@ -394,7 +428,25 @@ def model_columns(key, meta):
                        "lr_plus": np.exp(log_lr), "log_lr_plus_p5": p5, "log_lr_plus_p95": p95,
                        "prior": prior, "posterior": _posterior_from_log_lr(log_lr, prior),
                        "points_out_of_bag": oob_pts, "n_out_of_bag_fits": n_oob}, index=variants)
-    oob_f = Path(config.PKNN_DIR) / "production_oob" / f"{key}.csv"
+    if extra:
+        with warnings.catch_warnings(), np.errstate(all="ignore"):
+            warnings.simplefilter("ignore")
+            p50 = np.nanmedian(L, axis=0)
+        df.insert(df.columns.get_loc("log_lr_plus_p95"), "log_lr_plus_p50", p50)
+        df["log_lr_combined"] = _combine_directional_log_lr(p5, p95)
+        # points from the median log LR+ alone, against the model's own
+        # thresholds (exact median prior, as its points were assigned; the
+        # reported prior above is rounded to 4 decimals)
+        from src.assay_calibration.multivariate_analysis.mv_calibration import _assign_points_vec, _thresholds
+        tp, tb, _, _ = _thresholds(float(np.nanmedian(mv["priors"])), list(POINT_VALUES))
+        ok = np.isfinite(p5) & np.isfinite(p95)
+        lo = _assign_points_vec(np.where(ok, p5, 0.0), tp, tb, list(POINT_VALUES))
+        hi = _assign_points_vec(np.where(ok, p95, 0.0), tp, tb, list(POINT_VALUES))
+        rule = np.where(lo > 0, lo, np.where(hi < 0, hi, 0))
+        assert np.array_equal(rule[ok], np.nan_to_num(points[ok])), f"{key}: thresholds do not reproduce the points"
+        df["points_median_lr"] = np.where(np.isfinite(p50), _assign_points_vec(np.nan_to_num(p50), tp, tb,
+                                                                                list(POINT_VALUES)), np.nan)
+    oob_f = OOB_DIR / f"{key}.csv"  # beside the mv.npz used ($MV_PRODUCTION_OOB_DIR, default PKNN_DIR/production_oob)
     if oob_f.exists():
         o = pd.read_csv(oob_f).set_index("variant")
         o = o[o["n_oob"] > 0]
@@ -416,6 +468,8 @@ def model_columns(key, meta):
         # for variants with both evidence types
         from mv_analysis.report import _both_modality_mask
         keep &= np.asarray(_both_modality_mask(ms), bool)
+    if extra:
+        return df[keep], dict(ms=ms, L=L, keep=np.asarray(keep, bool))
     return df[keep]
 
 
@@ -478,9 +532,35 @@ def _integrated():
     return pd.read_csv(INTEGRATED, sep="\t", low_memory=False)
 
 
+def labelseq_protein_key(v):
+    """A LABEL-seq model row id ("NP_...:p.Ala334=", or that string wrapped in
+    a 1-tuple, or its str()) -> "p.Ala334=": the input table's mapped_hgvs_p
+    without the RefSeq prefix (analysis.vus_reclassification.build_hgvs3_index's
+    convention)."""
+    s = str(v)
+    if s.startswith("("):
+        try:
+            t = ast.literal_eval(s)
+            s = str(t[0] if isinstance(t, tuple) else t)
+        except (ValueError, SyntaxError):
+            pass
+    return s.split(":", 1)[1] if ":" in s else s
+
+
+@functools.lru_cache(maxsize=1)
+def _labelseq_input():
+    from src.assay_calibration.multivariate_data.labelseq import build_labelseq_dataframe
+    with contextlib.redirect_stdout(io.StringIO()):
+        return build_labelseq_dataframe()
+
+
 def input_table(gene, gene_sets):
     """(input DataFrame, genomic key Series, protein key Series) for a gene:
     the table its functional measurements were read from."""
+    if "labelseq" in gene_sets:
+        df = _labelseq_input()
+        df = df[df["Gene"].astype(str).str.lower() == gene.lower()].reset_index(drop=True)
+        return df, pd.Series(None, index=df.index, dtype=object), df["hgvs_p"].map(labelseq_protein_key)
     if "tp53" in gene_sets:
         from src.assay_calibration.multivariate_data import tp53
         df = pd.read_csv(tp53.DEFAULT_VARIANTS_PATH)
@@ -524,7 +604,8 @@ def gene_table(gene, models):
             continue
         cols = model_columns(key, m)
         genomic = m["gene_set"] in ("integrated", "fgfr")
-        cols.index = [_norm_tuple(v) for v in cols.index] if genomic else cols.index.astype(str)
+        cols.index = [_norm_tuple(v) for v in cols.index] if genomic else \
+            [labelseq_protein_key(v) for v in cols.index] if m["gene_set"] == "labelseq" else cols.index.astype(str)
         cols = cols[~cols.index.duplicated()]
         j = (gkey if genomic else pkey).map(lambda k: k if k in cols.index else None)
         block = cols.reindex(j.to_numpy())
