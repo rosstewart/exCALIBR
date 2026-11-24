@@ -196,8 +196,10 @@ def next_greedy_lambda(cur_lambda, slot, n_patterns):
     tests/cfusn_simulations/sim_init_enumeration_vs_datadriven.py:153-188:
     `cand = cur ^ (1 << slot); if cand >= n_patterns: continue`). `n_patterns`
     is the same `min((2**q)**K, 100)` cap generate_fit_jobs already applies
-    elsewhere, so this only returns None in the (currently unreached, at
-    production's K=3/4) case where K*q >= n_patterns.
+    elsewhere, so this returns None whenever the flipped pattern is out of
+    range -- e.g. K=4, q=2 (n_patterns 100 < 2**8): slot 7 always, slot 6
+    once cur_lambda >= 36. hpc/run_array_task.py deducts such skipped slots
+    from its pending-fit count.
 
     Pure and side-effect-free by design so it can be unit-tested against
     run_greedy's own candidate sequence without touching any fit machinery.
@@ -226,7 +228,23 @@ def tryToFit(observations, sample_indicators, num_components, constrained,
             likelihoods=[-np.inf],
             xlims=None,
             times_submerged=[],
+            n_em_iters=None,
+            stop_reason="failed",
         )
+
+
+def _fit_run_stats(result, t0):
+    """Per-fit run statistics lifted to the top level of an execute_fit_job
+    result: EM iterations, why EM stopped, and wall time of the whole job.
+    Diagnostics only; readers must tolerate their absence (older results)."""
+    import time
+    stop = result.get("stop_reason")
+    return {
+        "n_em_iters": result.get("n_em_iters"),
+        "stop_reason": stop,
+        "fit_seconds": time.perf_counter() - t0,
+        "hit_cap": stop == "cap",
+    }
 
 
 def get_bootstrap_indices(dataset_size):
@@ -337,6 +355,85 @@ def pattern_stratified_bootstrap(observations, sample_assignments, bootstrap_see
 
     train_out = np.concatenate(train_indices)
     eval_out = np.concatenate(eval_indices) if eval_indices else np.array([], dtype=int)
+    return train_out, eval_out
+
+
+def collapse_pattern_cells(obs_mask, n_min=5):
+    """Resampling cells for one stratum: its rows grouped by exact readout
+    pattern, then thin cells (fewer than ``n_min`` rows) merged
+    agglomeratively -- smallest first -- into their nearest cell, where the
+    distance between two cells is the smallest scarcity-weighted Hamming
+    distance between any of their patterns: a readout observed in a fraction
+    c of the stratum's rows weighs 1/c, so cells that differ only in a
+    well-covered readout merge before cells that differ in a scarce one.
+    ``obs_mask``: (n, D) bool for the stratum's rows. Returns a list of index
+    arrays (positions within ``obs_mask``) covering every row once."""
+    obs_mask = np.asarray(obs_mask, dtype=bool)
+    n = obs_mask.shape[0]
+    if n == 0:
+        return []
+    cov = obs_mask.mean(axis=0)
+    w = 1.0 / np.maximum(cov, 1.0 / n)
+    cells = {}
+    for i, row in enumerate(obs_mask):
+        cells.setdefault(tuple(row.tolist()), []).append(i)
+    groups = [dict(patterns={p}, rows=list(r)) for p, r in cells.items()]
+
+    def dist(a, b):
+        return min(float(np.sum(w * (np.array(pa) != np.array(pb)))) for pa in a["patterns"] for pb in b["patterns"])
+
+    while len(groups) > 1:
+        small = [g for g in groups if len(g["rows"]) < n_min]
+        if not small:
+            break
+        g = min(small, key=lambda x: (len(x["rows"]), sorted(x["patterns"])))
+        others = [h for h in groups if h is not g]
+        h = min(others, key=lambda x: (dist(g, x), -len(x["rows"]), sorted(x["patterns"])))
+        h["patterns"] |= g["patterns"]
+        h["rows"].extend(g["rows"])
+        groups.remove(g)
+    return [np.array(sorted(g["rows"]), dtype=int) for g in groups]
+
+
+def stratum_pattern_bootstrap(observations, sample_assignments, bootstrap_seed=None, n_min=5,
+                              n_minus_one=False, return_cells=False):
+    """Bootstrap within stratum x readout-pattern cells (strata = the one-hot
+    columns of ``sample_assignments``), thin cells collapsed into their
+    nearest cell within the same stratum (collapse_pattern_cells). Each cell
+    is resampled with replacement to its own size (``n_minus_one``: size - 1,
+    McCarthy-Snowden), requiring at least one out-of-bag row per cell when
+    possible, as pattern_stratified_bootstrap. ``return_cells`` also returns
+    the cell label of every row (for logging)."""
+    rng = np.random.RandomState(bootstrap_seed)
+    obs = ~np.isnan(np.asarray(observations, dtype=float))
+    sa = np.asarray(sample_assignments, dtype=bool)
+    train, evals = [], []
+    cell_of = np.full(len(obs), -1, dtype=int)
+    c_id = 0
+    for s in range(sa.shape[1]):
+        rows = np.flatnonzero(sa[:, s])
+        for cell in collapse_pattern_cells(obs[rows], n_min=n_min):
+            group = rows[cell]
+            cell_of[group] = c_id
+            c_id += 1
+            size = len(group) - 1 if (n_minus_one and len(group) > 1) else len(group)
+            if len(group) == 1:
+                train.append(group)
+                continue
+            for _ in range(100):
+                g_train = rng.choice(group, size=size, replace=True)
+                g_eval = np.setdiff1d(group, g_train)
+                if len(g_eval):
+                    break
+            else:
+                g_train, g_eval = group, np.array([], dtype=int)
+            train.append(g_train)
+            if len(g_eval):
+                evals.append(g_eval)
+    train_out = np.concatenate(train) if train else np.array([], dtype=int)
+    eval_out = np.concatenate(evals) if evals else np.array([], dtype=int)
+    if return_cells:
+        return train_out, eval_out, cell_of
     return train_out, eval_out
 
 
@@ -1016,24 +1113,87 @@ class Fit:
             # readout of the scoreset: keep the calibrated readouts and move it
             # into the standardized space the EM runs in.
             if kwargs.get("gamma_noise_floor") is not None:
+                # A vector of variances or a full (p, p) noise covariance.
                 nf = np.asarray(kwargs["gamma_noise_floor"], dtype=float)
+                sub = lambda a, idx: a[idx] if a.ndim == 1 else a[np.ix_(idx, idx)]
                 if calibrated_dims is not None and len(nf) != observations.shape[1]:
-                    nf = nf[calibrated_dims]
+                    nf = sub(nf, calibrated_dims)
                 if len(nf) != observations.shape[1]:
                     raise ValueError(f"gamma_noise_floor has {len(nf)} entries for "
                                      f"{observations.shape[1]} calibrated dims")
-                nf = nf / scale_std ** 2
+                nf = nf / (scale_std ** 2 if nf.ndim == 1 else np.outer(scale_std, scale_std))
                 if cat_spec is not None:  # Gamma covers the continuous columns only
-                    nf = nf[cat_spec.cont_positions]
+                    nf = sub(nf, list(cat_spec.cont_positions))
                 kwargs["gamma_noise_floor"] = nf.tolist()
 
         train_indices = np.arange(len(observations))
         val_indices = np.array([], dtype=int)
         if kwargs.get("bootstrap", True):
-            if mv:
+            # bootstrap_scheme (multivariate): "pattern" (default) = sample x
+            # exact pattern; "stratum" = within each sample only;
+            # "stratum_pattern" = sample x pattern with thin cells collapsed
+            # (stratum_pattern_bootstrap, bootstrap_min_cell, bootstrap_n_minus_one).
+            # bootstrap_assignments: an (N_scoreset, S') membership used ONLY
+            # for resampling (e.g. composite samples while the fit's samples
+            # are strata); rows follow the same filtering as the observations.
+            scheme = kwargs.get("bootstrap_scheme", "pattern")
+            strat = sample_assignments
+            if kwargs.get("bootstrap_assignments") is not None:
+                ba = np.asarray(kwargs["bootstrap_assignments"], dtype=bool)[original_indices]
+                strat = makeOneHot(ba[:, ba.any(axis=0)], rng=np.random.RandomState(composition_seed))
+            kwargs.pop("bootstrap_assignments", None)  # resampling only; never shipped in jobs
+            # uni_bootstrap_scheme (univariate only, opt-in; unset = the historical
+            # sample-specific bootstrap on the fit's own samples, unchanged):
+            #   "composite": resample within the (re-one-hot) bootstrap_assignments
+            #                samples, e.g. the standard composites while the fit's
+            #                samples are consequence strata (ExCALIBR-equivalent);
+            #   "groups":    resample within caller-supplied row groups
+            #                (bootstrap_groups: (N_scoreset,) int labels, e.g. thin
+            #                strata merged into a same-role sibling); rows with a
+            #                negative label fall back to their own fit sample.
+            uni_scheme = kwargs.pop("uni_bootstrap_scheme", None)
+            groups = kwargs.pop("bootstrap_groups", None)
+            if not mv and uni_scheme is not None:
+                if uni_scheme == "composite":
+                    if strat is sample_assignments:          # no bootstrap_assignments given
+                        raise ValueError("uni_bootstrap_scheme='composite' needs bootstrap_assignments")
+                    uni_strat = strat
+                elif uni_scheme == "groups":
+                    if groups is None:
+                        raise ValueError("uni_bootstrap_scheme='groups' needs bootstrap_groups")
+                    g = np.asarray(groups, dtype=int)[original_indices]
+                    own = np.argmax(np.asarray(sample_assignments, bool), axis=1)
+                    g = np.where(g >= 0, g, -1 - own)          # unlabeled rows: own-sample groups
+                    _, inv = np.unique(g, return_inverse=True)
+                    uni_strat = np.zeros((len(g), inv.max() + 1), dtype=bool)
+                    uni_strat[np.arange(len(g)), inv] = True
+                else:
+                    raise ValueError(f"unknown uni_bootstrap_scheme {uni_scheme!r}")
+                train_indices, val_indices = sample_specific_bootstrap(uni_strat, composition_seed)
+                # resampling coarser than the fit's samples can leave a fit sample (e.g. a thin stratum)
+                # with no training row, whose mixing weights are then undefined: move one of its rows,
+                # chosen with a seeded draw, from out-of-bag into the training set
+                fsa = np.asarray(sample_assignments, dtype=bool)
+                fix_rng = np.random.RandomState(None if composition_seed is None else int(composition_seed) + 104729)
+                covered = fsa[train_indices].any(axis=0)
+                for s_col in np.flatnonzero(fsa.any(axis=0) & ~covered):
+                    pick = int(fix_rng.choice(np.flatnonzero(fsa[:, s_col])))
+                    train_indices = np.append(train_indices, pick)
+                    val_indices = val_indices[val_indices != pick]
+            elif mv and scheme == "pattern":
                 train_indices, val_indices = pattern_stratified_bootstrap(
-                    observations, sample_assignments, composition_seed
+                    observations, strat, composition_seed
                 )
+            elif mv and scheme == "stratum_pattern":
+                train_indices, val_indices = stratum_pattern_bootstrap(
+                    observations, strat, composition_seed,
+                    n_min=int(kwargs.get("bootstrap_min_cell", 5)),
+                    n_minus_one=bool(kwargs.get("bootstrap_n_minus_one", False)),
+                )
+            elif mv and scheme == "stratum":
+                train_indices, val_indices = sample_specific_bootstrap(strat, composition_seed)
+            elif mv:
+                raise ValueError(f"unknown bootstrap_scheme {scheme!r}")
             else:
                 train_indices, val_indices = sample_specific_bootstrap(
                     sample_assignments, composition_seed
@@ -1225,6 +1385,8 @@ class Fit:
 
     @staticmethod
     def execute_fit_job(job):
+        import time
+        _t0 = time.perf_counter()
         try:
             mv = job.get("multivariate", False)
             result = tryToFit(
@@ -1261,6 +1423,7 @@ class Fit:
                     "fit": result,
                     "val_ll": -np.inf,
                     "calibrated_dims": job.get("calibrated_dims"),
+                    **_fit_run_stats(result, _t0),
                 }
 
             # Guard: EM can occasionally run away to a self-consistent but
@@ -1315,6 +1478,7 @@ class Fit:
                     "fit": result,
                     "val_ll": -np.inf,
                     "calibrated_dims": job.get("calibrated_dims"),
+                    **_fit_run_stats(result, _t0),
                 }
 
             # Mixed q=1/q=2 restarts (see generate_fit_jobs): if this
@@ -1369,6 +1533,7 @@ class Fit:
                 "fit": result,
                 "val_ll": val_ll,
                 "calibrated_dims": job.get("calibrated_dims"),
+                **_fit_run_stats(result, _t0),
             }
         except Exception as e:
             print(f"Failed: b{job['bootstrap_seed']} c{job['num_components']} f{job['fit_idx']}: {e}")
@@ -1395,6 +1560,9 @@ def thresholds_from_prior(prior, point_values,
     acmg_mapping_method : str
         "tavtigian" (default): legacy C*-based thresholds via
             get_tavtigian_constant.  lrP = C^(pv/len(pv)).
+        "lp_anchored": sensitivity-analysis option; C chosen so 6 points give a
+            0.90 posterior at the prior (capped at prior 0.5), lrP = C^(pv/8);
+            benign thresholds fixed at Tavtigian's C = 350, lrB = 350^(-pv/8).
         "piecewise": prior-adaptive Bayesian thresholds with exact posteriors
             at the four ACMG boundary points (T = 10, 6, -1, -7).  See
             assay_calibration.fit_utils.bayesian_thresholds.
@@ -1411,6 +1579,17 @@ def thresholds_from_prior(prior, point_values,
         pv = np.array(point_values)
         lrP = C ** (pv / len(pv))
         lrB = 1 / lrP
+        return lrP, lrB, C
+    elif acmg_mapping_method in ("lp_anchored", "lp_anchored_b044"):
+        # sensitivity analyses only: LP posterior held at 0.90 up to prior 0.5,
+        # capped above; benign symmetric (see evidence_thresholds.lp_anchored_constant)
+        from .evidence_thresholds import lp_anchored_constant, lp_anchored_benign_constant
+        C = lp_anchored_constant(prior)
+        pv = np.array(point_values)
+        lrP = C ** (pv / 8)
+        # benign thresholds do not depend on the prior: C = 350 (prior 0.1) for
+        # lp_anchored, C anchored at prior 0.044 for lp_anchored_b044
+        lrB = 1 / (lp_anchored_benign_constant(acmg_mapping_method) ** (pv / 8))
         return lrP, lrB, C
     elif acmg_mapping_method == "piecewise":
         from .bayesian_thresholds import piecewise_tier_thresholds
@@ -1430,7 +1609,7 @@ def thresholds_from_prior(prior, point_values,
     else:
         raise ValueError(
             f"Unknown acmg_mapping_method {acmg_mapping_method!r}; "
-            f"expected 'tavtigian', 'piecewise', or 'strict_additive'"
+            f"expected 'tavtigian', 'lp_anchored', 'piecewise', or 'strict_additive'"
         )
 
 

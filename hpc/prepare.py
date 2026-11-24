@@ -9,9 +9,9 @@ Sub-commands
   basicscoreset Univariate BasicScoreset from CSV with sample_assignments column
   multivariate  MultiScoreset for multi-assay genes (--gene-set selects the
                 ingestion source: integrated [default] / fgfr / tp53 /
-                labelseq / card11 / combined)
+                labelseq / card11 / tsc2 / combined)
   predictor-mv  BasicMultiScoreset for predictor-score data
-  mv_all        Merge FGFR/TP53/LABEL-seq/CARD11/predictor-mv/combined (--pipelines
+  mv_all        Merge FGFR/TP53/LABEL-seq/CARD11/TSC2/predictor-mv/combined (--pipelines
                 selects which, in priority order) into ONE job array/manifest
 
 Usage
@@ -158,7 +158,9 @@ def _count_eventual_fits(minimal_jobs: list) -> int:
     `n_slots` further candidates at execution time -- so the literal list
     length would undercount, and run_array_task.py's `remaining` bookkeeping
     (seeded from this total) would fire prematurely and drop every candidate
-    past the seed. Counted analytically here instead.
+    past the seed. Counted analytically here instead. This is an upper
+    bound: a slot whose flipped pattern is out of range (K=4, q=2) is skipped
+    at run time (run_array_task.py deducts it then).
     """
     total = 0
     for j in minimal_jobs:
@@ -183,32 +185,59 @@ def _shared_data(jobs: list) -> dict | None:
     }
 
 
-def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
-                   n_bootstraps: int, extra_index_fields: dict | None = None) -> tuple[int, int]:
+def _tp53_default_kawoligo_mode():
+    from src.assay_calibration.multivariate_data.tp53 import DEFAULT_KAWOLIGO_MODE
+    return DEFAULT_KAWOLIGO_MODE
+
+
+# Set from --packing in main(); read by _save_manifest (module-level so the
+# many existing _save_manifest call sites need no change).
+_PACK_OPTS = {"packing": "balanced"}
+
+
+def _save_manifest(output_dir: str, all_jobs: list, target_array_size, n_bootstraps: int,
+                   extra_index_fields: dict | None = None) -> tuple[int, int]:
+    """Write jobs/array_NNNN.pkl, jobs/job_index.json and jobs/costs.json.
+
+    target_array_size N gives ceil(total / ceil(total / N)) array files as
+    before. Which compact jobs share a file (--packing): "balanced"
+    (default) evens out estimated work (hpc/packing.py), heaviest first;
+    "contiguous" is the legacy consecutive slicing. This is only the default
+    layout: submit_array.sh TASKS=<n|auto> builds a layout for the machine
+    at submission (hpc/make_layout.py) from jobs/costs.json. Placement is
+    scheduling only: CPU-path fit results are bitwise unchanged. global_idx
+    is always a job's position in all_jobs (so condition job_index_range
+    fields keep their meaning under any layout).
+    """
     jobs_dir = os.path.join(output_dir, "jobs")
     os.makedirs(jobs_dir, exist_ok=True)
 
     total_jobs = len(all_jobs)
-    jobs_per_array = max(1, -(-total_jobs // target_array_size))
-    num_arrays = (total_jobs + jobs_per_array - 1) // jobs_per_array
-
-    print(f"\nOptimal arrangement:")
-    print(f"  Jobs per array task : {jobs_per_array}")
+    from hpc import packing as _packing
+    costs = [_packing.cjob_fit_costs(c) for c in all_jobs]
+    jobs_per_array = max(1, -(-total_jobs // int(target_array_size)))
+    n_tasks = (total_jobs + jobs_per_array - 1) // jobs_per_array
+    mode = _PACK_OPTS["packing"]
+    if mode == "contiguous":
+        bins = _packing.contiguous(total_jobs, jobs_per_array)
+    else:
+        bins = _packing.assign(costs, n_tasks)
+    print(f"\nDefault array layout ({mode}; submit_array.sh TASKS=... re-lays it out at submission):")
+    print(f"  Jobs per array task : up to {max((len(b) for b in bins), default=1)}")
+    num_arrays = len(bins)
     print(f"  Number of array tasks: {num_arrays}")
 
     job_index = []
     print("\nSaving job files...")
-    for array_idx in range(num_arrays):
-        start = array_idx * jobs_per_array
-        end = min(start + jobs_per_array, total_jobs)
-        array_jobs = all_jobs[start:end]
+    for array_idx, members in enumerate(bins):
+        array_jobs = [all_jobs[i] for i in members]
         with open(os.path.join(jobs_dir, f"array_{array_idx:04d}.pkl"), "wb") as f:
             pickle.dump(array_jobs, f)
-        for local_idx, job in enumerate(array_jobs):
+        for local_idx, (gidx, job) in enumerate(zip(members, array_jobs)):
             entry = {
                 "array_idx": array_idx,
                 "local_idx": local_idx,
-                "global_idx": start + local_idx,
+                "global_idx": gidx,
                 "dataset_name": job["dataset_name"],
                 "bootstrap_seed": job["bootstrap_seed"],
                 "num_fits_total": job["num_fits_total"],
@@ -226,6 +255,7 @@ def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
         "n_bootstraps": n_bootstraps,
         "job_index": job_index,
     }
+    index["packing"] = mode
     if extra_index_fields:
         index.update(extra_index_fields)
 
@@ -233,6 +263,14 @@ def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
     with open(index_file, "w") as f:
         json.dump(index, f, indent=2)
     print(f"Job index saved to   : {index_file}")
+    # Per-compact-job fit-cost estimates (hpc/packing.py), so hpc/make_layout.py
+    # can lay the tasks out at submission time (task count, CPUs, concurrency
+    # are machine choices) without loading any job pickle.
+    loc = {e["global_idx"]: (e["array_idx"], e["local_idx"]) for e in job_index}
+    with open(os.path.join(jobs_dir, "costs.json"), "w") as f:
+        json.dump({"model": "hpc/packing.py v1",
+                   "jobs": [{"global_idx": g, "array_idx": loc[g][0], "local_idx": loc[g][1],
+                             "fit_costs": [round(c, 3) for c in costs[g]]} for g in range(total_jobs)]}, f)
 
     dataset_names = sorted({e["dataset_name"] for e in job_index})
     datasets_file = os.path.join(output_dir, "datasets.txt")
@@ -243,7 +281,8 @@ def _save_manifest(output_dir: str, all_jobs: list, target_array_size: int,
     return total_jobs, num_arrays
 
 
-def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int) -> None:
+def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int,
+                      calibration_flags: str | None = None) -> None:
     slurm_dir = str(_SCRIPT_DIR)
     print(f"\n{'='*80}")
     print("Setup complete!")
@@ -257,6 +296,9 @@ def _print_next_steps(output_dir: str, total_jobs: int, num_arrays: int) -> None
     print(f"  2. Monitor:   python {slurm_dir}/count_bootstraps.py {output_dir}")
     print(f"  3. Aggregate: python {slurm_dir}/aggregate_results.py {output_dir}")
     print(f"  4. Logs:      {output_dir}/logs/")
+    if calibration_flags:
+        print(f"  5. Calibrate: python run_igvf_batch.py --precomputed-fits <aggregated results> "
+              f"{calibration_flags} ...")
     print(f"\nSee hpc/README.md for full workflow and tunable parameters.")
 
 
@@ -351,11 +393,78 @@ def _components_from_config(config_file: str | None, new_to_old: dict, complemen
     return lookup
 
 
+def _parse_plp_subsample_n(v):
+    if v is None or v == "missense":
+        return v
+    return int(v)
+
+
+def _expected_onehot_counts(sample_assignments):
+    """Expected per-sample row counts after makeOneHot (each multi-label row goes
+    to one of its m samples uniformly at random): sum over members of 1/m."""
+    sa = np.asarray(sample_assignments, dtype=float)
+    m = sa.sum(axis=1, keepdims=True)
+    return (sa / np.maximum(m, 1.0)).sum(axis=0)
+
+
+def _composition_sample_weights(df_ds, kw, ds, plp_weight, extra_sample_pull, dataset_name):
+    """sample_proportions (+ anchor_weight_scale) for the control-composition
+    experiments, or {} (unweighted, production behaviour).
+
+    plp_weight="all_plp": the P/LP sample's total M-step pull is set to that of the
+    unrestricted all-variant-type P/LP sample (so a missense-only or subsampled
+    P/LP sample keeps the same leverage on the shared components).
+    extra_sample_pull="plp_all" / "plp": the extra (e.g. PTV) sample's total pull is
+    set to that of the all-type P/LP sample / the P/LP sample as used.
+    Totals are expected counts after the per-bootstrap one-hot assignment; every
+    other sample keeps its own expected count, so its per-row weight stays ~1.
+    """
+    if plp_weight in (None, "none") and extra_sample_pull in (None, "full"):
+        return {}
+    from src.assay_calibration.data_utils.dataset import Scoreset
+    names = [n for n, c in zip(ds.sample_names, ds.sample_counts) if c > 0]
+    props = _expected_onehot_counts(ds.sample_assignments)
+    plp = "Pathogenic/Likely Pathogenic"
+    ref_kw = {k: v for k, v in kw.items()
+              if k not in ("missense_plp_only", "plp_subsample_n", "plp_subsample_seed",
+                           "missense_controls_only")}
+    ref = Scoreset(df_ds, **ref_kw)
+    ref_names = [n for n, c in zip(ref.sample_names, ref.sample_counts) if c > 0]
+    n_all = _expected_onehot_counts(ref.sample_assignments)[ref_names.index(plp)] if plp in ref_names else None
+    if plp_weight == "all_plp" and plp in names and n_all is not None:
+        props[names.index(plp)] = n_all
+    extra = [i for i, n in enumerate(names) if n not in
+             (plp, "Benign/Likely Benign", "gnomAD", "population", "Synonymous")]
+    if extra and extra_sample_pull == "plp_ptv" and plp in ref_names:
+        # pull of the PTV P/LP rows in the unrestricted P/LP sample (P/LP rows that are
+        # also members of the extra PTV sample), so PTVs carry the leverage the
+        # nonsense/frameshift P/LP had in the all-type fit, in their own sample
+        rn = ref_names
+        ext = [i for i, n in enumerate(rn) if n not in
+               (plp, "Benign/Likely Benign", "gnomAD", "population", "Synonymous")]
+        rsa = np.asarray(ref.sample_assignments, bool)
+        target = float((rsa[:, rn.index(plp)] & rsa[:, ext].any(axis=1)).sum()) if ext else None
+        if target:
+            for i in extra:
+                props[i] = target
+    if extra and extra_sample_pull in ("plp_all", "plp"):
+        target = n_all if extra_sample_pull == "plp_all" else (props[names.index(plp)] if plp in names else None)
+        if target is not None:
+            for i in extra:
+                props[i] = target
+    print(f"  {dataset_name}: sample_proportions "
+          + ", ".join(f"{n}={p:.1f}" for n, p in zip(names, props)))
+    return {"sample_proportions": props.tolist(), "anchor_weight_scale": True}
+
+
 def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                               clinvar_release, selected_components, population_type,
-                              force_gaussian=False, default_release="2026",
+                              force_gaussian=False, default_release="2025",
                               master_seed=DEFAULT_MASTER_SEED,
-                              spliceai_threshold=0.2, vep_splice_filter=True):
+                              spliceai_threshold=0.2, vep_splice_filter=True,
+                              missense_controls_only=False, extra_sample=None,
+                              missense_plp_only=False, plp_subsample_n=None, plp_subsample_seed=0,
+                              plp_weight="none", extra_sample_pull="full"):
     from src.assay_calibration.data_utils.dataset import Scoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -375,6 +484,15 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
                    spliceai_threshold=spliceai_threshold, vep_splice_filter=vep_splice_filter)
         if population_type:
             kw["population_type"] = population_type
+        if missense_controls_only:
+            kw["missense_controls_only"] = True
+        if extra_sample:
+            kw["extra_sample"] = extra_sample
+        if missense_plp_only:
+            kw["missense_plp_only"] = True
+        if plp_subsample_n is not None:
+            kw["plp_subsample_n"] = plp_subsample_n
+            kw["plp_subsample_seed"] = plp_subsample_seed
         ds = Scoreset(df_ds, **kw)
     except (ValueError, KeyError) as e:
         print(f"  {dataset_name} skipping: {e}")
@@ -383,6 +501,8 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
     if sum(1 for _ in ds.samples) < 2:
         print(f"  {dataset_name} skipping: insufficient samples")
         return None
+
+    weight_kw = _composition_sample_weights(df_ds, kw, ds, plp_weight, extra_sample_pull, dataset_name)
 
     fitter = Fit(ds)
     all_jobs = []
@@ -393,7 +513,7 @@ def _process_default_dataset(df_ds, dataset, output_dir, N_BOOTSTRAPS, NUM_FITS,
             jobs = fitter.generate_fit_jobs(
                 component_range=[nc], bootstrap_seed=bs, master_seed=master_seed,
                 check_monotonic=True, num_fits=NUM_FITS,
-                force_gaussian=force_gaussian)
+                force_gaussian=force_gaussian, **weight_kw)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
             if ref_jobs is None:
                 ref_jobs = jobs
@@ -494,12 +614,12 @@ def run_default(args):
 
     # "default" mode. "pillar_project" mode. (see main()) reuses this same
     # function with clinvar_default_release="2025" instead -- every dataset
-    # that isn't forced to 2018 uses this release, rather than 2026.
-    default_release = getattr(args, "clinvar_default_release", "2026")
+    # that isn't forced to 2018 uses this release (2025 in both modes).
+    default_release = getattr(args, "clinvar_default_release", "2025")
 
     df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
-    df = pd.read_csv(df_path, sep=sep)
+    df = pd.read_csv(df_path, sep=sep, low_memory=False)
 
     if args.complement_components and args.components is not None:
         raise SystemExit("--complement-components cannot be combined with --components")
@@ -521,6 +641,10 @@ def run_default(args):
     else:
         _comp_for = lambda name: [2, 3]  # noqa: E731
         print("Components: [2, 3] for all datasets (no --config-file or --components given)")
+    if getattr(args, "components_plus_one", False):
+        _base_comp_for = _comp_for
+        _comp_for = lambda name: sorted({c + 1 for c in (_base_comp_for(name) or [])})  # noqa: E731
+        print("Components: +1 on every dataset's selection (--components-plus-one)")
 
     datasets = df.Dataset.unique()
     dataset_filter = _resolve_dataset_filter(args, df)
@@ -560,13 +684,42 @@ def run_default(args):
             master_seed=args.seed,
             spliceai_threshold=spliceai_threshold,
             vep_splice_filter=vep_splice_filter,
+            missense_controls_only=getattr(args, "missense_controls_only", False),
+            extra_sample=getattr(args, "extra_sample", None),
+            missense_plp_only=getattr(args, "missense_plp_only", False),
+            plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+            plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
+            plp_weight=getattr(args, "plp_weight", "none"),
+            extra_sample_pull=getattr(args, "extra_sample_pull", "full"),
         )
         for ds in datasets
     )
 
     all_jobs = [j for r in results if r for j in r]
-    total_jobs, num_arrays = _save_manifest(output_dir, all_jobs, args.target_array_size, N_BOOTSTRAPS)
-    _print_next_steps(output_dir, total_jobs, num_arrays)
+    sample_settings = {
+        "population_type": args.population_type,
+        "missense_controls_only": bool(getattr(args, "missense_controls_only", False)),
+        "extra_sample": getattr(args, "extra_sample", None),
+        "missense_plp_only": bool(getattr(args, "missense_plp_only", False)),
+        "plp_subsample_n": getattr(args, "plp_subsample_n", None),
+        "plp_subsample_seed": getattr(args, "plp_subsample_seed", 0),
+        "plp_weight": getattr(args, "plp_weight", "none"),
+        "extra_sample_pull": getattr(args, "extra_sample_pull", "full"),
+        "n_bootstraps": N_BOOTSTRAPS,
+        "clinvar_default_release": default_release,
+        # Rounding of rule posteriors in the Tavtigian c search to use when
+        # these fits are calibrated (run_igvf_batch.py
+        # --tavtigian-posterior-decimals): pillar_project reproduces the
+        # ExCALIBR manuscript ("3"); other modes use exact c ("none").
+        "tavtigian_posterior_decimals": getattr(args, "tavtigian_posterior_decimals", "none"),
+    }
+    for job in all_jobs:
+        job["tavtigian_posterior_decimals"] = sample_settings["tavtigian_posterior_decimals"]
+    total_jobs, num_arrays = _save_manifest(output_dir, all_jobs, args.target_array_size, N_BOOTSTRAPS,
+                                            extra_index_fields={"sample_settings": sample_settings})
+    _print_next_steps(output_dir, total_jobs, num_arrays,
+                      calibration_flags=(f"--clinvar-release {default_release} "
+                                         f"--tavtigian-posterior-decimals {sample_settings['tavtigian_posterior_decimals']}"))
 
 
 def run_mavedb(args):
@@ -576,7 +729,7 @@ def run_mavedb(args):
     os.makedirs(os.path.join(output_dir, "jobs"), exist_ok=True)
 
     sep = "\t" if args.dataframe.endswith((".tsv.gz", ".tsv")) else ","
-    df = pd.read_csv(args.dataframe, sep=sep)
+    df = pd.read_csv(args.dataframe, sep=sep, low_memory=False)
 
     genes = df[args.dataset_col].unique()
     combinations = [(gene, sc) for gene in sorted(genes) for sc in args.score_cols]
@@ -727,7 +880,7 @@ def run_basicscoreset(args):
         print(f"Found {len(partitions)} CSV files in {args.data_dir}")
     else:
         sep = "\t" if args.dataframe.endswith((".tsv.gz", ".tsv")) else ","
-        df = pd.read_csv(args.dataframe, sep=sep)
+        df = pd.read_csv(args.dataframe, sep=sep, low_memory=False)
         if "Dataset" not in df.columns:
             raise ValueError("--dataframe must have a 'Dataset' column or use --data-dir")
         partitions = {ds: df[df["Dataset"] == ds] for ds in df["Dataset"].unique()}
@@ -803,6 +956,19 @@ def _cluster_suffixed_label(dataset_label: str, cluster_idx: int) -> str:
     return f"{dataset_label[:pos]}_cluster{cluster_idx + 1}{dataset_label[pos:]}"
 
 
+_INTEGRATED_DF_CACHE = {}
+
+
+def _integrated_df_cached(path=None):
+    """The integrated dataframe, read once per process (strata annotation of
+    functional MultiScoreset rows)."""
+    from src.assay_calibration.multivariate_data.combined import DEFAULT_INTEGRATED_DATAFRAME
+    path = path or DEFAULT_INTEGRATED_DATAFRAME
+    if path not in _INTEGRATED_DF_CACHE:
+        _INTEGRATED_DF_CACHE[path] = pd.read_csv(path, sep="\t", low_memory=False)
+    return _INTEGRATED_DF_CACHE[path]
+
+
 def sample_roles(ms):
     """Role of each column of ``ms.sample_assignments`` (empty samples are
     dropped there, so positions shift: a gene with no P/LP starts at B/LB, and
@@ -811,6 +977,8 @@ def sample_roles(ms):
     phenotype sub-model's phenotype group), "pathogenic" (auxiliary pathogenic
     samples: phenotype groups, TP53 RPV), "benign", "population", "synonymous".
     """
+    if getattr(ms, "strata_roles", None) is not None:  # fit_utils/strata.StrataView
+        return list(ms.strata_roles)
     roles = []
     for name in ms.sample_names:
         n = str(name).lower()
@@ -860,6 +1028,49 @@ def noise_floor_variances(ms, min_n=20):
                 break
         out.append(var if var else float("nan"))
     return out if np.isfinite(out).any() else None
+
+
+def noise_floor_covariance(ms, min_n=20):
+    """Full measurement-noise covariance for the floor: the per-readout robust
+    variances of noise_floor_variances, with robust correlations between
+    floored readouts -- a 2-D minimum covariance determinant estimate on the
+    variants observed on both readouts in the same reference sample
+    (synonymous, else B/LB) when at least ``min_n`` such variants exist,
+    otherwise 0 (independent noise). The correlation matrix is projected to
+    the nearest valid one (eigenvalues clipped at 1e-6, unit diagonal).
+    (p, p) list with NaN rows/columns for readouts without a floor, or None."""
+    var = noise_floor_variances(ms, min_n=min_n)
+    if var is None:
+        return None
+    from sklearn.covariance import MinCovDet
+    var = np.asarray(var, dtype=float)
+    F = np.flatnonzero(np.isfinite(var))
+    sa = np.asarray(ms.sample_assignments).astype(bool)
+    X = np.asarray(ms.scores, dtype=float)
+    roles = sample_roles(ms)
+    R = np.eye(len(F))
+    for a in range(len(F)):
+        for b in range(a + 1, len(F)):
+            i, j = F[a], F[b]
+            for role in ("synonymous", "benign"):
+                cols = [c for c, r in enumerate(roles) if r == role]
+                if not cols:
+                    continue
+                Z = X[sa[:, cols].any(axis=1)][:, [i, j]]
+                Z = Z[~np.isnan(Z).any(axis=1)]
+                if len(Z) >= min_n:
+                    C = MinCovDet(random_state=0).fit(Z).covariance_
+                    if C[0, 0] > 0 and C[1, 1] > 0:
+                        R[a, b] = R[b, a] = C[0, 1] / np.sqrt(C[0, 0] * C[1, 1])
+                    break
+    eig, vec = np.linalg.eigh(R)
+    R = vec @ np.diag(np.maximum(eig, 1e-6)) @ vec.T
+    d = np.sqrt(np.diag(R))
+    R = R / np.outer(d, d)
+    S = np.full((len(var), len(var)), np.nan)
+    sd = np.sqrt(var[F])
+    S[np.ix_(F, F)] = R * np.outer(sd, sd)
+    return S.tolist()
 
 
 def pathogenic_share_proportions(ms, tau):
@@ -939,13 +1150,22 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
     observations = np.asarray(ms.scores, dtype=float)
     clusters = []
     if observations.ndim == 2 and observations.shape[1] > 1:
-        clusters = Fit._select_all_calibration_clusters(observations, min_overlap_rows=min_overlap_rows)
-    if len(clusters) > 1:
+        if (extra_cjob_fields or {}).get("gene_set") == "combined":
+            from src.assay_calibration.multivariate_data.combined import combined_calibration_clusters
+            clusters = combined_calibration_clusters(observations, list(ms.dataset_names),
+                                                     min_overlap_rows=min_overlap_rows)
+        else:
+            clusters = Fit._select_all_calibration_clusters(observations, min_overlap_rows=min_overlap_rows)
+    if len(clusters) > 1 or (len(clusters) == 1 and len(clusters[0]) < observations.shape[1]
+                             and (extra_cjob_fields or {}).get("gene_set") == "combined"):
         all_jobs = []
         for cluster_idx, dims in enumerate(clusters):
             cluster_ms = copy.deepcopy(ms)
             from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
             select_dims(cluster_ms, dims)
+            if getattr(cluster_ms, "combined_population", None) == "intersection":
+                from src.assay_calibration.multivariate_data.combined import restrict_to_both_modalities
+                restrict_to_both_modalities(cluster_ms)
             cluster_label = _cluster_suffixed_label(dataset_label, cluster_idx)
             cluster_save_dir = save_dir if cluster_idx == 0 else f"{save_dir}_cluster{cluster_idx + 1}"
             cluster_extra_fields = dict(extra_cjob_fields or {})
@@ -963,10 +1183,46 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             ))
         return all_jobs
 
-    proportions, path_factor = pathogenic_share_proportions(ms, pathogenic_share)
+    fit_options = fit_options or {}
+    by_ds = fit_options.get("components_by_dataset") or {}
+    for key in (dataset_label, gene, str(gene).upper()):
+        if key in by_ds:
+            component_range = [int(k) for k in by_ds[key]]
+            print(f"  {dataset_label}: components {component_range} (from --components-file, key {key!r})")
+            break
+    # Consequence-stratified mixture (fit_options["strata"]): the fitter's
+    # samples are the strata (fit_utils/strata.py); composites are rebuilt at
+    # scoring time. The stratum layout is written next to the jobs so scoring
+    # can check it rebuilt the same strata.
+    ms_fit, strata = ms, None
+    if fit_options.get("strata"):
+        from src.assay_calibration.fit_utils.strata import row_annotations, build_strata, StrataView
+        if fit_options.get("tied_population"):
+            raise NotImplementedError("tied_population is not defined for a stratified fit")
+        ann = row_annotations(ms, _integrated_df_cached() if getattr(ms, "_row_atoms", None) is not None
+                              and getattr(ms, "row_meta", None) is None else None, gene=gene)
+        # Rows the fit will use: observed in its calibrated dimensions (a
+        # single calibration cluster may drop a poorly connected assay; the
+        # fitter then drops rows measured only there). Scoring rebuilds the
+        # strata on the ms restricted to those dimensions, so both agree.
+        _row_mask = None
+        if len(clusters) == 1 and len(clusters[0]) < observations.shape[1]:
+            _row_mask = ~np.isnan(observations[:, list(clusters[0])]).all(axis=1)
+        strata = build_strata(ms, ann, min_stratum=int(fit_options.get("strata_min", 5)), row_mask=_row_mask)
+        ms_fit = StrataView(ms, strata)
+        print(f"  {dataset_label}: {len(strata.names)} strata: "
+              + ", ".join(f"{n}={c}" for n, c in zip(strata.names, strata.counts)))
+        for m in strata.merges:
+            print(f"  {dataset_label}:   {m}")
+        sdir = os.path.join(os.path.dirname(save_dir.rstrip("/")), "strata")
+        os.makedirs(sdir, exist_ok=True)
+        with open(os.path.join(sdir, f"{dataset_label}.json"), "w") as f:
+            json.dump(dict(strata.to_dict(), bootstrap_scheme=fit_options.get("bootstrap_scheme", "stratum_pattern"),
+                           bootstrap_min_cell=int(fit_options.get("bootstrap_min_cell", 5)),
+                           bootstrap_n_minus_one=bool(fit_options.get("bootstrap_n_minus_one", False))), f, indent=1)
+    proportions, path_factor = pathogenic_share_proportions(ms_fit, pathogenic_share)
     if pathogenic_share:
         print(f"  {dataset_label}: pathogenic share {pathogenic_share:g} -> factor {path_factor:.2f}")
-    fit_options = fit_options or {}
     tied_spec = None
     if fit_options.get("tied_population"):
         from src.assay_calibration.fit_utils.cfusn.tied_population import spec_from_roles
@@ -974,9 +1230,14 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
         print(f"  {dataset_label}: tied population {tied_spec if tied_spec else 'not applicable (fit free)'}")
     noise_floor = None
     if fit_options.get("noise_floor"):
-        noise_floor = noise_floor_variances(ms)
+        if fit_options.get("noise_floor_shape", "full") == "full":
+            noise_floor = noise_floor_covariance(ms)
+            sd = np.sqrt(np.diag(np.asarray(noise_floor, float))) if noise_floor else None
+        else:
+            noise_floor = noise_floor_variances(ms)
+            sd = np.sqrt(np.asarray(noise_floor, float)) if noise_floor else None
         print(f"  {dataset_label}: noise floor (SD; nan = no floor on that readout) "
-              f"{np.round(np.sqrt(noise_floor), 3).tolist() if noise_floor else 'not available (no floor)'}")
+              f"{np.round(sd, 3).tolist() if noise_floor else 'not available (no floor)'}")
 
     constrained_flags = []
     if "con" in constraint_modes:
@@ -984,7 +1245,17 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
     if "unc" in constraint_modes:
         constrained_flags.append(False)
 
-    fitter = Fit(ms)
+    fitter = Fit(ms_fit)
+    boot_kwargs = {}
+    if fit_options.get("bootstrap_scheme") or strata is not None:
+        scheme = fit_options.get("bootstrap_scheme") or "stratum_pattern"
+        if scheme == "composite_pattern":  # resample composite samples x pattern while fitting strata
+            boot_kwargs = dict(bootstrap_scheme="pattern",
+                               bootstrap_assignments=np.asarray(ms._sample_assignments, dtype=bool))
+        else:
+            boot_kwargs = dict(bootstrap_scheme=scheme,
+                               bootstrap_min_cell=int(fit_options.get("bootstrap_min_cell", 5)),
+                               bootstrap_n_minus_one=bool(fit_options.get("bootstrap_n_minus_one", False)))
     all_jobs = []
     for bs in range(N_BOOTSTRAPS):
         jobs_by_key = {}
@@ -1012,6 +1283,13 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                     fit_kwargs["tied_population"] = tied_spec
                 if noise_floor is not None:
                     fit_kwargs["gamma_noise_floor"] = noise_floor
+                # Opt-in, approximate speed options: only added when set, so
+                # default job kwargs stay byte-identical.
+                if fit_options.get("em_accelerator", "none") != "none":
+                    fit_kwargs["em_accelerator"] = fit_options["em_accelerator"]
+                if fit_options.get("completed_moments_einsum", "exact") != "exact":
+                    fit_kwargs["completed_moments_einsum"] = fit_options["completed_moments_einsum"]
+                fit_kwargs.update(boot_kwargs)
                 if greedy_restarts:
                     fit_kwargs["greedy_restarts"] = True
                 elif NUM_FITS is not None:
@@ -1047,8 +1325,13 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
             "multivariate": True,
             "num_fits_total": sum(_count_eventual_fits(v) for v in jobs_by_key.values()),
         }
+        if strata is not None:
+            cjob["strata"] = dict(names=list(strata.names), counts=strata.counts.tolist(),
+                                  bootstrap=dict((k, v) for k, v in boot_kwargs.items() if k != "bootstrap_assignments"))
         if (fit_options.get("tied_population") or fit_options.get("noise_floor")
-                or fit_options.get("weight_neff", "weighted") != "weighted"):
+                or fit_options.get("weight_neff", "weighted") != "weighted"
+                or fit_options.get("em_accelerator", "none") != "none"
+                or fit_options.get("completed_moments_einsum", "exact") != "exact"):
             cjob["fit_options"] = dict(fit_options, tied_population_spec=tied_spec, noise_floor_var=noise_floor)
         if pathogenic_share:
             cjob["pathogenic_share"] = pathogenic_share
@@ -1068,7 +1351,7 @@ def _process_multivariate_gene(df_gene, gene, datasets, output_dir, N_BOOTSTRAPS
                                 greedy_restarts=False, pathogenic_share=None, fit_options=None):
     from src.assay_calibration.multivariate_data.common import build_multiscoreset_from_long_dataframe
 
-    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release != '2026' else ''}"
+    gene_label = f"{gene}_mv{'_clinvar_' + clinvar_release if clinvar_release not in ('2025', '2026') else ''}"
     save_dir = os.path.join(output_dir, gene_label)
 
     scoreset_kwargs = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
@@ -1101,7 +1384,26 @@ def _build_gene_set_ms_map(gene_set, args):
     ``--gene-set`` values other than "integrated" (the pre-existing,
     untouched BRCA1/PTEN/MSH2/pillar-project path in run_multivariate).
     Returns {gene: MultiScoreset/BasicMultiScoreset}.
+
+    Genes with phenotype-specific groups (mv_analysis.phenotype_samples.
+    PHENOTYPE_SAMPLE_GROUPS, e.g. RET's MEN2 / Hirschsprung) get each group as
+    its own sample after the four standard ones, as CARD11's BENTA / CADINS.
+    The variants also stay in P/LP, so each bootstrap's one-hot resolution
+    puts a variant in one of its samples; P/LP evaluation is unchanged and
+    mv_analysis.phenotype_evidence reads the fitted rows. args.posthoc_phenotypes
+    skips this (groups then estimated post hoc on the frozen components).
     """
+    ms_map = _build_gene_set_ms_map_base(gene_set, args)
+    if not getattr(args, "posthoc_phenotypes", False):
+        from mv_analysis.phenotype_samples import phenotype_roles, with_phenotype_samples
+        for gene in list(ms_map):
+            if phenotype_roles(gene_set, gene):
+                ms_map[gene] = with_phenotype_samples(ms_map[gene], gene_set, gene)
+    return ms_map
+
+
+def _build_gene_set_ms_map_base(gene_set, args):
+    """_build_gene_set_ms_map before the phenotype-specific samples."""
     if gene_set == "fgfr":
         from src.assay_calibration.multivariate_data.fgfr import build_fgfr_multiscoresets
         return build_fgfr_multiscoresets(
@@ -1115,28 +1417,21 @@ def _build_gene_set_ms_map(gene_set, args):
         return {"TP53": build_tp53_multiscoreset(
             RPVS_ALL=args.rpvs_all, kawoligo_seed=args.kawoligo_seed,
             kawoligo_jitter_sigma=args.kawoligo_jitter_sigma,
-            kawoligo_mode=getattr(args, "kawoligo_mode", "jitter"),
+            kawoligo_mode=getattr(args, "kawoligo_mode", _tp53_default_kawoligo_mode()),
         )}
 
     if gene_set == "labelseq":
         from src.assay_calibration.multivariate_data.labelseq import build_labelseq_multiscoresets
-        ms_map = build_labelseq_multiscoresets(
+        return build_labelseq_multiscoresets(
             regularization_type=getattr(args, "regularization_type", None))
-        if "ret" in ms_map and not getattr(args, "ret_posthoc_phenotypes", False):
-            # RET's MEN2 / Hirschsprung groups enter the fit as their own
-            # samples (roles 4, 5), as CARD11's BENTA / CADINS do. The variants
-            # also stay in role 0 (P/LP), so each bootstrap's one-hot
-            # resolution puts a variant in one of its samples; P/LP evaluation
-            # is unchanged. mv_analysis.phenotype_evidence reads the fitted rows.
-            from mv_analysis.phenotype_evidence import (
-                _with_phenotype_samples, ret_phenotype_masks, RET_PHENOTYPE_ROLES)
-            ms_map["ret"] = _with_phenotype_samples(
-                ms_map["ret"], ret_phenotype_masks(ms_map["ret"]), RET_PHENOTYPE_ROLES)
-        return ms_map
 
     if gene_set == "card11":
         from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset
         return {"CARD11": build_card11_multiscoreset()}
+
+    if gene_set == "tsc2":
+        from src.assay_calibration.multivariate_data.tsc2 import build_tsc2_multiscoreset
+        return {"TSC2": build_tsc2_multiscoreset()}
 
     if gene_set == "phenotype_sub":
         from mv_analysis.phenotype_submodels import build_phenotype_submodel_ms_map
@@ -1170,6 +1465,7 @@ def _build_gene_set_ms_map(gene_set, args):
             # 4 genes that are also predictor-mv DEFAULT_GENES.
             functional_scoresets = build_functional_scoresets(
                 df, gene, datasets, clinvar_release=resolve_clinvar_release(gene),
+                tp53_build_kwargs={"kawoligo_mode": getattr(args, "kawoligo_mode", _tp53_default_kawoligo_mode())},
             )
             # Variants with functional data must use the functional side's
             # ClinVar label (fixed at that release); predictor CSVs carry
@@ -1188,7 +1484,13 @@ def _build_gene_set_ms_map(gene_set, args):
                 # this default. Locking this explicitly means job generation
                 # doesn't silently change behavior if build_combined_
                 # multiscoreset's own default ever flips again.
-                require_both_modalities=False,
+                # --combined-population intersection fits on the evaluated
+                # population only (>=1 functional AND >=1 predictor score),
+                # which also drops the __predictor_dup label copies.
+                require_both_modalities=getattr(args, "combined_population", "union") == "intersection",
+                predictor_transform=getattr(args, "predictor_transform_value", None),
+                predictor_label_copies=getattr(args, "predictor_label_copies", True),
+                row_builder=getattr(args, "row_builder", "v2"), df_integrated=df,
             )
             if ms is None:
                 print(f"  {gene}: no predictor CSVs under {args.predictor_data_dir}, skipping")
@@ -1440,7 +1742,11 @@ def _load_and_filter_gene_groups(args):
     """
     df_path = args.dataframe or "/data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset_pp_final.tsv.gz"
     sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
-    df = pd.read_csv(df_path, sep=sep)
+    # low_memory=False: chunked type inference gave Chrom / hg38_start mixed
+    # int and str within a gene (PALB2, GCK), so the same variant measured by
+    # two assays was not recognised as one row; scoring
+    # (mv_analysis/integrated_gene_data.py) reads it this way too.
+    df = pd.read_csv(df_path, sep=sep, low_memory=False)
 
     max_dim = args.max_dimensions  # may be None
     gene_groups = _discover_gene_groups(df, max_dimensions=max_dim)
@@ -1592,7 +1898,8 @@ def _generate_predictor_mv_jobs(by_gene, args):
     def process_one(gene, predictor_dfs):
         label = predictor_dataset_label(gene)
         save_dir = os.path.join(output_dir, label)
-        ms, info = build_basic_multi_scoreset(gene, predictor_dfs, standardize=standardize_predictors)
+        ms, info = build_basic_multi_scoreset(gene, predictor_dfs, standardize=standardize_predictors,
+                                              transform=getattr(args, "predictor_transform_value", None))
         if ms is None:
             print(f"  {gene}: skipping — {info}")
             return None
@@ -1644,9 +1951,9 @@ def run_predictor_mv(args):
 # in priority order)
 # =============================================================================
 
-_MV_ALL_PIPELINE_CHOICES = ["integrated", "fgfr", "tp53", "labelseq", "card11", "predictor-mv", "combined",
-                            "phenotype_sub"]
-_MV_ALL_GENE_SET_PIPELINES = {"fgfr", "tp53", "labelseq", "card11", "combined", "phenotype_sub"}
+_MV_ALL_PIPELINE_CHOICES = ["integrated", "fgfr", "tp53", "labelseq", "card11", "tsc2", "predictor-mv",
+                            "combined", "phenotype_sub"]
+_MV_ALL_GENE_SET_PIPELINES = {"fgfr", "tp53", "labelseq", "card11", "tsc2", "combined", "phenotype_sub"}
 
 
 def run_mv_all(args):
@@ -1736,23 +2043,72 @@ def _add_pathogenic_share_arg(p):
                         "pi * W[P/LP] + (1 - pi) * W[B/LB + synonymous] during the fit "
                         "(cfusn/tied_population.py: population containment). Datasets "
                         "without P/LP, a benign reference or a population sample fit free.")
+    p.add_argument("--components-file", default=None,
+                   help="JSON mapping a dataset label (e.g. BRCA2_combined_mv, "
+                        "BRCA2_combined_cluster2_mv) or a gene to its component counts, "
+                        "e.g. {\"BRCA2_combined_mv\": [3, 4], \"TP53\": [4]}. Datasets it "
+                        "doesn't name use --components. The user writes it after "
+                        "inspecting the component diagnostic (mv_analysis/k_advisor.py); "
+                        "nothing fills it automatically.")
+    p.add_argument("--strata", action="store_true",
+                   help="Consequence-stratified mixture: fit with every variant in one stratum "
+                        "(membership x consequence x splice flag; fit_utils/strata.py) as the "
+                        "samples, composites rebuilt at scoring. Writes strata/<dataset>.json "
+                        "and a strata.txt marker that mv_analysis/config.py reads.")
+    p.add_argument("--strata-min", type=int, default=5,
+                   help="--strata: strata with fewer rows merge into a same-role sibling (default 5).")
+    p.add_argument("--bootstrap-scheme", default=None,
+                   choices=["pattern", "stratum", "stratum_pattern", "composite_pattern"],
+                   help="MV bootstrap stratification: 'pattern' (fit samples x exact readout "
+                        "pattern; the default without --strata), 'stratum' (fit samples only), "
+                        "'stratum_pattern' (fit samples x pattern, thin cells collapsed into the "
+                        "nearest cell; the default with --strata), 'composite_pattern' (--strata "
+                        "only: resample the standard samples x pattern while fitting strata).")
+    p.add_argument("--bootstrap-min-cell", type=int, default=5,
+                   help="'stratum_pattern': minimum resampling cell size (default 5).")
+    p.add_argument("--bootstrap-n-minus-one", action="store_true",
+                   help="'stratum_pattern': draw n-1 rows per cell (McCarthy-Snowden).")
     p.add_argument("--noise-floor", action="store_true",
                    help="Floor every component's covariance at the per-readout measurement "
                         "noise, estimated from synonymous (else B/LB) variants "
                         "(noise_floor_variances), so small samples cannot form spikes.")
+    p.add_argument("--noise-floor-shape", choices=["full", "diagonal"], default="full",
+                   help="--noise-floor noise covariance: 'full' = robust per-readout variances with "
+                        "robust (MCD) correlations between readouts (noise_floor_covariance); "
+                        "'diagonal' = independent noise per readout (noise_floor_variances).")
     p.add_argument("--weight-neff", choices=["weighted", "kish"], default="weighted",
                    help="Observation count behind each component's covariance ridge under "
                         "--pathogenic-share: 'weighted' = weighted mass (upweighted samples "
                         "count as extra observations); 'kish' = Kish effective sample size "
                         "(upweighting moves components but adds no information). No effect "
                         "on unweighted (TAU=0) jobs.")
+    p.add_argument("--em-accelerator", choices=["none", "squarem"], default="none",
+                   help="EXPERIMENTAL, opt-in: accelerate the multivariate EM with SQUAREM "
+                        "(cfusn/squarem.py; Varadhan & Roland 2008). Not bitwise identical "
+                        "to plain EM; see docs/fit_speed_report.md before using it. CPU only. "
+                        "Default none: job kwargs unchanged.")
+    p.add_argument("--completed-moments-einsum", choices=["exact", "two_stage"], default="exact",
+                   help="EXPERIMENTAL, opt-in: 'two_stage' evaluates the completed-data "
+                        "B Psi B' term as a batched matmul (faster, not bitwise identical; "
+                        "see docs/fit_speed_report.md). CPU only. Default exact: job kwargs "
+                        "unchanged.")
 
 
 def _fit_options(args):
     """--weight-neff / --tied-population as the fit_options dict job generation takes."""
     return {"weight_neff": getattr(args, "weight_neff", "weighted"),
             "tied_population": bool(getattr(args, "tied_population", False)),
-            "noise_floor": bool(getattr(args, "noise_floor", False))}
+            "noise_floor": bool(getattr(args, "noise_floor", False)),
+            "noise_floor_shape": getattr(args, "noise_floor_shape", "full"),
+            "components_by_dataset": (json.load(open(args.components_file))
+                                      if getattr(args, "components_file", None) else None),
+            "strata": bool(getattr(args, "strata", False)),
+            "strata_min": getattr(args, "strata_min", 5),
+            "bootstrap_scheme": getattr(args, "bootstrap_scheme", None),
+            "bootstrap_min_cell": getattr(args, "bootstrap_min_cell", 5),
+            "bootstrap_n_minus_one": bool(getattr(args, "bootstrap_n_minus_one", False)),
+            "em_accelerator": getattr(args, "em_accelerator", "none"),
+            "completed_moments_einsum": getattr(args, "completed_moments_einsum", "exact")}
 
 
 def _merge_condition_manifests(output_root: str, condition_labels: list, target_array_size: int) -> None:
@@ -1778,7 +2134,7 @@ def _merge_condition_manifests(output_root: str, condition_labels: list, target_
             array_file.unlink()  # superseded by the merged copy below
         conditions[label] = {"job_index_range": [start, len(all_jobs)],
                              **{k: v for k, v in index.items() if k not in
-                                ("total_jobs", "num_arrays", "jobs_per_array", "job_index")}}
+                                ("total_jobs", "num_arrays", "jobs_per_array", "job_index", "packing")}}
     print(f"\nMerging {len(all_jobs)} jobs from {len(condition_labels)} condition(s) "
           f"{condition_labels} into one job array under {output_root}/jobs/")
     total_jobs, num_arrays = _save_manifest(output_root, all_jobs, target_array_size, n_bootstraps,
@@ -1808,10 +2164,48 @@ def run_pathogenic_share_conditions(args):
     _merge_condition_manifests(root, labels, args.target_array_size)
 
 
+def run_predictor_transform_conditions(args):
+    """Build one condition per --predictor-transform value (each through the
+    subcommand's normal builder, into <output-dir>/ptx_<TRANSFORM>/, at the one
+    --pathogenic-share value if given) and merge them into one job array. Each
+    condition dir gets a predictor_transform.txt marker, which mv_analysis/
+    config.py reads so scoring rebuilds the scores on the same scale."""
+    from src.assay_calibration.multivariate_data.predictors import PREDICTOR_TRANSFORMS
+    taus = getattr(args, "pathogenic_share", None) or [0]
+    if len(taus) != 1:
+        raise SystemExit("--predictor-transform takes a single --pathogenic-share value")
+    root = args.output_dir
+    labels = []
+    for transform in args.predictor_transform:
+        if transform not in PREDICTOR_TRANSFORMS:
+            raise SystemExit(f"unknown --predictor-transform {transform!r}")
+        label = f"ptx_{transform}"
+        print(f"\n{'#' * 80}\nCondition {label} (predictor transform {transform}, "
+              f"pathogenic share {taus[0]:g})\n{'#' * 80}")
+        sub = copy.copy(args)
+        sub.output_dir = os.path.join(root, label)
+        sub.predictor_transform_value = transform
+        sub.pathogenic_share_value = taus[0] if taus[0] > 0 else None
+        args.func(sub)
+        with open(os.path.join(sub.output_dir, "predictor_transform.txt"), "w") as f:
+            f.write(transform + "\n")
+        labels.append(label)
+    if getattr(args, "list_only", False):
+        return
+    _merge_condition_manifests(root, labels, args.target_array_size)
+
+
 def _add_common_args(p):
     p.add_argument("--output-dir", required=True, help="Directory for jobs and results")
     p.add_argument("--target-array-size", type=int, default=1000,
-                   help="Target SLURM array size (default: 1000)")
+                   help="Target SLURM array size of the default layout (default: 1000). "
+                        "submit_array.sh TASKS=<n|auto> can re-lay the tasks out for the "
+                        "machine at submission without re-running prepare.py.")
+    p.add_argument("--packing", choices=["balanced", "contiguous"], default="balanced",
+                   help="Which compact jobs share an array file: 'balanced' (default) evens "
+                        "out estimated work (hpc/packing.py); 'contiguous' is the legacy "
+                        "consecutive slicing. Scheduling only: CPU-path fit results are "
+                        "bitwise unchanged.")
     p.add_argument("--n-jobs", type=int, default=30,
                    help="Parallel workers for job generation (default: 30)")
     p.add_argument("--seed", type=_parse_seed, default=DEFAULT_MASTER_SEED,
@@ -1837,6 +2231,35 @@ def main():
         p.add_argument("--config-file", default=None,
                        help="Dataset config JSON (default: dataset_configs_jan_2026.json)")
         p.add_argument("--population-type", default=None)
+        p.add_argument("--missense-controls-only", action="store_true",
+                       help="Restrict the P/LP and B/LB samples to missense variants "
+                            "(population/synonymous/extra samples unaffected; combine with "
+                            "--population-type gnomAD_missense_nsSNV for a missense-only "
+                            "population sample). Must match at calibration.")
+        p.add_argument("--missense-plp-only", action="store_true",
+                       help="Restrict only the P/LP sample to missense (B/LB, population, synonymous "
+                            "unchanged). Must match at calibration.")
+        p.add_argument("--plp-subsample-n", default=None,
+                       help="Keep the P/LP label on a random subset of this many P/LP rows ('missense' = "
+                            "the dataset's missense P/LP count): matched-count control. Must match at calibration.")
+        p.add_argument("--plp-subsample-seed", type=int, default=0)
+        p.add_argument("--plp-weight", choices=["none", "all_plp"], default="none",
+                       help="'all_plp': upweight the (restricted) P/LP sample so its total M-step pull "
+                            "equals the unrestricted all-type P/LP sample's (sample_proportions). Fit-only.")
+        p.add_argument("--extra-sample-pull", choices=["full", "plp_all", "plp", "plp_ptv"], default="full",
+                       help="Total M-step pull of the extra sample: its own size (full), the all-type "
+                            "P/LP sample's, the P/LP sample's as used, or the number of P/LP variants that "
+                            "are PTVs (plp_ptv). Fit-only.")
+        p.add_argument("--components-plus-one", action="store_true",
+                       help="Fit one more component than each dataset's selected n_c (e.g. 3c -> 4c).")
+        p.add_argument("--extra-sample", dest="extra_sample", default=None,
+                       choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
+                       help="Add a 5th sample fit with its own weights over the shared "
+                            "components but never used in lr+ or prior estimation -- e.g. "
+                            "'ptv' (stop-gained of any length + frameshift). Must match at "
+                            "calibration.")
+        p.add_argument("--regularization-type", dest="extra_sample", default=None,
+                       help=argparse.SUPPRESS)  # deprecated name of --extra-sample
         p.add_argument("--components", nargs="+", type=int, default=None,
                        help="Override component counts (default: per-config)")
         p.add_argument("--force-gaussian", action="store_true",
@@ -1896,15 +2319,21 @@ def main():
 
     p_def = sub.add_parser("default", help="Univariate Scoreset from integrated TSV")
     _add_default_mode_args(p_def)
-    p_def.set_defaults(func=run_default, clinvar_default_release="2026")
+    p_def.set_defaults(func=run_default, clinvar_default_release="2025",
+                       tavtigian_posterior_decimals="none")
 
     p_pillar = sub.add_parser(
         "pillar_project",
-        help="Same as 'default', but ClinVar 2025 in place of ClinVar 2026 "
-             "everywhere (datasets forced to 2018 are unaffected)",
+        help="Same as 'default' (ClinVar 2025; datasets forced to 2018 are "
+             "unaffected), with Tavtigian c "
+             "computed with rule posteriors rounded to 3 decimals at calibration, "
+             "as in the ExCALIBR manuscript",
     )
     _add_default_mode_args(p_pillar)
-    p_pillar.set_defaults(func=run_default, clinvar_default_release="2025")
+    # pillar_project reproduces the ExCALIBR manuscript: rule posteriors
+    # rounded to 3 decimals when solving for c at calibration.
+    p_pillar.set_defaults(func=run_default, clinvar_default_release="2025",
+                          tavtigian_posterior_decimals="3")
 
     # ── mavedb ───────────────────────────────────────────────────────────────
     p_mv = sub.add_parser("mavedb", help="Univariate Scoreset.from_mavedb")
@@ -1914,7 +2343,7 @@ def main():
                       help="Score columns to iterate over")
     p_mv.add_argument("--dataset-col", default="gene_symbol")
     p_mv.add_argument("--population-type", default=None)
-    p_mv.add_argument("--regularization-type", default=None)
+    p_mv.add_argument("--extra-sample", "--regularization-type", dest="regularization_type", default=None)
     p_mv.add_argument("--components", nargs="+", type=int, default=None)
     p_mv.add_argument("--splice-measure",
                       type=lambda x: x.lower() in ("yes", "true", "1"),
@@ -1964,14 +2393,14 @@ def main():
     p_multi.add_argument("--max-dimensions", type=int, default=None,
                          help="Skip genes with more datasets than this")
     p_multi.add_argument("--population-type", default=None)
-    p_multi.add_argument("--regularization-type", default=None,
-                         choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv"],
+    p_multi.add_argument("--extra-sample", "--regularization-type", dest="regularization_type", default=None,
+                         choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
                          help="Adds a 5th sample role retaining variants regardless of "
                               "clinical label -- 'all_assayed' (every assayed variant; "
                               "used by this session's staged-init experiments) or one of "
                               "the SNV-subset variants. Supported for --gene-set "
                               "labelseq and integrated (the default); not yet wired for "
-                              "fgfr/tp53/card11/combined.")
+                              "fgfr/tp53/card11/tsc2/combined.")
     p_multi.add_argument("--n-bootstraps", type=int, default=1000)
     p_multi.add_argument("--num-fits", type=int, default=100,
                          help="Override dynamic NUM_FITS (default: 100). "
@@ -1987,7 +2416,7 @@ def main():
     p_multi.add_argument("--list-only", action="store_true",
                          help="Print gene groups and exit")
     p_multi.add_argument("--gene-set", default="integrated",
-                         choices=["integrated", "fgfr", "tp53", "labelseq", "card11", "combined",
+                         choices=["integrated", "fgfr", "tp53", "labelseq", "card11", "tsc2", "combined",
                                   "phenotype_sub"],
                          help="Ingestion source (default: integrated, the pre-existing "
                               "BRCA1/PTEN/MSH2/pillar-project path via --dataframe/--datasets). "
@@ -1996,10 +2425,10 @@ def main():
     p_multi.add_argument("--rpvs-all", action="store_true",
                          help="[--gene-set tp53] Use the full RPV list instead of the "
                               "high-confidence subset (default: high-confidence only)")
-    p_multi.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default="jitter",
-                         help="[tp53] EXPERIMENTAL: 'categorical' fits KawOligo as a nominal "
-                              "categorical dim (location model) instead of jittered {0,0.5,1} "
-                              "(default: jitter)")
+    p_multi.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default=_tp53_default_kawoligo_mode(),
+                         help="[tp53] 'categorical' fits KawOligo as a nominal categorical dim "
+                              "(location model); 'jitter' is the earlier jittered {0,0.5,1} encoding "
+                              "(default: tp53.DEFAULT_KAWOLIGO_MODE, categorical)")
     p_multi.add_argument("--kawoligo-seed", type=int, default=0,
                          help="[--gene-set tp53] Seed for KawOligo's jitter (default: 0)")
     p_multi.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,
@@ -2174,10 +2603,10 @@ def main():
                        help="['integrated' pipeline only]")
     p_mv_all.add_argument("--rpvs-all", action="store_true",
                        help="[tp53] use the full RPV list instead of the high-confidence subset")
-    p_mv_all.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default="jitter",
-                       help="[tp53] EXPERIMENTAL: 'categorical' fits KawOligo as a nominal "
-                            "categorical dim (location model) instead of jittered {0,0.5,1} "
-                            "(default: jitter)")
+    p_mv_all.add_argument("--kawoligo-mode", choices=["jitter", "categorical"], default=_tp53_default_kawoligo_mode(),
+                       help="[tp53] 'categorical' fits KawOligo as a nominal categorical dim "
+                            "(location model); 'jitter' is the earlier jittered {0,0.5,1} encoding "
+                            "(default: tp53.DEFAULT_KAWOLIGO_MODE, categorical)")
     p_mv_all.add_argument("--kawoligo-seed", type=int, default=0,
                        help="[tp53] seed for KawOligo's jitter (default: 0)")
     p_mv_all.add_argument("--kawoligo-jitter-sigma", type=float, default=0.1,
@@ -2189,8 +2618,64 @@ def main():
     p_mv_all.set_defaults(func=run_mv_all)
     for p in (p_multi, p_pred, p_mv_all):
         _add_pathogenic_share_arg(p)
+        p.add_argument("--predictor-transform", nargs="+", default=None,
+                       metavar="TRANSFORM",
+                       help="Fit the computational predictor readouts (REVEL/MutPred2/"
+                            "AlphaMissense) on a monotone transform of their scores: none, "
+                            "logit, rank_int (multivariate_data/predictors.py). Each value "
+                            "becomes its own condition <output-dir>/ptx_<TRANSFORM>/, merged "
+                            "into one job array. Functional readouts are untouched.")
+        p.add_argument("--combined-population", choices=["union", "intersection"], default="union",
+                       help="[combined] Fit population: 'union' (default; every variant with "
+                            "any score, plus the predictor-label copies of assayed variants) or "
+                            "'intersection' (only variants with >=1 functional AND >=1 "
+                            "predictor score, the population that is evaluated). Writes a "
+                            "combined_population.txt marker that mv_analysis/config.py reads "
+                            "so scoring rebuilds the same rows.")
+        p.add_argument("--no-predictor-label-copies", dest="predictor_label_copies",
+                       action="store_false", default=True,
+                       help="[combined] One row per variant: a variant with >=1 functional "
+                            "score keeps only its functional-release label (predictor-CSV label "
+                            "cleared, no __predictor_dup copy); every other variant keeps its "
+                            "predictor-CSV label. Writes a predictor_label_copies.txt marker "
+                            "(\"false\") that mv_analysis/config.py reads.")
+        p.add_argument("--row-builder", choices=["v2", "legacy"], default="v2",
+                       help="[MV] Row construction. 'v2' (default): combined rows from "
+                            "multivariate_data/rows.py (one row per protein change, SpliceAI "
+                            "<= 0.2, one label source per row, predictors from the integrated "
+                            "dataframe, training variants blanked) and averaged merged rows in "
+                            "functional MultiScoresets. 'legacy': the pre-2026-11-19 rows. "
+                            "Writes row_builder.txt and clinvar_release.txt markers that "
+                            "mv_analysis/config.py reads.")
 
     args = parser.parse_args()
+    if hasattr(args, "packing"):
+        _PACK_OPTS["packing"] = args.packing
+    # Pin the ClinVar default release for job generation before anything can
+    # import mv_analysis.config, whose legacy-run fallback would otherwise set
+    # it to 2026 for the whole process. An explicit environment value wins.
+    os.environ.setdefault("MV_CLINVAR_DEFAULT_RELEASE", "2025")
+    if getattr(args, "strata", False) and getattr(args, "output_dir", None):
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "strata.txt"), "w") as f:
+            f.write("true\n")
+    if hasattr(args, "row_builder"):
+        os.environ["MV_ROW_BUILDER"] = args.row_builder
+        if getattr(args, "output_dir", None):
+            from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, "row_builder.txt"), "w") as f:
+                f.write(args.row_builder + "\n")
+            with open(os.path.join(args.output_dir, "clinvar_release.txt"), "w") as f:
+                f.write(resolve_clinvar_release("__default__") + "\n")
+    if getattr(args, "combined_population", "union") != "union":
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "combined_population.txt"), "w") as f:
+            f.write(args.combined_population + "\n")
+    if not getattr(args, "predictor_label_copies", True):
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "predictor_label_copies.txt"), "w") as f:
+            f.write("false\n")
 
     # Sample one dataset slice to estimate per-worker memory more accurately
     _sample_slice = None
@@ -2198,7 +2683,7 @@ def main():
     if df_path and os.path.exists(df_path):
         try:
             sep = "\t" if df_path.endswith((".tsv.gz", ".tsv")) else ","
-            _df_peek = pd.read_csv(df_path, sep=sep)
+            _df_peek = pd.read_csv(df_path, sep=sep, low_memory=False)
             if "Dataset" in _df_peek.columns:
                 first_ds = _df_peek["Dataset"].iloc[0]
                 _sample_slice = _df_peek[_df_peek["Dataset"] == first_ds]
@@ -2211,7 +2696,9 @@ def main():
     print("=" * 80)
     print(f"ExCALIBR job manifest — mode: {args.mode}  (workers: {args.n_jobs})")
     print("=" * 80)
-    if getattr(args, "pathogenic_share", None):
+    if getattr(args, "predictor_transform", None):
+        run_predictor_transform_conditions(args)
+    elif getattr(args, "pathogenic_share", None):
         run_pathogenic_share_conditions(args)
     else:
         args.func(args)

@@ -40,7 +40,15 @@ shrinks each component toward the pooled category frequencies (so a
 component with no categorical data contributes ~no evidence), and the
 uniform floor lam keeps every probability strictly positive even when a
 level never appears in a bootstrap's training rows.
+
+The pooled frequencies come from the population sample (gnomAD, sample
+column DEFAULT_POOL_SAMPLE) so no class label enters the prior; cat_pool_sample=None
+pools every training row instead. Fits made before 2026-10-28 (incl. the
+TP53 KawOligo fits in jobs_tp53_categorical_4c_tau0.1_100b_3f_102726) pooled
+every row; they store their alpha (fit["cat_alpha"]), so evaluating them is
+unaffected.
 """
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -48,6 +56,10 @@ import numpy as np
 
 DEFAULT_TAU = 3.0
 DEFAULT_LAMBDA = 0.1
+# sample column the pooled frequencies come from (gnomAD); None pools every row.
+# CFUSN_CAT_POOL=all restores the pre-2026-10-28 behaviour, e.g. for refits
+# (out-of-bag) that must match fits stored before then.
+DEFAULT_POOL_SAMPLE = None if os.environ.get("CFUSN_CAT_POOL", "gnomad") == "all" else 2
 
 
 @dataclass
@@ -156,11 +168,12 @@ def split_observations(observations, spec: CatSpec):
     return X_cont, labels, has_cont
 
 
-def cat_alpha(labels, spec: CatSpec, tau=DEFAULT_TAU, lam=DEFAULT_LAMBDA):
-    """Dirichlet pseudo-counts per categorical dim, from the pooled training frequencies."""
+def cat_alpha(labels, spec: CatSpec, tau=DEFAULT_TAU, lam=DEFAULT_LAMBDA, rows=None):
+    """Dirichlet pseudo-counts per categorical dim, from the pooled frequencies
+    of the training rows selected by the boolean mask ``rows`` (all if None)."""
     alpha = []
     for c, L in enumerate(spec.n_levels):
-        lab = labels[:, c]
+        lab = labels[:, c] if rows is None else labels[np.asarray(rows, bool), c]
         lab = lab[lab >= 0]
         counts = np.bincount(lab, minlength=L).astype(float)
         freq = counts / counts.sum() if counts.sum() > 0 else np.full(L, 1.0 / L)

@@ -383,6 +383,19 @@ def run_vus_sankey(output_dir: str = None):
 
 
 # %% [markdown]
+# ## Analysis: LABEL-seq report (per-variant table, Brnich regions, readout attribution, sankeys)
+#
+# For the LABEL-seq manuscript; shells out to mv_analysis/labelseq_report.py, which
+# sets its own fits/output paths before mv_analysis.config is imported.
+
+# %%
+def run_labelseq_report(stage: str = "all", workers: int = 12):
+    import subprocess
+    subprocess.run([sys.executable, "-m", "mv_analysis.labelseq_report", stage, "--workers", str(workers)],
+                   check=True, cwd=str(_ROOT))
+
+
+# %% [markdown]
 # ## Analysis: confusion matrices (MV-vs-ClinVar, MV-vs-ClinGen with/without PS3/BS3)
 #
 # Deliberately NOT `analysis.clingen.build_clingen_confusion` (needs the
@@ -643,7 +656,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gene-set", required=True,
-                     choices=["labelseq", "integrated", "predictor", "combined", "card11", "tp53"])
+                     choices=["labelseq", "integrated", "predictor", "combined", "card11", "tsc2", "tp53"])
     ap.add_argument("--fit-type", default="canonical",
                      choices=["canonical", "paper", "staged_init_all_assayed"])
     ap.add_argument("--genes", nargs="+", default=None,
@@ -652,7 +665,8 @@ def main():
     ap.add_argument("--output-dir", default=".")
     ap.add_argument("--analyses", nargs="+", default=["results-table"],
                      choices=["results-table", "uv-comparison",
-                              "evidence-3d", "vus-sankey", "confusion-matrices", "brnich-comparison"])
+                              "evidence-3d", "vus-sankey", "confusion-matrices", "brnich-comparison",
+                              "labelseq-report"])
     ap.add_argument("--no-strip-functional-evidence", action="store_true",
                      help="For --analyses confusion-matrices: keep PS3/BS3 in the ClinGen "
                           "ground truth instead of stripping (circularity-check mode).")
@@ -707,6 +721,9 @@ def main():
         out = Path(args.output_dir) / f"{args.gene_set}_{args.fit_type}_brnich_comparison.png"
         run_brnich_comparison(args.gene_set, args.fit_type, genes, args.n_components, run_kwargs,
                                save_path=str(out))
+
+    if "labelseq-report" in args.analyses:
+        run_labelseq_report("all")
 
 
 # %%

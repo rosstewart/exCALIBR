@@ -247,6 +247,11 @@ Examples:
     parser.add_argument("--no-pathomechanism-prior",
                        dest="pathomechanism_prior_enabled", action="store_false", default=None,
                        help=argparse.SUPPRESS)
+    parser.add_argument("--exclude-degenerate-prior-fits", action="store_true", default=False,
+                        help="Leave bootstrap fits whose standard-mode prior EM never left its 0.5 "
+                             "start (prior undefined) out of the median prior, prior percentiles "
+                             "and OOB median prior; still used for every LR+ percentile. Off by "
+                             "default (published calibrations do not use it).")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
     # experimentation only -- mutually exclusive with --pathomechanism-prior above.
     # Parses with default=None; resolve_prior_mode reconciles it after parsing.
@@ -264,7 +269,7 @@ Examples:
     # constructions) are kept only for dev/debugging comparison against
     # 'boundary', not a top-level user-facing choice.
     parser.add_argument("--pathomechanism-method",
-                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary"],
+                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary", "subtraction_grid"],
                        default=None,
                        help=argparse.SUPPRESS)
     # EXPERIMENTAL, hidden: only meaningful when --pathomechanism-method
@@ -286,7 +291,7 @@ Examples:
                        help="Use p-value test instead of conservative 5th percentile")
 
     # ClinVar / ACMG-mapping options
-    parser.add_argument("--clinvar-release", choices=["2026", "2025", "2018"], default="2026", help="ClinVar release year")
+    parser.add_argument("--clinvar-release", choices=["2026", "2025", "2018"], default="2025", help="ClinVar release year (IGVF/PillarProject-format input only)")
     parser.add_argument("--min-clinvar-star", type=int, default=1,
                        help="Minimum ClinVar review stars (default: 1)")
     parser.add_argument("--acmg-mapping-method",
@@ -299,6 +304,8 @@ Examples:
                             "for reporting (supersedes the former separate 'piecewise'/"
                             "'continuous'/'strict_additive' options); "
                             "'all' = run both and write per-method output files.")
+    parser.add_argument("--tavtigian-posterior-decimals", choices=["none", "3"], default=None,
+                       help="Rounding of rule posteriors when solving for Tavtigian's c: 'none' = exact (c = smallest integer meeting every combining rule; 351 at prior 0.1), '3' = round to 3 decimals as in the ExCALIBR manuscript (348 at prior 0.1). Default: the EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS environment variable, else exact.")
     parser.add_argument("--acmg-bayes-targets", type=json.loads, default=None,
                        help="Override acmg_bayes target posteriors as a JSON object, "
                             "e.g. '{\"LB\": 0.01, \"B\": 0.001}'. Any key not given falls "
@@ -342,6 +349,11 @@ Examples:
 
     args = parser.parse_args()
 
+    # Process-wide (read at call time by get_tavtigian_constant and inherited
+    # by joblib workers), so every threshold computation in this run agrees.
+    if args.tavtigian_posterior_decimals is not None:
+        os.environ["EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS"] = args.tavtigian_posterior_decimals
+
     # --n-bootstraps/--fits-per-bootstrap, if explicitly passed, override the
     # --preset shorthand for that one setting only.
     preset_n_bootstraps, preset_fits_per_bootstrap = BOOTSTRAP_PRESETS[args.preset]
@@ -356,9 +368,11 @@ Examples:
 
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode
-    # expects, defaulting the sub-choice to "boundary" when enabled.
+    # expects, defaulting the sub-choice to "subtraction_grid" when enabled
+    # (subtraction, grid-boundary fallback for a benign reference < 10 variants;
+    # see PipelineConfig.pathomechanism_method).
     if args.pathomechanism_prior_enabled:
-        pm_flag = args.pathomechanism_method or "boundary"
+        pm_flag = args.pathomechanism_method or "subtraction_grid"
     elif args.pathomechanism_prior_enabled is False:
         pm_flag = "off"
     else:
@@ -413,6 +427,7 @@ Examples:
         pathogenic_percentile=args.pathogenic_percentile,
         benign_percentile=args.benign_percentile,
         filter_pathogenic_sample_by_lr=args.filter_pathogenic_sample_by_lr,
+        exclude_degenerate_prior_fits=args.exclude_degenerate_prior_fits,
         pathomechanism_method=args.pathomechanism_method,
         pathomechanism_boundary_joint_prior=args.pathomechanism_boundary_joint_prior,
         acmg_mapping_method=(args.acmg_mapping_method

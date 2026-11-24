@@ -64,7 +64,7 @@ PRECOMPUTED_FITS = _env(
 #                            include (copied from exploratory_figures/ at the end
 #                            of each run), plus generated/ (macros.tex, tables)
 #   tables/                  LaTeX table files and IGVF data-release CSVs
-#   supplementary_data/      Supplementary Data 1-3
+#   supplementary_data/      Supplementary Data 1-6 (5-6: Human Domainome 1)
 #   submission/              flattened .tex (no personal macros) for Nature Genetics
 #   pillar_project_figures/  IGVF Pillar Project outputs (other paper)
 FIGURE_DIR = _env("EXCALIBR_FIGURE_DIR", str(Path(OUTPUT_DIR) / "exploratory_figures"))
@@ -286,6 +286,41 @@ SKEW_LOCKED_BOOTSTRAP_RESULTS = _env(
     "/data/ross/assay_calibration/skew_locked_gmm/bootstrap_results.json.gz",
 )
 
+# Prior-estimation simulation (Reviewer 3 #4/#6; Supplementary Figure/Table,
+# section A11h): outputs of `python -m analysis.prior_simulation.test_priors`
+# (paired_replicates.csv, paired_tests.csv).
+PRIOR_SIMULATION_DIR = _env(
+    "EXCALIBR_PRIOR_SIMULATION_DIR",
+    "/data/ross/assay_calibration/prior_simulation",
+)
+
+# Calibration-quality simulation (Reviewer 2 comment on minimal truth sets; section A11i): results.csv and
+# acmgscaler_rows.csv from `python -m analysis.calibration_quality.tasks collect` / `.acmgscaler_arm`, and the
+# deliberately misspecified cells (misfit_results.csv, or included in results.csv once run on the HPC).
+CALIBRATION_QUALITY_DIR = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_DIR",
+    # hpc_grid_r8_v2 (2026-11-13): 588 settings incl. NU, 1%/2.5%/60% and continuous-prior slices, prior-effect and
+    # Yang-vs-truth columns; its 516 original settings reproduce hpc_grid_r8 (kept for comparison)
+    "/data/ross/assay_calibration/calibration_quality/hpc_grid_r8_v2",
+)
+# Local rerun (2026-11-14) of the S3/S4 replicates adding the shares of held-out variants overshooting at all / by
+# > 5 / > 10 pp (run.py post_over_any/_5/_10): results.csv (ExCALIBR rows, same tasks as the grid; stored columns
+# reproduce) and acmg/acmgscaler_rows.csv (whole acmgscaler arm). Text-only shares; figures plot the mean overshoot.
+CALIBRATION_QUALITY_OVERSHOOT_DIR = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_OVERSHOOT_DIR",
+    "/data/ross/assay_calibration/calibration_quality/s3_overshoot_rerun",
+)
+# Local rerun (2026-11-15) adding evidence retention capped at the Tavtigian C of each setting's true prior
+# (run.py *_capc columns) for every replicate whose retention is shown or quoted (S3; mislabeled controls).
+CALIBRATION_QUALITY_CAPC_DIR = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_CAPC_DIR",
+    "/data/ross/assay_calibration/calibration_quality/retention_capc",
+)
+CALIBRATION_QUALITY_MISFIT_CSV = _env(
+    "EXCALIBR_CALIBRATION_QUALITY_MISFIT_CSV",
+    "/data/ross/assay_calibration/calibration_quality/misfit_results.csv",
+)
+
 # Pathomechanism-aware ExCALIBR rerun ("canonical" vs "pathomech_boundary"
 # comparison -- see Supplementary Section sec:pathomechanism_prior). Same
 # ExCALIBR-shaped output tree as OUTPUT_DIR/SKEW_LOCKED_OUTPUT_DIR, so it's
@@ -424,6 +459,8 @@ CURATED_DATASET_METADATA_CSV = _env(
 # Review aid: render every generated number that differs from the
 # pre-automation manuscript (or is new) in red. Turn off once reviewed.
 HIGHLIGHT_CHANGED_NUMBERS = _env("EXCALIBR_HIGHLIGHT_CHANGED_NUMBERS", "1") == "1"
+# xcolor name or model spec for those numbers, e.g. "red", "blue", "[HTML]{1F6FB2}".
+HIGHLIGHT_COLOR = _env("EXCALIBR_HIGHLIGHT_COLOR", "red")
 
 # Explicit, reasoned exemptions from the manuscript build's staleness checks:
 # {input path: reason}. Every waiver is copied into build_report.md.
@@ -459,3 +496,22 @@ def warn_if_missing(path: str, what: str) -> bool:
         print(f"  SKIP {what}: path not found ({path})")
         return True
     return False
+
+
+# BibTeX keys (ExCALIBR_latex_src/references.bib), by display name (plot_common.display_name), for datasets named in the text by a generated list macro; a dataset
+# without a key is listed uncited and flagged by a claim check. Add the key here once its entry is in the .bib.
+DATASET_CITE_KEYS = {
+    "SCN5A_Glazer_2020": "glazer2020deep",
+    "OTC_Lo_2023": "lo2023functional",
+    "CRX_Shepherdson_2024": "shepherdson2024CRX",
+    "TARDBP_Bolognesi_Faure_2019": "bolognesi2019mutational",
+    "ASPA_Grønbæk-Thygesen_2024_abundance": "gronbaek2024deep",
+    "ASPA_Grønbæk-Thygesen_2024_toxicity": "gronbaek2024deep",
+    "TPK1_Weile_2017": "weile2017framework",
+    "KCNQ4_Zheng_2022_v12_homozygous": "zheng2022proactive",
+    "PAX6_McDonnell_2024_LE9_geneticin": "mcdonnell2024deep",
+    "BRCA2_Sahu_2025_SGE": "sahu2025saturation",
+    "BRCA1_Findlay_2018": "findlay2018accurate",
+    "MSH2_Jia_2021": "jia2021massively",
+    "TP53_Giacomelli_2018_combined_score": "giacomelli2018mutational",
+}

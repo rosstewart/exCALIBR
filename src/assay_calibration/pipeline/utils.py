@@ -17,6 +17,7 @@ logging.getLogger('PIL').setLevel(logging.WARNING)
 from .config import PipelineConfig
 
 from ..fit_utils.utils import serialize_dict
+from ..fit_utils.evidence_thresholds import default_posterior_decimals as _tavtigian_posterior_decimals
 from ..data_utils.dataset import Scoreset, BasicScoreset
 
 def setup_logging(output_dir: str, dataset_name: str) -> logging.Logger:
@@ -106,12 +107,32 @@ def save_results(
                 'PLP_frac_pathomechanism_measured', None),
             'PLP_frac_pathomechanism_measured_unstable': calibration.get(
                 'PLP_frac_pathomechanism_measured_unstable', False),
+            'pathomechanism_estimator_used': calibration.get('pathomechanism_estimator_used', None),
+            'pathomechanism_ref_n': calibration.get('pathomechanism_ref_n', None),
+            # always-on P(M=1|Y=1) diagnostic (subtraction, grid boundary if benign reference < 10)
+            **{k: calibration.get(k, None) for k in (
+                'gamma_hat_diagnostic', 'gamma_hat_diagnostic_p5', 'gamma_hat_diagnostic_p95',
+                'gamma_hat_diagnostic_n_fits', 'gamma_hat_diagnostic_estimator', 'gamma_hat_diagnostic_ref_n')},
             'pct_bootstraps_kept': calibration.get('pct_bootstraps_kept', None),
             'pct_pathogenic_rows_kept': calibration.get('pct_pathogenic_rows_kept', None),
             'point_ranges': calibration['point_ranges'],
             # Benign blocks removed on the auto-bidirectional path as
             # [lo, hi, population share] -- see prune_small_benign_blocks.
             'pruned_benign_islands': calibration.get('pruned_benign_islands', []),
+            # Dataset-level auto-bidirectional decision and fraction of
+            # bootstrap fits flagged (None for outputs predating this field;
+            # see analysis.supplementary_data.bidirectional_decision).
+            'bidirectional': calibration.get('bidirectional', None),
+            'bidirectional_frac_flagged': calibration.get('bidirectional_frac_flagged', None),
+            # Benign reference mean score, and the record of the plain-path
+            # pathogenic side rule (drop_wrong_side_pathogenic_fragments;
+            # None on the bidirectional path or for outputs predating it).
+            'benign_center': calibration.get('benign_center', None),
+            'pathogenic_side_rule': calibration.get('pathogenic_side_rule', None),
+            # Rounding of rule posteriors in the Tavtigian c search used for
+            # this calibration (None = exact; 3 = manuscript setting). See
+            # fit_utils.evidence_thresholds.default_posterior_decimals.
+            'tavtigian_posterior_decimals': _tavtigian_posterior_decimals(),
             'dataset': config.dataset_name,
             'relax': True,
             'liberal_monotonicity': config.liberal_monotonicity,
@@ -138,7 +159,12 @@ def save_results(
             import numpy as _np
             llr = _np.asarray(calibration['log_lr_plus'])
             pct = _np.nanpercentile(llr, [5, 50, 95], axis=0)
-            priors_arr = _np.asarray(calibration.get('priors', calibration['prior']))
+            priors_arr = _np.atleast_1d(_np.asarray(calibration.get('priors', calibration['prior']), dtype=float))
+            # Undefined (EM-start) priors are left out when
+            # exclude_degenerate_prior_fits flagged them (all-False otherwise).
+            degen = calibration.get('prior_degenerate')
+            if degen is not None and len(degen) == len(priors_arr) and not _np.all(degen):
+                priors_arr = priors_arr[~_np.asarray(degen, dtype=bool)]
             priors_pct = _np.nanpercentile(priors_arr, [5, 50, 95]).tolist()
             lr_data = {
                 'dataset': config.dataset_name,
@@ -229,6 +255,11 @@ def load_dataset_from_df(df, config):
             min_clinvar_star=config.min_clinvar_star,
             population_type=config.population_type,
             synonymous_exclusive=getattr(config, "synonymous_exclusive", False),
+            missense_controls_only=getattr(config, "missense_controls_only", False),
+            missense_plp_only=getattr(config, "missense_plp_only", False),
+            plp_subsample_n=getattr(config, "plp_subsample_n", None),
+            plp_subsample_seed=getattr(config, "plp_subsample_seed", 0),
+            extra_sample=getattr(config, "extra_sample", None),
             spliceai_threshold=getattr(config, "spliceai_threshold", 0.2),
             vep_splice_filter=getattr(config, "vep_splice_filter", True),
         )

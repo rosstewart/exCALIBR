@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import os
 from pathlib import Path
 from fire import Fire
 from functools import reduce
@@ -461,7 +462,7 @@ class Scoreset:
 
         Optional Arg:
         - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-        - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
+        - clinvar_release : str in {'2025','2026','2018'} (default '2025') : Clinvar release to use
         """
         self._init_kwargs = dict(kwargs)
         self._init_dataframe(dataframe, **kwargs)
@@ -808,7 +809,7 @@ class Scoreset:
 
         Optional Arg:
             - min_clinvar_star : int (default 1) : minimum review status (star count) to use Clinical Significance annotations
-            - clinvar_release : str in {'2026','2018'} (default '2026') : Clinvar release to use
+            - clinvar_release : str in {'2025','2026','2018'} (default '2025') : Clinvar release to use
         Returns
         -------
         None
@@ -856,7 +857,7 @@ class Scoreset:
         self.filter_invalid()
         self.splicing_filter(**kwargs)
         min_clinvar_star = kwargs.get("min_clinvar_star",1)
-        clinvar_release = kwargs.get("clinvar_release",'2026')
+        clinvar_release = kwargs.get("clinvar_release", '2025')
         n_jobs = kwargs.get("n_jobs", 1)
         rows = self.dataframe.to_dict('records')
         if n_jobs == 1:
@@ -870,6 +871,18 @@ class Scoreset:
                 for row in rows
             )
         self.synonymous_exclusive = kwargs.get("synonymous_exclusive",False)
+        # Restrict the P/LP and B/LB samples to missense variants (population,
+        # synonymous and extra samples are unaffected; use population_type to
+        # restrict the population sample). Default off = production behaviour.
+        self.missense_controls_only = kwargs.get("missense_controls_only", False)
+        # Restrict only the P/LP sample to missense (B/LB, population, synonymous
+        # and extra samples unchanged). Default off.
+        self.missense_plp_only = kwargs.get("missense_plp_only", False)
+        # Keep the P/LP label on a random subset of plp_subsample_n P/LP rows only
+        # (other memberships kept); a matched-count control for missense_plp_only.
+        # Default None = off.
+        self.plp_subsample_n = kwargs.get("plp_subsample_n", None)
+        self.plp_subsample_seed = kwargs.get("plp_subsample_seed", 0)
         self.score_avg = kwargs.get("score_avg",True)
 
         # for discordance and downsampling analyses
@@ -1020,22 +1033,23 @@ class Scoreset:
         
         """
         self.has_synomyous = any([variant.is_synonymous for variant in self.variants])
-        self.parse_regularization_type(**kwargs)
-        self.NSamples = 5 if self.regularization_type is not None else 4
+        self.parse_extra_sample(**kwargs)
+        self.NSamples = 5 if self.extra_sample is not None else 4
         self.sample_names = [
             "Pathogenic/Likely Pathogenic",
             "Benign/Likely Benign",
             "population",
             "Synonymous",
         ]
-        if self.regularization_type is not None:
-            self.sample_names.append(self.regularization_type)
+        if self.extra_sample is not None:
+            self.sample_names.append(self.extra_sample)
         variants_by_id = self.get_variants_by_id()
         self.n_variants = len(variants_by_id)
         self._sample_assignments = np.zeros(
             (self.n_variants, self.NSamples), dtype=bool
         )
         self._scores = np.zeros(self.n_variants)
+        self._plp_is_missense = np.zeros(self.n_variants, dtype=bool)
         self._auth_labels = np.empty(self.n_variants, dtype='U50')
         self._raw_func_classes = np.empty(self.n_variants, dtype=object)
         _fcc_cols = sorted(
@@ -1054,7 +1068,9 @@ class Scoreset:
         self.parse_population_type(**kwargs)
         group_cols = ['Gene','Chrom','hg38_start','ref_allele','alt_allele']
         is_pop = self.is_population_member  # avoid repeated self-lookup in tight loop
-        is_reg = self.is_regularization_member if self.regularization_type is not None else None
+        is_reg = self.is_extra_sample_member if self.extra_sample is not None else None
+        _mis_gate = getattr(self, "missense_controls_only", False)
+        _plp_mis_gate = _mis_gate or getattr(self, "missense_plp_only", False)
 
         # Determine variant-matching strategy once for the whole scoreset.
         # Use .all() so a strategy is only chosen when it covers every variant.
@@ -1160,9 +1176,10 @@ class Scoreset:
                     continue
             if any(is_pop(v) for v in variants):
                 self._sample_assignments[idx, 2] = True
-            if any(v.is_pathogenic for v in variants):
+            self._plp_is_missense[idx] = any(v.is_pathogenic and v.is_missense for v in variants)
+            if any(v.is_pathogenic and (v.is_missense or not _plp_mis_gate) for v in variants):
                 self._sample_assignments[idx, 0] = True
-            if any(v.is_benign for v in variants):
+            if any(v.is_benign and (v.is_missense or not _mis_gate) for v in variants):
                 self._sample_assignments[idx, 1] = True
             if is_reg is not None and any(is_reg(v) for v in variants):
                 self._sample_assignments[idx, 4] = True
@@ -1174,6 +1191,17 @@ class Scoreset:
         # pipeline/visualize.py instead of the sample-filtered range.
         self.global_score_min = float(np.nanmin(self._scores))
         self.global_score_max = float(np.nanmax(self._scores))
+
+        if self.plp_subsample_n is not None:
+            _plp_rows = np.flatnonzero(self._sample_assignments[:, 0])
+            # "missense": match the number of missense P/LP rows in this dataset
+            _n = (int((self._sample_assignments[:, 0] & self._plp_is_missense).sum())
+                  if self.plp_subsample_n == "missense" else int(self.plp_subsample_n))
+            if len(_plp_rows) > _n:
+                _rng = np.random.default_rng(int(self.plp_subsample_seed))
+                _keep = _rng.choice(_plp_rows, size=_n, replace=False)
+                _drop = np.setdiff1d(_plp_rows, _keep)
+                self._sample_assignments[_drop, 0] = False
 
         keep_mask = self._sample_assignments.any(axis=1)
         self._keep_mask = keep_mask
@@ -1272,25 +1300,46 @@ class Scoreset:
     
     
 
-    def parse_regularization_type(self, **kwargs):
-        regularization_type = kwargs.get("regularization_type", None)
-        valid = {None, 'all_missense_snv', 'all_assayed', 'all_snv', 'all_nsSNV'}
-        if regularization_type not in valid:
+    EXTRA_SAMPLE_TYPES = {None, 'all_missense_snv', 'all_assayed', 'all_snv', 'all_nsSNV', 'ptv'}
+
+    def parse_extra_sample(self, **kwargs):
+        """Optional fifth sample (raw column 4): fit with its own mixture weights over the
+        shared components, but given no role in lr+ or prior estimation (pipeline/visualize.py
+        assigns roles by sample name). `regularization_type` is the deprecated name of
+        `extra_sample` and is still accepted (MV tooling and saved job manifests use it)."""
+        extra = kwargs.get("extra_sample", None)
+        legacy = kwargs.get("regularization_type", None)
+        if extra is not None and legacy is not None and extra != legacy:
+            raise ValueError(f"extra_sample={extra!r} conflicts with regularization_type={legacy!r}")
+        extra = extra if extra is not None else legacy
+        if extra not in self.EXTRA_SAMPLE_TYPES:
             raise ValueError(
-                f"Invalid regularization_type {regularization_type!r}; must be one of {valid}"
+                f"Invalid extra_sample {extra!r}; must be one of {self.EXTRA_SAMPLE_TYPES}"
             )
-        self.regularization_type = regularization_type
+        self.extra_sample = extra
+        self.regularization_type = extra  # deprecated alias, kept for existing callers/pickles
+
+    def parse_regularization_type(self, **kwargs):
+        """Deprecated alias of parse_extra_sample."""
+        return self.parse_extra_sample(**kwargs)
+
+    def is_extra_sample_member(self, variant) -> bool:
+        kind = self.extra_sample
+        if kind == 'all_assayed':
+            return True
+        if kind == 'all_snv':
+            return variant.is_snv
+        if kind == 'all_nsSNV':
+            return variant.is_nsSNV
+        if kind == 'all_missense_snv':
+            return variant.is_missense and variant.is_snv
+        if kind == 'ptv':
+            return getattr(variant, "is_ptv", False)
+        return False
 
     def is_regularization_member(self, variant) -> bool:
-        if self.regularization_type == 'all_assayed':
-            return True
-        if self.regularization_type == 'all_snv':
-            return variant.is_snv
-        if self.regularization_type == 'all_nsSNV':
-            return variant.is_nsSNV
-        if self.regularization_type == 'all_missense_snv':
-            return variant.is_missense and variant.is_snv
-        return False
+        """Deprecated alias of is_extra_sample_member."""
+        return self.is_extra_sample_member(variant)
 
     def parse_population_type(self,**kwargs):
         population_type = kwargs.get("population_type",'gnomAD')
@@ -1539,6 +1588,8 @@ class Variant:
         cons_str = cons if isinstance(cons, str) else ""
         self.is_synonymous = (cons_str.lower() == "synonymous") or (cons_str == "synonymous_variant")
         self.is_missense = (cons_str == 'missense_variant') or (cons_str.lower() == 'missense')
+        # protein-truncating: stop-gain of any length (SNV or MNV) or frameshift
+        self.is_ptv = cons_str.lower() in {"stop_gained", "frameshift_variant", "nonsense", "frameshift"}
         self.is_snv = len(str(self.ref_allele)) == 1 and len(str(self.alt_allele)) == 1 and str(self.ref_allele) != str(self.alt_allele)
 
     def parse_clinvar_sig(self):
@@ -2237,6 +2288,18 @@ class MultiScoreset:
         raw_fc_matrix = np.empty((n_variants, self.d), dtype=object)
         raw_fc_matrix[:] = ''
 
+        # Several entries of ONE assay can land in the same merged row, e.g.
+        # every SGE SNV of a protein change that a protein-level assay also
+        # measures (union-find links them through the protein-level group).
+        # row_merge="mean" (the v2 row builder, MV_ROW_BUILDER != "legacy")
+        # averages them -- replicate measurements of one protein effect --
+        # instead of keeping whichever entry came last ("last", legacy).
+        row_merge = self._init_kwargs.get(
+            "row_merge", "last" if os.environ.get("MV_ROW_BUILDER", "v2") == "legacy" else "mean")
+        if row_merge not in ("last", "mean"):
+            raise ValueError(f"row_merge must be 'last' or 'mean', got {row_merge!r}")
+        score_sum = np.zeros((n_variants, self.d))
+        score_n = np.zeros((n_variants, self.d), dtype=int)
         for assay_i in range(self.d):
             row_indices = assay_row_idx[assay_i]
             scores = scores_list[assay_i]
@@ -2245,7 +2308,11 @@ class MultiScoreset:
             al = getattr(s, '_auth_labels', None)
             rfc = getattr(s, '_raw_func_classes', None)
             for k, idx in enumerate(row_indices):
-                scores_matrix[idx, assay_i] = scores[k]
+                if row_merge == "mean" and np.isfinite(scores[k]):
+                    score_sum[idx, assay_i] += scores[k]
+                    score_n[idx, assay_i] += 1
+                else:
+                    scores_matrix[idx, assay_i] = scores[k]
                 sample_assignments[idx] |= samples[k]
                 if al is not None and k < len(al) and al[k]:
                     label = al[k]
@@ -2256,15 +2323,31 @@ class MultiScoreset:
                 if rfc is not None and k < len(rfc):
                     raw_fc_matrix[idx, assay_i] = rfc[k] or ''
 
+        if row_merge == "mean":
+            filled = score_n > 0
+            scores_matrix[filled] = score_sum[filled] / score_n[filled]
+        self._row_merge_counts = score_n
+
         # ── Keep only variants with at least one observed score ────────────────
         missing_mask = np.isnan(scores_matrix)
         keep_mask = ~np.all(missing_mask, axis=1)
+
+        # Every genomic atom (gene, chrom, pos, ref, alt) of each merged row,
+        # aligned with the kept rows -- the row's member SNVs, used to assign
+        # consequence / SpliceAI strata (fit_utils/strata.py).
+        _members: dict = {}
+        for assay_keys in variant_keys:
+            for fset in assay_keys:
+                for a in fset:
+                    _members.setdefault(uf.find(a), set()).add(a)
 
         # Build _variants_kept: one representative group_col tuple per variant
         # (the canonical atom chosen by union-find).  Stored as a tuple matching
         # group_cols so downstream code (e.g. align_variants) can unpack it.
         all_canonical = canonical   # list of group_col tuples, one per variant
         self._variants_kept = [all_canonical[i] for i in range(n_variants) if keep_mask[i]]
+        self._row_atoms = [sorted(_members.get(uf.find(all_canonical[i]), {all_canonical[i]}), key=lambda a: tuple(map(str, a)))
+                           for i in range(n_variants) if keep_mask[i]]
 
         self._scores_matrix = scores_matrix
         self._missing_mask = missing_mask

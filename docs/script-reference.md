@@ -69,8 +69,8 @@ python hpc/prepare.py <subcommand> --output-dir /path/to/run [options]
 ```
 
 Subcommands:
-- `default` — IGVF/PillarProject TSV, ClinVar 2026
-- `pillar_project` — same as `default`, ClinVar 2025 default
+- `default` — IGVF/PillarProject TSV, ClinVar 2025, Tavtigian constant solved exactly
+- `pillar_project` — same as `default`, but rule posteriors rounded to 3 decimals when solving for the Tavtigian constant, as in releases up to v1.1.x
 - `mavedb` — MaveDB CSV with `--score-cols` and `--dataframe`
 - `basicscoreset` — bare-bones CSV or directory of CSVs
 - `multivariate` — multi-assay fitting; groups genes with >1 dataset

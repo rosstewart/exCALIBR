@@ -10,6 +10,18 @@
 # Example:
 #   bash hpc/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
 #   SLURM_MEM=8G SLURM_CPUS=24 bash hpc/submit_array.sh /projects/pedjas_lab/stewart.ro/my_run
+#
+# Task layout is a submission-time choice (no need to re-run prepare.py). The
+# default is one task per concurrent slot (TASKS=MAX_CONCURRENT): with a fixed
+# number of slots, extra tasks only queue behind the first wave and start
+# their long fits late (docs/fit_speed_report.md, "Static vs dynamic").
+#   TASKS=150 bash hpc/submit_array.sh <dir>   # e.g. when one-wave tasks would exceed SLURM_TIME
+#   TASKS=auto bash hpc/submit_array.sh <dir>  # count chosen by make_layout for MAX_CONCURRENT x SLURM_CPUS
+#   TASKS=prepare bash hpc/submit_array.sh <dir>  # prepare.py's own layout
+# hpc/make_layout.py balances the compact jobs (dataset x bootstrap) across the
+# tasks from prepare.py's fit-time estimates, longest tasks first, and prints
+# the predicted CPU use (and a smaller SLURM_CPUS if extra cores would sit
+# idle). Scheduling only: fit results are bitwise unchanged.
 
 set -euo pipefail
 
@@ -24,10 +36,6 @@ if [ ! -f "$JOB_INDEX" ]; then
     exit 1
 fi
 
-# Read number of array tasks from the job index
-NUM_ARRAYS=$(python3 -c "import json; print(json.load(open('$JOB_INDEX'))['num_arrays'])")
-MAX_IDX=$((NUM_ARRAYS - 1))
-
 mkdir -p "$OUTPUT_DIR/logs"
 
 # ── SLURM parameters ───────────────────────────────────────────────────────────
@@ -40,7 +48,21 @@ CPUS="${SLURM_CPUS:-16}"
 PARTITION="${SLURM_PARTITION:-short}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-50}"        # max simultaneously running tasks
 PYTHON="${PYTHON:-/home/stewart.ro/.conda/envs/pillar_project/bin/python}"
+TASKS="${TASKS:-$MAX_CONCURRENT}"             # default: one task per concurrent slot (one wave);
+                                              # N or auto: re-lay out; "prepare": prepare.py's layout
 # ──────────────────────────────────────────────────────────────────────────────
+
+LAYOUT_ARG=""
+if [ "$TASKS" != "prepare" ]; then
+    LAYOUT_FILE=$(${PYTHON} ${SCRIPT_DIR}/make_layout.py "$OUTPUT_DIR" --tasks "$TASKS" \
+        --cpus "$CPUS" --max-concurrent "$MAX_CONCURRENT" | tail -n 1)
+    NUM_ARRAYS=$(python3 -c "import json; print(json.load(open('$LAYOUT_FILE'))['n_tasks'])")
+    LAYOUT_ARG="--layout ${LAYOUT_FILE}"
+else
+    NUM_ARRAYS=$(python3 -c "import json; print(json.load(open('$JOB_INDEX'))['num_arrays'])")
+fi
+MAX_IDX=$((NUM_ARRAYS - 1))
+ARRAY_SPEC="${ARRAY_SPEC:-0-${MAX_IDX}}"      # e.g. "3,7,10-20" to (re)run only some tasks (indices of the layout in use)
 
 JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 #!/bin/bash
@@ -48,7 +70,7 @@ JOB_ID=$(sbatch --parsable << SBATCH_SCRIPT
 #SBATCH --job-name=${JOB_NAME}
 #SBATCH --output=${OUTPUT_DIR}/logs/array_%A_%a.out
 #SBATCH --error=${OUTPUT_DIR}/logs/array_%A_%a.err
-#SBATCH --array=0-${MAX_IDX}%${MAX_CONCURRENT}
+#SBATCH --array=${ARRAY_SPEC}%${MAX_CONCURRENT}
 #SBATCH --time=${TIME}
 #SBATCH --mem=${MEM}
 #SBATCH --cpus-per-task=${CPUS}
@@ -62,13 +84,16 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+${EXCALIBR_SAVE_RESTART_LL:+export EXCALIBR_SAVE_RESTART_LL=${EXCALIBR_SAVE_RESTART_LL}}
+${PYTHONUNBUFFERED:+export PYTHONUNBUFFERED=${PYTHONUNBUFFERED}}
 
-${PYTHON} ${SCRIPT_DIR}/run_array_task.py ${OUTPUT_DIR} \${SLURM_ARRAY_TASK_ID}
+${PYTHON} ${SCRIPT_DIR}/run_array_task.py ${OUTPUT_DIR} \${SLURM_ARRAY_TASK_ID} ${LAYOUT_ARG}
 SBATCH_SCRIPT
 )
 
 echo "Submitted job array ${JOB_ID}"
-echo "  Tasks      : ${NUM_ARRAYS}  (indices 0–${MAX_IDX}, max ${MAX_CONCURRENT} concurrent)"
+echo "  Tasks      : ${NUM_ARRAYS} in run; submitted indices ${ARRAY_SPEC} (max ${MAX_CONCURRENT} concurrent)"
+if [ -n "$LAYOUT_ARG" ]; then echo "  Layout     : ${LAYOUT_FILE}"; fi
 echo "  mem / cpus : ${MEM} / ${CPUS}"
 echo "  Partition  : ${PARTITION}   time limit: ${TIME}"
 echo "  Output dir : ${OUTPUT_DIR}"

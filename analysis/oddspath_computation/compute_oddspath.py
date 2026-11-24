@@ -218,6 +218,35 @@ def prepare_variants(tsv: str) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- OddsPath
 
+def odds_path_ratio(path_in_class, pathogenic_controls, benign_in_class, benign_controls):
+    """OddsPath of one functional class: the share of pathogenic controls in
+    it over the share of benign controls in it (counts after pseudocounts)."""
+    return (path_in_class / pathogenic_controls) / (benign_in_class / benign_controls)
+
+
+def odds_path_from_counts(path_abnormal, path_normal, benign_abnormal, benign_normal,
+                          pathogenic_controls, benign_controls, pseudocount="if_zero"):
+    """(OddsPath abnormal, OddsPath normal, pseudocount notes) from control
+    counts, as odds_lr. pseudocount "if_zero" is odds_lr's rule (the
+    manuscript's): +1 benign in the abnormal class only when it has none, +1
+    pathogenic in the normal class only when it has none. "always" adds both
+    unconditionally (the convention of the earlier LABEL-seq OddsPath CSV,
+    kept only to reproduce it). (None, None) when a control class is empty;
+    callers handle a functional class with no variants (odds_lr's "No
+    functionally ... controls")."""
+    notes = []
+    if pseudocount == "always" or (pseudocount == "if_zero" and benign_abnormal == 0):
+        benign_abnormal += 1
+        notes.append("Added 1 misclassified benign variant to abnormal function class")
+    if pseudocount == "always" or (pseudocount == "if_zero" and path_normal == 0):
+        path_normal += 1
+        notes.append("Added 1 misclassified pathogenic variant to normal function class")
+    if pathogenic_controls == 0 or benign_controls == 0:
+        return None, None, notes
+    return (odds_path_ratio(path_abnormal, pathogenic_controls, benign_abnormal, benign_controls),
+            odds_path_ratio(path_normal, pathogenic_controls, benign_normal, benign_controls), notes)
+
+
 def odds_lr(df: pd.DataFrame, clnsig_group: str = "clnsig_group_18_25") -> dict:
     """Notebook cell 19 (OddsPath with +1 pseudocounts)."""
     dataset = df["Dataset"].iloc[0]
@@ -257,11 +286,11 @@ def odds_lr(df: pd.DataFrame, clnsig_group: str = "clnsig_group_18_25") -> dict:
     if assay_abnormal_num == 0:
         odds_abnormal = "No functionally abnormal controls"
     else:
-        odds_abnormal = (path_abnormal / pathogenic_controls) / (benign_abnormal / benign_controls)
+        odds_abnormal = odds_path_ratio(path_abnormal, pathogenic_controls, benign_abnormal, benign_controls)
     if assay_normal_num == 0:
         odds_normal = "No functionally normal controls"
     else:
-        odds_normal = (path_normal / pathogenic_controls) / (benign_normal / benign_controls)
+        odds_normal = odds_path_ratio(path_normal, pathogenic_controls, benign_normal, benign_controls)
     return {**base,
             "OddsNormal": round(odds_normal, 4) if isinstance(odds_normal, float) else odds_normal,
             "OddsAbnormal": round(odds_abnormal, 4) if isinstance(odds_abnormal, float) else odds_abnormal,

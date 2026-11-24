@@ -320,6 +320,8 @@ def load_aou_or_estimates(
         "Wald p-value": "p-value",
         "Carrier cases": "Cases with variants",
         "Carrier controls": "Controls with variants",
+        "Total cases": "Total Cases",
+        "Total controls": "Total Controls",
     })
 
     return df
@@ -1236,6 +1238,8 @@ def prepare_or_display_table(df_ors, gene_to_dataset, gene_order=None, dataset_m
     # Include controls column if available
     if 'Controls with variants' in df_ors.columns:
         keep_cols.append('Controls with variants')
+    # Cohort totals (Supplementary Data 4)
+    keep_cols += [c for c in ('Total Cases', 'Total Controls') if c in df_ors.columns]
 
     # Compute significance flag inline (avoids needing LogOR columns at plot time)
     df['significant'] = (df['OR_LI'] > 1) | (df['OR_UI'] < 1)

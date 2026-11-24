@@ -381,12 +381,14 @@ def test_spec_resolves_after_gating_drops_a_dim():
 def test_tp53_categorical_ingestion_and_collapse():
     from src.assay_calibration.multivariate_data import tp53
     from src.assay_calibration.multivariate_data import redundancy_collapse as rc
-    jit = tp53.build_tp53_multiscoreset()
-    jit2 = tp53.build_tp53_multiscoreset(kawoligo_mode="jitter")
-    assert np.array_equal(jit.scores, jit2.scores, equal_nan=True), "default mode must be unchanged"
+    assert tp53.DEFAULT_KAWOLIGO_MODE == "categorical"
+    jit = tp53.build_tp53_multiscoreset(kawoligo_mode="jitter")
     assert jit.categorical_dims == {}
 
     ms = tp53.build_tp53_multiscoreset(kawoligo_mode="categorical")
+    default = tp53.build_tp53_multiscoreset()
+    assert np.array_equal(default.scores, ms.scores, equal_nan=True), "default mode must be categorical"
+    assert default.categorical_dims == ms.categorical_dims
     assert ms.categorical_dims == {"KawOligo": ["Tetramer", "Dimer", "Monomer"]}
     k = list(ms.dataset_names).index("KawOligo")
     vals = ms.scores[:, k]
@@ -435,11 +437,13 @@ def test_dim_weights_with_categorical_raises():
                    max_em_iters=5, **FIT_COMMON)
 
 
-def test_jax_path_refuses_categorical():
+def test_jax_path_accepts_categorical():
+    # The JAX batch EM has carried the categorical term since 2026-11-19
+    # (batch_em_cfusn._cat_extra/_cat_mstep; parity: tests/test_batch_em_parity.py
+    # ::test_cfusn_parity_categorical); it used to refuse it.
     pytest.importorskip("jax")
     from src.assay_calibration.fit_utils.jax_batch import interop
-    with pytest.raises(NotImplementedError):
-        interop._init_cfusn({"kwargs": {"cat_spec": {"names": ["x"]}}})
+    interop._check_cfusn_supported({"constrained": False, "kwargs": {"cat_spec": {"names": ["x"]}}})
 
 
 # ── Phase 3: downstream (analysis-side) evaluation ──────────────────────────

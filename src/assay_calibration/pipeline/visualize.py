@@ -22,15 +22,16 @@ from ..fit_utils.point_ranges import (
     compute_lr_filtered_pathogenic_mask,
     get_bootstrap_score_ranges,
     get_bootstrap_score_ranges_dual,
-    remove_insufficient_bootstrap_converage_points,
     check_thresholds_reached,
     extend_points_to_xlims,
+    drop_wrong_side_pathogenic_fragments,
     compute_single_fit_log_densities,
     compute_pathomechanism_lr_curves,
     resolve_pathomechanism_anchor,
+    resolve_subtraction_grid,
+    mechanism_match_frac_per_fit,
     _compute_log_fp_only,
     is_bidirectional_by_weights,
-    is_bidirectional_by_raw_points,
     resolve_bidirectional_weight_vectors,
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
@@ -49,10 +50,16 @@ _mpl.use('Agg')
 import matplotlib.pyplot as plt
 from ..plot_utils.utils import (
     plot_scoreset_best_config, sample_density, add_thresholds, log_thresholds_with_ylim_pad,
+    sample_display_name, sample_hist_style, reference_config_label,
 )
 
 from .config import PipelineConfig
 from .utils import load_dataset_from_df
+
+# |prior - 0.5| below this marks a standard-mode prior EM that never left its
+# 0.5 start (get_fit_prior's EM tolerance is 1e-6): see
+# PipelineConfig.exclude_degenerate_prior_fits.
+DEGENERATE_PRIOR_TOL = 1e-6
 
 _precomputed_fits_cache: Dict[str, Dict] = {}
 
@@ -181,7 +188,9 @@ def generate_visualizations(
                     indv_summary=calibration,
                     fits=fits,
                     score_range=np.asarray(calibration['score_range']),
-                    config=f"({config.benign_method})",
+                    config=reference_config_label(
+                        config.benign_method, scoreset,
+                        getattr(config, "force_benign_reference", False)),
                     n_c=component_key,
                     n_samples=len([s for s in scoreset.samples]),
                     relax=False,
@@ -256,7 +265,12 @@ def process_component_fits(
         raise ValueError("Must have at least pathogenic OR (benign/synonymous)")
     
     # Adjust benign_method based on available samples
-    if synonymous_idx is None and (config.benign_method == 'avg' or config.benign_method == 'synonymous'):
+    force_benign = getattr(config, "force_benign_reference", False)
+    if force_benign:
+        # Benign reference = B/LB only, whatever the dataset config says; with no B/LB the
+        # dataset goes to PU mode (synonymous is still fit but never used as reference).
+        config.benign_method = 'benign'
+    elif synonymous_idx is None and (config.benign_method == 'avg' or config.benign_method == 'synonymous'):
         logger.warning(f"  No synonymous sample, setting benign_method from {config.benign_method} to benign")
         config.benign_method = 'benign'
     elif benign_idx is None and (config.benign_method == 'avg' or config.benign_method == 'benign'):
@@ -291,6 +305,10 @@ def process_component_fits(
                 synonymous_idx = None
             elif name == "benign":
                 benign_idx = None
+
+    if force_benign and synonymous_idx is not None:
+        logger.info("  force_benign_reference: synonymous sample fit but not used as benign reference")
+        synonymous_idx = None
 
     # Re-check benign_method after validation
     if synonymous_idx is None and config.benign_method == 'avg':
@@ -373,6 +391,26 @@ def process_component_fits(
         if config.manual_prior is not None:
             logger.warning("  pathomechanism_method is ignored because manual_prior is set")
 
+    # "subtraction_grid": subtraction unless the benign reference has fewer than
+    # pathomechanism_ref_min_n variants, else the grid boundary over the
+    # reference's score range (resolve_subtraction_grid). The same rule drives the
+    # always-on gamma_hat_diagnostic below.
+    pathomechanism_method_requested = pathomechanism_method
+    pm_boundary_points = None
+    pm_ref_n = None
+    diag_rule = None
+    if pathogenic_idx is not None and gnomad_idx is not None:
+        diag_rule = resolve_subtraction_grid(
+            np.asarray(scoreset.scores), np.asarray(scoreset.sample_assignments), config.benign_method,
+            benign_idx, synonymous_idx, ref_min_n=getattr(config, "pathomechanism_ref_min_n", 10),
+            n_grid=getattr(config, "pathomechanism_grid_points", 2000))
+    if pathomechanism_method == "subtraction_grid":
+        if diag_rule is None:
+            pathomechanism_method = "subtraction"
+        else:
+            pathomechanism_method, pm_boundary_points, pm_ref_n = diag_rule
+        logger.info(f"  subtraction_grid -> {pathomechanism_method} (benign reference n = {pm_ref_n})")
+
     # True unmixing (PU/NU) mode, per get_fit_prior's own mode selection --
     # pathogenic XOR benign/synonymous present. Used below to flag prior
     # instability specific to that estimator (its saturation floor).
@@ -386,6 +424,7 @@ def process_component_fits(
     pct_pathogenic_rows_kept = None  # LR-filter row-level retention (filter_flag only)
     pct_bootstraps_kept = None  # fraction of bootstrap fits used for LR+/prior computation
 
+    keep_extreme = getattr(config, "keep_extreme_prior_fits", False)
     if config.manual_prior is not None:
         # Use manually specified prior — skip estimation. Both directions
         # collapse to the same manual value (dual pathomechanism curves never
@@ -395,6 +434,7 @@ def process_component_fits(
         prior = config.manual_prior
         prior_pathogenic = config.manual_prior
         fit_priors = np.full(len(fits), prior)
+        prior_degenerate = np.zeros(len(fits), dtype=bool)
         fit_priors_pathogenic = fit_priors
         fit_mechanism_match_fracs = np.full(len(fits), np.nan)
         valid_bootstrap_seeds = bootstrap_seeds  # no filtering
@@ -440,9 +480,11 @@ def process_component_fits(
                         sample_assignments=sa_arr,
                         pathogenic_row_mask=pathogenic_row_mask,
                         pathomechanism_method=method,
+                        pathomechanism_boundary_points=(pm_boundary_points if method == "boundary" else None),
                         pathomechanism_boundary_joint_prior=getattr(
                             config, "pathomechanism_boundary_joint_prior", "product"
                         ),
+                        keep_extreme_prior=getattr(config, "keep_extreme_prior_fits", False),
                     )
                     for fit in fits
                 )
@@ -555,10 +597,17 @@ def process_component_fits(
         # entirely rather than partially retained -- simpler and lower-risk
         # than tracking two independently-filtered fit sets through the rest
         # of this function, at the cost of a small, documented efficiency loss.
-        valid_mask = ~(
-            np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1) |
-            np.isnan(fit_priors_pathogenic) | (fit_priors_pathogenic <= 0) | (fit_priors_pathogenic >= 1)
-        )
+        if keep_extreme:
+            # keep_extreme_prior_fits: priors of exactly 0 or 1 are kept (final median clipped below)
+            valid_mask = ~(
+                np.isnan(fit_priors) | (fit_priors < 0) | (fit_priors > 1) |
+                np.isnan(fit_priors_pathogenic) | (fit_priors_pathogenic < 0) | (fit_priors_pathogenic > 1)
+            )
+        else:
+            valid_mask = ~(
+                np.isnan(fit_priors) | (fit_priors <= 0) | (fit_priors >= 1) |
+                np.isnan(fit_priors_pathogenic) | (fit_priors_pathogenic <= 0) | (fit_priors_pathogenic >= 1)
+            )
         fit_priors = fit_priors[valid_mask]
         fit_priors_pathogenic = fit_priors_pathogenic[valid_mask]
         fit_mechanism_match_fracs = fit_mechanism_match_fracs[valid_mask]
@@ -571,13 +620,36 @@ def process_component_fits(
                     if pct_bootstraps_kept is not None else "  pct_bootstraps_kept: n/a (0 fits)")
 
         if len(fits) == 0:
-            logger.warning(f"  No valid priors; skipping {component_key}")
+            logger.warning(f"  No valid priors; skipping n_c={n_c}")
             return None
 
         # Compute prior(s). 'prior' (P(Y=1), benign-direction) is unchanged in
         # meaning/name for backward compatibility; 'prior_pathogenic' (P(Y=1,M=1)) is
         # new, only meaningful when mechanism_flag.
-        prior = np.nanmedian(fit_priors)
+        # Opt-in (PipelineConfig.exclude_degenerate_prior_fits): fits whose
+        # standard-mode prior EM never left its 0.5 start carry no information
+        # about the prior; leave them out of the median prior (kept for LR+).
+        if (getattr(config, "exclude_degenerate_prior_fits", False) and used_get_fit_prior
+                and not unmixing_mode and not mechanism_flag):
+            prior_degenerate = np.abs(fit_priors - 0.5) < DEGENERATE_PRIOR_TOL
+            n_degenerate = int(prior_degenerate.sum())
+            logger.info(f"  exclude_degenerate_prior_fits: {n_degenerate}/{len(fit_priors)} kept fits "
+                        f"have an undefined (EM-start) prior; excluded from the median prior, kept for LR+")
+            if n_degenerate == len(fit_priors):
+                logger.warning("  exclude_degenerate_prior_fits: every kept fit is degenerate; "
+                               "using all kept fits for the prior")
+                prior_degenerate = np.zeros(len(fit_priors), dtype=bool)
+                prior_unstable = True
+        else:
+            prior_degenerate = np.zeros(len(fit_priors), dtype=bool)
+
+        prior = np.nanmedian(fit_priors[~prior_degenerate])
+        if keep_extreme:
+            from .config import EXTREME_PRIOR_CLIP
+            n_ext = int(((fit_priors <= EXTREME_PRIOR_CLIP) | (fit_priors >= 1 - EXTREME_PRIOR_CLIP)).sum())
+            logger.info(f"  keep_extreme_prior_fits: {n_ext}/{len(fit_priors)} kept fits have a prior "
+                        f"outside ({EXTREME_PRIOR_CLIP}, {1 - EXTREME_PRIOR_CLIP}); raw median {prior:.6f}")
+            prior = float(np.clip(prior, EXTREME_PRIOR_CLIP, 1 - EXTREME_PRIOR_CLIP))
         prior_pathogenic = np.nanmedian(fit_priors_pathogenic) if mechanism_flag else np.nan
         logger.info(f"  Prior (benign-direction, P(Y=1)): {prior:.6f}")
         if mechanism_flag:
@@ -642,6 +714,11 @@ def process_component_fits(
             ))
 
     acmg_mapping_method = getattr(config, "acmg_mapping_method", "tavtigian")
+    # drawn threshold lines follow the mapping actually used for point_ranges
+    from ..plot_utils import utils as _plot_utils
+    _plot_utils.THRESHOLD_MAPPING_METHOD = (acmg_mapping_method
+                                            if acmg_mapping_method in ("tavtigian", "lp_anchored", "lp_anchored_b044")
+                                            else "tavtigian")
 
     log_lr_pathogenic = None  # set below only when mechanism_flag; stays None otherwise
     C_pathogenic = np.array([np.nan, np.nan])
@@ -668,7 +745,8 @@ def process_component_fits(
         # computed once via scoreset directly rather than scores_arr/sa_arr,
         # which are only defined in the (non-manual-prior) branch above.
         lr_curve_labeled_scores = (
-            scoreset.scores[np.asarray(scoreset.sample_assignments)[:, pathogenic_idx].astype(bool)]
+            (pm_boundary_points if pm_boundary_points is not None else
+             scoreset.scores[np.asarray(scoreset.sample_assignments)[:, pathogenic_idx].astype(bool)])
             if pathomechanism_method == "boundary" else None
         )
         results_dual_curves = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
@@ -737,7 +815,8 @@ def process_component_fits(
                     if log_fp_prefilter is not None else None
                 ),
             )
-            for j, (fit, prior) in enumerate(zip(fits, fit_priors))
+            for j, (fit, prior) in enumerate(zip(
+                fits, np.clip(fit_priors, 0.001, 0.999) if keep_extreme else fit_priors))
         )
 
         # Unpack results
@@ -749,7 +828,9 @@ def process_component_fits(
         # Get bootstrap score ranges
         results = Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
             delayed(get_bootstrap_score_ranges)(
-                fitIdx, fit, fp, fb, score_range, fit_priors, config.point_values,
+                fitIdx, fit, fp, fb, score_range,
+                (np.clip(fit_priors, 0.001, 0.999) if keep_extreme else fit_priors),
+                config.point_values,
                 acmg_mapping_method=acmg_mapping_method,
                 acmg_bayes_targets=getattr(config, "acmg_bayes_targets", None),
                 acmg_bayes_floor_at_neutral=getattr(
@@ -972,8 +1053,6 @@ def process_component_fits(
                     else:
                         point_ranges[point_value] = [[threshold, upper_lim]]
     
-    # Check for insufficient bootstrap coverage
-    percent_no_evidence = {point: 0.0 for point in config.point_values + list(-1 * np.array(config.point_values))}
 
     # Auto-detect bidirectional assays (e.g. LoF/GoF in one assay) per
     # bootstrap fit, and force postprocess_point_ranges=False (custom
@@ -982,17 +1061,16 @@ def process_component_fits(
     # PipelineConfig.auto_bidirectional and BIDIRECTIONAL_VOTE_THRESHOLD
     # (fit_utils/point_ranges.py).
     #
-    # Method choice depends on n_c: the mixture-component-weights method
-    # (is_bidirectional_by_weights) needs >=2 non-reference components (one
-    # on each side of the reference) plus the reference itself, i.e. >=3
-    # components total, so it's meaningless for 2c fits (only one
-    # non-reference component exists -- nothing for it to detect). For n_c<3,
-    # use the raw-points method instead: it looks for a
-    # pathogenic->benign->pathogenic pattern directly in each fit's raw
-    # (pre-postprocess) threshold-crossing point ranges, which a 2c fit's
-    # non-monotonic LR+ curve can still exhibit even with only one
-    # non-reference component.
+    # Detection applies only to n_c >= 3: the mixture-component-weights
+    # method (is_bidirectional_by_weights) needs a pathogenic-like component
+    # on each side of a benign-like one. For n_c < 3 detection is skipped:
+    # a two-component LR+ is monotonic wherever the density constraint is
+    # enforced (Supplementary Theorem S1), so any pathogenic->benign->
+    # pathogenic reversal in a 2c fit is a tail density violation (the wider
+    # abnormal component outlasting the normal one past e^-7), not
+    # bidirectional signal -- see is_bidirectional_by_raw_points (unused).
     force_no_postprocess = False
+    frac_flagged = 0.0
     auto_bidirectional = getattr(config, "auto_bidirectional", False)
     if auto_bidirectional and n_c >= 3:
         n_flagged = 0
@@ -1018,17 +1096,9 @@ def process_component_fits(
             f"{'forcing postprocess_point_ranges=False' if force_no_postprocess else 'no override'}"
         )
     elif auto_bidirectional:
-        n_flagged = sum(
-            1 for ranges_p, ranges_b in zip(ranges_pathogenic, ranges_benign)
-            if is_bidirectional_by_raw_points(ranges_p, ranges_b)
-        )
-        frac_flagged = n_flagged / len(fits) if fits else 0.0
-        force_no_postprocess = frac_flagged >= BIDIRECTIONAL_VOTE_THRESHOLD
         logger.info(
-            f"  Bidirectional auto-detect (raw-points, n_c={n_c}): {n_flagged}/{len(fits)} "
-            f"bootstrap fits flagged ({frac_flagged:.1%}), "
-            f"threshold={BIDIRECTIONAL_VOTE_THRESHOLD:.0%} -> "
-            f"{'forcing postprocess_point_ranges=False' if force_no_postprocess else 'no override'}"
+            f"  Bidirectional auto-detect skipped (n_c={n_c}): two-component lr+ is monotonic "
+            f"where the density constraint holds; reversals are tail density violations"
         )
     # benign_center: same actual-score mean already used for scoreset_flipped
     # detection above (ben_mean_score), reused here as the reference position
@@ -1036,7 +1106,17 @@ def process_component_fits(
     # than trying to identify "the benign component" from an EM fit (which
     # has no stable identity across bootstrap fits; see git history for the
     # per-fit component-weighted-argmax version this replaced).
-    benign_center = float(ben_mean_score) if force_no_postprocess else None
+    # Also used (always, not only when bidirectional) as the reference position
+    # for drop_wrong_side_pathogenic_fragments on the plain path.
+    benign_center = float(ben_mean_score) if np.isfinite(ben_mean_score) else None
+    # Support for drop_wrong_side_pathogenic_fragments: the P/LP sample, or the
+    # population sample in NU mode (no P/LP).
+    _support_idx = pathogenic_idx if pathogenic_idx is not None else gnomad_idx
+    pathogenic_side_support_scores = (
+        np.asarray(scoreset.scores)[np.asarray(scoreset.sample_assignments)[:, _support_idx].astype(bool)]
+        if _support_idx is not None else np.array([])
+    )
+    pathogenic_side_rule = None
     # Population-sample scores for prune_small_benign_blocks (bidirectional
     # path only), shared with the OOB path below via the result dict.
     benign_island_min_frac = getattr(config, "benign_island_min_frac", BENIGN_ISLAND_MIN_FRAC)
@@ -1079,6 +1159,18 @@ def process_component_fits(
                 logger.info(f"    {k:+d}: {point_ranges[k]}")
 
         if getattr(config, "postprocess_point_ranges", True) and not force_no_postprocess:
+            if getattr(config, "drop_wrong_side_pathogenic", True):
+                pathogenic_side_rule = drop_wrong_side_pathogenic_fragments(
+                    point_ranges, config.point_values, benign_center, scoreset_flipped,
+                    support_scores=pathogenic_side_support_scores,
+                )
+                if pathogenic_side_rule["action"] != "none":
+                    logger.info(f"  Pathogenic side rule: {pathogenic_side_rule['action']} "
+                                f"(benign_center={benign_center}, support low/high="
+                                f"{pathogenic_side_rule['support_low']}/{pathogenic_side_rule['support_high']}, "
+                                f"dropped={pathogenic_side_rule['dropped']})")
+                if pathogenic_side_rule["flag"]:
+                    logger.warning(f"  REVIEW: {pathogenic_side_rule['flag']}")
             # Enforce monotonicity (first pass)
             enforce_monotonicity_point_ranges(
                 point_ranges,
@@ -1159,6 +1251,40 @@ def process_component_fits(
 
     logger.info(f"  Final ranges computed: {len([k for k, v in point_ranges.items() if v])} non-empty")
     
+    # Always-on diagnostic (PipelineConfig.pathomechanism_diagnostic): P(M=1|Y=1)
+    # under the subtraction_grid rule on the kept fits, whether or not the
+    # pathomechanism correction is applied. Evidence is unaffected.
+    gamma_diag = None
+    if getattr(config, "pathomechanism_diagnostic", True) and diag_rule is not None:
+        d_method, d_points, d_ref_n = diag_rule
+        if (mechanism_flag and pathomechanism_method_requested == "subtraction_grid"
+                and config.manual_prior is None):
+            g = np.asarray(fit_mechanism_match_fracs, dtype=float)
+        else:
+            try:
+                g = np.asarray(Parallel(n_jobs=min(len(fits), n_cores), verbose=0)(
+                    delayed(mechanism_match_frac_per_fit)(
+                        fit, np.asarray(scoreset.scores), np.asarray(scoreset.sample_assignments),
+                        config.benign_method, pathogenic_idx, benign_idx, gnomad_idx, synonymous_idx,
+                        d_method, d_points)
+                    for fit in fits), dtype=float)
+            except Exception as e:  # diagnostic only: never fail a calibration over it
+                logger.warning(f"  gamma_hat_diagnostic failed: {e!r}")
+                g = np.array([], dtype=float)
+        gf = g[np.isfinite(g)]
+        gamma_diag = {
+            'gamma_hat_diagnostic': float(np.median(gf)) if len(gf) else None,
+            'gamma_hat_diagnostic_p5': float(np.percentile(gf, 5)) if len(gf) else None,
+            'gamma_hat_diagnostic_p95': float(np.percentile(gf, 95)) if len(gf) else None,
+            'gamma_hat_diagnostic_n_fits': int(len(gf)),
+            'gamma_hat_diagnostic_estimator': ("subtraction" if d_method == "subtraction" else "grid_boundary"),
+            'gamma_hat_diagnostic_ref_n': (None if not np.isfinite(d_ref_n) else int(d_ref_n)),
+        }
+        if gamma_diag['gamma_hat_diagnostic'] is not None:
+            logger.info(f"  gamma_hat_diagnostic: {gamma_diag['gamma_hat_diagnostic']:.4f} "
+                        f"({gamma_diag['gamma_hat_diagnostic_estimator']}, benign reference n = "
+                        f"{gamma_diag['gamma_hat_diagnostic_ref_n']})")
+
     # Serialize and return
     result = {
         # 'prior' (P(Y=1)) and every legacy field below stay benign-direction /
@@ -1170,7 +1296,10 @@ def process_component_fits(
         'prior_unstable': bool(prior_unstable),
         'pathomechanism_prior': prior_pathogenic if mechanism_flag else None,
         'pathomechanism_prior_unstable': bool(prior_pathogenic_unstable) if mechanism_flag else False,
-        'pathomechanism_method': pathomechanism_method,
+        'pathomechanism_method': pathomechanism_method_requested,
+        'pathomechanism_estimator_used': pathomechanism_method,
+        'pathomechanism_ref_n': (None if pm_ref_n is None or not np.isfinite(pm_ref_n) else int(pm_ref_n)),
+        **(gamma_diag or {}),
         # PLP_frac_pathomechanism_measured (a.k.a. mechanism_match_frac_hat): estimated fraction
         # of PLP-labeled variants whose disease mechanism this assay actually
         # measures (a 0-1 fraction, median over bootstrap fits).
@@ -1181,6 +1310,9 @@ def process_component_fits(
         'PLP_frac_pathomechanism_measured_unstable': bool(mechanism_match_frac_unstable),
         'PLP_frac_pathomechanism_measured_per_fit': fit_mechanism_match_fracs,
         'priors': fit_priors,
+        # Per kept fit: prior excluded from the median/percentiles/OOB median
+        # as undefined (only ever True with exclude_degenerate_prior_fits).
+        'prior_degenerate': prior_degenerate,
         'priors_pathogenic': fit_priors_pathogenic if mechanism_flag else None,
         'pct_bootstraps_kept': pct_bootstraps_kept,
         'pct_pathogenic_rows_kept': pct_pathogenic_rows_kept,
@@ -1206,7 +1338,17 @@ def process_component_fits(
         # vs none) as this global in-bag fit, instead of always using the plain
         # path regardless of how this dataset was actually postprocessed.
         'force_no_postprocess': force_no_postprocess,
+        # Saved to *_calibration.json (pipeline/utils.py:save_results): the
+        # dataset-level bidirectional decision and the fraction of bootstrap
+        # fits flagged (0.0 when detection did not run, e.g. n_c < 3).
+        'bidirectional': bool(force_no_postprocess),
+        'bidirectional_frac_flagged': float(frac_flagged),
         'benign_center': benign_center,
+        # Plain path only (None otherwise): see drop_wrong_side_pathogenic_fragments.
+        'pathogenic_side_rule': pathogenic_side_rule,
+        # In-memory only: reused by the OOB path for its per-variant rule.
+        'pathogenic_side_support_scores': pathogenic_side_support_scores,
+        'drop_wrong_side_pathogenic': bool(getattr(config, "drop_wrong_side_pathogenic", True)),
         'benign_island_reference_scores': benign_island_reference_scores,
         'benign_island_min_frac': benign_island_min_frac,
         # Saved to *_calibration.json: benign blocks removed by
@@ -1344,7 +1486,6 @@ def plot_all_configs_comparison(
     n_cols = n_samples + 2          # sample columns + LR+ + confusion
     n_rows_per_nc = 1 + len(BENIGN_METHODS)   # density + one row per benign_method
     n_rows = len(n_components) * n_rows_per_nc
-    hist_colors = ["#CA7682", "#1D7AAB", "#A0A0A0", "#6BAA75"]
 
     height_ratios = []
     for _ in n_components:
@@ -1405,8 +1546,9 @@ def plot_all_configs_comparison(
                 fd_w = 2 * iqr * n ** (-1 / 3) if iqr > 0 else 0
                 w = scores_s.max() - scores_s.min()
                 bins = max(min(100, int(w / fd_w)) if fd_w > 0 else 50, 10)
+                _hc, _ = sample_hist_style(scoreset.sample_names[s_raw], s_raw)
                 sns.histplot(scores_s, bins=bins, stat="density", ax=ax_fit,
-                             alpha=0.5, color=hist_colors[s_raw % len(hist_colors)])
+                             alpha=0.5, color=_hc)
                 density = sample_density(score_range_ref, fits, s_col)
                 for c in range(density.shape[1]):
                     d = np.nanpercentile(density[:, c, :], [pathogenic_percentile, 50, benign_percentile], axis=0)
@@ -1416,7 +1558,7 @@ def plot_all_configs_comparison(
                 d_pct = np.nanpercentile(d_tot, [pathogenic_percentile, 50, benign_percentile], axis=0)
                 ax_fit.plot(score_range_ref, d_pct[1], color="black", alpha=0.5)
                 ax_fit.fill_between(score_range_ref, d_pct[0], d_pct[2], color="gray", alpha=0.2)
-                ax_fit.set_title(f"{n_c_str}: {scoreset.sample_names[s_raw]}\n(n={n:,d})", fontsize=8)
+                ax_fit.set_title(f"{n_c_str}: {sample_display_name(scoreset.sample_names[s_raw])}\n(n={n:,d})", fontsize=8)
                 ax_fit.legend(fontsize=6)
                 ax_fit.grid(linewidth=0.5, alpha=0.3)
                 ax_fit.set_xlabel("Score", fontsize=7)

@@ -357,6 +357,35 @@ def collapse_block(ms, block_names: Sequence[str], k: int,
     return transform
 
 
+def impute_block_conditional_mean(ms, block_names: Sequence[str], min_complete_rows: int = 20) -> int:
+    """Fill each partially observed row of a named block IN PLACE with the
+    conditional mean of its missing dims given its observed ones, under a
+    Gaussian fitted to the block's complete rows (label-free). Rows missing
+    the whole block stay missing. Needed before `collapse_block`, whose PCA
+    projection is defined only for complete rows (a partially observed row
+    would otherwise lose the whole block). Single imputation: the imputed
+    rows carry no spread in the missing directions. Returns the number of
+    rows imputed."""
+    names = list(ms.dataset_names)
+    idx = [names.index(n) for n in block_names]
+    X = np.array(ms.scores, float)
+    sub = X[:, idx]
+    miss = np.isnan(sub)
+    complete = ~miss.any(axis=1)
+    if complete.sum() < max(min_complete_rows, len(idx) + 2):
+        raise ValueError(f"impute_block_conditional_mean: only {complete.sum()} complete rows")
+    mu = sub[complete].mean(axis=0)
+    cov = np.cov(sub[complete], rowvar=False)
+    partial = miss.any(axis=1) & ~miss.all(axis=1)
+    for r in np.flatnonzero(partial):
+        m, o = miss[r], ~miss[r]
+        sub[r, m] = mu[m] + cov[np.ix_(m, o)] @ np.linalg.solve(cov[np.ix_(o, o)], sub[r, o] - mu[o])
+    X[:, idx] = sub
+    ms._scores = X
+    ms._missing = np.isnan(X)
+    return int(partial.sum())
+
+
 def select_dims(ms, dim_indices: Sequence[int]) -> None:
     """Restrict `ms` IN PLACE to exactly the given column indices, in that
     order -- same mutation pattern/target attributes as `collapse_block`

@@ -22,7 +22,7 @@ def read_macros(macros_tex: Path) -> Dict[str, str]:
             re.match(r"\\newcommand\{\\([A-Za-z]+)\}\{(.*)\}\s*$", line)
         if m:
             value = m.group(2)
-            hl = re.fullmatch(r"\\textcolor\{red\}\{(.*)\}", value)
+            hl = re.fullmatch(r"\\textcolor(?:\[[^\]]*\])?\{[^}]*\}\{(.*)\}", value)  # any HIGHLIGHT_COLOR
             out[m.group(1)] = hl.group(1) if hl else value
     return out
 
@@ -132,6 +132,9 @@ def flatten_tex(tex: str, macros: Dict[str, str], figure_root: Path) -> Tuple[st
     tex = re.sub(r"[ \t]*\\input\{Figures/generated/macros(?:\.tex)?\}[ \t]*\n?", "", tex)
 
     def inline_table(m):
+        line_start = tex.rfind("\n", 0, m.start()) + 1
+        if re.search(r"(?<!\\)%", tex[line_start:m.start()]):
+            return m.group(0)  # commented out (e.g. a removed table): leave as is, nothing to inline
         rel = m.group(1)
         path = Path(figure_root) / rel[len("Figures/"):]
         if path.suffix != ".tex":

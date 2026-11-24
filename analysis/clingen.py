@@ -338,9 +338,9 @@ def convert_3x2_to_2x3(mat_3x2: np.ndarray) -> np.ndarray:
     ])
 
 
-_BLUE_COLORS = ['#F0F8FC', '#99C8DC', '#7AB5D1', '#4B91A6', '#2E6B7E']
-_RED_COLORS = ['#FCF0F2', '#E6B1B8', '#D68F99', '#B85C6B', '#943744']
-_GRAY_COLORS = ['#F5F5F5', '#CCCCCC', '#999999', '#666666']
+from src.assay_calibration.plot_utils.style import (  # shared repository style
+    CONFUSION_BLUE as _BLUE_COLORS, CONFUSION_RED as _RED_COLORS, CONFUSION_GRAY as _GRAY_COLORS,
+)
 
 
 def _plot_clingen_confusion_panel(ax, mat: np.ndarray, title: str, letter: str,

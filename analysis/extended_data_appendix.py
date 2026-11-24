@@ -740,9 +740,15 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
                             point_values_to_plot, linestyles, sample_colors,
                             sample_alphas, sample_name_shortener, strength_color, map_point_to_text,
                             output_dir=None, dataset_tsv=None, precomputed_fits=None,
-                            dataset_configs_path=None):
+                            dataset_configs_path=None, all_variants=False,
+                            score_label='Assay Score'):
     """
     Plot a single page of datasets (full style).
+
+    all_variants: plot every scored variant (Scoreset.all_scores, "All
+    variants") instead of SNV-accessible ones (snv_scores, "SNVs") in the
+    combined histogram -- for protein-level libraries (e.g. Domainome) that
+    test all 19 substitutions. score_label: x-axis label of the evidence bar.
 
     Returns
     -------
@@ -810,7 +816,7 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
         # off-screen.
         x_min = min(score_range_arr[0], float(np.nanmin(scoreset.scores)), float(np.nanmin(scoreset_2018.scores)))
         x_max = max(score_range_arr[-1], float(np.nanmax(scoreset.scores)), float(np.nanmax(scoreset_2018.scores)))
-        all_scores = scoreset.snv_scores
+        all_scores = scoreset.all_scores if all_variants else scoreset.snv_scores
         bin_width = _compute_robust_bin_width(scoreset, all_scores, x_min, x_max, n_target_bins=30)
         point_ranges = indv_summary['point_ranges']
 
@@ -937,7 +943,7 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
 
             if sample_num == 2:
                 hist_data = all_scores
-                display_name = 'SNVs'
+                display_name = 'All variants' if all_variants else 'SNVs'
                 n_count = len(all_scores)
                 target_ax = ax_twin
             else:
@@ -1045,7 +1051,7 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
         ax_calib.set_xlim(x_min, x_max)
         ax_calib.set_ylim(0, 1)
         ax_calib.set_yticks([])
-        ax_calib.set_xlabel('Assay Score' if row == nrows - 1 else '', fontsize=8)
+        ax_calib.set_xlabel(score_label if row == nrows - 1 else '', fontsize=8)
         ax_calib.tick_params(axis='x', labelsize=6)
 
         # === ROW 4: MINI LEGEND (skip row 3 spacer) ===
@@ -1083,7 +1089,8 @@ def _plot_single_page_full(page_idx, page_datasets, nrows, ncols,
 def _plot_multi_calibration_appendix(dataset_list, datasets_per_page=4, ncols=2,
                                      debug_first_page_only=False, n_jobs=-1,
                                      output_dir=None, dataset_tsv=None,
-                                     precomputed_fits=None, dataset_configs_path=None):
+                                     precomputed_fits=None, dataset_configs_path=None,
+                                     all_variants=False, score_label='Assay Score'):
     """
     Create multi-panel calibration plots for appendix publication (parallelized),
     full style. Each dataset retains full format: fits, histogram, calibration, legend.
@@ -1148,6 +1155,7 @@ def _plot_multi_calibration_appendix(dataset_list, datasets_per_page=4, ncols=2,
             point_values_to_plot, linestyles, sample_colors, sample_alphas,
             sample_name_shortener, strength_color, map_point_to_text,
             output_dir, dataset_tsv, precomputed_fits, dataset_configs_path,
+            all_variants, score_label,
         )
         for page_idx, page_datasets in page_data
     )
@@ -1465,6 +1473,8 @@ def build_appendix_pdf(
     dataset_tsv: Optional[str] = None,
     precomputed_fits: Optional[str] = None,
     dataset_configs_path: Optional[str] = None,
+    all_variants: bool = False,
+    score_label: str = 'Assay Score',
 ):
     """Build the extended-data appendix PDF, one page per ``datasets_per_page``
     datasets, saved as a single multi-page PDF at ``output_path``.
@@ -1500,6 +1510,11 @@ def build_appendix_pdf(
         Forwarded to ``analysis.legacy_fits.load_scoreset_and_fits`` (and
         dataset-list discovery); default to the matching ``analysis.config``
         values when None.
+    all_variants, score_label :
+        "full" style only (plot_thresholds=True). all_variants=True plots
+        every scored variant ("All variants") in place of SNV-accessible
+        ones ("SNVs") in the combined histogram; score_label sets the
+        evidence-bar x-axis label. Defaults reproduce Supplementary Data 2.
 
     Returns
     -------
@@ -1526,6 +1541,8 @@ def build_appendix_pdf(
             dataset_tsv=dataset_tsv,
             precomputed_fits=precomputed_fits,
             dataset_configs_path=dataset_configs_path,
+            all_variants=all_variants,
+            score_label=score_label,
         )
     else:
         figures = _plot_multi_datasets_stacked_appendix(

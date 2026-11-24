@@ -1,0 +1,25 @@
+# Blocks a PR into main unless its title starts with a new release version
+# (e.g. "v1.2.0" or "v1.2.0: short summary"). Make "release-check / version"
+# a required status check in main's branch protection.
+name: release-check
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # all history and tags
+
+      - name: PR title is a new vX.Y.Z
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: python3 .github/scripts/release_version.py check "$TITLE"

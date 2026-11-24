@@ -822,7 +822,8 @@ class MVCalibrationAnalysis:
                  gnomad_idx=2, synonymous_idx=3,
                  auxiliary_pathogenic_indices=None,
                  benign_method='benign',
-                 dataset_name=None, dataset_suffix='_mv', gene_set=None):
+                 dataset_name=None, dataset_suffix='_mv', gene_set=None,
+                 strata=None, strata_arm=None):
         """
         Parameters
         ----------
@@ -912,9 +913,14 @@ class MVCalibrationAnalysis:
             )
         self.raw_boots = raw[self.dataset_name]
         print(f"  Using gene key: {self.dataset_name}")
+        self.strata, self.strata_arm = strata, strata_arm
+        if strata is not None:
+            self.raw_boots = self._compose_strata_weights(self.raw_boots, strata, strata_arm)
 
-        sample_boot = next(iter(self.raw_boots.values()))
-        self.configs = sorted([k for k in sample_boot.keys() if sample_boot[k] is not None])
+        # Configs present in any bootstrap (the first one may have failed, e.g.
+        # an empty stratum, leaving it without fits).
+        self.configs = sorted({k for b in self.raw_boots.values() if isinstance(b, dict)
+                               for k, v in b.items() if v is not None})
         print(f"  Configs found: {self.configs}")
         print(f"  Bootstraps: {len(self.raw_boots)}")
 
@@ -923,6 +929,37 @@ class MVCalibrationAnalysis:
         self._validate_fit_shape()
 
         self.results = {}
+
+    def _compose_strata_weights(self, raw_boots, strata, arm):
+        """Consequence-stratified fits store one weight row per stratum.
+        Replace them by the arm's composite weights (fit_utils/strata.py:
+        W_r = sum_c M[r, c] W_c / sum_c M[r, c]), keeping the composite rows
+        present in ``self.ms`` (apply_arm already set its columns), so every
+        downstream step sees standard sample roles. Copies; the cached raw
+        results are not mutated."""
+        from ..fit_utils.strata import compose_weights
+        M = strata.composition(arm)
+        present = np.where(np.asarray(self.ms.sample_counts)[:M.shape[0]] > 0)[0]
+        out = {}
+        for seed, bd in raw_boots.items():
+            nb = {}
+            for cfg, fr in bd.items():
+                if fr is None:
+                    nb[cfg] = None
+                    continue
+                inner = fr.get('fit', fr)
+                if inner is None or 'weights' not in inner:
+                    nb[cfg] = fr
+                    continue
+                W = np.asarray(inner['weights'], dtype=float)
+                if W.shape[0] != len(strata.names):
+                    raise ValueError(f"{self.dataset_name}/{cfg}: {W.shape[0]} weight rows but "
+                                     f"{len(strata.names)} strata rebuilt -- data or strata rules changed")
+                new_inner = dict(inner, weights=compose_weights(W, M)[present].tolist(),
+                                 strata_weights=W.tolist())
+                nb[cfg] = dict(fr, fit=new_inner) if 'fit' in fr else new_inner
+            out[seed] = nb
+        return out
 
     def _validate_fit_shape(self):
         """Compare the first valid stored fit's dimensionality/role-count
@@ -946,6 +983,15 @@ class MVCalibrationAnalysis:
                 fit = self._reconstitute_params(inner)
                 if fit is None:
                     continue
+                fit_cats = set((inner.get('cat_spec') or {}).get('names', []))
+                ms_cats = set(getattr(self.ms, 'categorical_dims', None) or {})
+                if fit_cats != ms_cats:
+                    raise ValueError(
+                        f"Stored fit for '{self.dataset_name}'/{config} models "
+                        f"{sorted(fit_cats) or 'no'} dimension(s) as categorical, but the "
+                        f"freshly-built MultiScoreset marks {sorted(ms_cats) or 'none'} -- the "
+                        f"data encoding (e.g. tp53.DEFAULT_KAWOLIGO_MODE) does not match the "
+                        f"fit's; re-fit, or build the dataset the way the fit was made.")
                 fit_n_dims = _cat.total_dims(fit['component_params'])
                 if fit_n_dims != ms_n_dims:
                     raise ValueError(

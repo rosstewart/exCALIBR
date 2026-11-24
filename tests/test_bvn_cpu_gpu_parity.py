@@ -56,7 +56,7 @@ def load_jax_helpers_under_numpy():
     """Exec just the shared-helper block of the JAX module with jnp -> numpy."""
     src = JAX_SRC.read_text()
     start = src.index("_LOG_SQRT_2PI = ")
-    end = src.index("def _augment_omega(")
+    end = src.index("def _sym(")
     block = src[start:end]
 
     # numpy has no `jnp.asarray(...)`-only spellings to fix up beyond the name

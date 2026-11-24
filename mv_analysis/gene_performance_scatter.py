@@ -360,13 +360,26 @@ def build_panel_a(results_json, cache_dir=None):
         if r:
             rows.append(r)
 
-    if _all_ok_cached(cache_dir, "A", ["CARD11"]):
+    if not config.paper_includes("card11"):  # held back from the paper
+        pass
+    elif _all_ok_cached(cache_dir, "A", ["CARD11"]):
         rows.extend(_cached_rows(cache_dir, "A", ["CARD11"]))
     else:
         ms = build_card11_multiscoreset()
         r = _gene_row("CARD11", "card11", ms, results_json,
                       dataset_name="CARD11_card11_mv", aux_idx=_AUX_INDICES["card11"],
                       cache_dir=cache_dir, panel="A")
+        if r:
+            rows.append(r)
+
+    if not config.paper_includes("tsc2"):  # held back from the paper
+        pass
+    elif _all_ok_cached(cache_dir, "A", ["TSC2"]):
+        rows.extend(_cached_rows(cache_dir, "A", ["TSC2"]))
+    else:
+        ms = config.build_multiscoresets_for_gene_set("tsc2")["TSC2"]
+        r = _gene_row("TSC2", "tsc2", ms, results_json,
+                      dataset_name="TSC2_tsc2_mv", cache_dir=cache_dir, panel="A")
         if r:
             rows.append(r)
 
@@ -385,7 +398,9 @@ def build_panel_a(results_json, cache_dir=None):
         if r:
             rows.append(r)
 
-    if _all_ok_cached(cache_dir, "A", config.LABELSEQ_GENES):
+    if not config.paper_includes("labelseq"):  # held back from the paper
+        pass
+    elif _all_ok_cached(cache_dir, "A", config.LABELSEQ_GENES):
         print("All LABEL-seq genes cached -- skipping the ~10min ms rebuild.")
         rows.extend(_cached_rows(cache_dir, "A", config.LABELSEQ_GENES))
     else:

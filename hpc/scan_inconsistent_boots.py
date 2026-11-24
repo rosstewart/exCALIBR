@@ -24,7 +24,7 @@ AUX = {"TP53_tp53_mv": [4], "CARD11_card11_mv": [4, 5]}
 
 def parse(key):
     for suf, gs in (("_labelseq_mv", "labelseq"), ("_predictors_mv", "predictor"), ("_combined_fgfr_mv", "fgfr"),
-                    ("_combined_mv", "combined"), ("_card11_mv", "card11"), ("_tp53_mv", "tp53"),
+                    ("_combined_mv", "combined"), ("_card11_mv", "card11"), ("_tsc2_mv", "tsc2"), ("_tp53_mv", "tp53"),
                     ("_mv_clinvar_2018", "integrated"), ("_mv", "integrated")):
         if key.endswith(suf):
             return gs, key[: -len(suf)]

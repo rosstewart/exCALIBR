@@ -26,7 +26,7 @@ python run_pipeline.py \
 
 ### 2. IGVF / PillarProject format
 
-Per-variant metadata table matching the IGVF Coding Variants Focus Group schema (Tejura et al. 2026, bioRxiv 2026.02.14.705848). Example: `example/MSH2_Jia_2021.csv`; exact columns in `Scoreset`/`Variant` (`src/assay_calibration/data_utils/dataset.py`).
+Per-variant metadata table matching the IGVF Coding Variants Focus Group schema ([Tejura et al. 2026](https://doi.org/10.64898/2026.02.14.705848), bioRxiv 2026.02.14.705848). Example: `example/MSH2_Jia_2021.csv`; exact columns in `Scoreset`/`Variant` (`src/assay_calibration/data_utils/dataset.py`).
 
 ```bash
 python run_pipeline.py --dataset example/MSH2_Jia_2021.csv --name MSH2_Jia_2021
@@ -36,7 +36,7 @@ Sample groups are derived automatically (not assigned by hand) from:
 
 - `Dataset` — dataset name; `--name` selects which one in a multi-dataset file.
 - `auth_reported_score` — the functional score.
-- `clinvar_sig_2026`/`clinvar_star_2026` (or `_2025`/`_2018`, via `--clinvar-release`) — determines Pathogenic/LP vs. Benign/LB; `--min-clinvar-star` sets the trust threshold (default 1).
+- `clinvar_sig_2025`/`clinvar_star_2025` by default (or `_2026`/`_2018`, via `--clinvar-release`) — determines Pathogenic/LP vs. Benign/LB; `--min-clinvar-star` sets the trust threshold (default 1).
 - `gnomad_MAF` — non-missing ⇒ gnomAD/population member.
 - `simplified_consequence` — identifies synonymous variants; also drives splice filtering.
 - `splice_measure` (`Yes`/`No`) — if `No`, splice-consequence and SpliceAI-flagged rows are dropped.
@@ -62,8 +62,8 @@ Which mode a dataset runs in is determined automatically by which control sample
 
 ### 3. MaveDB format
 
-MaveDB-style CSV with functional classification columns; used via `hpc/prepare.py mavedb`.
+The output format of [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation), which is used to annotate score sets in MaveDB; used via `hpc/prepare.py mavedb`.
 
 Implementation: `src/assay_calibration/data_utils/dataset.py` — `BasicScoreset`, `Scoreset`, `MultiScoreset`, `BasicMultiScoreset`.
 
-> Multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `hpc/prepare.py multivariate`) and calibration of computational predictor scores like REVEL/AlphaMissense (`hpc/prepare.py predictor-mv`, `predictor_mv_utils.py`) are also supported but not yet documented here. Ask in the repo/issues if you want to use either.
+> **Experimental, unpublished:** the code also includes multivariate calibration (`MultiScoreset`/`BasicMultiScoreset`, jointly fitting several assays per gene — `hpc/prepare.py multivariate`), consequence-specific calibration (variants calibrated by molecular consequence, such as missense or protein-truncating — `fit_utils/strata.py`, `csq_analysis/`), and calibration of computational predictor scores like REVEL/AlphaMissense (`hpc/prepare.py predictor-mv`, `predictor_mv_utils.py`). None of these is documented here or supported yet, and all may change without notice. [Email us](../README.md#questions-help-and-collaboration) if you want to use any of them.

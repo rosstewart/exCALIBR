@@ -26,7 +26,10 @@ from src.assay_calibration.data_utils.dataset import Scoreset
 from src.assay_calibration.multivariate_data.common import resolve_clinvar_release
 
 SOURCE_PATH = "/data/ross/assay_calibration/FGFR/dataframe_processed.csv.gz"
-OUTPUT_DIR = Path("/data/ross/assay_calibration/FGFR")
+import os
+# $FGFR_UV_INPUT_DIR: where to write (the ClinVar 2025 inputs go to their own
+# directory so earlier runs' inputs are kept).
+OUTPUT_DIR = Path(os.environ.get("FGFR_UV_INPUT_DIR", "/data/ross/assay_calibration/FGFR"))
 DIMENSIONS = {
     "activation": "score_activation",
     "pemr": "score_pemr",
@@ -35,6 +38,7 @@ DIMENSIONS = {
 
 
 def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(SOURCE_PATH, low_memory=False)
     clinvar_release = resolve_clinvar_release("FGFR1")
 

@@ -115,6 +115,7 @@ def aggregate_results(output_dir: Path, output_file: Path) -> None:
 
     n_loaded = 0
     n_failed = 0
+    n_dropped = defaultdict(int)                 # dataset -> dropped (bootstrap, K) fits
     for pkl in pkl_files:
         dataset_name = pkl.parent.name
         parts = pkl.stem.split("_")
@@ -127,6 +128,16 @@ def aggregate_results(output_dir: Path, output_file: Path) -> None:
         try:
             with open(pkl, "rb") as f:
                 fits = pickle.load(f)
+            # Drop component counts with no usable fit: None (every restart
+            # failed), a -inf val_ll (failed or excluded -- older results stored
+            # such a fit as the "best"), or empty component params.
+            for lbl in list(fits):
+                res = fits[lbl]
+                params = ((res or {}).get("fit") or {}).get("component_params") or []
+                if (res is None or not np.isfinite(res.get("val_ll", -np.inf))
+                        or not params or any(len(p) == 0 for p in params)):
+                    del fits[lbl]
+                    n_dropped[dataset_name] += 1
             all_results[dataset_name][seed] = fits
             n_loaded += 1
         except Exception as e:
@@ -134,6 +145,10 @@ def aggregate_results(output_dir: Path, output_file: Path) -> None:
             n_failed += 1
 
     print(f"Loaded {n_loaded} files ({n_failed} failed)")
+    if n_dropped:
+        print(f"Dropped {sum(n_dropped.values())} (bootstrap, K) fits with no usable result:")
+        for ds, n in sorted(n_dropped.items(), key=lambda x: -x[1]):
+            print(f"  {ds}: {n}")
     print(f"Datasets: {len(all_results)}")
     total_bootstraps = sum(len(v) for v in all_results.values())
     print(f"Total bootstrap entries: {total_bootstraps:,}")
@@ -144,6 +159,24 @@ def aggregate_results(output_dir: Path, output_file: Path) -> None:
 
     size_mb = output_file.stat().st_size / 1e6
     print(f"Saved → {output_file}  ({size_mb:.1f} MB)")
+
+    # Per-restart run statistics (n_em_iters, stop_reason, fit_seconds, ...),
+    # written by run_array_task.py since 2026-11-19. Kept in a separate file so
+    # bootstrap_results.json.gz keeps its label-keyed layout; older runs simply
+    # have none.
+    stats_files = sorted(output_dir.rglob("bootstrap_*_restart_stats.json"))
+    if stats_files:
+        stats: dict = defaultdict(dict)
+        for sf in stats_files:
+            try:
+                seed = int(sf.stem.split("_")[1])
+                stats[sf.parent.name][seed] = json.loads(sf.read_text())
+            except Exception as e:
+                print(f"  Warning: failed to load {sf}: {e}")
+        stats_out = output_file.parent / "restart_stats.json.gz"
+        with gzip.open(stats_out, "wt", encoding="utf-8") as f:
+            json.dump(stats, f)
+        print(f"Saved restart stats → {stats_out}  ({len(stats_files)} files)")
 
 
 if __name__ == "__main__":

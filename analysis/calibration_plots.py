@@ -410,8 +410,11 @@ def plot_yang_distance_diagnostic(
     if len(dataset_names) != 4:
         raise ValueError("Must provide exactly 4 dataset names")
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.4))
+    # sizes for a figure set at full text width (7.2 in): fonts stay legible without rescaling
+    FS_TITLE, FS_LABEL, FS_TICK, TITLE_PAD = 10, 9, 8, 7
     panel_letters = ["A", "B", "C", "D"]
+    titles = []
 
     for ax, dataset, letter in zip(axes.flat, dataset_names, panel_letters):
         try:
@@ -439,28 +442,39 @@ def plot_yang_distance_diagnostic(
         data = [distances[k][~np.isnan(distances[k])] for k in present]
         positions = np.arange(len(present)) + 1
 
-        bp = ax.boxplot(data, positions=positions, widths=0.6, patch_artist=True, showfliers=False)
+        # whiskers at the 2.5th and 97.5th percentiles of the bootstrap distances (caption states this)
+        bp = ax.boxplot(data, positions=positions, widths=0.6, patch_artist=True, showfliers=False, whis=(2.5, 97.5))
         for patch, key in zip(bp["boxes"], present):
             patch.set_facecolor(_YANG_SAMPLE_COLORS.get(key, "#888888"))
             patch.set_alpha(0.6)
 
-        ax.axhline(good_fit_threshold, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        ax.axhline(good_fit_threshold, color="black", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.set_ylim(0, good_fit_threshold * 1.05)  # same y range in every panel, starting at 0
         ax.set_xticks(positions)
-        ax.set_xticklabels([_YANG_SAMPLE_LABELS.get(k, k) for k in present], fontsize=9)
+        ax.set_xticklabels([_YANG_SAMPLE_LABELS.get(k, k) for k in present], fontsize=FS_LABEL)
         gene_name = dataset.split("_")[0]
         author_name = dataset.split("_")[1] if "_" in dataset else ""
-        # Panel letter separate from the centered gene/author title (same
-        # split used by plot_four_datasets_publication) -- _bold_italic_gene_title
-        # renders gene_name as plain (non-mathtext) bold+italic text since
-        # mathtext has no combined bold-italic command, so it can't just be
-        # concatenated into one ax.set_title string with the letter prefix.
-        ax.text(0.0, 1.14, f"({letter})", transform=ax.transAxes,
-                fontsize=12, fontweight="bold", va="bottom", ha="left")
-        _bold_italic_gene_title(ax, gene_name, f" – {author_name}", fontsize=12, y=1.0, va="bottom")
-        ax.set_ylabel("Normalized Yang distance (p=2)", fontsize=9)
-        ax.tick_params(labelsize=8)
+        # placeholder title so tight_layout reserves the title row; the real
+        # letter and gene/author title are drawn after the layout is fixed
+        # (_bold_italic_gene_title positions its two parts in axes fractions,
+        # so a later tight_layout that resizes the axes opened a gap between them)
+        ax.set_title("X", fontsize=FS_TITLE, pad=TITLE_PAD, color="none")
+        titles.append((ax, letter, gene_name, author_name))
+        if ax in axes[:, 0]:
+            ax.set_ylabel("Normalized Yang distance (p=2)", fontsize=FS_LABEL)
+        ax.tick_params(labelsize=FS_TICK)
         ax.grid(True, alpha=0.2, linewidth=0.5)
 
-    fig.tight_layout()
+    fig.tight_layout(h_pad=1.5, w_pad=1.2)
+    # Panel letter at the axes' left edge and gene/author title centred, both on
+    # one baseline a fixed TITLE_PAD points above the top axis (as in Figure 2)
+    for ax, letter, gene_name, author_name in titles:
+        ax.set_title("")
+        ax.annotate(f"({letter})", xy=(0.0, 1.0), xycoords="axes fraction",
+                    xytext=(0, TITLE_PAD), textcoords="offset points",
+                    fontsize=FS_TITLE, fontweight="bold", va="baseline", ha="left",
+                    annotation_clip=False)
+        _bold_italic_gene_title(ax, gene_name, f" – {author_name}" if author_name else "",
+                                fontsize=FS_TITLE, y=1.0, va="baseline", pad=TITLE_PAD)
     _save(fig, figure_dir / filename)
     return fig

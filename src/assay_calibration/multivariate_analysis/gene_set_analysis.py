@@ -15,6 +15,7 @@ import pickle
 from collections import Counter
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from .mv_calibration import MVCalibrationAnalysis, _PARTIAL_PATTERN_MODES
@@ -74,6 +75,12 @@ def build_gene_set_analysis(
     """
     if gene_set == "combined" and benign_method == "avg":
         benign_method = "benign"
+    mvcal_kwargs = dict(mvcal_kwargs or {})
+    if os.environ.get("MV_STRATA", "").lower() == "true" and "strata" not in mvcal_kwargs:
+        strata, arm = stratify_for_scoring(ms, gene, gene_set, dataset_name)
+        mvcal_kwargs.update(strata=strata, strata_arm=arm)
+        from ..fit_utils.strata import ARM_BENIGN_METHOD
+        benign_method = ARM_BENIGN_METHOD.get(arm, benign_method)
     return MVCalibrationAnalysis(
         ms, gene, fits_json_path,
         pathogenic_idx=0, benign_idx=1, gnomad_idx=2, synonymous_idx=3,
@@ -82,8 +89,49 @@ def build_gene_set_analysis(
         dataset_name=dataset_name,
         dataset_suffix=dataset_suffix,
         gene_set=gene_set,
-        **(mvcal_kwargs or {}),
+        **mvcal_kwargs,
     )
+
+
+_INTEGRATED_CACHE = {}
+
+
+def stratify_for_scoring(ms, gene, gene_set, dataset_name=None):
+    """Rebuild the strata of ``ms`` exactly as hpc/prepare.py did for the
+    fit, check them against the run's strata/<dataset>.json ($MV_STRATA_DIR),
+    and rewrite ms's sample columns to the scoring arm IN PLACE
+    (fit_utils/strata.apply_arm). Arm: $MV_STRATA_ARM, else "missense" for
+    the combined gene set and "pooled" otherwise; evaluation controls from
+    $MV_STRATA_EVAL_ARM, else the gene set's main arm (so sensitivity arms
+    are evaluated on the same controls). Returns (strata, arm)."""
+    import json
+    from ..fit_utils.strata import row_annotations, build_strata, apply_arm, ARMS
+    main = "missense" if str(gene_set).startswith("combined") else "pooled"
+    arm = os.environ.get("MV_STRATA_ARM") or main
+    eval_arm = os.environ.get("MV_STRATA_EVAL_ARM") or main
+    if arm not in ARMS or eval_arm not in ARMS:
+        raise ValueError(f"unknown strata arm {arm!r}/{eval_arm!r}; choose from {sorted(ARMS)}")
+    df = None
+    if getattr(ms, "_row_atoms", None) is not None and getattr(ms, "row_meta", None) is None:
+        from ..multivariate_data.combined import DEFAULT_INTEGRATED_DATAFRAME
+        if DEFAULT_INTEGRATED_DATAFRAME not in _INTEGRATED_CACHE:
+            _INTEGRATED_CACHE[DEFAULT_INTEGRATED_DATAFRAME] = pd.read_csv(
+                DEFAULT_INTEGRATED_DATAFRAME, sep="\t", low_memory=False)
+        df = _INTEGRATED_CACHE[DEFAULT_INTEGRATED_DATAFRAME]
+    sidecar = None
+    sdir = os.environ.get("MV_STRATA_DIR")
+    if sdir and dataset_name and os.path.exists(os.path.join(sdir, f"{dataset_name}.json")):
+        with open(os.path.join(sdir, f"{dataset_name}.json")) as f:
+            sidecar = json.load(f)
+    strata = build_strata(ms, row_annotations(ms, df, gene=gene),
+                          min_stratum=int(os.environ.get("MV_STRATA_MIN", 5)))
+    if sidecar is not None and (sidecar["names"] != list(strata.names)
+                                or sidecar["counts"] != strata.counts.tolist()):
+        raise ValueError(f"{dataset_name}: rebuilt strata differ from the fit's "
+                         f"({list(zip(strata.names, strata.counts.tolist()))} vs "
+                         f"{list(zip(sidecar['names'], sidecar['counts']))})")
+    apply_arm(ms, strata, arm, eval_arm=eval_arm)
+    return strata, arm
 
 
 def run_gene_set_analysis(
@@ -165,6 +213,13 @@ def run_gene_set_analysis_cached(
         "auxiliary_pathogenic_indices": auxiliary_pathogenic_indices,
         "benign_method": analysis.benign_method,
         "run_kwargs": sorted(run_kwargs.items()),
+        # the data the fits are scored on (rows, labels: release, row builder,
+        # strata arm) and the strata arm itself
+        "ms_digest": hashlib.sha1(np.ascontiguousarray(np.asarray(ms.scores, dtype=float)).tobytes()
+                                  + np.ascontiguousarray(np.asarray(ms._sample_assignments, dtype=bool)).tobytes()
+                                  ).hexdigest(),
+        "strata_arm": getattr(analysis, "strata_arm", None),
+        "eval_arm": os.environ.get("MV_STRATA_EVAL_ARM"),
     })
     key = hashlib.sha1(key_material.encode()).hexdigest()[:16]
     cache_path = os.path.join(cache_dir, f"{gene}_run_{key}.pkl")

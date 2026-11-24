@@ -35,6 +35,78 @@ _LOG2   = np.log(2.0)
 # Helpers
 # ──────────────────────────────────────────────
 
+
+from scipy.special import log_ndtr as _log_ndtr  # = scipy.stats.norm.logcdf, without per-call overhead
+
+def pattern_groups(obs_mask):
+    """``np.unique(obs_mask, axis=0, return_inverse=True)`` for a boolean
+    (N, p) missingness mask, without sorting whole rows: each row is packed
+    into one integer with column 0 as the most significant bit, so integer
+    order equals np.unique's lexicographic row order. Same patterns, same
+    order, same inverse -- a drop-in that leaves every downstream result
+    bitwise unchanged (it is called on every E/M-step)."""
+    obs_mask = np.asarray(obs_mask, dtype=bool)
+    if obs_mask.ndim != 2 or obs_mask.shape[1] > 62:
+        return np.unique(obs_mask, axis=0, return_inverse=True)
+    p = obs_mask.shape[1]
+    weights = (np.int64(1) << np.arange(p - 1, -1, -1, dtype=np.int64))
+    codes = obs_mask.astype(np.int64) @ weights
+    uniq, inverse = np.unique(codes, return_inverse=True)
+    patterns = ((uniq[:, None] & weights[None, :]) != 0)
+    return patterns, inverse.reshape(-1)
+
+class ObsLayout:
+    """Data-only structure of an (N, p) observation matrix with NaN for
+    missing entries, computed once per fit instead of on every E/M-step call.
+
+    For each missingness pattern (in pattern_groups order) it holds the
+    pattern, the row indices (ascending, exactly as np.where(inverse == pi)
+    gives them), the observed and missing dimension lists, and the observed
+    sub-block x[np.ix_(idx, obs_dims)]. Every consumer reads the same values
+    it used to recompute, in the same order, so results are bitwise identical;
+    consumers take ``layout=None`` to keep their original code path.
+
+    ``x`` must not be modified after the layout is built.
+    """
+
+    __slots__ = ("x", "N", "p", "obs_mask", "any_missing", "miss_rows", "groups")
+
+    def __init__(self, x):
+        x = np.atleast_2d(np.asarray(x, dtype=float))
+        self.x = x
+        self.N, self.p = x.shape
+        obs_mask = ~np.isnan(x)
+        self.obs_mask = obs_mask
+        self.any_missing = bool(np.isnan(x).any())
+        self.miss_rows = ~obs_mask.all(axis=1)
+        patterns, inverse = pattern_groups(obs_mask)
+        order = np.argsort(inverse, kind="stable")
+        bounds = np.cumsum(np.bincount(inverse, minlength=len(patterns)))[:-1]
+        self.groups = []
+        for pattern, idx in zip(patterns, np.split(order, bounds)):
+            o = np.where(pattern)[0]
+            m = np.where(~pattern)[0]
+            idx = np.ascontiguousarray(idx)
+            self.groups.append((pattern, idx, o, m, x[np.ix_(idx, o)]))
+
+
+def _layout_groups(x, layout):
+    """(pattern, idx, obs_dims, mis_dims, x_obs) per missingness pattern, from
+    ``layout`` when given, else computed from ``x`` exactly as the original
+    per-call loops did."""
+    if layout is not None:
+        return layout.groups
+    obs_mask = ~np.isnan(x)
+    patterns, inverse = pattern_groups(obs_mask)
+    out = []
+    for pi, pattern in enumerate(patterns):
+        o = np.where(pattern)[0]
+        m = np.where(~pattern)[0]
+        idx = np.where(inverse == pi)[0]
+        out.append((pattern, idx, o, m, x[np.ix_(idx, o)]))
+    return out
+
+
 def _delta_ndim(Delta):
     """Return the latent dimension q from Delta."""
     Delta = np.asarray(Delta)
@@ -182,7 +254,7 @@ def _mvn_logcdf(upper, mean, cov):
     q = len(upper)
     if q == 1:
         sigma = np.sqrt(np.asarray(cov).ravel()[0]) if np.asarray(cov).ndim > 0 else np.sqrt(float(cov))
-        return norm.logcdf((upper[0] - mean[0]) / max(sigma, 1e-15))
+        return _log_ndtr((upper[0] - mean[0]) / max(sigma, 1e-15))
     # For q >= 2, use scipy's mvn CDF (not log, so take log after)
     try:
         val = mvn(mean=mean, cov=cov, allow_singular=True).cdf(upper)
@@ -206,7 +278,7 @@ def _mvn_logcdf_batch(uppers, mean, cov):
     N, q = uppers.shape
     if q == 1:
         s = np.sqrt(max(float(np.asarray(cov).ravel()[0]), 1e-15))
-        return norm.logcdf((uppers[:, 0] - mean[0]) / s)
+        return _log_ndtr((uppers[:, 0] - mean[0]) / s)
     if q == 2:
         # Use the SAME Phi_2 as the E-step's truncated-normal moments.
         #
@@ -309,7 +381,7 @@ def cfusn_logpdf_alternate(x, mu, Delta, Gamma):
 
 
 
-def cfusn_logpdf_alternate_missing(x, mu, Delta, Gamma):
+def cfusn_logpdf_alternate_missing(x, mu, Delta, Gamma, layout=None):
     """Compute CFUSN log-density handling NaN (missing dims) per observation.
 
     Uses the CFUSN marginal property: for observed set S,
@@ -332,26 +404,21 @@ def cfusn_logpdf_alternate_missing(x, mu, Delta, Gamma):
     Gamma = np.asarray(Gamma, dtype=float)
 
     if Delta.ndim <= 1:
-        return msn_logpdf_alternate_missing(x, mu, Delta, Gamma)
+        return msn_logpdf_alternate_missing(x, mu, Delta, Gamma, layout=layout)
 
     x = np.atleast_2d(np.asarray(x, dtype=float))
     N, p_dim = x.shape
     log_pdf = np.zeros(N)
 
-    # Vectorised pattern partition (was a per-row Python dict loop).
-    obs_mask = ~np.isnan(x)
-    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
-
-    for pi, pattern in enumerate(patterns):
-        obs_dims = np.where(pattern)[0]
+    # Vectorised pattern partition (was a per-row Python dict loop);
+    # precomputed once per fit when a layout is given.
+    for _pattern, idx, obs_dims, _m, x_s in _layout_groups(x, layout):
         if len(obs_dims) == 0:
             continue
-        idx = np.where(inverse == pi)[0]
 
         mu_s = mu[obs_dims]
         Delta_s = Delta[obs_dims, :]          # (|S|, q)
         Gamma_s = Gamma[np.ix_(obs_dims, obs_dims)]
-        x_s = x[np.ix_(idx, obs_dims)]
 
         try:
             lp = cfusn_logpdf_alternate(x_s, mu_s, Delta_s, Gamma_s)
@@ -404,14 +471,14 @@ def msn_logpdf_alternate(x, mu, Delta, Gamma):
     Omega_inv_Delta = cho_solve(cf, Delta, check_finite=False)
     eta             = residuals @ Omega_inv_Delta
     sigma_sq        = max(1.0 - Delta @ Omega_inv_Delta, 1e-12)
-    log_Phi         = norm.logcdf(eta / np.sqrt(sigma_sq))
+    log_Phi         = _log_ndtr(eta / np.sqrt(sigma_sq))
 
     result = np.asarray(_LOG2 + log_phi + log_Phi, dtype=float).ravel()
     result[~np.isfinite(result)] = -np.inf
     return result[0] if N == 1 else result
 
 
-def msn_logpdf_alternate_missing(x, mu, Delta, Gamma):
+def msn_logpdf_alternate_missing(x, mu, Delta, Gamma, layout=None):
     """MSN log-density with NaN handling for q=1. Delta is (p,) vector."""
     mu = np.asarray(mu, dtype=float)
     Delta = np.asarray(Delta, dtype=float).ravel()
@@ -420,19 +487,14 @@ def msn_logpdf_alternate_missing(x, mu, Delta, Gamma):
     N, K = x.shape
     log_pdf = np.zeros(N)
 
-    # Vectorised pattern partition (was a per-row Python dict loop).
-    obs_mask = ~np.isnan(x)
-    patterns, inverse = np.unique(obs_mask, axis=0, return_inverse=True)
-
-    for pi, pattern in enumerate(patterns):
-        obs_dims = np.where(pattern)[0]
+    # Vectorised pattern partition (was a per-row Python dict loop);
+    # precomputed once per fit when a layout is given.
+    for _pattern, idx, obs_dims, _m, x_s in _layout_groups(x, layout):
         if len(obs_dims) == 0:
             continue
-        idx = np.where(inverse == pi)[0]
         mu_s = mu[obs_dims]
         Delta_s = Delta[obs_dims]
         Gamma_s = Gamma[np.ix_(obs_dims, obs_dims)]
-        x_s = x[np.ix_(idx, obs_dims)]
 
         try:
             lp = msn_logpdf_alternate(x_s, mu_s, Delta_s, Gamma_s)
@@ -449,11 +511,12 @@ def msn_logpdf_alternate_missing(x, mu, Delta, Gamma):
 # Unified single-component log-pdf
 # ──────────────────────────────────────────────
 
-def _single_component_logpdf(x, params, multivariate=False):
+def _single_component_logpdf(x, params, multivariate=False, layout=None):
     """Log-pdf of a single component.
 
     For multivariate, params = (mu, Delta, Gamma) in alternate form.
-    Delta can be (p,) for q=1 or (p, q) for CFUSN.
+    Delta can be (p,) for q=1 or (p, q) for CFUSN. ``layout``: optional
+    ObsLayout of ``x`` (precomputed missingness structure; same values).
     """
     if not multivariate:
         return sps.skewnorm.logpdf(x, *params)
@@ -462,18 +525,18 @@ def _single_component_logpdf(x, params, multivariate=False):
         Delta_arr = np.asarray(Delta)
         if isinstance(Gamma, np.ndarray) and Gamma.ndim == 2:
             x_arr = np.atleast_2d(x)
-            has_nan = np.isnan(x_arr).any()
+            has_nan = layout.any_missing if layout is not None else np.isnan(x_arr).any()
             if Delta_arr.ndim == 2 and Delta_arr.shape[1] > 1:
                 # CFUSN path
                 if has_nan:
-                    out = cfusn_logpdf_alternate_missing(x_arr, mu, Delta, Gamma)
+                    out = cfusn_logpdf_alternate_missing(x_arr, mu, Delta, Gamma, layout=layout)
                 else:
                     out = cfusn_logpdf_alternate(x_arr, mu, Delta, Gamma)
             else:
                 # q=1 restricted MSN path
                 Delta_vec = Delta_arr.ravel()
                 if has_nan:
-                    out = msn_logpdf_alternate_missing(x_arr, mu, Delta_vec, Gamma)
+                    out = msn_logpdf_alternate_missing(x_arr, mu, Delta_vec, Gamma, layout=layout)
                 else:
                     out = msn_logpdf_alternate(x_arr, mu, Delta_vec, Gamma)
             # Always (N,): the fully-observed paths squeeze a single row to a

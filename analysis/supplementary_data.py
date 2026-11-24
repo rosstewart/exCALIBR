@@ -1,6 +1,9 @@
 """
 Supplementary Data 1-3 for the Nature Genetics manuscript, built from
 pipeline output (Supplementary Data 4, All of Us, is a collaborator file).
+Supplementary Data 5-6 (Human Domainome 1, Reviewer 3) reuse build_sd1 and
+extended_data_appendix.build_appendix_pdf on the Domainome calibrations
+(analysis/domainome/build_domainome_supplementary_data.py).
 
 - SD1 `SD1_dataset_summaries.csv`: one row per calibrated dataset, same
   columns/order as `ExCALIBR_latex_src/old_supp_data_1_dataset_summaries.csv`.
@@ -12,6 +15,8 @@ pipeline output (Supplementary Data 4, All of Us, is a collaborator file).
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -30,7 +35,7 @@ SD1_COLUMNS = [
     "range_1", "range_2", "range_3", "range_4", "range_5", "range_6", "range_7", "range_8",
     "prior", "yang_dist_plp", "yang_dist_blb", "yang_dist_gnomad", "yang_dist_synonymous",
     "yang_dist_heldout_plp", "yang_dist_heldout_blb", "yang_dist_heldout_gnomad", "yang_dist_heldout_synonymous",
-    "relax", "n_c", "benign_method", "clinvar_2018", "scoreset_flipped", "new_functional_classifications_created",
+    "n_c", "benign_method", "clinvar_2018", "scoreset_flipped", "new_functional_classifications_created",
 ]
 SD3_COLUMNS = [
     "Dataset", "Total Controls", "OddsNormal", "OddsAbnormal", "Pathogenic Controls", "Benign Controls",
@@ -53,14 +58,98 @@ def _fmt_ranges(ranges) -> str:
     return ";".join(f"{_fmt_bound(lo)} {_fmt_bound(hi)}" for lo, hi in (ranges or []))
 
 
-def _resolved_calibration(dataset: str, tree, model_selections, dataset_configs) -> Dict:
+def _resolved_calibration(dataset: str, tree, model_selections, dataset_configs, output_dir=None) -> Dict:
     from analysis.discovery import resolve_component
     comp = resolve_component(dataset, list(tree[dataset].keys()), model_selections, dataset_configs)
-    path = next(iter(sorted((Path(cfg.OUTPUT_DIR) / dataset).glob(f"{dataset}_{comp}_calibration.json"))), None)
+    path = next(iter(sorted((Path(output_dir or cfg.OUTPUT_DIR) / dataset).glob(f"{dataset}_{comp}_calibration.json"))), None)
     if path is None:
         raise FileNotFoundError(f"{dataset}: no calibration json for component {comp}")
     with open(path) as f:
         return json.load(f)
+
+
+_BIDIR_HEADER_RE = re.compile(r" - INFO - Dataset (?P<ds>.+?): .*components=\[(?P<comps>[\d, ]+)\] (?P<bm>\w+)\s*$")
+_BIDIR_PROCESSING_RE = re.compile(r"^Processing (?P<n>\d+)c\.\.\.")
+_BIDIR_DETECT_RE = re.compile(r"Bidirectional auto-detect.*\((?P<pct>[\d.]+)%\).*-> (?P<decision>forcing|no override)")
+
+
+def bidirectional_decision(dataset: str, calibration: Dict, output_dir=None) -> tuple:
+    """Whether the auto-bidirectional postprocessing path was applied to this
+    dataset's selected calibration, as (bidirectional, fraction of bootstrap
+    fits flagged).
+
+    Read from the calibration JSON's ``bidirectional`` field when present.
+    Outputs predating that field only record the decision in the pipeline
+    log, so fall back to the last ``Bidirectional auto-detect`` line logged
+    under a run of this calibration's component count and benign method.
+    A selected calibration whose decision is not in the log raises: no
+    decision is never silently read as "not bidirectional".
+    """
+    if calibration.get("bidirectional") is not None:
+        return bool(calibration["bidirectional"]), float(calibration.get("bidirectional_frac_flagged") or 0.0)
+
+    # Match on the run's own component key ("3c_avg"): an avg run on a
+    # dataset without synonymous variants stores benign_method="benign".
+    comp_key = str(calibration["n_c"])
+    n_part, _, bm_part = comp_key.partition("_")
+    n_target = int(n_part.rstrip("c"))
+    bm_target = bm_part or calibration["benign_method"]
+    ds_dir = Path(output_dir or cfg.OUTPUT_DIR) / dataset
+    cal_path = ds_dir / f"{dataset}_{comp_key}_calibration.json"
+    cal_mtime = cal_path.stat().st_mtime if cal_path.exists() else None
+
+    # (timestamp, decision, frac) for every matching detection line, from the
+    # dataset log (needs the run header to know the combo) and the per-combo
+    # log {dataset}_{comp_key}_pipeline.log (one combo, no header).
+    candidates = []
+
+    def _stamp(line):
+        try:
+            return datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            return None
+
+    def _record(line, m):
+        candidates.append((_stamp(line), m["decision"] == "forcing", float(m["pct"]) / 100))
+
+    main_log = ds_dir / "logs" / f"{dataset}_pipeline.log"
+    if main_log.exists():
+        bm, n = None, None
+        with open(main_log, errors="replace") as f:
+            for line in f:
+                m = _BIDIR_HEADER_RE.search(line)
+                if m:
+                    if m["ds"] != dataset:
+                        bm, n = None, None
+                        continue
+                    comps = [int(c) for c in m["comps"].split(",")]
+                    bm, n = m["bm"], (comps[0] if len(comps) == 1 else None)
+                    continue
+                m = _BIDIR_PROCESSING_RE.match(line)
+                if m:
+                    n = int(m["n"])
+                    continue
+                m = _BIDIR_DETECT_RE.search(line)
+                if m and bm == bm_target and n == n_target:
+                    _record(line, m)
+    combo_log = ds_dir / "logs" / f"{dataset}_{comp_key}_pipeline.log"
+    if combo_log.exists():
+        with open(combo_log, errors="replace") as f:
+            for line in f:
+                m = _BIDIR_DETECT_RE.search(line)
+                if m:
+                    _record(line, m)
+
+    if not candidates:
+        raise ValueError(f"{dataset}: no bidirectional auto-detect line for {comp_key} in {main_log} or {combo_log}")
+    # The run that wrote the calibration: latest detection logged no later
+    # than the calibration file (1 min slack); else the latest logged.
+    stamped = [c for c in candidates if c[0] is not None]
+    if cal_mtime is not None and stamped:
+        before = [c for c in stamped if c[0] <= cal_mtime + 60]
+        if before:
+            return max(before, key=lambda c: c[0])[1:]
+    return candidates[-1][1:]
 
 
 def canonical_yang_rows(yang_df: pd.DataFrame, datasets, tree, model_selections, dataset_configs) -> pd.DataFrame:
@@ -114,28 +203,38 @@ def _heldout_yang_cell(row: Optional[pd.Series], sample: str, n_fit: int, min_n:
     return f"{med:.3f} ({lo:.3f}-{hi:.3f})"
 
 
-def fit_sample_counts(dataset: str) -> Dict[str, int]:
+def fit_sample_counts(dataset: str, dataset_tsv=None) -> Dict[str, int]:
     """Sample sizes as the pipeline constructs them for fitting (Scoreset from
-    load_dataset_from_df with the run's PipelineConfig)."""
+    load_dataset_from_df with the run's PipelineConfig). `dataset_tsv`
+    defaults to cfg.DATASET_TSV (another resource, e.g. Domainome, otherwise)."""
     from src.assay_calibration.pipeline.config import PipelineConfig
     from src.assay_calibration.pipeline.utils import load_dataset_from_df
     from analysis.discovery import load_master_df
 
-    df_full = load_master_df(str(cfg.DATASET_TSV))
+    dataset_tsv = str(dataset_tsv or cfg.DATASET_TSV)
+    df_full = load_master_df(dataset_tsv)
     df_ds = df_full[df_full["Dataset"] == dataset.replace("_clinvar_2018", "")].copy()
     df_ds["Dataset"] = dataset
-    pcfg = PipelineConfig(dataset_csv=str(cfg.DATASET_TSV), dataset_name=dataset, output_dir="/tmp",
+    pcfg = PipelineConfig(dataset_csv=dataset_tsv, dataset_name=dataset, output_dir="/tmp",
                           clinvar_release="2018" if "_clinvar_2018" in dataset else "2025")
     scoreset = load_dataset_from_df(df_ds, pcfg)
-    counts = dict(zip([s[1] for s in scoreset.samples], (int(c) for c in scoreset.sample_counts)))
-    return {f"{k}_fit": counts.get(v, counts.get("gnomAD", 0) if k == "n_gnomad" else 0) for k, v in _SAMPLES.items()}
+    # Pair names with counts positionally over ALL samples: `scoreset.samples` yields only non-empty samples, so
+    # zipping it with `sample_counts` (all samples) misaligns the counts whenever an empty sample precedes a
+    # non-empty one (e.g. no B/LB: the population count was reported as B/LB's 0).
+    counts = dict(zip(scoreset.sample_names, (int(c) for c in scoreset.sample_counts)))
+    out = {f"{k}_fit": counts.get(v, counts.get("gnomAD", 0) if k == "n_gnomad" else 0) for k, v in _SAMPLES.items()}
+    out["n_snv"] = int(len(scoreset.snv_scores))  # SNVs the assay measured, as loaded for fitting
+    return out
 
 
 def build_sd1(datasets: List[str], tree, model_selections, dataset_configs, df_variants: pd.DataFrame,
               df_all_groups: Optional[pd.DataFrame] = None, yang_df: Optional[pd.DataFrame] = None,
               curated_csv: Optional[str] = None, yang_heldout_df: Optional[pd.DataFrame] = None,
+              output_dir=None, dataset_tsv=None,
               ) -> (pd.DataFrame, List[str]):
-    """SD1 rows for `datasets`. Returns (table, problems)."""
+    """SD1 rows for `datasets`. Returns (table, problems). `output_dir` and
+    `dataset_tsv` default to cfg.OUTPUT_DIR / cfg.DATASET_TSV; SD5 (Domainome)
+    passes its own."""
     from analysis.plot_common import sample_matches
 
     problems = []
@@ -163,23 +262,19 @@ def build_sd1(datasets: List[str], tree, model_selections, dataset_configs, df_v
         for col, cat in _SAMPLES.items():
             row[col] = int(sample_matches(sub, cat).sum())
         row["n_vus"] = int(sub["is_vus"].fillna(False).astype(bool).sum()) if "is_vus" in sub else 0
-        src = df_all_groups[df_all_groups["dataset"] == ds] if df_all_groups is not None else sub
-        snv_col = "is_snv" if "is_snv" in src.columns else None
-        row["n_snv"] = int(src[snv_col].fillna(False).astype(bool).sum()) if snv_col else ""
         auth = sub["auth_label"].astype(str) if "auth_label" in sub else pd.Series(dtype=str)
         row["author_assignments_provided"] = bool(auth.str.upper().isin(["NORMAL", "ABNORMAL"]).any())
         try:
-            row.update(fit_sample_counts(ds))
+            row.update(fit_sample_counts(ds, dataset_tsv=dataset_tsv))
         except Exception as e:  # noqa: BLE001 -- reported, not hidden
             problems.append(f"{ds}: fit sample counts failed ({e})")
             row.update({f"{k}_fit": "" for k in _SAMPLES})
 
-        cal = _resolved_calibration(ds, tree, model_selections, dataset_configs)
+        cal = _resolved_calibration(ds, tree, model_selections, dataset_configs, output_dir=output_dir)
         pr = cal.get("point_ranges", {})
         for i in [*range(-8, 0), *range(1, 9)]:
             row[f"range_{i}"] = _fmt_ranges(pr.get(str(i), []))
         row["prior"] = cal.get("prior")
-        row["relax"] = bool(cal.get("relax"))
         row["n_c"] = str(cal.get("n_c", "")).split("_", 1)[0]
         row["benign_method"] = cal.get("benign_method")
         row["clinvar_2018"] = bool(cal.get("clinvar_2018"))
@@ -281,8 +376,11 @@ SD4_OR_COLUMN_DEFINITIONS = [
     ("OR_LI", "The lower bound of the 95% confidence interval of the odds ratio estimate."),
     ("OR_UI", "The upper bound of the 95% confidence interval of the odds ratio estimate."),
     ("p-value", "The Wald test p-value for the OR estimate."),
-    ("Cases with variants", "Number of case participants carrying one or more variants in the set. All of Us "
-                            "reports counts of 20 or fewer only as \u201c\u2264 20\u201d."),
+    ("Total Cases", "Total number of case participants in the cohort analyzed for the gene-associated phenotype."),
+    ("Total Controls", "Total number of control participants in the cohort analyzed for the gene-associated "
+                       "phenotype."),
+    ("Cases with variants", "Number of case participants carrying one or more variants in the set. We report "
+                            "counts of 20 or fewer as \u201c\u2264 20\u201d due to All of Us reporting policies."),
     ("Controls with variants", "Number of control participants carrying one or more variants in the set "
                                "(\u201c\u2264 20\u201d as above)."),
     ("significant", "True if the 95% confidence interval of the odds ratio excludes 1."),

@@ -186,6 +186,8 @@ def test_zero_lambda_is_bitwise_identical():
     kw = dict(fit_seed=3, max_em_iters=30, latent_q=1, **FIT_COMMON)
     base = single_fit(X, S, 3, **kw)
     off = single_fit(X, S, 3, weight_divergence={"lambda": 0.0, "groups": GROUPS}, **kw)
+    for r in (base, off):
+        r.pop("em_seconds", None)  # wall-clock timing, not a fit result
     assert _eq(base, off)
 
 
@@ -212,7 +214,7 @@ def test_jax_path_refuses_weight_divergence():
     pytest.importorskip("jax")
     from src.assay_calibration.fit_utils.jax_batch import interop
     with pytest.raises(NotImplementedError):
-        interop._init_cfusn({"kwargs": {"weight_divergence": {"lambda": 0.1, "pairs": [(0, 1)]}}})
+        interop._check_cfusn_supported({"kwargs": {"weight_divergence": {"lambda": 0.1, "pairs": [(0, 1)]}}})
 
 
 # ── dedicated component for a tiny sample (add_component_to_fit min_rows) ───

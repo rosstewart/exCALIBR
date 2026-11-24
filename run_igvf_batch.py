@@ -152,7 +152,7 @@ def run_single_dataset(
     elif "clinvar_2018" in dataset_name and "not_clinvar_2018" not in dataset_name:
         clinvar_release = "2018"
     else:
-        clinvar_release = getattr(args, "clinvar_release", None) or "2026"
+        clinvar_release = getattr(args, "clinvar_release", None) or "2025"
 
     # Build component list
     if n_c == "all":
@@ -177,9 +177,12 @@ def run_single_dataset(
         **({} if getattr(args, "benign_island_prune", True) else {"benign_island_min_frac": 0.0}),
         benign_method=benign_method,
         scoreset_flipped_override=overrides.get("scoreset_flipped_override", None),
+        drop_wrong_side_pathogenic=overrides.get("drop_wrong_side_pathogenic", True),
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=getattr(args, "filter_pathogenic_sample_by_lr", False),
+        exclude_degenerate_prior_fits=getattr(args, "exclude_degenerate_prior_fits", False),
+        keep_extreme_prior_fits=getattr(args, "keep_extreme_prior_fits", False),
         pathomechanism_method=getattr(args, "pathomechanism_method", None),
         pathomechanism_boundary_joint_prior=getattr(
             args, "pathomechanism_boundary_joint_prior", "product"
@@ -202,6 +205,12 @@ def run_single_dataset(
             "acmg_bayes_floor_at_neutral", getattr(args, "acmg_bayes_floor_at_neutral", False)
         ),
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         seed=getattr(args, "seed", None),
         spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
         vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
@@ -254,11 +263,14 @@ def run_single_dataset(
                     child_pid = os.fork()
                     if child_pid == 0:
                         try:
-                            from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config
+                            from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config, reference_config_label
                             fig = plot_scoreset_best_config(
                                 dataset=dataset_name, scoreset=scoreset, indv_summary=indv_summary,
                                 fits=fits, score_range=np.asarray(indv_summary["score_range"]),
-                                config=f"({benign_method})", n_c=comp_key, n_samples=n_samples,
+                                config=reference_config_label(
+                                    benign_method, scoreset,
+                                    getattr(config, "force_benign_reference", False)),
+                                n_c=n_c, n_samples=n_samples,
                                 relax=False, flipped=indv_summary.get("scoreset_flipped", False),
                                 pathogenic_percentile=config.pathogenic_percentile,
                                 benign_percentile=config.benign_percentile,
@@ -475,6 +487,13 @@ def _load_calibration_from_disk(calib_path: Path, lr_path: Path):
     }
 
 
+def _parse_plp_subsample_n(v):
+    """None, 'missense', or an int (CLI gives strings)."""
+    if v is None or v == "missense":
+        return v
+    return int(v)
+
+
 def _run_one_combo(
     n_c_str: str,
     benign_method: str,
@@ -523,6 +542,12 @@ def _run_one_combo(
         point_values=[1, 2, 3, 4, 5, 6, 7, 8],
         n_jobs=n_bootstrap_jobs,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         acmg_mapping_method=getattr(args, "acmg_mapping_method", "tavtigian"),
         acmg_bayes_targets=getattr(args, "acmg_bayes_targets", None),
         acmg_bayes_floor_at_neutral=getattr(args, "acmg_bayes_floor_at_neutral", False),
@@ -530,6 +555,8 @@ def _run_one_combo(
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
         filter_pathogenic_sample_by_lr=filter_pathogenic_sample_by_lr,
+        exclude_degenerate_prior_fits=getattr(args, "exclude_degenerate_prior_fits", False),
+        keep_extreme_prior_fits=getattr(args, "keep_extreme_prior_fits", False),
         pathomechanism_method=pathomechanism_method,
         pathomechanism_boundary_joint_prior=getattr(
             args, "pathomechanism_boundary_joint_prior", "product"
@@ -579,10 +606,16 @@ def _detect_benign_sample_availability(dataset_df: pd.DataFrame, dataset_name: s
         output_dir=args.output_dir,
         components=[2],
         benign_method="avg",
-        clinvar_release=getattr(args, "clinvar_release", None) or "2026",
+        clinvar_release=getattr(args, "clinvar_release", None) or "2025",
         min_clinvar_star=args.min_clinvar_star,
         population_type=args.population_type,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         spliceai_threshold=_parse_spliceai_threshold(getattr(args, "spliceai_threshold", "0.2")),
         vep_splice_filter=not getattr(args, "disable_vep_splice_filter", False),
     )
@@ -627,7 +660,7 @@ def run_all_configs_for_dataset(
         print(f"  SKIP {dataset_name}: no rows in CSV")
         return
 
-    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2026")
+    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2025")
 
     # Extract fits by n_c once in the parent process
     fits_by_nc: Dict[str, list] = {}
@@ -839,7 +872,7 @@ def generate_all_configs_viz(
     output_dir = Path(args.output_dir) / dataset_name
     logger = setup_logging(str(output_dir), dataset_name)
 
-    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2026")
+    clinvar_release = "2018" if clinvar_mode == "2018" else (getattr(args, "clinvar_release", None) or "2025")
 
     csv_name = dataset_name.replace("_clinvar_2018", "")
     dataset_df = df[df["Dataset"] == csv_name].copy()
@@ -864,6 +897,12 @@ def generate_all_configs_viz(
         point_values=[1, 2, 3, 4, 5, 6, 7, 8],
         n_jobs=1,
         synonymous_exclusive=getattr(args, "synonymous_exclusive", False),
+        missense_controls_only=getattr(args, "missense_controls_only", False),
+        missense_plp_only=getattr(args, "missense_plp_only", False),
+        plp_subsample_n=_parse_plp_subsample_n(getattr(args, "plp_subsample_n", None)),
+        plp_subsample_seed=getattr(args, "plp_subsample_seed", 0),
+        extra_sample=getattr(args, "extra_sample", None),
+        force_benign_reference=getattr(args, "force_benign_reference", False),
         seed=getattr(args, "seed", None),
         pathogenic_percentile=getattr(args, "pathogenic_percentile", 5.0),
         benign_percentile=getattr(args, "benign_percentile", None),
@@ -950,14 +989,16 @@ def generate_all_configs_viz(
         child_pid = os.fork()
         if child_pid == 0:
             try:
-                from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config
+                from src.assay_calibration.plot_utils.utils import plot_scoreset_best_config, reference_config_label
                 fig = plot_scoreset_best_config(
                     dataset=dataset_name,
                     scoreset=scoreset,
                     indv_summary=calib,
                     fits=fits_by_nc[n_c_str],
                     score_range=np.asarray(calib["score_range"]),
-                    config=f"({benign_method})",
+                    config=reference_config_label(
+                        benign_method, scoreset,
+                        getattr(config_load, "force_benign_reference", False)),
                     n_c=comp_key,
                     n_samples=scoreset.n_samples,
                     relax=False,
@@ -1174,6 +1215,24 @@ def main():
                        help="Skip datasets whose calibration JSON output already exists "
                             "(useful for resuming a failed run)")
 
+    parser.add_argument("--force-benign-reference", action="store_true",
+                       help="Use only B/LB as the benign reference for lr+ and the prior, overriding each "
+                            "dataset's benign_method; datasets without B/LB go to PU mode (no synonymous fallback).")
+    parser.add_argument("--missense-controls-only", action="store_true",
+                       help="Load Scoreset with missense_controls_only=True (P/LP and B/LB restricted to "
+                            "missense). Must match the hpc/prepare.py run that produced --precomputed-fits.")
+    parser.add_argument("--missense-plp-only", action="store_true",
+                       help="Restrict only the P/LP sample to missense (B/LB, population, synonymous unchanged). "
+                            "Must match the hpc/prepare.py run that produced --precomputed-fits.")
+    parser.add_argument("--plp-subsample-n", default=None,
+                       help="Keep the P/LP label on a random subset of this many P/LP rows ('missense' = the "
+                            "dataset's number of missense P/LP). Must match the hpc/prepare.py run.")
+    parser.add_argument("--plp-subsample-seed", type=int, default=0,
+                       help="Seed for --plp-subsample-n.")
+    parser.add_argument("--extra-sample", dest="extra_sample", default=None,
+                       choices=["all_assayed", "all_snv", "all_nsSNV", "all_missense_snv", "ptv"],
+                       help="5th sample used in fitting but not in lr+/prior (e.g. 'ptv'). Must match "
+                            "the hpc/prepare.py run that produced --precomputed-fits.")
     parser.add_argument("--synonymous-exclusive", action="store_true",
                        help="Load Scoreset with synonymous_exclusive=True: synonymous variants "
                             "are assigned only to the synonymous sample, not also to P/LP or B/LB. "
@@ -1234,6 +1293,18 @@ def main():
                             "the two, e.g. to sweep --pathogenic-percentile while always keeping "
                             "the benign-direction bound at the 95th percentile. Global, batch-wide "
                             "-- not settable per-dataset via --dataset-configs.")
+    parser.add_argument("--exclude-degenerate-prior-fits", action="store_true", default=False,
+                       help="Leave bootstrap fits whose standard-mode prior EM never left its 0.5 "
+                            "start (pathogenic and benign-reference densities coincide, so the "
+                            "prior is undefined) out of the median prior, prior percentiles and "
+                            "OOB median prior; they are still used for every LR+ percentile. "
+                            "Off by default (published calibrations do not use it). Global, "
+                            "batch-wide.")
+    parser.add_argument("--keep-extreme-prior-fits", action="store_true", default=False,
+                       help="Sensitivity option: keep bootstrap fits whose standard EM prior is "
+                            "<= 0.001 or >= 0.999 (normally dropped from every LR+ percentile, "
+                            "the median prior and OOB); only the final median prior (dataset "
+                            "and per-variant OOB) is clipped to [0.001, 0.999]. Off by default.")
     # EXPERIMENTAL, hidden: LR-filter cleaning of the pathogenic sample. Kept for
     # experimentation only -- mutually exclusive with --pathomechanism-prior below.
     # Parses with default=None; resolve_prior_mode reconciles it after parsing.
@@ -1275,7 +1346,7 @@ def main():
     # constructions) are kept only for dev/debugging comparison against
     # 'boundary', not a top-level user-facing choice. Global, batch-wide.
     parser.add_argument("--pathomechanism-method",
-                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary"],
+                       dest="pathomechanism_method", choices=["off", "subtraction", "masking", "boundary", "subtraction_grid"],
                        default=None,
                        help=argparse.SUPPRESS)
     parser.add_argument("--no-postprocess", action="store_true",
@@ -1327,7 +1398,7 @@ def main():
                        help="Write a config template JSON (all datasets with n_c/benign_method=null) "
                             "and exit. Preserves override fields from --dataset-configs if provided.")
     parser.add_argument("--acmg-mapping-method",
-                       choices=["tavtigian", "acmg_bayes", "all"],
+                       choices=["tavtigian", "acmg_bayes", "lp_anchored", "lp_anchored_b044", "all"],
                        default="tavtigian",
                        help="ACMG-mapping method (default: tavtigian). "
                             "'acmg_bayes' = prior-adaptive posterior-based classification, "
@@ -1335,7 +1406,18 @@ def main():
                             "display-only ACMG point label for reporting (supersedes the "
                             "former separate 'piecewise'/'continuous'/'strict_additive' "
                             "options); 'all' runs tavtigian and acmg_bayes and writes "
-                            "per-method output files for comparison.")
+                            "per-method output files for comparison. 'lp_anchored' (sensitivity "
+                            "analyses only, not production): 6 points give exactly a 0.90 "
+                            "posterior at the dataset prior, priors above 0.5 treated as 0.5; "
+                            "benign thresholds fixed at Tavtigian's C = 350 (prior-independent). "
+                            "'lp_anchored_b044' (sensitivity only): same, but benign "
+                            "thresholds anchored at prior 0.044 (C ~= 1135).")
+    parser.add_argument("--tavtigian-posterior-decimals", choices=["none", "3"], default=None,
+                       help="Rounding of rule posteriors when solving for Tavtigian's c: 'none' = exact (c = smallest integer meeting every combining rule; 351 at prior 0.1), '3' = round to 3 decimals as in the ExCALIBR manuscript (348 at prior 0.1). Default: the EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS environment variable, else exact.")
+    parser.add_argument("--no-output-suffix", action="store_true",
+                       help="With a single --acmg-mapping-method, write production file names "
+                            "(no _<method> suffix; the suffix is also appended to the Dataset "
+                            "name, which changes name-keyed lookups). Use a separate --output-dir.")
     parser.add_argument("--acmg-bayes-targets", type=json.loads, default=None,
                        help="Override acmg_bayes target posteriors as a JSON object, "
                             "e.g. '{\"LB\": 0.01, \"B\": 0.001}'. Any key not given falls "
@@ -1350,11 +1432,18 @@ def main():
 
     args = parser.parse_args()
 
+    # Process-wide (read at call time by get_tavtigian_constant and inherited
+    # by joblib workers), so every threshold computation in this run agrees.
+    if args.tavtigian_posterior_decimals is not None:
+        os.environ["EXCALIBR_TAVTIGIAN_POSTERIOR_DECIMALS"] = args.tavtigian_posterior_decimals
+
     # Combine the visible --pathomechanism-prior on/off toggle with the hidden
     # --pathomechanism-method sub-choice into the single value resolve_prior_mode
-    # expects, defaulting the sub-choice to "boundary" when enabled.
+    # expects, defaulting the sub-choice to "subtraction_grid" when enabled
+    # (subtraction, grid-boundary fallback for a benign reference < 10 variants;
+    # see PipelineConfig.pathomechanism_method).
     if args.pathomechanism_prior_enabled:
-        pm_flag = args.pathomechanism_method or "boundary"
+        pm_flag = args.pathomechanism_method or "subtraction_grid"
     elif args.pathomechanism_prior_enabled is False:
         pm_flag = "off"
     else:
@@ -1639,7 +1728,8 @@ def main():
     acmg_mapping_methods = (["tavtigian", "acmg_bayes"]
                              if args.acmg_mapping_method == "all"
                              else [args.acmg_mapping_method])
-    suffix = (lambda m: "" if (len(acmg_mapping_methods) == 1 and m == "tavtigian")
+    suffix = (lambda m: "" if (len(acmg_mapping_methods) == 1
+                               and (m == "tavtigian" or args.no_output_suffix))
               else f"_{m}")
 
     print(f"\nProcessing {len(datasets_to_process)} datasets × "

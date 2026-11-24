@@ -36,8 +36,23 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from adjustText import adjust_text  # pip install adjustText
+try:  # optional: only the labelled-scatter helper below uses it (and re-imports it there)
+    from adjustText import adjust_text  # pip install adjustText
+except ImportError:  # e.g. cluster envs without it; calibration and fitting do not need it
+    adjust_text = None
 
+
+
+def _defined_priors(summary):
+    """Per-fit priors for display, without fits whose prior is undefined
+    (summary['prior_degenerate'], set only with
+    PipelineConfig.exclude_degenerate_prior_fits) -- the same fits the
+    pipeline leaves out of the median prior."""
+    priors = np.atleast_1d(np.asarray(summary['priors'], dtype=float))
+    degen = summary.get('prior_degenerate') if hasattr(summary, 'get') else None
+    if degen is not None and len(degen) == len(priors) and not np.all(degen):
+        priors = priors[~np.asarray(degen, dtype=bool)]
+    return priors
 
 def _display_dataset(name) -> str:
     """Figure-label dataset name: the internal "_clinvar_2018" suffix is dropped."""
@@ -187,7 +202,7 @@ def plot_scoreset_compare_point_assignments(dataset, scoresets, summary, scorese
             tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(
                 summary[(config, n_c)]['prior'], point_values,
             )
-            priors = np.percentile(np.array(summary[(config, n_c)]['priors']),[5,50,95])
+            priors = np.percentile(_defined_priors(summary[(config, n_c)]),[5,50,95])
 
             ax_lr.set_title(f"{st} LR+ {config}\nprior: {priors[1]:.3f} ({priors[0]:.3f}-{priors[2]:.3f}), C: {summary[(config, n_c)]['C']}", fontsize=10)
             add_thresholds(tauP, tauB, ax_lr)
@@ -234,6 +249,57 @@ def plot_scoreset_compare_point_assignments(dataset, scoresets, summary, scorese
     fig.suptitle(f"{scoreset_data[scoreset_types[-1]]['scoreset'].scoreset_name} ({n_c_auto_selected} auto selected)", fontsize=16, y=0.995)
     
     return fig
+
+
+# Display label / histogram style per Scoreset sample name. Raw names are the
+# Scoreset.sample_names entries; a 5th "extra" sample is named by its
+# extra_sample type (data_utils/dataset.py EXTRA_SAMPLE_TYPES).
+SAMPLE_DISPLAY_NAMES = {
+    "population": "gnomAD",
+    "ptv": "PTV (nonsense + frameshift)",
+    "all_missense_snv": "All missense SNVs",
+    "all_assayed": "All assayed variants",
+    "all_snv": "All SNVs",
+    "all_nsSNV": "All nonsynonymous SNVs",
+}
+SAMPLE_HIST_STYLE = {
+    "Pathogenic/Likely Pathogenic": ("#CA7682", 0.6),
+    "Benign/Likely Benign": ("#1D7AAB", 0.6),
+    "gnomAD": ("#A0A0A0", 0.3),
+    "population": ("#A0A0A0", 0.3),
+    "Synonymous": ("#6BAA75", 0.5),
+}
+EXTRA_SAMPLE_HIST_STYLE = ("#B07AA1", 0.5)
+
+
+def reference_config_label(benign_method, scoreset, force_benign_reference=False):
+    """Title label "(<benign_method>)" for plot_scoreset_best_config. Under
+    force_benign_reference a dataset with no B/LB has no benign reference at all
+    (PU mode) -- the title heuristic there would otherwise relabel it as
+    "(synonymous)" whenever a synonymous sample exists."""
+    counts = getattr(scoreset, "sample_counts", None)
+    if force_benign_reference and counts is not None and len(counts) > 1 and counts[1] == 0:
+        return "(PU)"
+    return f"({benign_method})"
+
+
+def sample_display_name(name):
+    return SAMPLE_DISPLAY_NAMES.get(name, name)
+
+
+_INDEX_HIST_STYLE = [("#CA7682", 0.6), ("#1D7AAB", 0.6), ("#A0A0A0", 0.3), ("#6BAA75", 0.5)]
+
+
+def sample_hist_style(name, index=None):
+    """(color, alpha) for a sample's histogram. Known names map to the
+    standard P/LP, B/LB, gnomAD, synonymous styles; an unknown name falls back
+    to the historical by-column style for columns 0-3 (e.g. BasicScoreset
+    names), and anything beyond (the extra sample) gets its own style."""
+    if name in SAMPLE_HIST_STYLE:
+        return SAMPLE_HIST_STYLE[name]
+    if name not in SAMPLE_DISPLAY_NAMES and index is not None and 0 <= index < 4:
+        return _INDEX_HIST_STYLE[index]
+    return EXTRA_SAMPLE_HIST_STYLE
 
 
 def sample_density(x, fits, sampleNum):
@@ -411,7 +477,13 @@ def plot_initial_vs_final_skew_grid(records, output_path=None, n_cols=4):
     return fig
 
 
-def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2):
+# Mapping used to DRAW tier thresholds on LR+ panels. The pipeline sets it from
+# config.acmg_mapping_method (pipeline/visualize.py) so the dashed lines match the
+# thresholds point_ranges were computed with; "tavtigian" unless changed.
+THRESHOLD_MAPPING_METHOD = "tavtigian"
+
+
+def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2, acmg_mapping_method=None):
     """log(lrP)/log(lrB) tier thresholds for `point_values`, plus a y-axis
     padding value extrapolated `pad_points` tiers beyond the highest one.
 
@@ -426,11 +498,20 @@ def log_thresholds_with_ylim_pad(prior, point_values, pad_points=2):
     using the real per-tier step (log(C) / len(point_values)), which keeps
     the drawn thresholds identical to the ones point_ranges was computed with.
     """
-    lrP, lrB, C = thresholds_from_prior(prior, point_values)
+    method = acmg_mapping_method or THRESHOLD_MAPPING_METHOD
+    lrP, lrB, C = thresholds_from_prior(prior, point_values, acmg_mapping_method=method)
     tauP, tauB, log_c = np.log(lrP), np.log(lrB), np.log(C)
-    step = log_c / len(point_values)
+    # tavtigian: lrP = C^(pv/len(pv)); lp_anchored: lrP = C^(pv/8)
+    _lp = method in ("lp_anchored", "lp_anchored_b044")
+    step = log_c / (8 if _lp else len(point_values))
+    # lp_anchored*: benign tiers use a fixed, prior-independent C, so their step differs from the pathogenic one
+    if _lp:
+        from ..fit_utils.evidence_thresholds import lp_anchored_benign_constant
+        step_b = np.log(lp_anchored_benign_constant(method)) / 8
+    else:
+        step_b = step
     ylim_top = tauP[-1] + pad_points * step
-    ylim_bottom = tauB[-1] - pad_points * step
+    ylim_bottom = tauB[-1] - pad_points * step_b
     return tauP, tauB, ylim_top, ylim_bottom
 
 
@@ -443,7 +524,7 @@ def plot_summary(scoreset: Scoreset, fits: List[Dict], summary:Dict, score_range
         ax.plot(score_range,llr_curves[i],color=c,label=labels[i])
     point_values = sorted(list(set([abs(int(k)) for k in summary['point_ranges'].keys()])))
     tauP,tauB,_ = list(map(np.log, thresholds_from_prior(summary['prior'],point_values)) )
-    priors = np.percentile(np.array(summary['priors']),[5,50,95])
+    priors = np.percentile(_defined_priors(summary),[5,50,95])
     ax.set_title(f"{_display_dataset(dataset)} ({n_c}, median:{use_median_prior},em:{not use_2c_equation}): prior: {priors[1]:.3f} ({priors[0]:.3f}-{priors[2]:.3f}), C: {C}")
     add_thresholds(tauP, tauB, ax)
     ax.set_xlabel("Score")
@@ -519,20 +600,11 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         bins = min(100, int(score_range_width / fd_width)) if fd_width > 0 else 50
         bins = max(bins, 10)
 
-        # Plot based on sample number (which category)
-        if sample_num == 0:  # P/LP
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.6, color='#CA7682')
-        elif sample_num == 1:  # B/LB
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.6, color='#1D7AAB')
-        elif sample_num == 2:  # gnomAD
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.3, color='#A0A0A0')
-        elif sample_num == 3:  # Synonymous
-            sns.histplot(sample_scores, bins=bins,
-                         stat='density', ax=ax_fit, alpha=0.5, color='#6BAA75')
-    
+        # Style by sample name, so a 5th (extra) sample also gets a histogram.
+        hist_color, hist_alpha = sample_hist_style(scoreset.sample_names[sample_num], sample_num)
+        sns.histplot(sample_scores, bins=bins,
+                     stat='density', ax=ax_fit, alpha=hist_alpha, color=hist_color)
+
         max_hist_density = max([patch.get_height() for patch in ax_fit.patches]) if ax_fit.patches else 1.0
         
         density = sample_density(score_range, fits, sample_num-num_skipped)
@@ -546,7 +618,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         d_perc = np.percentile(d, [pathogenic_percentile,50,benign_percentile], axis=0)
         ax_fit.plot(score_range, d_perc[1], color='black', alpha=.5)
         ax_fit.fill_between(score_range, d_perc[0], d_perc[2], color='gray', alpha=0.3)
-        ax_fit.set_title(f"{n_c}{relax_code}: {scoreset.sample_names[sample_num].replace('population','gnomAD')}\n(n={scoreset.sample_assignments[:,sample_num-num_skipped].sum():,d})")
+        ax_fit.set_title(f"{n_c}{relax_code}: {sample_display_name(scoreset.sample_names[sample_num])}\n(n={scoreset.sample_assignments[:,sample_num-num_skipped].sum():,d})")
         ax_fit.set_xlabel("Score")
         ax_fit.set_ylabel("Density")
         ax_fit.set_ylim([0, max_hist_density * 1.1])
@@ -585,7 +657,7 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
     tauP, tauB, ylim_top, ylim_bottom = log_thresholds_with_ylim_pad(
         indv_summary['prior'], point_values_all,
     )
-    priors = np.percentile(np.array(indv_summary['priors']),[pathogenic_percentile,50,benign_percentile])
+    priors = np.percentile(_defined_priors(indv_summary),[pathogenic_percentile,50,benign_percentile])
     
     # Identify which point values have insufficient evidence (empty ranges)
     point_ranges_dict = {int(k): v for k, v in indv_summary['point_ranges'].items()}
@@ -673,8 +745,13 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
 
         # Check pathogenic-direction (lower-bound) percentile: find max and its position
         lr_5th = llr_curves[0]
-        max_5th_idx = np.nanargmax(lr_5th)
-        max_5th = lr_5th[max_5th_idx]
+        # An all-NaN curve (e.g. too few samples for any finite LR+) gets no
+        # threshold annotations rather than crashing the whole figure.
+        if np.all(np.isnan(lr_5th)):
+            max_5th_idx, max_5th = 0, -np.inf
+        else:
+            max_5th_idx = np.nanargmax(lr_5th)
+            max_5th = lr_5th[max_5th_idx]
         exceeds_pathogenic = any(max_5th > tau for tau in tauP)
         
         # Check if insufficient evidence causes cutoff
@@ -726,8 +803,11 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
         
         # Check 95th percentile: find min and its position
         lr_95th = llr_curves[2]
-        min_95th_idx = np.nanargmin(lr_95th)
-        min_95th = lr_95th[min_95th_idx]
+        if np.all(np.isnan(lr_95th)):
+            min_95th_idx, min_95th = 0, np.inf
+        else:
+            min_95th_idx = np.nanargmin(lr_95th)
+            min_95th = lr_95th[min_95th_idx]
         exceeds_benign = any(min_95th < tau for tau in tauB)
         
         # Check if insufficient evidence causes cutoff
@@ -883,7 +963,8 @@ def plot_scoreset_best_config(dataset, scoreset, indv_summary, fits, score_range
                              linewidth=2)
             
         
-        ax_lr.set_title(f"Log LR+\nprior: {priors[1]:.3f}, C: {indv_summary['C']}", fontsize=11)
+        _c_txt = f", C: {indv_summary['C']}" if indv_summary.get('C') is not None else ""
+        ax_lr.set_title(f"Log LR+\nprior: {priors[1]:.3f}{_c_txt}", fontsize=11)
         add_thresholds(tauP, tauB, ax_lr)
         ax_lr.set_xlabel("Score")
         ax_lr.set_ylabel("Log LR+")
@@ -2650,11 +2731,14 @@ def plot_four_datasets_publication(dataset_names, dataset_configs, dataset_relax
                 author_name = dataset.split('_')[1]
                 
                 # Panel letter on far left (matching Yang plot position)
-                ax.text(0.00, 1.23 if panel_idx < 2 else 1.18, f"({letter})",
-                       transform=ax.transAxes,
-                       fontsize=14, fontweight='bold',
-                       verticalalignment='top',
-                       horizontalalignment='left')
+                # fixed offset in points above the top axis, so the letter sits at the same height whatever the
+                # number of sample rows (an axes-fraction offset put (D) on the axis line when its panel had
+                # more rows, and hence a shorter top axis, than the others)
+                ax.annotate(f"({letter})", xy=(0.0, 1.0), xycoords='axes fraction',
+                            xytext=(0, 3), textcoords='offset points',
+                            fontsize=14, fontweight='bold',
+                            verticalalignment='bottom',
+                            horizontalalignment='left', annotation_clip=False)
                 
                 # Gene and author name centered (matching Yang plot)
                 _bold_italic_gene_title(ax, gene_name, f" – {author_name}",

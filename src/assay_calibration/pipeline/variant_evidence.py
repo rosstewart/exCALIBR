@@ -17,6 +17,7 @@ import logging
 from ..fit_utils.fit import calculate_score_ranges, thresholds_from_prior
 from ..fit_utils.point_ranges import (
     enforce_monotonicity_point_ranges,
+    drop_wrong_side_pathogenic_fragments,
     extend_points_to_xlims,
     clean_benign_fragments_no_extend,
     clean_bidirectional_pathogenic_evidence,
@@ -127,10 +128,10 @@ def _get_variant_aa_fields(scoreset) -> Optional[List[Dict]]:
 def _get_variant_is_vus(scoreset) -> Optional[List[bool]]:
     """Per-kept-variant VUS flag, aligned 1:1 with _get_variant_ids's output.
 
-    Always ClinVar-2026-based, regardless of the Scoreset's own
+    Always ClinVar-2025-based, regardless of the Scoreset's own
     clinvar_release (used only for that variant's own P/LP/B/LB
     classification) -- see Variant.is_vus in data_utils/dataset.py, which is
-    hardcoded to clinvar_sig_2026 ("VUS ALWAYS 2026 SINCE NOT CONTROL") even
+    hardcoded to clinvar_sig_2025 ("VUS ALWAYS 2025") even
     for clinvar_2018-mode datasets (BRCA1/MSH2/PTEN/TP53). Deriving VUS by
     negation from the `sample` column instead (not P/LP, not B/LB, not
     gnomAD, not Synonymous) would silently use whichever release the dataset
@@ -885,11 +886,19 @@ def _process_variant_oob(
     benign_center: Optional[float] = None,
     benign_island_reference_scores: Optional[np.ndarray] = None,
     benign_island_min_frac: float = 0.0,
+    prior_degenerate: Optional[np.ndarray] = None,
+    keep_extreme_prior: bool = False,
+    drop_wrong_side_pathogenic: bool = False,
+    pathogenic_side_support_scores: Optional[np.ndarray] = None,
 ) -> Tuple[int, Optional[Dict]]:
     """
     Compute OOB evidence for one variant using FULL in-bag processing logic.
 
-    This matches _process_single_variant_oob_full in point_ranges.py:
+    prior_degenerate (aligned with priors): fits whose prior is undefined
+    (PipelineConfig.exclude_degenerate_prior_fits) are left out of this
+    variant's OOB median prior but kept for its OOB LR+.
+
+    Steps (the same as the in-bag calibration in visualize.py's process_component_fits):
     1. Subset to OOB bootstraps
     2. Filter invalid priors
     3. Compute OOB median prior
@@ -915,16 +924,28 @@ def _process_variant_oob(
     oob_priors = priors[oob_indices]
     oob_fp = log_fp[oob_indices]
     oob_fb = log_fb[oob_indices]
+    oob_degen = (np.asarray(prior_degenerate, dtype=bool)[oob_indices] if prior_degenerate is not None
+                 else np.zeros(len(oob_indices), dtype=bool))
 
     # Filter invalid priors
-    valid = ~np.isnan(oob_priors) & (oob_priors > 0) & (oob_priors < 1)
+    if keep_extreme_prior:
+        # PipelineConfig.keep_extreme_prior_fits: 0/1 priors kept, median clipped below
+        valid = ~np.isnan(oob_priors) & (oob_priors >= 0) & (oob_priors <= 1)
+    else:
+        valid = ~np.isnan(oob_priors) & (oob_priors > 0) & (oob_priors < 1)
     n_valid = int(valid.sum())
     oob_priors, oob_fp, oob_fb = oob_priors[valid], oob_fp[valid], oob_fb[valid]
+    oob_degen = oob_degen[valid]
 
     if len(oob_priors) < min_samples:
         return variant_idx, {"_fail": f"too_few_valid_priors ({n_valid}<{min_samples})"}
 
-    prior = float(np.nanmedian(oob_priors))
+    # Undefined priors (if flagged) are left out of the median only; all
+    # valid fits still enter the OOB LR+ below.
+    prior = float(np.nanmedian(oob_priors[~oob_degen] if (~oob_degen).any() else oob_priors))
+    if keep_extreme_prior:
+        from .config import EXTREME_PRIOR_CLIP
+        prior = float(np.clip(prior, EXTREME_PRIOR_CLIP, 1 - EXTREME_PRIOR_CLIP))
     if prior <= 0 or prior >= 1:
         return variant_idx, {"_fail": f"invalid_median_prior ({prior})"}
 
@@ -967,6 +988,12 @@ def _process_variant_oob(
                 pr, point_values, vsr, benign_center, liberal=liberal, inf=True,
             )
         elif postprocess:
+            # Step 5b: same pathogenic side rule as the in-bag plain path, with the
+            # dataset-level benign_center and support sample (flags are in-bag only).
+            if drop_wrong_side_pathogenic:
+                drop_wrong_side_pathogenic_fragments(
+                    pr, point_values, benign_center, flipped, support_scores=pathogenic_side_support_scores,
+                )
             # Step 6: enforce monotonicity (first pass)
             enforce_monotonicity_point_ranges(pr, point_values, vsr, flipped, liberal)
 
@@ -1021,7 +1048,18 @@ def _compute_oob_evidence(
     if benign_island_reference_scores is not None:
         benign_island_reference_scores = np.asarray(benign_island_reference_scores, dtype=float)
     benign_island_min_frac = calibration.get("benign_island_min_frac", 0.0) or 0.0
+    # Plain-path pathogenic side rule: on only if the in-bag fit applied it
+    # (in-memory key; absent for calibrations reconstructed from disk JSON).
+    drop_wrong_side = bool(calibration.get("drop_wrong_side_pathogenic", False))
+    side_support = calibration.get("pathogenic_side_support_scores", None)
+    if side_support is not None:
+        side_support = np.asarray(side_support, dtype=float)
     valid_seeds = np.asarray(calibration["valid_bootstrap_seeds"])
+    prior_degenerate = calibration.get("prior_degenerate", None)
+    if prior_degenerate is not None:
+        prior_degenerate = np.asarray(prior_degenerate, dtype=bool)
+        if len(prior_degenerate) != len(priors):
+            prior_degenerate = None
 
     oob_map = _build_oob_mapping(scoreset, dataset_splits, valid_seeds)
     log(f"  OOB mapping built: {len(oob_map)} variants have OOB data")
@@ -1045,6 +1083,10 @@ def _compute_oob_evidence(
             benign_center=benign_center,
             benign_island_reference_scores=benign_island_reference_scores,
             benign_island_min_frac=benign_island_min_frac,
+            prior_degenerate=prior_degenerate,
+            keep_extreme_prior=getattr(config, "keep_extreme_prior_fits", False),
+            drop_wrong_side_pathogenic=drop_wrong_side,
+            pathogenic_side_support_scores=side_support,
         )
         for vidx, oob_idx in oob_map.items()
     )

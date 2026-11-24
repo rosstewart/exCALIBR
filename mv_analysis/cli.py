@@ -37,7 +37,7 @@ from mv_analysis.build import build_ms
 from mv_analysis.report import build_comparison_table
 from src.assay_calibration.multivariate_analysis.mv_calibration import _PARTIAL_PATTERN_MODES
 
-_GENE_SET_CHOICES = ["fgfr", "tp53", "labelseq", "card11", "predictor-mv", "combined"]
+_GENE_SET_CHOICES = ["fgfr", "tp53", "labelseq", "card11", "tsc2", "predictor-mv", "combined"]
 _AUX_INDICES = {"tp53": [4], "card11": [4, 5]}
 _NO_UV_GENE_SETS = {"fgfr"}
 

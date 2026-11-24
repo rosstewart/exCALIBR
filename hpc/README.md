@@ -9,6 +9,23 @@ run from any directory.
 
 ### 1. Generate the job manifest
 
+**Array layout is chosen at submission, not here.** `prepare.py` stores the compact jobs (one dataset x bootstrap, all K x restarts), plus a per-job fit-time estimate in `jobs/costs.json` (from the model in `hpc/packing.py`), and a balanced default layout of `--target-array-size` tasks (`--packing contiguous` gives the old consecutive slicing).
+
+At submission, `submit_array.sh` lays the jobs out for the machine without re-running `prepare.py`. The default is one task per concurrent slot (`TASKS=$MAX_CONCURRENT`, a single wave). With a fixed number of slots, extra tasks only queue behind the first wave and start their long fits late. In simulation with realistic fit-time noise, 50 tasks beat 100–1000 at 50 × 16 CPUs, and even ideal dynamic pulling gained at most about 10% (`docs/fit_speed_report.md`). Raise `TASKS` only when one-wave tasks would exceed `SLURM_TIME`. `TASKS=prepare` keeps `prepare.py`'s own layout.
+
+```bash
+TASKS=50   SLURM_CPUS=16 MAX_CONCURRENT=50  bash hpc/submit_array.sh <dir>   # few big tasks
+TASKS=1000 SLURM_CPUS=2  MAX_CONCURRENT=400 bash hpc/submit_array.sh <dir>   # many small tasks
+TASKS=auto SLURM_CPUS=16 MAX_CONCURRENT=50  bash hpc/submit_array.sh <dir>   # count chosen for this machine
+```
+
+`hpc/make_layout.py` balances estimated work across the tasks, longest first. It prints:
+- the predicted CPU use within tasks;
+- the predicted CPU use and longest task at other `SLURM_CPUS` values;
+- a warning if many reserved cores would sit idle.
+
+A task's wall time is at least its slowest fit, so many small tasks need few CPUs each: roughly as many CPUs as fits per task. Inside a task, `run_array_task.py` submits the slowest fits first. All of this is scheduling only; CPU fit results are bitwise unchanged.
+
 All manifest modes are unified in `hpc/prepare.py`.  Run with a sub-command:
 
 ```bash
@@ -17,8 +34,12 @@ python hpc/prepare.py default \
     --output-dir /projects/pedjas_lab/stewart.ro/my_run \
     --dataframe /data/ross/assay_calibration/dataframe/integrated_variant_effect_dataset.tsv.gz \
     --config-file src/igvf_configs/dataset_configs_jan_2026.json \
-    --target-array-size 1000 \
     --n-jobs 30
+
+# ExCALIBR manuscript reproduction: same as default, but ClinVar 2025 and Tavtigian c
+# with rule posteriors rounded to 3 decimals (recorded in the manifest; pass
+# --clinvar-release 2025 --tavtigian-posterior-decimals 3 to run_igvf_batch.py when calibrating):
+python hpc/prepare.py pillar_project --output-dir ... [same options as default]
 
 # MaveDB / label-seq input:
 python hpc/prepare.py mavedb \

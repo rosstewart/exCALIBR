@@ -337,7 +337,7 @@ def _process_dataset(df_ds, dataset, clinvar_release, population_type,
                       acmg_mapping_method, generate_viz):
     from src.assay_calibration.data_utils.dataset import Scoreset
 
-    dataset_name = dataset if clinvar_release == "2026" else f"{dataset}_clinvar_{clinvar_release}"
+    dataset_name = dataset if clinvar_release in ("2025", "2026") else f"{dataset}_clinvar_{clinvar_release}"
     variants = ("plp_blb", "plp_blb_synon", "all_plp_blb", "all_plp_blb_synon")
     try:
         kw = dict(clinvar_release=clinvar_release, min_clinvar_star=1)
@@ -407,7 +407,7 @@ def main():
     results = Parallel(n_jobs=args.n_jobs, verbose=5)(
         delayed(_process_dataset)(
             partitions[ds], ds,
-            clinvar_release="2018" if _requires_2018(df, ds) else "2026",
+            clinvar_release="2018" if _requires_2018(df, ds) else "2025",
             population_type=args.population_type,
             prior=args.prior,
             output_dir=args.output_dir,

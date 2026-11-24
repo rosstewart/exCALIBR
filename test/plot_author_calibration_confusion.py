@@ -736,7 +736,7 @@ for dataset in reported_list:
 #     if calibration_data["point_ranges"] is None:
 #         raise ValueError(f"Dataset uncalibratable")
     
-#     point_ranges = flatten_point_ranges(calibration_data["point_ranges"])
+#     point_ranges = calibration_data["point_ranges"]
 #     print(f"\nPoint Ranges: {point_ranges}")
     
 #     # Get P/LP and B/LB variants (ClinVar ground truth)
@@ -992,7 +992,7 @@ import src.assay_calibration.plot_utils.utils
 import src.assay_calibration.data_utils.dataset
 importlib.reload(src.assay_calibration.plot_utils.utils)
 importlib.reload(src.assay_calibration.data_utils.dataset)
-from src.assay_calibration.plot_utils.utils import calculate_confusion_mat, plot_confusion_mat, flatten_point_ranges, assign_points
+from src.assay_calibration.plot_utils.utils import calculate_confusion_mat, plot_confusion_mat, assign_points
 from src.assay_calibration.data_utils.dataset import Scoreset
 import re
 
@@ -1155,7 +1155,7 @@ def calculate_confusion_mat_oob(dataset, scoreset, variant_to_oob_points, calibr
                 raise ValueError(f"  ERROR: Dataset was uncalibratable {calibration_f}")
                 return None, None
             
-            point_ranges = flatten_point_ranges(calibration_data["point_ranges"])
+            point_ranges = calibration_data["point_ranges"]
             points = assign_points(scoreset.scores[idx], point_ranges)
         
         # Classify
@@ -1451,7 +1451,7 @@ def process_datasets_parallel_with_coverage(
             print(f"  {dataset_std_name}: No point_ranges in calibration")
             continue
         
-        point_ranges = flatten_point_ranges(calibration_data["point_ranges"])
+        point_ranges = calibration_data["point_ranges"]
         
         # Load scoreset
         clinvar_rel = "2018" if use_2018 else "2025"

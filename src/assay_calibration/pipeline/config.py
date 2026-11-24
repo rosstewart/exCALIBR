@@ -4,6 +4,9 @@ Configuration for Assay Calibration Pipeline
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional
 
+EXTREME_PRIOR_CLIP = 0.001  # keep_extreme_prior_fits clipping bound
+
+
 @dataclass
 class PipelineConfig:
     """Main configuration for the calibration pipeline"""
@@ -49,19 +52,27 @@ class PipelineConfig:
     # is_bidirectional_by_weights/resolve_bidirectional_weight_vectors in
     # fit_utils/point_ranges.py, which also handle the PU/NU sample-
     # availability cases via a gnomAD fallback). When a majority of
-    # bootstrap fits are flagged (BIDIRECTIONAL_VOTE_THRESHOLD), skips
-    # monotonicity enforcement for this dataset (like --no-postprocess) and
-    # instead extends only the outermost pathogenic evidence island on each
-    # side to the axis limit, via extend_bidirectional_pathogenic_islands --
-    # see that function's docstring for the full rationale/algorithm.
-    # Weights-based detection only applies when n_c >= 3 (needs a
-    # pathogenic-like component on each side of the reference, so a 2c fit's
-    # single non-reference component has nothing to detect). For n_c < 3,
-    # is_bidirectional_by_raw_points is used instead -- it looks for a
-    # pathogenic->benign->pathogenic pattern directly in each fit's raw
-    # (pre-postprocess) threshold-crossing point ranges, which a 2c fit's
-    # non-monotonic LR+ curve can still exhibit.
+    # bootstrap fits are flagged (BIDIRECTIONAL_VOTE_THRESHOLD), the standard
+    # monotonic postprocessing is replaced for this dataset by
+    # clean_benign_fragments_no_extend (+ prune_small_benign_blocks) on the
+    # benign side and clean_bidirectional_pathogenic_evidence (standard
+    # monotonic postprocessing run separately on each side of the benign
+    # reference mean score) on the pathogenic side -- see those docstrings.
+    # Detection applies only when n_c >= 3 (needs a pathogenic-like component
+    # on each side of the reference). It is skipped for n_c < 3: a 2c LR+ is
+    # monotonic where the density constraint holds, so reversals there are
+    # tail density violations (see is_bidirectional_by_raw_points, unused).
     auto_bidirectional: bool = True
+
+    # Plain (single-direction) postprocessing only: before the first
+    # monotonicity pass, drop raw pathogenic fragments on the far side of the
+    # benign reference mean score when fragments exist on both sides and the
+    # expected side holds at least as much P/LP support (population sample in
+    # NU mode) -- see drop_wrong_side_pathogenic_fragments in
+    # fit_utils/point_ranges.py. Opposite-side-only or opposite-side-supported
+    # cases are flagged, not changed. Per-dataset override key:
+    # "drop_wrong_side_pathogenic".
+    drop_wrong_side_pathogenic: bool = True
 
     # On the auto-bidirectional path only: after the benign-side cleanup, drop
     # any contiguous benign evidence block holding less than this fraction of
@@ -101,6 +112,29 @@ class PipelineConfig:
     # exclusive with pathomechanism_method (below), which is the supported
     # opt-in alternative pathogenic-sample-cleaning strategy.
     filter_pathogenic_sample_by_lr: bool = False
+
+    # Opt-in (default off: the published calibrations do not use it). In
+    # standard (P/LP + benign-reference) mode, get_fit_prior's EM starts at
+    # 0.5; a bootstrap fit whose pathogenic and benign-reference densities
+    # coincide on the population sample makes every posterior 0.5, so the EM
+    # returns its start value. That prior is undefined (the population
+    # likelihood is flat in the prior), not 0.5. When enabled, such fits
+    # (|prior - 0.5| < DEGENERATE_PRIOR_TOL) are left out of the median
+    # prior, the prior percentiles and each variant's OOB median prior, but
+    # are KEPT for every LR+ percentile (their LR+ = 1 is a genuine
+    # no-separation draw). Not applied in unmixing (PU/NU) mode or with
+    # pathomechanism_method. Falls back to all kept fits (and flags
+    # prior_unstable) if every kept fit is degenerate.
+    exclude_degenerate_prior_fits: bool = False
+
+    # Sensitivity option (off = published behaviour). Standard EM priors <= 0.001 or
+    # >= 0.999 normally make get_fit_prior return NaN, dropping that bootstrap fit from
+    # every LR+ percentile, the median prior and OOB. When True those fits are kept
+    # (raw per-fit prior in [0, 1]) and only the final median prior -- the dataset
+    # prior and each variant's OOB median prior -- is clipped to
+    # [EXTREME_PRIOR_CLIP, 1 - EXTREME_PRIOR_CLIP]. Per-bootstrap point ranges use
+    # the clipped per-fit priors (thresholds are undefined at exactly 0 or 1).
+    keep_extreme_prior_fits: bool = False
 
     # EXPERIMENTAL, opt-in alternative to filter_pathogenic_sample_by_lr's
     # ad-hoc row filter, for any dataset with a pathogenic-labeled sample.
@@ -180,7 +214,24 @@ class PipelineConfig:
     # raw single LR+/prior) is the default; pass pathomechanism_method=
     # "subtraction" (CLI --pathomechanism-prior) to opt into the dual-prior
     # correction, or "masking"/"boundary" for the alternative constructions.
-    pathomechanism_method: Optional[Literal["subtraction", "masking", "boundary"]] = None
+    #
+    # "subtraction_grid" (CLI --pathomechanism-prior default since 2026-11-20):
+    # "subtraction" unless the anchor's benign reference sample (B/LB,
+    # synonymous, or both per benign_method) has fewer than
+    # pathomechanism_ref_min_n variants, in which case "boundary" with the
+    # min-ratio taken over a grid spanning the reference sample's scores (not
+    # the P/LP points, which bias P(M=1|Y=1) low). Subtraction needs the
+    # reference to identify the benign component(s); with a tiny reference
+    # (e.g. PTEN_Mighell_2018, 1 B/LB) it can call a normal-located component
+    # "disease-specific". Evidence: calibration_quality/gamma_benign_cap/
+    # FINDINGS.md sections 11-15. Resolved per dataset in process_component_fits.
+    pathomechanism_method: Optional[Literal["subtraction", "masking", "boundary", "subtraction_grid"]] = None
+    pathomechanism_ref_min_n: int = 10
+    pathomechanism_grid_points: int = 2000
+    # Always-on diagnostic: report P(M=1|Y=1) under the subtraction_grid rule in
+    # every calibration JSON (keys gamma_hat_diagnostic*), computed on the raw
+    # fits even when pathomechanism_method is None. Evidence is unaffected.
+    pathomechanism_diagnostic: bool = True
 
     # Only meaningful when pathomechanism_method == "boundary" (ignored for
     # "subtraction"/"masking", which keep their own direct re-derivation
@@ -270,7 +321,7 @@ class PipelineConfig:
     #                  paths (single-item vs point-tier display).
     # "all" is handled at the orchestration layer (run_pipeline / run_igvf_batch)
     # by running the calibration step once per ACMG-mapping method.
-    acmg_mapping_method: Literal["tavtigian", "acmg_bayes"] = "tavtigian"
+    acmg_mapping_method: Literal["tavtigian", "acmg_bayes", "lp_anchored", "lp_anchored_b044"] = "tavtigian"
 
     # Optional override of the acmg_bayes target posteriors, e.g.
     # {"LB": 0.01, "B": 0.001} for stricter benign-direction targets. Any key
@@ -288,9 +339,21 @@ class PipelineConfig:
     acmg_bayes_floor_at_neutral: bool = False
 
     # ClinVar parameters
-    clinvar_release: str = "2026"
+    clinvar_release: str = "2025"
     min_clinvar_star: int = 1
     synonymous_exclusive: bool = False
+    # Sample-composition knobs, forwarded to Scoreset by load_dataset_from_df; must
+    # match the values hpc/prepare.py used when the bootstrap fits were generated.
+    missense_controls_only: bool = False
+    # P/LP-only missense restriction, and the matched-count random P/LP subset
+    # control (plp_subsample_n: int or "missense"); see Scoreset.
+    missense_plp_only: bool = False
+    plp_subsample_n: Optional[object] = None
+    plp_subsample_seed: int = 0
+    extra_sample: Optional[str] = None
+    # Use only the B/LB sample as the benign reference (lr+ and prior), overriding
+    # benign_method; datasets without B/LB fall back to PU mode, never synonymous.
+    force_benign_reference: bool = False
 
     # Splice-filter ablation knobs, forwarded to Scoreset.splicing_filter via
     # load_dataset_from_df -- same two knobs hpc/prepare.py already exposes
@@ -361,7 +424,7 @@ class PipelineConfig:
             )
 
         # Validate pathomechanism_method
-        valid_pm_methods = {None, "subtraction", "masking", "boundary"}
+        valid_pm_methods = {None, "subtraction", "masking", "boundary", "subtraction_grid"}
         if self.pathomechanism_method not in valid_pm_methods:
             raise ValueError(
                 f"pathomechanism_method must be one of {valid_pm_methods}, "
@@ -409,7 +472,7 @@ def resolve_prior_mode(filter_flag, pathomechanism_method_flag):
     """Resolve the two mutually-exclusive pathogenic-sample-cleaning flags.
 
     ``filter_flag`` (bool|None) is the experimental LR-row-filter flag.
-    ``pathomechanism_method_flag`` (None|"off"|"subtraction"|"masking"|"boundary")
+    ``pathomechanism_method_flag`` (None|"off"|"subtraction"|"masking"|"boundary"|"subtraction_grid")
     is the already-resolved pathomechanism-method selection (the caller
     combines its own visible on/off toggle with the hidden
     subtraction/masking/boundary sub-choice before calling this function --

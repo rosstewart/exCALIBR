@@ -78,6 +78,8 @@ def datasets():
             d = d.assign(gene_set=panel)
         best = d.sort_values(["mcc", "determinate"], ascending=False).groupby(["gene_set", "gene", "cluster"]).head(1)
         for r in best.itertuples():
+            if not config.paper_includes(r.gene_set):
+                continue
             cl = 0 if r.cluster == "gene" else int(str(r.cluster).replace("cluster", "")) - 1
             key = f"{r.gene_set}__{r.gene}" + (f"__c{cl}" if cl else "")
             out.append(dict(key=key, panel=panel, gene_set=r.gene_set, gene=r.gene, cluster_idx=cl,
@@ -89,7 +91,7 @@ def datasets():
 def _prep_one(ds):
     from mv_analysis.gene_performance_scatter import fast_results_json
     from mv_analysis.mv_cockpit import DEFAULT_RUN_KWARGS
-    from mv_analysis.report import _eval_labels
+    from mv_analysis.report import _both_modality_mask, _eval_labels, _uv_nonconflicting_points
     from src.assay_calibration.multivariate_analysis.gene_set_analysis import build_gene_set_analysis
     warnings.filterwarnings("ignore")
     key, gs, gene, cl = ds["key"], ds["gene_set"], ds["gene"], ds["cluster_idx"]
@@ -109,10 +111,16 @@ def _prep_one(ds):
     measured = ~np.isnan(X).all(axis=1)
     labelled = (plp | blb) & measured
     gnomad = (sa[:, an.g_idx] & measured) if an.g_idx is not None else np.zeros(len(X), bool)
+    # population variants on the evaluation footing of the controls (combined:
+    # measured by both evidence types), and the independent baseline's points
+    # for every row, for the evidence-strength distributions
+    gnomad_eval = gnomad & _both_modality_mask(ms) if gs.startswith("combined") else gnomad
+    uv = _uv_nonconflicting_points(gene.lower() if gs == "labelseq" else gene.upper(), gs, ms)  # as mv_cockpit
+    uv_points = np.full(len(X), np.nan) if uv is None else np.nan_to_num(np.asarray(uv, float))
     prior = GENOME_WIDE_PRIOR if gs == "predictor" else float(r["median_prior"])
     np.savez_compressed(
         OUT / "prep" / f"{key}.npz", X=X, plp=plp, blb=blb, labelled=labelled, eval_mask=eval_mask,
-        gnomad=gnomad, variants=np.asarray([str(v) for v in ms.kept_variants]),
+        gnomad=gnomad, gnomad_eval=gnomad_eval, uv_points=uv_points, variants=np.asarray([str(v) for v in ms.kept_variants]),
         dims=np.asarray([str(n) for n in ms.dataset_names]), mv_points=np.asarray(r["points"], float),
         sample_names=np.asarray([str(n) for n in ms.sample_names]), sa=sa)
     meta = dict(ds, dataset_name=dataset_name, prior=prior, mv_median_prior=float(r["median_prior"]),
@@ -187,7 +195,7 @@ def _run_one(key, setting, n_jobs, folds):
 
 
 def stage_run(args):
-    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("*.json"))
+    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("*.json") if config.paper_includes(p.stem))
     jobs = [(k, s) for s in args.settings for k in keys if args.force or not (OUT / k / f"{s}.csv").exists()]
     # largest first so the long LOO runs start early
     size = {k: json.load(open(OUT / "prep" / f"{k}.json"))["n_labelled"] for k in keys}
@@ -253,6 +261,79 @@ def stage_genomewide(args):
                           reg="gnomAD (genome-wide)", prior=GENOME_WIDE_PRIOR)).to_csv(out_csv, index=False)
         np.save(OUT / key / "genomewide_post.npy", post.astype(np.float32))
         print(f"  {key}: {e.sum()} scored, calibration {len(cal_g)} (removed {int((~keep).sum())} {meta['gene']}), "
+              f"[{(time.time() - t0) / 60:.1f} min]", flush=True)
+
+
+def stage_genomewide_combined(args):
+    """Genome-wide P-KNN evidence from the three predictors alone for the
+    combined models' evaluation rows (variants with functional and predictor
+    scores), exactly as stage_genomewide (same calibration and regularization
+    sets, N_calibration, prior and LR base, the evaluated gene's labelled
+    variants removed from the calibration set). Combined controls take their
+    labels from the functional data, so not all of them are predictor-model
+    controls; scoring every row keeps one procedure. The comparison adds these
+    points to the functional evidence (run_pknn_comparison)."""
+    _single_threaded()
+    from mv_analysis.comparison_methods import pknn
+    warnings.filterwarnings("ignore")
+    cal, reg = _gw_tables()
+    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("combined__*.json") if config.paper_includes(p.stem))
+    for key in keys:
+        out_csv = OUT / key / "genomewide_predictors.csv"
+        if out_csv.exists() and not args.force:
+            continue
+        d, meta = load_prep(key)
+        dims = [str(x) for x in d["dims"]]
+        idx = [i for i, n in enumerate(dims) if n in GW_TOOLS]
+        cols = [GW_TOOLS[dims[i]] for i in idx]
+        e = d["eval_mask"]
+        q = d["X"][e][:, idx]
+        keep = cal["genename"].astype(str).str.split(";").apply(lambda g: meta["gene"] not in g).to_numpy()
+        cal_g = cal[keep]
+        t0 = time.time()
+        post, drops = pknn.bootstrap_posteriors(cal_g[cols].to_numpy(float), cal_g["ClinVar_annotation"].to_numpy(int),
+                                                q, reg[cols].to_numpy(float), GENOME_WIDE_PRIOR, GW_N_CAL,
+                                                n_jobs=args.inner)
+        p_path, p_ben, pts = pknn.to_points(post, GENOME_WIDE_PRIOR, logbase=GW_LOGBASE)
+        (OUT / key).mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(dict(variant=d["variants"][e], label=d["plp"][e].astype(int), points=pts,
+                          fold_scheme="leave-one-gene-out", n_cal=GW_N_CAL, reg="gnomAD (genome-wide)",
+                          prior=GENOME_WIDE_PRIOR)).to_csv(out_csv, index=False)
+        print(f"  {key}: {e.sum()} scored on {'+'.join(cols)}, calibration {len(cal_g)} "
+              f"[{(time.time() - t0) / 60:.1f} min]", flush=True)
+
+
+def stage_genomewide_ingene(args):
+    """Genome-wide P-KNN as published, the evaluated gene's labelled variants
+    left in the calibration set (in-sample, like the other baselines of the
+    pooled performance table), for the predictor models' evaluation rows and,
+    from the three predictors alone, the combined models' evaluation rows.
+    Settings as stage_genomewide. Writes <key>/genomewide_ingene.csv."""
+    _single_threaded()
+    from mv_analysis.comparison_methods import pknn
+    warnings.filterwarnings("ignore")
+    cal, reg = _gw_tables()
+    keys = args.keys or sorted(p.stem for p in (OUT / "prep").glob("*.json")
+                               if p.stem.startswith(("predictor__", "combined__")) and config.paper_includes(p.stem))
+    for key in keys:
+        out_csv = OUT / key / "genomewide_ingene.csv"
+        if out_csv.exists() and not args.force:
+            continue
+        d, meta = load_prep(key)
+        dims = [str(x) for x in d["dims"]]
+        idx = [i for i, n in enumerate(dims) if n in GW_TOOLS]
+        cols = [GW_TOOLS[dims[i]] for i in idx]
+        e = d["eval_mask"]
+        t0 = time.time()
+        post, drops = pknn.bootstrap_posteriors(cal[cols].to_numpy(float), cal["ClinVar_annotation"].to_numpy(int),
+                                                d["X"][e][:, idx], reg[cols].to_numpy(float), GENOME_WIDE_PRIOR,
+                                                GW_N_CAL, n_jobs=args.inner)
+        p_path, p_ben, pts = pknn.to_points(post, GENOME_WIDE_PRIOR, logbase=GW_LOGBASE)
+        (OUT / key).mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(dict(variant=d["variants"][e], label=d["plp"][e].astype(int), points=pts,
+                          fold_scheme="in-sample (gene in calibration set)", n_cal=GW_N_CAL,
+                          reg="gnomAD (genome-wide)", prior=GENOME_WIDE_PRIOR)).to_csv(out_csv, index=False)
+        print(f"  {key}: {e.sum()} scored on {'+'.join(cols)}, calibration {len(cal)} (gene included) "
               f"[{(time.time() - t0) / 60:.1f} min]", flush=True)
 
 
@@ -368,6 +449,66 @@ def stage_vus(args):
         pd.DataFrame(rows).to_csv(OUT / "vus" / "pknn_vus_points.csv", index=False)
 
 
+_OOB_SPLIT_CACHE = {}
+
+
+def _job_dir_splits(jd):
+    """{(condition or None, dataset_name, seed): out-of-bag indices} for every
+    job pickle in one jobs directory, read once per process."""
+    import pickle as _pickle
+    key = str(jd)
+    if key not in _OOB_SPLIT_CACHE:
+        out = {}
+        for a in sorted(jd.glob("array_*.pkl")):
+            with open(a, "rb") as f:
+                for job in _pickle.load(f):
+                    out[(job.get("condition"), job["dataset_name"], int(job["bootstrap_seed"]))] = np.asarray(
+                        job["shared_data"]["val_variant_indices"], int)
+        _OOB_SPLIT_CACHE[key] = out
+    return _OOB_SPLIT_CACHE[key]
+
+
+def job_pickle_oob_splits(dataset_name, seeds, fits_dir=None):
+    """{bootstrap seed: out-of-bag row indices} read from the run's job
+    pickles (shared_data["val_variant_indices"], already scoreset-row
+    indices) -- the only option for consequence-stratified runs, whose
+    resampling cannot be regenerated from the multiscoreset alone.
+
+    Looks for a jobs/ directory holding array pickles in <fits_dir> and its
+    ancestors (up to three levels: a bundle built by
+    hpc/build_v2_bundles.py merges every condition's jobs into
+    <bundle root>/jobs). When the jobs directory is above <fits_dir>, only
+    jobs whose "condition" tag equals <fits_dir>'s path relative to it are
+    used (e.g. "S0/tp53/tau_0.1"), so conditions sharing a dataset name and
+    seeds never mix."""
+    from pathlib import Path as _P
+    from mv_analysis import config as _cfg
+    base = _P(fits_dir or _cfg.PAPER_FITS_DIR).resolve()
+    for anc in [base, *list(base.parents)[:3]]:
+        jd = anc / "jobs"
+        if (jd / "job_index.json").exists() and any(jd.glob("array_*.pkl")):
+            rel = base.relative_to(anc).as_posix()
+            break
+    else:
+        raise FileNotFoundError(f"no job pickles under {base} or its ancestors")
+    allsp = _job_dir_splits(jd)
+    want = {int(b) for b in seeds}
+    out = {}
+    for (cond, ds, seed), v in allsp.items():
+        if ds != dataset_name or seed not in want:
+            continue
+        if rel != "." and cond is not None and cond != rel:
+            continue
+        if seed in out and not np.array_equal(out[seed], v):
+            raise ValueError(f"{dataset_name} seed {seed}: different splits under {jd} for condition {rel!r}")
+        out[seed] = v
+    missing = want - set(out)
+    if missing:
+        raise KeyError(f"{dataset_name}: no job pickle for bootstrap seeds {sorted(missing)[:5]} "
+                       f"(condition {rel!r} under {jd})")
+    return out
+
+
 def _paper_oob_splits(ms, seeds, K):
     """{bootstrap seed: out-of-bag row indices} for the paper fits, regenerated
     with the same job generator and seeds (Fit.generate_fit_jobs, master seed
@@ -415,6 +556,8 @@ def run_all(workers=4, inner=8, settings=("main", "gnomadreg", "N5", "N25")):
     stage_prep(args)
     stage_run(args)
     stage_genomewide(args)
+    stage_genomewide_combined(args)
+    stage_genomewide_ingene(args)
     if not (OUT / "genomewide_score_concordance.csv").exists():
         stage_concordance(args)
     if not (OUT / "vus" / "pknn_vus_points.csv").exists():
@@ -423,7 +566,7 @@ def run_all(workers=4, inner=8, settings=("main", "gnomadreg", "N5", "N25")):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["prep", "run", "selftest", "genomewide", "concordance", "vus"])
+    ap.add_argument("stage", choices=["prep", "run", "selftest", "genomewide", "genomewide-combined", "genomewide-ingene", "concordance", "vus"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--inner", type=int, default=1)
     ap.add_argument("--keys", nargs="*")
@@ -433,7 +576,9 @@ def main():
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     {"prep": stage_prep, "run": stage_run, "selftest": stage_selftest, "genomewide": stage_genomewide,
-     "concordance": stage_concordance, "vus": stage_vus}[args.stage](args)
+     "genomewide-combined": stage_genomewide_combined, "genomewide-ingene": stage_genomewide_ingene,
+     "concordance": stage_concordance,
+     "vus": stage_vus}[args.stage](args)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,13 @@ def _cache_dir(regularization_type: Optional[str], population_type: Optional[str
     # legacy rebuild inside allow_derived_datasets() gets its own cache.
     from src.assay_calibration.multivariate_data import common
     suffix = "_withderived" if common._ALLOW_DERIVED else ""
-    return CACHE_ROOT / f"reg{regularization_type}_pop{population_type}{suffix}"
+    # The ClinVar default release and the row builder change labels and rows,
+    # so they key the cache too (legacy caches were 2026 / legacy rows).
+    import os
+    rel = os.environ.get("MV_CLINVAR_DEFAULT_RELEASE", "2025")
+    rows = os.environ.get("MV_ROW_BUILDER", "v2")
+    tag = "" if (rel, rows) == ("2026", "legacy") else f"_cv{rel}_rows{rows}"
+    return CACHE_ROOT / f"reg{regularization_type}_pop{population_type}{suffix}{tag}"
 
 
 def build_integrated_multiscoresets(

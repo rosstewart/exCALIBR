@@ -1,0 +1,58 @@
+# When a PR into main is merged, publish a GitHub Release (which creates the
+# tag and triggers Zenodo archiving), using the PR title as the release name
+# and the PR description as the release notes. Then merge main back into dev,
+# so dev's history contains the release tag (setuptools-scm versions on dev
+# count up from it) and servers on dev just `git pull`.
+name: release
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Read version from PR title
+        id: version
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: python3 .github/scripts/release_version.py parse "$TITLE" --github-output
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; skipping creation."
+          else
+            if [ -n "$BODY" ]; then printf '%s\n' "$BODY" > notes.md; else echo "Release $VERSION." > notes.md; fi
+            gh release create "$VERSION" --target "$SHA" --title "$TITLE" --notes-file notes.md --latest
+          fi
+
+      - name: Merge main back into dev
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin dev main
+          git checkout -B dev origin/dev
+          git merge --no-edit origin/main -m "Merge release ${{ steps.version.outputs.version }} (main) into dev"
+          git push origin dev

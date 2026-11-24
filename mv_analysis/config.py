@@ -62,6 +62,40 @@ CHEN_PREDICTOR_TABLE = _env(
 CARD11_UV_CALIB_DIR = _env(
     "MV_CARD11_UV_CALIB", "/data/ross/assay_calibration/CARD11/results_data101326/calibration_results")
 
+# Univariate ExCALIBR calibrations (3 components, 1,000 bootstraps, B/LB as
+# the benign reference) for the TP53 readouts the integrated calibrations lack,
+# fitted on the joint model's own scores and samples
+# (<dir>/<dataset>/<dataset>_3c_benign_calibration.json). KawOligo is
+# categorical: its levels take the points of the categorical calibration
+# below; the ExCALIBR run on the earlier jittered encoding (tp53.KAWOLIGO_MAP
+# plus noise) is the fallback, scored at each level's jitter-free value
+# (uv_sources._tp53_extra_uv_rows).
+TP53_EXTRA_UV_CALIB_DIR = _env(
+    "MV_TP53_EXTRA_UV_CALIB", "/data/ross/assay_calibration/exc_tp53_missing_uv_3c_102726/calibration")
+TP53_EXTRA_UV_DIMS = {"Kotler_RFS": "TP53_Kotler_RFS", "DN_score": "TP53_DN_score", "log_TempSens": "TP53_TempSens",
+                      "KawOligo": "TP53_KawOligo"}
+# TP53's readouts calibrated in the standard pipeline: calibration dataset ->
+# its column in TP53_ANNOTATED_VARIANTS_PATH (the joint model's input), to
+# which the calibration is applied directly (uv_sources.load_tp53_uv_points)
+TP53_UV_COLUMNS = {
+    **{f"TP53_Kato_2003_{r}_clinvar_2018": r for r in ("WAF1nWT", "MDM2nWT", "BAXnWT", "h1433snWT", "AIP1nWT",
+                                                      "GADD45nWT", "NOXAnWT", "P53R2nWT")},
+    "TP53_Giacomelli_2018_p53WT_Nutlin3_clinvar_2018": "Giac_WT_Nut",
+    "TP53_Giacomelli_2018_p53null_Nutlin3_clinvar_2018": "Giac_NULL_Nut",
+    "TP53_Giacomelli_2018_p53null_etoposide_clinvar_2018": "Giac_Etop",
+    "TP53_Funk_2025_clinvar_2018": "Funk_RFS",
+}
+# categorical readouts' independent calibration: mv_analysis/categorical_uv.py's
+# design (frequency / shrunk / ordinal), read from <dataset>_categorical/ in
+# TP53_EXTRA_UV_CALIB_DIR; empty falls back to the jittered continuous fit
+TP53_CATEGORICAL_UV_DESIGN = _env("MV_TP53_CATEGORICAL_UV_DESIGN", "shrunk")
+
+# TSC2 (Biar et al. 2026) VAMP-seq / immune SGE / cliPE UV calibrations, the
+# same range-based CSV format as CARD11's (tsc2_calibrations.csv, written by
+# TSC2_Biar/run_uv.sh finalize).
+TSC2_UV_CALIB_DIR = _env(
+    "MV_TSC2_UV_CALIB", "/data/ross/assay_calibration/TSC2/results_data102726/calibration_results")
+
 # Raw per-predictor input CSVs (protein_variant, score, sample_assignments)
 # used both to build the predictor-mv MultiScoreset (multivariate_data/
 # predictors.py) and, here, to bridge predictor UV calibration outputs'
@@ -77,7 +111,9 @@ PREDICTOR_RAW_DATA_DIR = _env(
 # uv_sources.load_fgfr_uv_points (verified: reproduces the exact same
 # standard_points distribution as the calibration's own exported variants.csv
 # for all 3 assays, all 1462 FGFR ms variants bridged).
-FGFR_UV_CALIB_DIR = "/data/ross/assay_calibration/FGFR/uv_calib_logscores"
+# 1,000 bootstrap iterations x 100 fits per component count (FGFR_Tangermann/run_uv.sh); the earlier
+# 20-iteration calibration is /data/ross/assay_calibration/FGFR/uv_calib_logscores
+FGFR_UV_CALIB_DIR = "/data/ross/assay_calibration/FGFR/uv_1000b_103026/calibration"
 
 # Canonical n_c/benign_method per dataset for the exc_pp_clinvar2025_calib
 # source (same file the UV/analysis/ package uses to pick "the" calibration
@@ -160,10 +196,115 @@ PAPER_FITS_DIR = _env(
 # paper notebook's stage 0 generates this if it doesn't exist yet.
 PAPER_RESULTS_JSON = _env("MV_PAPER_RESULTS_JSON", f"{PAPER_FITS_DIR}/bootstrap_results.json.gz")
 
+# A run whose predictor readouts were fit on transformed scores (hpc/prepare.py
+# --predictor-transform) carries a predictor_transform.txt marker: rebuild the
+# scores on that same scale, or every predictor LR would be evaluated off-scale.
+# An explicit $MV_PREDICTOR_TRANSFORM still wins.
+_PTX_MARKER = os.path.join(PAPER_FITS_DIR, "predictor_transform.txt")
+if "MV_PREDICTOR_TRANSFORM" not in os.environ and os.path.exists(_PTX_MARKER):
+    with open(_PTX_MARKER) as _f:
+        os.environ["MV_PREDICTOR_TRANSFORM"] = _f.read().strip()
+
+# A run whose combined models were fit on the intersection population
+# (hpc/prepare.py --combined-population intersection) carries a
+# combined_population.txt marker; combined multiscoresets must then be rebuilt
+# on the same rows, or the stored fits' row shapes would not match.
+# $MV_COMBINED_POPULATION (union|intersection) wins.
+COMBINED_POPULATION = os.environ.get("MV_COMBINED_POPULATION", "")
+if not COMBINED_POPULATION:
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        _m = os.path.join(_d, "combined_population.txt")
+        if os.path.exists(_m):
+            with open(_m) as _f:
+                COMBINED_POPULATION = _f.read().strip()
+            break
+COMBINED_POPULATION = COMBINED_POPULATION or "union"
+
+# A run built with hpc/prepare.py --no-predictor-label-copies carries a
+# predictor_label_copies.txt marker ("false"): combined multiscoresets are then
+# rebuilt with one row per variant (no __predictor_dup rows). Default True
+# (the paper's union fits); $MV_PREDICTOR_LABEL_COPIES (true|false) wins.
+_PLC = os.environ.get("MV_PREDICTOR_LABEL_COPIES", "")
+if not _PLC:
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        _m = os.path.join(_d, "predictor_label_copies.txt")
+        if os.path.exists(_m):
+            with open(_m) as _f:
+                _PLC = _f.read().strip()
+            break
+if _PLC.lower() not in ("", "true", "false"):
+    raise ValueError(f"MV_PREDICTOR_LABEL_COPIES must be true or false, not {_PLC!r}")
+PREDICTOR_LABEL_COPIES = _PLC.lower() != "false"
+def _marker(name):
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        _m = os.path.join(_d, name)
+        if os.path.exists(_m):
+            with open(_m) as _f:
+                return _f.read().strip()
+    return None
+
+
+# Runs prepared from 2026-11-19 on carry row_builder.txt ("v2": rows.py's
+# combined rows, averaged merged functional rows) and clinvar_release.txt
+# ("2025"); both are exported so the builders in src/ rebuild the same rows
+# and labels. A fits directory WITHOUT these markers predates them: it was
+# built with the legacy rows and ClinVar 2026 labels, so it is re-scored that
+# way (legacy reproduction only -- every new run is 2025/v2). $MV_ROW_BUILDER
+# and $MV_CLINVAR_DEFAULT_RELEASE win.
+ROW_BUILDER = os.environ.get("MV_ROW_BUILDER") or _marker("row_builder.txt") or "legacy"
+CLINVAR_DEFAULT_RELEASE = (os.environ.get("MV_CLINVAR_DEFAULT_RELEASE") or _marker("clinvar_release.txt")
+                           or "2026")
+if ROW_BUILDER not in ("v2", "legacy"):
+    raise ValueError(f"MV_ROW_BUILDER must be v2 or legacy, not {ROW_BUILDER!r}")
+os.environ["MV_ROW_BUILDER"] = ROW_BUILDER
+os.environ["MV_CLINVAR_DEFAULT_RELEASE"] = CLINVAR_DEFAULT_RELEASE
+# Consequence-stratified runs (hpc/prepare.py --strata) carry strata.txt and a
+# strata/ directory of per-dataset layouts; scoring composes the stratum
+# weights into the arm's composite samples (gene_set_analysis.stratify_for_scoring).
+STRATA = (os.environ.get("MV_STRATA") or _marker("strata.txt") or "false").lower() == "true"
+os.environ["MV_STRATA"] = "true" if STRATA else "false"
+if STRATA and "MV_STRATA_DIR" not in os.environ:
+    for _d in (PAPER_FITS_DIR, os.path.dirname(PAPER_FITS_DIR.rstrip("/"))):
+        if os.path.isdir(os.path.join(_d, "strata")):
+            os.environ["MV_STRATA_DIR"] = os.path.join(_d, "strata")
+            break
+# Univariate baselines with the run's ClinVar release: 2025 runs use the 2025
+# refits (2026-11-20, same settings as before), legacy runs the earlier ones.
+# $MV_TSC2_UV_CALIB / $MV_FGFR_UV_CALIB win.
+if CLINVAR_DEFAULT_RELEASE == "2025":
+    if "MV_TSC2_UV_CALIB" not in os.environ:
+        TSC2_UV_CALIB_DIR = "/data/ross/assay_calibration/TSC2/results_clinvar2025_111926/calibration_results"
+    FGFR_UV_CALIB_DIR = os.environ.get(
+        "MV_FGFR_UV_CALIB", "/data/ross/assay_calibration/FGFR/uv_1000b_clinvar2025_111926/calibration")
+else:
+    FGFR_UV_CALIB_DIR = os.environ.get("MV_FGFR_UV_CALIB", FGFR_UV_CALIB_DIR)
+if CLINVAR_DEFAULT_RELEASE != "2025" or ROW_BUILDER != "v2":
+    print(f"[mv_analysis.config] {PAPER_FITS_DIR}: legacy run (rows={ROW_BUILDER}, "
+          f"ClinVar default release {CLINVAR_DEFAULT_RELEASE}); re-scoring it as it was fit.")
+
+if COMBINED_POPULATION not in ("union", "intersection"):
+    raise ValueError(f"MV_COMBINED_POPULATION must be union or intersection, not {COMBINED_POPULATION!r}")
+
 # Run-specific figure output, NOT the paper repo's Figures/mv/ -- matches
 # the tp53_pca10_run/figures precedent; copying into the paper repo is a
 # separate, deliberate step the user does themselves.
-PAPER_FIGURES_DIR = _env("MV_PAPER_FIGURES_DIR", f"{PAPER_FITS_DIR}/figures")
+#
+# Gene sets held back from the paper (2026-10-27: LABEL-seq and CARD11, for a
+# later revision). Every paper output filters on this; with exclusions the
+# outputs go to their own figures dir, leaving the full-panel version in
+# figures/. Reincorporate with MV_PAPER_EXCLUDE_GENE_SETS="".
+PAPER_EXCLUDED_GENE_SETS = tuple(
+    s.strip() for s in _env("MV_PAPER_EXCLUDE_GENE_SETS", "labelseq,card11").split(",") if s.strip())
+PAPER_FIGURES_DIR = _env(
+    "MV_PAPER_FIGURES_DIR",
+    f"{PAPER_FITS_DIR}/figures_excl_{'_'.join(PAPER_EXCLUDED_GENE_SETS)}" if PAPER_EXCLUDED_GENE_SETS
+    else f"{PAPER_FITS_DIR}/figures")
+
+
+def paper_includes(gene_set_or_key):
+    """False for a gene set held back from the paper; accepts a gene-set name
+    or a "{gene_set}__{gene}[__cN]" key."""
+    return str(gene_set_or_key).split("__")[0] not in PAPER_EXCLUDED_GENE_SETS
 
 # Categorized subdirectories under PAPER_FIGURES_DIR -- every save-path call
 # site should build off these rather than hardcoding "{PAPER_FIGURES_DIR}/foo"
@@ -187,18 +328,19 @@ PAPER_CORRELATION_DIR = f"{PAPER_FIGURES_DIR}/correlation"
 PAPER_CACHE_DIR = f"{PAPER_FIGURES_DIR}/.cache"
 PAPER_PKNN_DIR = f"{PAPER_FIGURES_DIR}/pknn"
 PAPER_PRODUCTION_OOB_DIR = f"{PAPER_FIGURES_DIR}/production_oob"
+PAPER_STRENGTH_DIR = f"{PAPER_FIGURES_DIR}/strength"
 # P-KNN comparison-method runs (comparison_methods/pknn_runs.py) and the
 # production-scored out-of-bag evaluation (production_oob.py, under
 # PKNN_DIR/production_oob): per-dataset inputs and out-of-sample results.
 PKNN_DIR = _env("MV_PKNN_DIR", "/data/ross/assay_calibration/multivariate/pknn_101626")
 
-# The manuscript source tree (ExCALIBR_MV.tex / ExCALIBR_MV_supp.tex). The
+# The manuscript source tree (main_102826.tex / ExCALIBR_MV_supp.tex). The
 # paper notebook's "manuscript" section writes Figures/generated/macros.tex
 # here and copies every figure the .tex includes from PAPER_FIGURES_DIR into
 # Figures/generated/, mirroring analysis/analyze_pipeline_output.py's
 # MANUSCRIPT_FIGURE_DIR for the univariate paper.
 MANUSCRIPT_DIR = _env("MV_MANUSCRIPT_DIR", os.path.join(_ROOT, "ExCALIBR-MV_latex_092026"))
-MANUSCRIPT_MAIN_TEX = os.path.join(MANUSCRIPT_DIR, "ExCALIBR_MV.tex")
+MANUSCRIPT_MAIN_TEX = os.path.join(MANUSCRIPT_DIR, "main_102826.tex")  # the canonical main text
 MANUSCRIPT_SUPP_TEX = os.path.join(MANUSCRIPT_DIR, "ExCALIBR_MV_supp.tex")
 MANUSCRIPT_FIGURE_DIR = os.path.join(MANUSCRIPT_DIR, "Figures")
 MANUSCRIPT_GENERATED_DIR = os.path.join(MANUSCRIPT_FIGURE_DIR, "generated")
@@ -345,6 +487,36 @@ def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
 
 def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0,
                               results_json: str = None, rebuild=None, min_overlap_rows: int = 30):
+    """See _restrict_ms_to_stored_fit. For a combined ms built on the
+    intersection population (COMBINED_POPULATION), the rows are restricted
+    again on the selected dimensions, exactly as hpc/prepare.py did per
+    cluster, so stored out-of-bag masks index the same rows."""
+    ms = _restrict_ms_to_stored_fit(ms, gene, gene_set, cluster_idx, results_json, rebuild, min_overlap_rows)
+    if gene_set == "combined" and getattr(ms, "combined_population", None) == "intersection":
+        from src.assay_calibration.multivariate_data.combined import restrict_to_both_modalities
+        restrict_to_both_modalities(ms)
+    return with_fitted_phenotype_samples(ms, gene, gene_set, cluster_idx, results_json)
+
+
+def with_fitted_phenotype_samples(ms, gene, gene_set, cluster_idx=0, results_json=None):
+    """Genes with phenotype-specific groups (phenotype_samples.
+    PHENOTYPE_SAMPLE_GROUPS, e.g. RET's MEN2 / Hirschsprung) are fit with
+    them as extra samples (hpc/prepare.py). Rebuild them whenever the stored
+    fit has those sample rows (older post hoc runs do not), so the data --
+    and any bootstrap split regenerated from it -- is the fit's. Pathogenic
+    evidence is unaffected: it uses the P/LP sample only."""
+    from mv_analysis.phenotype_samples import phenotype_roles, with_phenotype_samples
+    roles = phenotype_roles(gene_set, gene)
+    if not roles:
+        return ms
+    n_fit = _stored_fit_n_samples(gene, gene_set, cluster_idx, results_json)
+    if n_fit is not None and n_fit > max(roles.values()) and len(ms.sample_assignments[0]) < n_fit:
+        ms = with_phenotype_samples(ms, gene_set, gene)
+    return ms
+
+
+def _restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0,
+                               results_json: str = None, rebuild=None, min_overlap_rows: int = 30):
     """Restrict an already-built MultiScoreset to the dimensions the stored fit
     for `gene`/`cluster_idx` was trained on (see build_ms_for_gene_cluster).
     `rebuild`: zero-argument callable that rebuilds the same data, called
@@ -355,10 +527,19 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
     import numpy as np
     from src.assay_calibration.fit_utils.fit import Fit
     from src.assay_calibration.multivariate_data.redundancy_collapse import select_dims
+    from src.assay_calibration.multivariate_data.combined import combined_calibration_clusters
+
+    def _clusters(ms, obs):
+        # combined: the functional panel's clusters, each joined by the
+        # predictors -- the same rule hpc/prepare.py generated the fits with
+        if obs.ndim != 2 or obs.shape[1] < 2:
+            return []
+        if gene_set == "combined":
+            return combined_calibration_clusters(obs, list(ms.dataset_names), min_overlap_rows=min_overlap_rows)
+        return Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
+
     obs = np.asarray(ms.scores, dtype=float)
-    clusters = []
-    if obs.ndim == 2 and obs.shape[1] > 1:
-        clusters = Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
+    clusters = _clusters(ms, obs)
 
     # Match the dimensions the STORED fit was trained on. Fits record their
     # datasets ("assay_datasets") since per-cluster job generation; older fits
@@ -398,8 +579,7 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
                   f"scoring it on its original {legacy.n_assays} datasets until refit")
             ms = legacy
             obs = np.asarray(ms.scores, dtype=float)
-            clusters = (Fit._select_all_calibration_clusters(obs, min_overlap_rows=min_overlap_rows)
-                        if obs.ndim == 2 and obs.shape[1] > 1 else [])
+            clusters = _clusters(ms, obs)
     if fit_info is not None:
         fit_names, fit_ndim = fit_info
         if fit_names:
@@ -420,7 +600,7 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
                 return ms
         # No candidate matches; fall through so the shape guard reports it.
 
-    if len(clusters) <= 1:
+    if len(clusters) <= 1 and not (clusters and len(clusters[0]) < obs.shape[1] and gene_set == "combined"):
         return ms
     if cluster_idx >= len(clusters):
         raise ValueError(
@@ -431,9 +611,29 @@ def restrict_ms_to_stored_fit(ms, gene: str, gene_set: str, cluster_idx: int = 0
     return ms
 
 
+def _stored_fit_n_samples(gene, gene_set, cluster_idx, results_json=None):
+    """Number of sample weight rows of the stored fit for this gene/cluster
+    (the samples it was fit with), or None if absent."""
+    entry = _stored_fit_entry(gene, gene_set, cluster_idx, results_json)
+    return None if entry is None else len(entry["fit"]["weights"])
+
+
 def _stored_fit_dims(gene, gene_set, cluster_idx, results_json=None):
     """(assay_datasets or None, n_dims) of the stored fit for this gene/
     cluster in `results_json` (default PAPER_RESULTS_JSON), or None if absent."""
+    entry = _stored_fit_entry(gene, gene_set, cluster_idx, results_json)
+    if entry is None:
+        return None
+    fit = entry["fit"]
+    # + categorical dims (experimental location-model fits keep them out of
+    # the continuous component_params)
+    n_cat = len((fit.get("cat_spec") or {}).get("positions", []))
+    return entry.get("assay_datasets"), len(fit["component_params"][0][0]) + n_cat
+
+
+def _stored_fit_entry(gene, gene_set, cluster_idx, results_json=None):
+    """The first stored bootstrap entry with a fit for this gene/cluster in
+    `results_json` (default PAPER_RESULTS_JSON), or None if absent."""
     results_json = results_json or PAPER_RESULTS_JSON
     try:
         from mv_analysis.gene_performance_scatter import _load_raw
@@ -450,10 +650,7 @@ def _stored_fit_dims(gene, gene_set, cluster_idx, results_json=None):
         for entry in (b or {}).values():
             fit = (entry or {}).get("fit") if isinstance(entry, dict) else None
             if fit and fit.get("component_params"):
-                # + categorical dims (experimental location-model fits keep
-                # them out of the continuous component_params)
-                n_cat = len((fit.get("cat_spec") or {}).get("positions", []))
-                return entry.get("assay_datasets"), len(fit["component_params"][0][0]) + n_cat
+                return entry
     return None
 
 
@@ -490,13 +687,13 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
                                        redundancy_collapse_preset=None):
     """MultiScoreset builder dispatch by gene_set -- one entry point for
     every gene_set the paper analysis notebook needs (labelseq, integrated,
-    predictor, card11, tp53, fgfr, combined), instead of each caller
+    predictor, card11, tsc2, tp53, fgfr, combined), instead of each caller
     reimplementing the per-gene-set ingestion logic that used to live only
     inline inside mv_analysis/gene_performance_scatter.py's panel builders.
 
     `regularization_type` (all_assayed staged-init support) only applies to
     labelseq/integrated (GENE_SETS_SUPPORTING_ALL_ASSAYED) -- predictor/
-    combined/card11/tp53/fgfr retain no unlabeled bulk at ingestion
+    combined/card11/tsc2/tp53/fgfr retain no unlabeled bulk at ingestion
     (confirmed this session), so a non-None value there raises rather than
     being silently ignored.
 
@@ -542,6 +739,9 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
     elif gene_set == "card11":
         from src.assay_calibration.multivariate_data.card11 import build_card11_multiscoreset
         ms_map = {"CARD11": build_card11_multiscoreset()}
+    elif gene_set == "tsc2":
+        from src.assay_calibration.multivariate_data.tsc2 import build_tsc2_multiscoreset
+        ms_map = {"TSC2": build_tsc2_multiscoreset()}
     elif gene_set == "fgfr":
         from src.assay_calibration.multivariate_data.fgfr import build_fgfr_multiscoresets
         # `genes` here filters the RAW paralog names (FGFR1-4) before
@@ -553,7 +753,7 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
         # confirmed via a real ValueError ("assayed_variant_level must be
         # constant across rows; got []"). Treat that specific case as "no
         # filter" (every paralog, default combine_genes=True behavior).
-        fgfr_genes = None if genes in (None, ["FGFR_combined"]) else genes
+        fgfr_genes = None if genes in (None, ["FGFR_combined"], ["FGFR"]) else genes  # "FGFR": dataset-name prefix
         ms_map = build_fgfr_multiscoresets(genes=fgfr_genes)
     elif gene_set == "predictor":
         from src.assay_calibration.multivariate_data.predictors import load_predictor_ms, DEFAULT_GENES
@@ -602,7 +802,9 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
                 # (which would mismatch the stored fit's variant/weight-row
                 # shape, same issue seen for TP53/BRCA2's role-count
                 # mismatch warnings this session).
-                require_both_modalities=False)
+                require_both_modalities=COMBINED_POPULATION == "intersection",
+                predictor_label_copies=PREDICTOR_LABEL_COPIES,
+                row_builder=ROW_BUILDER, df_integrated=df_integrated)
             if ms is None:
                 print(f"  [{gene}] could not build combined ms, skipping")
                 continue
@@ -610,7 +812,7 @@ def build_multiscoresets_for_gene_set(gene_set: str, genes=None, regularization_
     else:
         raise ValueError(
             f"No MultiScoreset builder registered for gene_set={gene_set!r}. Currently registered: "
-            f"'labelseq', 'integrated', 'tp53', 'card11', 'fgfr', 'predictor', 'combined'."
+            f"'labelseq', 'integrated', 'tp53', 'card11', 'tsc2', 'fgfr', 'predictor', 'combined'."
         )
     if redundancy_collapse_preset is not None:
         from src.assay_calibration.multivariate_data import redundancy_collapse as rc
