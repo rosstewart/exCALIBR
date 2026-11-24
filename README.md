@@ -87,7 +87,7 @@ Three formats are supported — see [docs/input-formats.md](docs/input-formats.m
 2. **IGVF / PillarProject format** ([Tejura et al. 2026](https://doi.org/10.64898/2026.02.14.705848)) — a rich per-variant metadata table; sample groups are instead derived automatically from ClinVar/gnomAD/consequence columns already present in the file, so you don't assign them by hand. Example: `example/MSH2_Jia_2021.csv`.
 3. **MaveDB format** — the output format of [bbi-lab/variant-annotation](https://github.com/bbi-lab/variant-annotation), which is used to annotate score sets in MaveDB.
 
-**Experimental:** the code also includes multi-assay (multivariate) calibration and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.). These are unpublished, may change without notice and are not yet supported. See the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
+**Experimental:** the code also includes multi-assay (multivariate) calibration, consequence-specific calibration (variants calibrated by molecular consequence, such as missense or protein-truncating), and calibration of computational variant-effect predictor scores (REVEL, AlphaMissense, etc.). These are unpublished, may change without notice and are not yet supported. See the note at the bottom of [docs/input-formats.md](docs/input-formats.md#3-mavedb-format).
 
 ## Documentation
 
