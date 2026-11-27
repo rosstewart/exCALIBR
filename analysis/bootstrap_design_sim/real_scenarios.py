@@ -62,16 +62,17 @@ ROLE = dict(P=0, B=1, g=2, s=3)
 # ── hook used by hpc/prepare.py and the scoring rebuild ──────────────────
 
 def _sample_matrix(ms):
-    """(N, 4) bool over P/LP, B/LB, gnomAD, synonymous from the ms's named samples."""
-    names = list(ms.sample_names)
+    """(N, 4) bool over P/LP, B/LB, gnomAD, synonymous from the ms's named
+    samples, read as hpc/prepare.sample_roles reads them. Auxiliary pathogenic
+    samples (TP53 RPV, phenotype groups) count as P/LP here: their rows are
+    drawn from the pathogenic class; sample memberships themselves are kept."""
     SA = np.asarray(ms.sample_assignments, bool)
     out = np.zeros((SA.shape[0], 4), bool)
-    for j, n in enumerate(names):
-        nl = str(n).lower()
-        k = (0 if "patho" in nl and "benign" not in nl else 1 if "benign" in nl else
-             3 if "synon" in nl else 2 if ("population" in nl or "gnomad" in nl) else None)
-        if k is not None:
-            out[:, k] |= SA[:, j]
+    for j, name in enumerate(ms.sample_names):
+        n = str(name).lower()
+        k = (2 if ("population" in n or "gnomad" in n) else 3 if "synonymous" in n else
+             1 if (n == "b/lb" or "benign" in n) else 0)
+        out[:, k] |= SA[:, j]
     return out
 
 
