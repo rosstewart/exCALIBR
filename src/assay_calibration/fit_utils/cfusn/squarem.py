@@ -1,4 +1,4 @@
-"""SQUAREM acceleration of the multivariate EM in cfusn/fit.py::single_fit.
+"""SQUAREM acceleration of the EM in cfusn/fit.py::single_fit.
 
 EXPERIMENTAL, opt-in (``em_accelerator="squarem"``; default off, so the plain
 EM path is untouched). Varadhan & Roland (2008, Scand J Stat 35:335-353),
@@ -52,9 +52,19 @@ Warm-up: plain EM steps until one gains < 1e-6 relative
 (DEFAULT_WARMUP_REL_TOL, kwarg squarem_warmup_rel_tol), then SQUAREM cycles.
 
 Supported: multivariate fits with q <= 2 (deterministic E-step), with strata,
-sample weights (tau), missing readouts and categorical readouts. Refused:
-univariate fits, q > 2 (Monte Carlo E-step), constrained/separation fits,
-dim_weights, weight_divergence and tied_population.
+sample weights (tau), missing readouts and categorical readouts; univariate
+fits (EXPERIMENTAL, 11/26/26), including the univariate density-ratio
+constraint. Refused: q > 2 (Monte Carlo E-step), multivariate constrained /
+separation fits, dim_weights, weight_divergence and tied_population.
+
+Univariate fits (UnivariatePacker): component params are the canonical
+(a, loc, scale) tuples; the difference vectors use the alternate form
+(loc, Delta, log Gamma), Gamma = scale^2 - Delta^2 > 0. A constrained fit's
+EM map line-searches each block toward its M-step candidate while the
+density-ratio constraint holds, starting from a feasible point; theta' must
+therefore satisfy the constraint too (the ``valid`` callback), or alpha is
+shrunk as for an invalid point. Force-Gaussian components (Delta = 0) keep
+Delta = 0 (r = v = 0 there).
 """
 
 import numpy as np
@@ -83,8 +93,6 @@ def resolve(kwargs):
 def check_supported(multivariate, latent_q, separation_active, dim_weighted_active,
                     weight_divergence, tied_population):
     why = []
-    if not multivariate:
-        why.append("univariate fits")
     if latent_q is not None and latent_q > 2:
         why.append("latent_q > 2 (Monte Carlo E-step)")
     if separation_active:
@@ -185,6 +193,44 @@ class Packer:
         return params, W, probs
 
 
+class UnivariatePacker:
+    """Packer for univariate fits: params are canonical (a, loc, scale)
+    tuples, packed as (loc, Delta, log Gamma) of the alternate form."""
+
+    def __init__(self, thetas):
+        from .density_utils import canonical_to_alternate
+        self._c2a = canonical_to_alternate
+        params0, W0, _ = thetas[0]
+        self.K = len(params0)
+        self.W_fixed = np.zeros(np.shape(W0), dtype=bool)
+        for _, W, _ in thetas:
+            self.W_fixed |= (np.asarray(W) <= 0)
+        self.W_fill = np.where(self.W_fixed, np.asarray(thetas[-1][1]), 0.0)
+
+    def pack(self, theta):
+        params, W, _ = theta
+        parts = []
+        for a, loc, scale in params:
+            loc_, D, G = self._c2a(a, loc, scale)
+            if not G > 0:
+                raise ValueError("non-positive Gamma")
+            parts.append(np.array([loc_, D, np.log(G)]))
+        parts.append(_log_simplex(np.asarray(W, dtype=float), self.W_fixed).ravel())
+        return np.concatenate(parts)
+
+    def unpack(self, x):
+        params = []
+        for k in range(self.K):
+            loc, D, lG = x[3 * k:3 * k + 3]
+            G = float(np.exp(lG))
+            a = float(np.sign(D) * np.sqrt(D * D / G))
+            params.append((a, float(loc), float(np.sqrt(G + D * D))))
+        i = 3 * self.K
+        n = self.W_fixed.size
+        W = _unlog_simplex(x[i:i + n].reshape(self.W_fixed.shape), self.W_fixed, self.W_fill)
+        return params, W, None
+
+
 def _moved_blocks(theta0, theta2):
     """Per component, which of (mu, Delta, Gamma) plain EM changed."""
     out = []
@@ -219,7 +265,8 @@ class StopFit(Exception):
 def run(theta0, cache0, obj0, F, objective, density, record, count_only, budget_left,
         guard_stats=None, tol=1e-8, plateau_rel_tol=1e-8, overshoot_rel_tol=1e-5,
         catastrophic_rel_tol=1e-1, step_max0=1.0, mstep=4.0, max_backtrack=3,
-        early_stopping=True, warmup_rel_tol=0.0, step_max_cap=np.inf):
+        early_stopping=True, warmup_rel_tol=0.0, step_max_cap=np.inf,
+        packer=Packer, valid=None, guard_check=True):
     """SQUAREM loop.
 
     F(theta, cache) -> (theta', ll, cache')  one EM iteration (counts as one).
@@ -232,6 +279,13 @@ def run(theta0, cache0, obj0, F, objective, density, record, count_only, budget_
     warmup_rel_tol: plain EM steps until one gains < this relative amount
     (0 = no warm-up), so extrapolation starts inside the basin plain EM is
     heading for. step_max_cap: upper bound on step_max.
+    packer: Packer (multivariate) or UnivariatePacker.
+    valid(theta) -> bool: extra feasibility test for theta' (the univariate
+    density-ratio constraint); False shrinks alpha like an invalid point.
+    guard_check: reject a cycle whose stabilising step kept an extrapolated
+    block (multivariate M-step guards). Off for univariate fits: there the
+    only block-keeping step is the constraint line search, which from a
+    feasible theta' is the constrained EM map itself.
 
     Returns (theta, stop_reason, stats); theta is the last accepted iterate.
     """
@@ -294,7 +348,7 @@ def run(theta0, cache0, obj0, F, objective, density, record, count_only, budget_
             # ---- extrapolation ------------------------------------------
             accepted = False
             try:
-                pk = Packer([theta0, theta1, theta2])
+                pk = packer([theta0, theta1, theta2])
                 x0, x1, x2 = pk.pack(theta0), pk.pack(theta1), pk.pack(theta2)
                 r = x1 - x0
                 v = x2 - x1 - r
@@ -313,8 +367,11 @@ def run(theta0, cache0, obj0, F, objective, density, record, count_only, budget_
                             cand = pk.unpack(x0 + 2.0 * alpha * r + alpha * alpha * v)
                             # L L' is PD in exact arithmetic but can be
                             # numerically indefinite after a long step.
-                            for _prm in cand[0]:
-                                np.linalg.cholesky(_prm[2])
+                            if packer is Packer:
+                                for _prm in cand[0]:
+                                    np.linalg.cholesky(_prm[2])
+                            if valid is not None and not valid(cand):
+                                raise ValueError("extrapolated point infeasible")
                             cache_c, ll_c = density(cand)
                         if all(np.all(np.isfinite(b)) for prm in cand[0] for b in prm) \
                                 and np.isfinite(ll_c):
@@ -340,7 +397,8 @@ def run(theta0, cache0, obj0, F, objective, density, record, count_only, budget_
                         err, theta_pp = True, None
                     if err:
                         stats["fallback_error"] += 1
-                    elif _guard_kept_extrapolated(theta_p, theta_pp, _moved_blocks(theta0, theta2)):
+                    elif guard_check and _guard_kept_extrapolated(theta_p, theta_pp,
+                                                                  _moved_blocks(theta0, theta2)):
                         stats["fallback_guard"] += 1
                     elif obj_pp < obj2:
                         stats["fallback_objective"] += 1

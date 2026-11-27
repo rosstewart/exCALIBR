@@ -80,9 +80,16 @@ def _oob(us, res, records, K, cfg, lg, kw=None):
                 n_oob=[int(pos[k]["n_oob"]) for k in keys])
 
 
-def calibrate_arm(us, records, arm, mapping, settings, manual_prior=None, n_jobs=8, oob=False, kw=None):
+def calibrate_arm(us, records, arm, mapping, settings, manual_prior=None, n_jobs=8, oob=False, kw=None,
+                  return_res=False):
     """records: {seed: {"<K>c": record}} from csq_analysis.fits. Returns a compact calibration dict, plus the
-    controls' out-of-bag points when oob (fits must carry val_variant_indices)."""
+    controls' out-of-bag points when oob (fits must carry val_variant_indices). return_res: (compact, full
+    process_component_fits result or None), for evaluation against truth (csq_analysis.sim)."""
+    out = _calibrate_arm(us, records, arm, mapping, settings, manual_prior, n_jobs, oob, kw)
+    return out if return_res else out[0]
+
+
+def _calibrate_arm(us, records, arm, mapping, settings, manual_prior=None, n_jobs=8, oob=False, kw=None):
     import tempfile
     from src.assay_calibration.fit_utils.strata import compose_weights
     from src.assay_calibration.pipeline.config import PipelineConfig
@@ -90,7 +97,7 @@ def calibrate_arm(us, records, arm, mapping, settings, manual_prior=None, n_jobs
     K = settings["K"]
     ss, idx, roles = U.arm_scoreset(us, arm)
     if 0 not in roles:
-        return dict(status="no P/LP composite")
+        return dict(status="no P/LP composite"), None
     M = us.composition(arm)[roles]
     fits, seeds = [], []
     for s, rec in sorted(records.items(), key=lambda kv: int(kv[0])):
@@ -103,7 +110,7 @@ def calibrate_arm(us, records, arm, mapping, settings, manual_prior=None, n_jobs
         fits.append({"fit": fit})
         seeds.append(int(s))
     if not fits:
-        return dict(status="no fits")
+        return dict(status="no fits"), None
     bm = _benign_method(arm, roles, settings["benign_method"])
     lg = logging.getLogger(f"csq.{us.dataset}.{arm}")
     lg.setLevel(logging.ERROR)
@@ -118,7 +125,7 @@ def calibrate_arm(us, records, arm, mapping, settings, manual_prior=None, n_jobs
                                      bootstrap_seeds=np.asarray(seeds))
         oob_pts = _oob(us, res, records, K, cfg, lg, kw) if (oob and res is not None) else None
     if res is None:
-        return dict(status="no valid priors", dataset=us.dataset, arm=arm, mapping=mapping, n_fits=len(fits))
+        return dict(status="no valid priors", dataset=us.dataset, arm=arm, mapping=mapping, n_fits=len(fits)), None
     pri = np.asarray(res.get("priors"), float) if res.get("priors") is not None else np.array([])
     pri = pri[np.isfinite(pri)]
     return dict(status="ok", dataset=us.dataset, arm=arm, mapping=mapping, K=K, benign_method=bm,
@@ -130,7 +137,7 @@ def calibrate_arm(us, records, arm, mapping, settings, manual_prior=None, n_jobs
                 point_ranges={str(k): v for k, v in res["point_ranges"].items()},
                 pct_bootstraps_kept=res.get("pct_bootstraps_kept"), n_fits=len(fits),
                 **{k: res.get(k) for k in res if str(k).startswith("gamma_hat_diagnostic")},
-                **({"oob": oob_pts} if oob_pts is not None else {}))
+                **({"oob": oob_pts} if oob_pts is not None else {})), res
 
 
 def _one(fit_dir, cfgname, ds, arms, mappings, n_jobs, oob=False):

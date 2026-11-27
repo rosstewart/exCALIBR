@@ -791,7 +791,8 @@ def _lookup_nc(dataset_name: str, cfg: dict, name_strip_re, fallback_components:
 
 def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
                                    N_BOOTSTRAPS, num_fits_by_nc, selected_components,
-                                   master_seed=DEFAULT_MASTER_SEED):
+                                   master_seed=DEFAULT_MASTER_SEED, em_accelerator="none",
+                                   squarem_warmup_rel_tol=None):
     from src.assay_calibration.data_utils.dataset import BasicScoreset
     from src.assay_calibration.fit_utils.fit import Fit
 
@@ -831,9 +832,14 @@ def _process_basicscoreset_dataset(dataset_name, dataset_df, output_dir,
         ref_jobs = None
         for nc in selected_components:
             num_fits = num_fits_by_nc.get(nc, num_fits_by_nc.get("default", 8))
+            # EXPERIMENTAL univariate SQUAREM (11/26/26): the key is added only
+            # when requested, so default jobs are unchanged.
+            _acc = {} if em_accelerator in (None, "none") else {"em_accelerator": em_accelerator}
+            if _acc and squarem_warmup_rel_tol is not None:
+                _acc["squarem_warmup_rel_tol"] = float(squarem_warmup_rel_tol)
             jobs = fitter.generate_fit_jobs(
                 component_range=[nc], bootstrap_seed=bs, master_seed=master_seed,
-                check_monotonic=True, num_fits=num_fits)
+                check_monotonic=True, num_fits=num_fits, **_acc)
             jobs_by_key[f"jobs_{nc}c"] = [_strip_minimal(j) for j in jobs]
             if ref_jobs is None:
                 ref_jobs = jobs
@@ -892,7 +898,8 @@ def run_basicscoreset(args):
         delayed(_process_basicscoreset_dataset)(
             name, df_ds, output_dir, N_BOOTSTRAPS, num_fits_by_nc,
             _lookup_nc(name, cfg, name_strip_re, fallback_components),
-            master_seed=args.seed,
+            master_seed=args.seed, em_accelerator=getattr(args, "em_accelerator", "none"),
+            squarem_warmup_rel_tol=getattr(args, "squarem_warmup_rel_tol", None),
         )
         for name, df_ds in partitions.items()
     )
@@ -1147,6 +1154,16 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
     """
     from src.assay_calibration.fit_utils.fit import Fit
 
+    if os.environ.get("MV_SIM_DUMP") or os.environ.get("MV_SIM_SCORES"):
+        # Bootstrap-design simulation (analysis/bootstrap_design_sim/real_scenarios.py):
+        # dump this dataset's real rows, or swap in simulated scores, before any
+        # job is built. Applied once per ms; cluster splits inherit it.
+        from analysis.bootstrap_design_sim.real_scenarios import apply_hook
+        from src.assay_calibration.fit_utils.strata import row_annotations as _row_ann
+        ms = apply_hook(ms, dataset_label, annotations=lambda: _row_ann(
+            ms, _integrated_df_cached() if getattr(ms, "_row_atoms", None) is not None
+            and getattr(ms, "row_meta", None) is None else None, gene=gene))
+
     observations = np.asarray(ms.scores, dtype=float)
     clusters = []
     if observations.ndim == 2 and observations.shape[1] > 1:
@@ -1283,10 +1300,15 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
                     fit_kwargs["tied_population"] = tied_spec
                 if noise_floor is not None:
                     fit_kwargs["gamma_noise_floor"] = noise_floor
-                # Opt-in, approximate speed options: only added when set, so
-                # default job kwargs stay byte-identical.
+                # EM accelerator (default squarem for multivariate fits since
+                # 11/24/26; --em-accelerator none gives plain EM and job kwargs
+                # byte-identical to earlier bundles) and the optional iteration
+                # cap (--max-em-iters; absent = the single_fit default).
                 if fit_options.get("em_accelerator", "none") != "none":
                     fit_kwargs["em_accelerator"] = fit_options["em_accelerator"]
+                if fit_options.get("max_em_iters") is not None:
+                    fit_kwargs["max_em_iters"] = int(fit_options["max_em_iters"])
+                # Opt-in, approximate: only added when set.
                 if fit_options.get("completed_moments_einsum", "exact") != "exact":
                     fit_kwargs["completed_moments_einsum"] = fit_options["completed_moments_einsum"]
                 fit_kwargs.update(boot_kwargs)
@@ -1331,6 +1353,7 @@ def _generate_bootstrap_fit_jobs(ms, dataset_label, gene, save_dir, N_BOOTSTRAPS
         if (fit_options.get("tied_population") or fit_options.get("noise_floor")
                 or fit_options.get("weight_neff", "weighted") != "weighted"
                 or fit_options.get("em_accelerator", "none") != "none"
+                or fit_options.get("max_em_iters") is not None
                 or fit_options.get("completed_moments_einsum", "exact") != "exact"):
             cjob["fit_options"] = dict(fit_options, tied_population_spec=tied_spec, noise_floor_var=noise_floor)
         if pathogenic_share:
@@ -2082,16 +2105,30 @@ def _add_pathogenic_share_arg(p):
                         "count as extra observations); 'kish' = Kish effective sample size "
                         "(upweighting moves components but adds no information). No effect "
                         "on unweighted (TAU=0) jobs.")
-    p.add_argument("--em-accelerator", choices=["none", "squarem"], default="none",
-                   help="EXPERIMENTAL, opt-in: accelerate the multivariate EM with SQUAREM "
-                        "(cfusn/squarem.py; Varadhan & Roland 2008). Not bitwise identical "
-                        "to plain EM; see docs/fit_speed_report.md before using it. CPU only. "
-                        "Default none: job kwargs unchanged.")
+    p.add_argument("--em-accelerator", choices=["none", "squarem"], default="squarem",
+                   help="Multivariate EM accelerator. Default squarem (cfusn/squarem.py; "
+                        "Varadhan & Roland 2008): converges to a plain-EM fixed point several "
+                        "times faster, with out-of-bag evidence equivalent to plain EM at "
+                        "production scale (docs/fit_speed_report.md); not bitwise identical "
+                        "to plain EM. 'none' = plain EM, job kwargs byte-identical to bundles "
+                        "built before 11/24/26. CPU only; recorded in each job's fit_options.")
+    p.add_argument("--max-em-iters", type=int, default=None,
+                   help="EM iteration cap for every multivariate fit (counts EM-map "
+                        "evaluations, also under SQUAREM). Default: 100000 with squarem "
+                        "(every SQUAREM fit capped at 50k in the production bootscheme run "
+                        "converged by 99k; test/fit_speed/cap_study.py); with none, the "
+                        "single_fit default (50000), so plain-EM jobs stay unchanged. "
+                        "Recorded in each job's fit_options.")
     p.add_argument("--completed-moments-einsum", choices=["exact", "two_stage"], default="exact",
                    help="EXPERIMENTAL, opt-in: 'two_stage' evaluates the completed-data "
                         "B Psi B' term as a batched matmul (faster, not bitwise identical; "
                         "see docs/fit_speed_report.md). CPU only. Default exact: job kwargs "
                         "unchanged.")
+
+
+# Default MV iteration cap under SQUAREM (11/26/26): the 28 bootscheme SQUAREM fits
+# that hit 50k all converged by 98,925 iterations (test/fit_speed/cap_study.py).
+SQUAREM_DEFAULT_MAX_EM_ITERS = 100000
 
 
 def _fit_options(args):
@@ -2108,6 +2145,10 @@ def _fit_options(args):
             "bootstrap_min_cell": getattr(args, "bootstrap_min_cell", 5),
             "bootstrap_n_minus_one": bool(getattr(args, "bootstrap_n_minus_one", False)),
             "em_accelerator": getattr(args, "em_accelerator", "none"),
+            "max_em_iters": (getattr(args, "max_em_iters", None)
+                             if getattr(args, "max_em_iters", None) is not None
+                             else SQUAREM_DEFAULT_MAX_EM_ITERS
+                             if getattr(args, "em_accelerator", "none") == "squarem" else None),
             "completed_moments_einsum": getattr(args, "completed_moments_einsum", "exact")}
 
 
@@ -2373,6 +2414,14 @@ def main():
     p_bs.add_argument("--name-strip", default=None,
                       help="Regex to strip robustness suffix before config lookup "
                            r"(e.g. '_ds[0-9]+_s[0-9]+$|_disc[0-9.]+_s[0-9]+$')")
+    p_bs.add_argument("--em-accelerator", choices=["none", "squarem"], default="none",
+                      help="EXPERIMENTAL, opt-in univariate EM accelerator (cfusn/squarem.py; "
+                           "under evaluation, test/fit_speed/uv_squarem.py). Default none = plain "
+                           "EM, job kwargs unchanged.")
+    p_bs.add_argument("--squarem-warmup-rel-tol", type=float, default=None,
+                      help="With --em-accelerator squarem: plain EM steps until one gains less "
+                           "than this (relative) before extrapolating (default: cfusn/squarem.py "
+                           "DEFAULT_WARMUP_REL_TOL).")
     p_bs.set_defaults(func=run_basicscoreset)
 
     # ── multivariate ─────────────────────────────────────────────────────────

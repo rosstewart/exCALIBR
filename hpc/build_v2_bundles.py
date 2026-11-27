@@ -1,7 +1,7 @@
 """Build the v2 cluster bundles (data only; the user submits).
 
     nice -n 19 python hpc/build_v2_bundles.py {bootscheme|standard|standard_n5|standard_sample|kdiag|kdiag_standard} <root>
-    nice -n 19 python hpc/build_v2_bundles.py {production|production_standard} <root> <components.json> "<scheme args>"
+    nice -n 19 python hpc/build_v2_bundles.py {production|production_standard} <root> {<components.json>|none} "<scheme args>"
 
   bootscheme  Phase 2a: bootstrap-scheme comparison on real data.
               Conditions <root>/<scheme>/<subrun>/tau_0.1; schemes S0 (composite
@@ -141,16 +141,19 @@ def kdiag(root, strata=True, refit_strata=None):
 KDIAG_STRATA_REFIT = {"integrated_strata_refit": (["integrated"], ["PALB2", "GCK"])}
 
 
+PRODUCTION_K = [3, 4, 5, 6]  # user's grid for every dataset (2026-11-26): K = 2 dropped
+
+
 def production(root, components_file, scheme_args, strata=True):
-    """Phase 6: every MV gene set of the paper at the per-dataset component
-    grids the user chose (components_file) and the bootstrap scheme chosen for
-    the model (scheme_args, e.g. "--bootstrap-scheme stratum_pattern
-    --bootstrap-min-cell 5", or "" for sample x pattern). strata=False builds
-    the standard 4-sample model. 100 bootstraps, 3 fits, tau 0.1."""
+    """Phase 6: every MV gene set of the paper at K = 3..6 (PRODUCTION_K) unless
+    components_file ("none" for no file) names a dataset's own grid, with the
+    bootstrap scheme chosen for the model (scheme_args, e.g. "--bootstrap-scheme
+    stratum", or "" for sample x pattern). strata=False builds the standard
+    4-sample model. 100 bootstraps, 3 fits, tau 0.1."""
+    cf = [] if str(components_file) == "none" else ["--components-file", str(components_file)]
     labels = []
     for sub, pipes in ALL_SUBRUNS.items():
-        prep(root / sub, pipes, None, [3, 4], 100,
-             ["--components-file", str(components_file), *scheme_args.split()], strata=strata)
+        prep(root / sub, pipes, None, PRODUCTION_K, 100, [*cf, *scheme_args.split()], strata=strata)
         labels.append(sub)
     merge(root, labels, 100)
 

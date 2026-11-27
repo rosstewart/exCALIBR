@@ -11,6 +11,8 @@
 # skipped, so a resubmission only reruns what is missing. Tar fits/ and strata/ back when done.
 #
 # SLURM parameters can be overridden via environment variables (as submit_array.sh).
+# MODULE=csq_analysis.sim submits a paper simulation bundle (python -m csq_analysis.sim make <bundle_dir>) instead;
+# it writes <bundle_dir>/runs/<task>.csv and needs no rows.pkl.
 
 set -euo pipefail
 
@@ -18,8 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$SCRIPT_DIR")"
 OUT="$(realpath "${1:?Usage: $0 <bundle_dir>}")"
 TASKS="$OUT/tasks.json"
-[ -f "$TASKS" ] || { echo "Error: $TASKS not found (run csq_analysis.fits make)"; exit 1; }
-[ -f "$OUT/rows.pkl" ] || { echo "Error: $OUT/rows.pkl not found"; exit 1; }
+MODULE="${MODULE:-csq_analysis.fits}"
+[ -f "$TASKS" ] || { echo "Error: $TASKS not found (run ${MODULE} make)"; exit 1; }
+if [ "$MODULE" = "csq_analysis.fits" ]; then
+    [ -f "$OUT/rows.pkl" ] || { echo "Error: $OUT/rows.pkl not found"; exit 1; }
+fi
 
 WORKERS="${WORKERS:-16}"
 N_ARRAYS="${N_ARRAYS:-50}"
@@ -54,11 +59,15 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 export PYTHONPATH=${REPO}
 cd ${REPO}
 # keep on one line: a backslash continuation here becomes a stray argument
-${PYTHON} -m csq_analysis.fits run ${OUT} --index \${SLURM_ARRAY_TASK_ID} --per-index ${PER_INDEX} --workers ${WORKERS}
+${PYTHON} -m ${MODULE} run ${OUT} --index \${SLURM_ARRAY_TASK_ID} --per-index ${PER_INDEX} --workers ${WORKERS}
 SBATCH_SCRIPT
 )
 
 echo "Submitted job array ${JOB_ID}"
 echo "  Tasks      : ${N_TASKS}, ${PER_INDEX} per array task (indices 0-${MAX_IDX}, max ${MAX_CONCURRENT} concurrent)"
 echo "  workers    : ${WORKERS}   mem / cpus : ${MEM} / ${CPUS}   partition ${PARTITION}, time limit ${TIME}"
-echo "Progress:   find ${OUT}/fits -name '*.json.gz' | wc -l   (of ${N_TASKS})"
+if [ "$MODULE" = "csq_analysis.fits" ]; then
+    echo "Progress:   find ${OUT}/fits -name '*.json.gz' | wc -l   (of ${N_TASKS})"
+else
+    echo "Progress:   ls ${OUT}/runs/*.csv | wc -l   (of ${N_TASKS})"
+fi

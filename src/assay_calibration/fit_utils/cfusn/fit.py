@@ -781,12 +781,22 @@ def single_fit(
                     _p, _w, _ll, _c, _pr = _r
                 else:
                     (_p, _w, _ll, _c), _pr = _r, None
+                if not mv:
+                    # as the plain univariate loop: scale clamp, then no cache
+                    _p = [(a, loc, max(scale, MIN_SCALE)) if scale < MIN_SCALE else (a, loc, scale)
+                          for a, loc, scale in _p]
+                    _c = None
                 return (_p, _w, _pr), _ll, _c
 
             def _sq_objective(theta, ll):
                 return ll + _penalty(theta[0], theta[2], theta[1])
 
             def _sq_density(theta):
+                if not mv:
+                    return None, get_likelihood(
+                        observations, sample_indicators, theta[0], theta[1],
+                        multivariate=False, sample_weights=monitor_weights,
+                    ) / len(sample_indicators)
                 return log_pdf_cache_and_ll(
                     observations, sample_indicators, theta[0], theta[1],
                     sample_weights=em_kwargs.get("sample_weights"),
@@ -822,6 +832,11 @@ def single_fit(
                 early_stopping=kwargs.get("early_stopping", True),
                 warmup_rel_tol=float(kwargs.get("squarem_warmup_rel_tol", _sq.DEFAULT_WARMUP_REL_TOL)),
                 step_max_cap=float(kwargs.get("squarem_step_max", np.inf)),
+                packer=_sq.Packer if mv else _sq.UnivariatePacker,
+                guard_check=mv,
+                valid=(None if mv or not constrained else
+                       lambda th: not constraints.multicomponent_density_constraint_violated(
+                           th[0], xlims, multivariate=False)),
             )
             updated_component_params, updated_weights, cat_probs = _theta_fin
             if stop_reason == "overshoot":

@@ -71,8 +71,12 @@ def _rows(out_dir, ds, sub=None):
 
 def layout(out_dir, ds, cfg, sub=None):
     """Strata of `ds` under fit config `cfg` (missense controls subsampled per `sub`), plus resampling kwargs."""
+    return layout_rows(ds, _rows(out_dir, ds, sub), cfg)
+
+
+def layout_rows(ds, rows, cfg):
+    """layout() on rows already in memory (csq_analysis.annotate format; also csq_analysis.sim replicates)."""
     from csq_analysis import strata_uni as U
-    rows = _rows(out_dir, ds, sub)
     us = U.build(ds, rows, min_stratum=cfg["min_stratum"])
     kw = {}
     scheme = cfg.get("scheme")
@@ -130,39 +134,50 @@ def _run_one(out_dir, t):
     f = out / "fits" / lab / f"{ds}__{seeds[0]}-{seeds[-1]}.json.gz"
     if f.exists():
         return "skip"
-    from src.assay_calibration.data_utils.dataset import BasicScoreset
-    from src.assay_calibration.fit_utils.fit import Fit
     us, kw = layout(out, ds, FIT_CONFIGS[cfgname], t.get("sub"))
     meta = out / "strata" / lab / f"{ds}.json"
     if not meta.exists():
         meta.parent.mkdir(parents=True, exist_ok=True)
         meta.write_text(json.dumps(_strata_meta(us)))
-    ss = BasicScoreset(us.rows.score.to_numpy(float)[us.fitted], us.onehot, sample_names=list(us.names))
-    fitter = Fit(ss)
-    rec = {}
-    for b in seeds:
-        try:
-            models, best, val_ll = fitter.run([K], bootstrap=True, bootstrap_seed=int(b), num_fits=int(t["R"]),
-                                              master_seed=0, check_monotonic=True, core_limit=1, verbose=False, **kw)
-        except Exception as e:      # a failed bootstrap is dropped, as in production
-            rec[str(b)] = {"error": repr(e)[:300]}
-            continue
-        fit = {k: v for k, v in models[best].items() if k not in ("history", "likelihoods")}
-        fit = json.loads(json.dumps(fit, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
-        # out-of-bag rows of this bootstrap (positions among the FITTED rows, i.e. strata.json fitted_variant_ids):
-        # Fit.run keeps them only in its internal job dicts, so regenerate the (deterministic) split once
-        job = fitter.generate_fit_jobs([K], bootstrap=True, bootstrap_seed=int(b), num_fits=1, master_seed=0,
-                                       check_monotonic=True, **kw)[0]
-        val = job.get("val_variant_indices")
-        rec[str(b)] = {f"{K}c": dict(dataset_name=ds, bootstrap_seed=int(b), num_components=K, fit_idx=int(best),
-                                     fit=fit, val_ll=float(val_ll), strata_config=cfgname, restarts=int(t["R"]),
-                                     val_variant_indices=(np.asarray(val, int).tolist() if val is not None else []))}
+    rec = fit_records(us, kw, K, seeds, int(t["R"]), ds, cfgname)
     f.parent.mkdir(parents=True, exist_ok=True)
     tmp = f.with_name(f.name + ".tmp")
     with gzip.open(tmp, "wt") as fh:
         json.dump(rec, fh)
     tmp.rename(f)
     return "ok"
+
+
+def fit_records(us, kw, K, seeds, R, ds, cfgname):
+    """{seed: {"<K>c": record}} of one strata layout: one best-of-R fit per bootstrap seed (failed bootstraps kept as
+    {"error"}), with each bootstrap's out-of-bag rows (positions among the fitted rows)."""
+    from src.assay_calibration.data_utils.dataset import BasicScoreset
+    from src.assay_calibration.fit_utils.fit import Fit
+    ss = BasicScoreset(us.rows.score.to_numpy(float)[us.fitted], us.onehot, sample_names=list(us.names))
+    fitter = Fit(ss)
+    fit_kw = {k: v for k, v in kw.items() if k != "force_gaussian"}
+    rec = {}
+    for b in seeds:
+        try:
+            models, best, val_ll = fitter.run([K], bootstrap=True, bootstrap_seed=int(b), num_fits=int(R),
+                                              master_seed=0, check_monotonic=True, core_limit=1, verbose=False, **kw)
+        except Exception as e:      # a failed bootstrap is dropped, as in production
+            rec[str(b)] = {"error": repr(e)[:300]}
+            continue
+        if best is None:
+            rec[str(b)] = {"error": "no valid restart"}
+            continue
+        fit = {k: v for k, v in models[best].items() if k not in ("history", "likelihoods")}
+        fit = json.loads(json.dumps(fit, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
+        # out-of-bag rows of this bootstrap (positions among the FITTED rows, i.e. strata.json fitted_variant_ids):
+        # Fit.run keeps them only in its internal job dicts, so regenerate the (deterministic) split once
+        job = fitter.generate_fit_jobs([K], bootstrap=True, bootstrap_seed=int(b), num_fits=1, master_seed=0,
+                                       check_monotonic=True, **fit_kw)[0]
+        val = job.get("val_variant_indices")
+        rec[str(b)] = {f"{K}c": dict(dataset_name=ds, bootstrap_seed=int(b), num_components=K, fit_idx=int(best),
+                                     fit=fit, val_ll=float(val_ll), strata_config=cfgname, restarts=int(R),
+                                     val_variant_indices=(np.asarray(val, int).tolist() if val is not None else []))}
+    return rec
 
 
 def run(out_dir, index, per_index, workers):

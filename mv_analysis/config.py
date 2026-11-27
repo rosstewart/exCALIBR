@@ -478,7 +478,11 @@ def build_ms_for_gene_cluster(gene_set: str, gene: str, cluster_idx: int = 0,
 
     def _build():
         ms_map = build_multiscoresets_for_gene_set(gene_set, genes=[gene])
-        return ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
+        ms = ms_map.get(gene_key) or ms_map.get(gene) or next(iter(ms_map.values()))
+        if os.environ.get("MV_SIM_SCORES"):  # bootstrap-design simulation: swap in simulated scores
+            from analysis.bootstrap_design_sim.real_scenarios import apply_hook_by_match
+            ms = apply_hook_by_match(ms)
+        return ms
 
     return restrict_ms_to_stored_fit(_build(), gene, gene_set, cluster_idx=cluster_idx,
                                      results_json=results_json, rebuild=_build,

@@ -68,6 +68,12 @@ python hpc/prepare.py predictor-mv \
 python hpc/prepare.py multivariate --output-dir /tmp/ignore --list-only
 ```
 
+**Multivariate EM settings** (`multivariate`, `predictor-mv` and `mv_all`; univariate sub-commands are unaffected):
+- `--em-accelerator`: defaults to `squarem` since 11/24/26. It reaches a plain-EM fixed point several times faster, and its out-of-bag evidence matched plain EM at production scale (`docs/fit_speed_report.md`). It is not bitwise identical to plain EM. `--em-accelerator none` gives plain EM, with job kwargs byte-identical to earlier bundles.
+- `--max-em-iters N`: sets the iteration cap of every multivariate fit. The default is 100000 with `squarem` (since 11/26/26: every SQUAREM fit that hit 50k in the production bootscheme run converged by 99k, `test/fit_speed/cap_study.py`). With `none`, fits keep the `single_fit` default (50000), so plain-EM jobs are unchanged.
+- Both settings are recorded in each compact job's `fit_options`.
+- The cluster checkout must have `cfusn/squarem.py`. Older code silently ignores `em_accelerator` and runs plain EM. Check that results contain `n_em_iters` and per-bootstrap `restart_stats` files.
+
 This writes:
 - `<output_dir>/jobs/job_index.json` — lightweight index of all tasks
 - `<output_dir>/jobs/array_NNNN.pkl` — one file per SLURM array task

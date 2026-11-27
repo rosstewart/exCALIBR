@@ -139,3 +139,53 @@ def test_refused_configurations(bad):
 def test_unknown_accelerator_rejected():
     with pytest.raises(ValueError):
         sq.resolve({"em_accelerator": "anderson"})
+
+
+# ── univariate (EXPERIMENTAL, opt-in) ───────────────────────────────────────
+
+UV_COMMON = dict(init_method="kmeans", init_constraint_adjustment="scale", multivariate=False,
+                 verbose=False, check_monotonic=True)
+
+
+def _make_uv(seed=0):
+    from scipy.stats import skewnorm
+    rng = np.random.RandomState(seed)
+    path = skewnorm.rvs(-2, loc=-2.0, scale=1.2, size=120, random_state=rng)
+    ben = skewnorm.rvs(2, loc=1.0, scale=1.0, size=200, random_state=rng)
+    pop = np.concatenate([skewnorm.rvs(-2, loc=-2.0, scale=1.2, size=60, random_state=rng),
+                          skewnorm.rvs(2, loc=1.0, scale=1.0, size=240, random_state=rng)])
+    x = np.concatenate([path, ben, pop])
+    S = np.zeros((len(x), 3), dtype=bool)
+    S[:120, 0] = True
+    S[120:320, 1] = True
+    S[320:, 2] = True
+    return x, S
+
+
+def test_univariate_pack_unpack_roundtrip():
+    params = [(-1.5, -2.0, 1.2), (0.0, 0.5, 0.8), (2.0, 1.0, 1.0)]
+    W = np.array([[0.7, 0.2, 0.1], [0.0, 0.4, 0.6]])
+    pk = sq.UnivariatePacker([(params, W, None)] * 3)
+    p2, W2, _ = pk.unpack(pk.pack((params, W, None)))
+    assert np.allclose(np.asarray(p2), np.asarray(params), atol=1e-12)
+    assert np.allclose(W2, W) and W2[1, 0] == 0.0
+
+
+@pytest.mark.parametrize("constrained", [True, False])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_univariate_squarem_monotone_feasible_and_close(constrained, seed):
+    from src.assay_calibration.fit_utils.cfusn import constraints
+    x, S = _make_uv(seed)
+    kw = dict(UV_COMMON, constrained=constrained, fit_seed=seed, max_em_iters=10000)
+    a = single_fit(x, S, 2, **kw)
+    b = single_fit(x, S, 2, em_accelerator="squarem", **kw)
+    assert b["em_accelerator"] == "squarem"
+    # accepted iterates are monotone in the objective (gamma prior is 0 univariate)
+    L = np.asarray(b["likelihoods"])
+    assert np.all(np.diff(L) >= -1e-8 * np.abs(L[:-1]))
+    if constrained:
+        assert not constraints.multicomponent_density_constraint_violated(
+            b["component_params"], b["xlims"], multivariate=False)
+    # same fixed point as plain EM, to within the stopping tolerance
+    assert b["final_objective"] >= a["final_objective"] - 1e-6 * abs(a["final_objective"])
+    assert np.allclose(np.asarray(b["component_params"]), np.asarray(a["component_params"]), atol=5e-2)

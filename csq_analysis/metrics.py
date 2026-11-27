@@ -5,8 +5,10 @@ A strategy maps each consequence class to an arm, with a default arm for every o
     routed        missense -> mis, PTV -> ptv_poolprior, synonymous/splice/intronic -> their arms, else pool
     mis:<arm>     missense -> <arm>, else pool        (one per missense benign-reference / prior variant)
     ptv:<arm>     PTV -> <arm>, else pool              (one per PTV prior variant)
+    <name>|flag   the same, but only in datasets flagged by csq_analysis.criteria (pooled elsewhere)
 A consequence arm is used only where its calibration succeeded and the dataset has >= min_n P/LP of that
-consequence; otherwise the strategy's default arm scores the variant. Counts are per measurement.
+consequence; otherwise the strategy's default arm scores the variant. Counts are per measurement. Flag-gated
+strategies need <fit_dir>/criteria/<criteria label>.csv (--criteria, default the --config label).
 
     python -m csq_analysis.metrics <fit_dir> --config S1_m5_R20 --mapping lp_anchored [--min 3] [--oob]
 
@@ -28,14 +30,30 @@ ROUTED = {"missense": "mis", "PTV": "ptv_poolprior", "synonymous": "syn", "splic
           "intronic": "intronic"}
 
 
-def strategies():
+GATED = ("routed", "mis:mis", "mis:mis_Ball", "mis:mis_Bmis_syn")
+
+
+def strategies(gated=True):
     s = {"pool": {}, "routed": dict(ROUTED)}
     for a in U.ARMS:
         if a.startswith("mis"):
             s[f"mis:{a}"] = {"missense": a}
         if a.startswith("ptv"):
             s[f"ptv:{a}"] = {"PTV": a}
+    if gated:
+        s.update({f"{k}|flag": s[k] for k in GATED})
     return s
+
+
+def load_flags(fit_dir, label, col="flag"):
+    """{dataset: bool} from csq_analysis.criteria output, or None if it has not been run."""
+    from pathlib import Path
+    f = Path(fit_dir) / "criteria" / f"{label}.csv"
+    if not f.exists():
+        return None
+    c = pd.read_csv(f)
+    c = c[c.status.eq("ok")]
+    return dict(zip(c.dataset, c[col].astype(bool)))
 
 
 STD_STRATS = {"pool": {}, "mis:std_mis": {"missense": "std_mis"}, "mis:std_misctl": {"missense": "std_misctl"},
@@ -64,12 +82,13 @@ def _ranges(cal):
     return {int(k): [(float(a), float(b)) for a, b in v] for k, v in cal["point_ranges"].items() if v}
 
 
-def points(fit_dir, cfgname, mapping, rows, min_n=3, strats=None, oob=False, loader=None):
+def points(fit_dir, cfgname, mapping, rows, min_n=3, strats=None, oob=False, loader=None, gate=None):
     """Long table, one row per scored variant (controls and VUS) of every dataset in rows, with one points column
     per strategy, plus csq / plp / blb / vus / dataset. rows must be the fit dir's rows.pkl (row order within a
     dataset = strata row positions). oob: controls take their out-of-bag points where the arm's calibration has
     them (calibrate --oob), else in-bag; VUS are never fitted, so they always take the full calibration's points.
-    loader(arm, ds) -> calibration dict replaces the strata calibration lookup (std_loader)."""
+    loader(arm, ds) -> calibration dict replaces the strata calibration lookup (std_loader).
+    gate: {dataset: flagged} for the "<name>|flag" strategies (unflagged or untested datasets stay pooled)."""
     from src.assay_calibration.fit_utils.fit import assign_points
     from csq_analysis.calibrate import load
     strats = strats or strategies()
@@ -104,13 +123,16 @@ def points(fit_dir, cfgname, mapping, rows, min_n=3, strats=None, oob=False, loa
         cols = {}
         for name, route in strats.items():
             p = pts["pool"].copy()
+            if name.endswith("|flag") and not (gate or {}).get(ds, False):
+                cols[name] = p
+                continue
             for csq, a in route.items():
                 if pts.get(a) is not None and n_plp.get(csq, 0) >= min_n:
                     sel = (r.csq == csq).to_numpy()
                     p[sel] = pts[a][sel]
             cols[name] = p
         out.append(pd.DataFrame(dict(dataset=ds, csq=r.csq.to_numpy(), plp=r.plp.to_numpy(), blb=r.blb.to_numpy(),
-                                     vus=r.vus.to_numpy(), **cols)))
+                                     vus=r.vus.to_numpy(), flagged=bool((gate or {}).get(ds, False)), **cols)))
     if oob and n_missing_oob:
         print(f"warning: {n_missing_oob} (dataset, arm) calibrations without OOB points scored in-bag")
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
@@ -148,6 +170,7 @@ def main():
     ap.add_argument("--min", type=int, default=3)
     ap.add_argument("--oob", action="store_true")
     ap.add_argument("--std", default=None, help="run_igvf_batch output root of the standard refits")
+    ap.add_argument("--criteria", default=None, help="criteria label for |flag strategies (default --config)")
     a = ap.parse_args()
     from pathlib import Path
     import json
@@ -155,12 +178,17 @@ def main():
     dss = json.loads((Path(a.fit_dir) / "bundle.json").read_text())["datasets"]
     rows = pd.read_pickle(Path(a.fit_dir) / ROWS_FILE)
     rows = rows[rows.dataset.isin(dss)]
+    gate = load_flags(a.fit_dir, a.criteria or a.config)
     if a.std:
-        st, a.config, a.oob = STD_STRATS, "std", False
-        t = points(None, None, a.mapping, rows, a.min, st, loader=std_loader(a.std, a.mapping))
+        st, a.config, a.oob = dict(STD_STRATS), "std", False
+        if gate is not None:
+            st.update({f"{k}|flag": v for k, v in STD_STRATS.items() if k != "pool"})
+        t = points(None, None, a.mapping, rows, a.min, st, loader=std_loader(a.std, a.mapping), gate=gate)
     else:
-        st = strategies()
-        t = points(a.fit_dir, a.config, a.mapping, rows, a.min, st, oob=a.oob)
+        st = strategies(gated=gate is not None)
+        if gate is None:
+            print(f"no criteria/{a.criteria or a.config}.csv: flag-gated strategies skipped")
+        t = points(a.fit_dir, a.config, a.mapping, rows, a.min, st, oob=a.oob, gate=gate)
     s = summarise(t, st)
     out = Path(a.fit_dir) / "metrics"
     out.mkdir(exist_ok=True)
